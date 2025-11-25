@@ -181,7 +181,7 @@ def initialize_federation_services(scheduler_service) -> bool:
             logger.warning(f"No bootstrap servers configured: {e}")
 
         # Register scheduled HTTP calls to discovery daemon endpoints
-        # The discovery daemon runs as a separate process on port 8302
+        # The discovery daemon runs as a separate process on port 1113
         _register_federation_scheduler_jobs(scheduler_service)
 
         logger.info(
@@ -201,7 +201,7 @@ def _register_federation_scheduler_jobs(scheduler_service):
     import httpx
     from apscheduler.triggers.interval import IntervalTrigger
 
-    discovery_daemon_url = "http://localhost:8302"
+    discovery_daemon_url = "http://localhost:1113"
 
     # Gossip announcement - every 10 minutes
     def call_gossip_endpoint():
@@ -323,7 +323,7 @@ def get_federation_status() -> Dict[str, Any]:
             "fingerprint": identity['fingerprint'],
             "created_at": identity['created_at'].isoformat(),
             "peers": peer_stats or {"total_peers": 0, "neighbors": 0, "trusted_peers": 0, "active_peers": 0},
-            "discovery_daemon_url": "http://localhost:8302"
+            "discovery_daemon_url": "http://localhost:1113"
         }
 
     except Exception as e:

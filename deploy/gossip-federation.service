@@ -12,10 +12,10 @@ WorkingDirectory=/opt/gossip-federation
 Environment="PATH=/opt/gossip-federation/venv/bin:/usr/local/bin:/usr/bin"
 Environment="PYTHONUNBUFFERED=1"
 
-# Federation discovery daemon runs on port 8302
+# Federation discovery daemon runs on port 1113
 ExecStart=/opt/gossip-federation/venv/bin/python -m uvicorn gossip_federation.discovery_daemon:app \
     --host 0.0.0.0 \
-    --port 8302 \
+    --port 1113 \
     --workers 1 \
     --log-level info
 

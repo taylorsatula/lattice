@@ -33,7 +33,7 @@ class FederationClient:
     This replaces direct imports of federation modules in MIRA.
     """
 
-    def __init__(self, base_url: str = "http://localhost:8302", timeout: int = 30):
+    def __init__(self, base_url: str = "http://localhost:1113", timeout: int = 30):
         """
         Initialize federation client.
 

@@ -138,7 +138,7 @@ See `FEDERATION_VAULT_SETUP.md` and `FEDERATION_SYSTEMD.md` for setup instructio
 4. Main MIRA scheduler automatically handles periodic tasks
 
 **Monitoring:**
-- Discovery daemon health: `http://localhost:8302/api/v1/health`
-- Peer list: `http://localhost:8302/api/v1/peers`
+- Discovery daemon health: `http://localhost:1113/api/v1/health`
+- Peer list: `http://localhost:1113/api/v1/peers`
 - Message queue status: Query `federation_messages` table
 - Circuit breaker state: Logged when failures occur

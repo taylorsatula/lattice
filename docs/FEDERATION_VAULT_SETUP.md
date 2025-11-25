@@ -104,7 +104,7 @@ Once Vault is configured:
 
 3. **Start discovery daemon**:
    ```bash
-   python -m uvicorn federation.discovery_daemon:app --host 0.0.0.0 --port 8302
+   python -m uvicorn federation.discovery_daemon:app --host 0.0.0.0 --port 1113
    ```
 
 4. **Register your server's domain name** (optional, for custom domain):

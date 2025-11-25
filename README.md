@@ -29,14 +29,14 @@ pip install -e .
 psql -U mira_admin -d mira_service -f deploy/federation_schema.sql
 
 # Start daemon
-uvicorn federation.discovery_daemon:app --host 0.0.0.0 --port 8302
+uvicorn federation.discovery_daemon:app --host 0.0.0.0 --port 1113
 ```
 
 ### Using Docker
 
 ```bash
 docker run -d \
-  -p 8302:8302 \
+  -p 1113:1113 \
   -e DATABASE_URL=postgresql://... \
   -e VAULT_ADDR=https://... \
   gossip-federation:latest
@@ -484,7 +484,7 @@ Without filtering, federated message content should be treated as untrusted user
 | Neighbor selection | 6 hours | `POST /api/v1/maintenance/update_neighbors` |
 | Cleanup | Daily | `POST /api/v1/maintenance/cleanup` |
 
-The main MIRA application's scheduler calls these endpoints on the discovery daemon (port 8302).
+The main MIRA application's scheduler calls these endpoints on the discovery daemon (port 1113).
 
 ---
 
@@ -520,7 +520,7 @@ pip install -e ".[dev]"
 pytest
 
 # Start development server
-uvicorn federation.discovery_daemon:app --reload --port 8302
+uvicorn federation.discovery_daemon:app --reload --port 1113
 ```
 
 ---

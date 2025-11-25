@@ -24,11 +24,11 @@ Environment="PYTHONUNBUFFERED=1"
 Environment="VAULT_ADDR=http://localhost:8200"
 EnvironmentFile=/etc/mira/federation.env
 
-# Start discovery daemon on port 8302
+# Start discovery daemon on port 1113
 ExecStart=/opt/mira/venv/bin/python -m uvicorn \
     federation.discovery_daemon:app \
     --host 0.0.0.0 \
-    --port 8302 \
+    --port 1113 \
     --log-level info
 
 # Restart policy
@@ -173,7 +173,7 @@ sudo journalctl -u mira-federation-discovery -n 50
 sudo cat /etc/mira/federation.env
 
 # Test manually as mira user
-sudo -u mira /opt/mira/venv/bin/python -m uvicorn federation.discovery_daemon:app --port 8302
+sudo -u mira /opt/mira/venv/bin/python -m uvicorn federation.discovery_daemon:app --port 1113
 ```
 
 #### Can't connect to Vault
@@ -189,23 +189,23 @@ vault status
 sudo systemctl show mira-federation-discovery | grep Environment
 ```
 
-#### Port 8302 already in use
+#### Port 1113 already in use
 
 ```bash
 # Check what's using the port
-sudo lsof -i :8302
+sudo lsof -i :1113
 
 # Or use netstat
-sudo netstat -tlnp | grep 8302
+sudo netstat -tlnp | grep 1113
 ```
 
 ## Integration with Main MIRA
 
 The main MIRA application (port 1993) schedules periodic HTTP calls to the discovery daemon:
 
-- **Gossip rounds**: `POST http://localhost:8302/api/v1/announce` (every 10 minutes)
-- **Neighbor updates**: `POST http://localhost:8302/api/v1/maintenance/update_neighbors` (every 6 hours)
-- **Cleanup**: `POST http://localhost:8302/api/v1/maintenance/cleanup` (daily)
+- **Gossip rounds**: `POST http://localhost:1113/api/v1/announce` (every 10 minutes)
+- **Neighbor updates**: `POST http://localhost:1113/api/v1/maintenance/update_neighbors` (every 6 hours)
+- **Cleanup**: `POST http://localhost:1113/api/v1/maintenance/cleanup` (daily)
 
 These are registered automatically when MIRA starts (see `federation/init_federation.py`).
 
@@ -215,7 +215,7 @@ These are registered automatically when MIRA starts (see `federation/init_federa
 
 ```bash
 # Check if daemon is responding
-curl http://localhost:8302/api/v1/peers
+curl http://localhost:1113/api/v1/peers
 
 # Expected: JSON list of peer servers
 ```
@@ -244,9 +244,9 @@ systemctl show mira-federation-discovery --property=MemoryCurrent,CPUUsage
 For external federation access, configure nginx:
 
 ```nginx
-# Federation discovery daemon (port 8302)
+# Federation discovery daemon (port 1113)
 location /discovery/ {
-    proxy_pass http://localhost:8302/;
+    proxy_pass http://localhost:1113/;
     proxy_http_version 1.1;
     proxy_set_header Host $host;
     proxy_set_header X-Real-IP $remote_addr;

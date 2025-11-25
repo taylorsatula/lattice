@@ -1180,5 +1180,5 @@ async def trigger_cleanup(_: str = Depends(localhost_only)):
 
 if __name__ == "__main__":
     import uvicorn
-    # Port 8302 for WAN gossip (use 8301 for LAN deployments)
-    uvicorn.run(app, host="0.0.0.0", port=8302, log_level="info")
+    # Port 1113 for gossip federation (all deployments)
+    uvicorn.run(app, host="0.0.0.0", port=1113, log_level="info")
