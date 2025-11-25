@@ -6,6 +6,7 @@ Provides REST API for local tools to query federation routes.
 """
 
 import asyncio
+import ipaddress
 import logging
 import random
 from collections import OrderedDict
@@ -82,14 +83,36 @@ async def localhost_only(request: Request):
 
     Use this for admin/maintenance endpoints that should not be exposed
     to the network (health checks, peer listings, maintenance tasks).
+
+    Handles IPv4-mapped IPv6 addresses (e.g., ::ffff:127.0.0.1) by normalizing
+    them to their IPv4 equivalent before checking.
     """
-    client_ip = request.client.host if request.client else None
-    if client_ip not in ("127.0.0.1", "::1"):
+    client_host = request.client.host if request.client else None
+    if not client_host:
         raise HTTPException(
             status_code=403,
             detail="This endpoint is restricted to localhost only"
         )
-    return client_ip
+
+    try:
+        ip = ipaddress.ip_address(client_host)
+        # Handle IPv4-mapped IPv6 addresses (e.g., ::ffff:127.0.0.1)
+        if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
+            ip = ip.ipv4_mapped
+
+        if not ip.is_loopback:
+            raise HTTPException(
+                status_code=403,
+                detail="This endpoint is restricted to localhost only"
+            )
+    except ValueError:
+        # Not a valid IP address
+        raise HTTPException(
+            status_code=403,
+            detail="This endpoint is restricted to localhost only"
+        )
+
+    return client_host
 
 
 # =====================================================================

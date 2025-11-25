@@ -448,6 +448,17 @@ Attacker tries: server_id="acme"  server_uuid="UUID-B"
 
 The first server to claim a domain owns it permanently (tied to UUID).
 
+### Prompt Injection Filtering
+
+The federation adapter calls `PromptInjectionDefense.filter_text()` before delivering inbound messages. **This filter is part of MIRA and is not included in gossip_federation.**
+
+If using gossip_federation outside of MIRA, you should implement your own content filtering using tools such as:
+- LlamaGuard
+- GPT-OSS-20B
+- Custom regex/heuristic filters
+
+Without filtering, federated message content should be treated as untrusted user input.
+
 ---
 
 ## Database Tables

@@ -9,9 +9,41 @@ This module handles federation setup including:
 
 import logging
 import os
+import subprocess
 from typing import Dict, Any
 
 from clients.postgres_client import PostgresClient
+
+
+def _secure_delete(filepath: str) -> None:
+    """
+    Securely delete a file by overwriting before removal.
+
+    Attempts to use 'shred' command if available (Linux), falls back to
+    manual overwrite with random data (portable, works on macOS).
+    """
+    try:
+        # Try shred first (Linux) - overwrites 3 times then removes
+        subprocess.run(
+            ['shred', '-u', '-z', filepath],
+            capture_output=True,
+            check=True
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        # Fallback: manual overwrite with random data (portable)
+        try:
+            size = os.path.getsize(filepath)
+            with open(filepath, 'wb') as f:
+                f.write(os.urandom(size))  # Overwrite with random data
+                f.flush()
+                os.fsync(f.fileno())  # Force write to disk
+            os.unlink(filepath)
+        except Exception:
+            # Last resort: just delete
+            if os.path.exists(filepath):
+                os.unlink(filepath)
+
+
 from clients.vault_client import _ensure_vault_client, get_service_config
 from .gossip_protocol import GossipProtocol
 from .domain_registration import DomainRegistrationService
@@ -53,7 +85,6 @@ def ensure_federation_identity() -> Dict[str, Any]:
         # Store private key in Vault using CLI
         vault_path = "mira/federation"
         try:
-            import subprocess
             import tempfile
 
             # Write private key to temp file
@@ -71,8 +102,8 @@ def ensure_federation_identity() -> Dict[str, Any]:
                 )
                 logger.info(f"Stored private key in Vault at {vault_path}")
             finally:
-                # Clean up temp file
-                os.unlink(temp_key_file)
+                # Securely delete temp file by overwriting before removal
+                _secure_delete(temp_key_file)
 
         except subprocess.CalledProcessError as e:
             logger.error(f"Failed to store private key in Vault via CLI: {e.stderr}")
