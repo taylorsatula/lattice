@@ -12,7 +12,8 @@ from pydantic import BaseModel, Field
 
 from .base import BaseHandler, APIResponse, create_success_response, create_error_response
 from lattice.lattice_adapter import LatticeAdapter
-from lattice.models import FederatedMessage
+from lattice.models import FederatedMessage, MessageAcknowledgment
+from lattice.gossip_protocol import GossipProtocol
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +26,7 @@ class MessageReceiveEndpoint(BaseHandler):
     def __init__(self):
         super().__init__()
         self.lattice_adapter = LatticeAdapter()
+        self.gossip_protocol = GossipProtocol()
         from clients.postgres_client import PostgresClient
         self.db = PostgresClient("lattice")
 
@@ -120,8 +122,20 @@ class MessageReceiveEndpoint(BaseHandler):
 
             result = self.lattice_adapter.receive_federated_message(message)
 
+            # Create signed acknowledgment
+            status = "delivered" if result.get("status") == "accepted" else "rejected"
+            ack = MessageAcknowledgment(
+                ack_type="message_received",
+                message_id=message.message_id,
+                status=status,
+                recipient_server=self.gossip_protocol.get_server_id() or "unknown",
+                signature=""
+            )
+            ack_dict = ack.model_dump(exclude={'signature'})
+            ack.signature = self.gossip_protocol.sign_message(ack_dict)
+
             return create_success_response(
-                data=result,
+                data={**result, "ack": ack.model_dump()},
                 message="Message received and processed"
             )
 

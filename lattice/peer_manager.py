@@ -18,7 +18,7 @@ from typing import List, Dict, Any, Optional
 
 from clients.postgres_client import PostgresClient
 from utils.timezone_utils import utc_now
-from .models import ServerAnnouncement
+from .models import ServerAnnouncement, KeyRotation, IdentityRevocation
 
 logger = logging.getLogger(__name__)
 
@@ -51,15 +51,25 @@ class PeerManager:
             True if peer was added/updated successfully
         """
         try:
+            # Check if UUID is revoked (cyanide pill)
+            revoked = self.db.execute_single(
+                "SELECT 1 FROM lattice_revocations WHERE server_uuid = %(uuid)s",
+                {'uuid': announcement.server_uuid}
+            )
+            if revoked:
+                logger.warning(f"Rejecting announcement from revoked UUID: {announcement.server_uuid}")
+                return False
+
             # Check if peer exists by UUID first (permanent identity)
+            # Use FOR UPDATE to prevent race conditions during collision check
             existing_by_uuid = self.db.execute_single(
-                "SELECT id, server_id, trust_status FROM lattice_peers WHERE server_uuid = %(server_uuid)s",
+                "SELECT id, server_id, trust_status FROM lattice_peers WHERE server_uuid = %(server_uuid)s FOR UPDATE",
                 {'server_uuid': announcement.server_uuid}
             )
 
             # Check if server_id is already taken
             existing_by_id = self.db.execute_single(
-                "SELECT id, server_uuid, trust_status FROM lattice_peers WHERE server_id = %(server_id)s",
+                "SELECT id, server_uuid, trust_status FROM lattice_peers WHERE server_id = %(server_id)s FOR UPDATE",
                 {'server_id': announcement.server_id}
             )
 
@@ -386,3 +396,94 @@ class PeerManager:
         except Exception as e:
             logger.error(f"Error cleaning up stale peers: {e}")
             return 0
+
+    def rotate_peer_key(self, rotation: KeyRotation, from_server: str) -> bool:
+        """
+        Process key rotation for a peer.
+
+        Validates old_public_key matches stored key, then updates.
+        Signature verification is done by gossip_protocol before calling this.
+        """
+        try:
+            # Get existing peer by UUID
+            peer = self.db.execute_single(
+                "SELECT server_id, public_key FROM lattice_peers WHERE server_uuid = %(uuid)s",
+                {'uuid': rotation.server_uuid}
+            )
+
+            if not peer:
+                logger.warning(f"Key rotation for unknown UUID: {rotation.server_uuid}")
+                return False
+
+            # Verify old key matches what we have stored
+            if peer['public_key'] != rotation.old_public_key:
+                logger.error(f"Key rotation rejected: old_public_key doesn't match stored key for {peer['server_id']}")
+                return False
+
+            # Generate fingerprints for logging
+            import hashlib
+            old_fp = hashlib.sha256(rotation.old_public_key.encode()).digest()[:16].hex().upper()
+            new_fp = hashlib.sha256(rotation.new_public_key.encode()).digest()[:16].hex().upper()
+
+            # Update the public key
+            self.db.execute_update(
+                "UPDATE lattice_peers SET public_key = %(new_key)s WHERE server_uuid = %(uuid)s",
+                {'new_key': rotation.new_public_key, 'uuid': rotation.server_uuid}
+            )
+
+            # Log the rotation
+            self.db.execute_insert(
+                """
+                INSERT INTO lattice_key_rotations
+                (server_uuid, old_key_fingerprint, new_key_fingerprint, reason, received_from)
+                VALUES (%(uuid)s, %(old_fp)s, %(new_fp)s, %(reason)s, %(from_server)s)
+                """,
+                {'uuid': rotation.server_uuid, 'old_fp': old_fp, 'new_fp': new_fp,
+                 'reason': rotation.reason, 'from_server': from_server}
+            )
+
+            logger.info(f"Rotated key for {peer['server_id']}: {old_fp[:8]}... -> {new_fp[:8]}...")
+            return True
+
+        except Exception as e:
+            logger.error(f"Error processing key rotation: {e}")
+            return False
+
+    def revoke_peer(self, revocation: IdentityRevocation, from_server: str) -> bool:
+        """
+        Permanently revoke a peer identity (cyanide pill).
+
+        Signature verification is done by gossip_protocol before calling this.
+        """
+        try:
+            # Check if already revoked
+            existing = self.db.execute_single(
+                "SELECT 1 FROM lattice_revocations WHERE server_uuid = %(uuid)s",
+                {'uuid': revocation.server_uuid}
+            )
+            if existing:
+                logger.info(f"UUID {revocation.server_uuid} already revoked")
+                return True
+
+            # Add to revocations table
+            self.db.execute_insert(
+                """
+                INSERT INTO lattice_revocations (server_uuid, server_id, reason, signature)
+                VALUES (%(uuid)s, %(server_id)s, %(reason)s, %(signature)s)
+                """,
+                {'uuid': revocation.server_uuid, 'server_id': revocation.server_id,
+                 'reason': revocation.reason, 'signature': revocation.signature}
+            )
+
+            # Update peer trust_status and remove from neighbors
+            self.db.execute_update(
+                "UPDATE lattice_peers SET trust_status = 'revoked', is_neighbor = false WHERE server_uuid = %(uuid)s",
+                {'uuid': revocation.server_uuid}
+            )
+
+            logger.warning(f"IDENTITY REVOKED: {revocation.server_id} (UUID: {revocation.server_uuid}) - {revocation.reason}")
+            return True
+
+        except Exception as e:
+            logger.error(f"Error processing identity revocation: {e}")
+            return False

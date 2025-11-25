@@ -6,6 +6,7 @@ All messages are cryptographically signed for authenticity.
 """
 
 import ipaddress
+import socket
 import uuid
 from datetime import datetime
 from typing import Dict, List, Optional, Literal, Any
@@ -29,13 +30,13 @@ def _is_internal_address(hostname: str) -> bool:
     - Link-local (169.254.x.x, fe80::)
     - Reserved/unspecified addresses
     - Known localhost hostnames
+    - Hostnames that resolve to internal IPs (DNS rebinding protection)
     """
     # Check for localhost hostnames
     if hostname.lower() in ("localhost", "localhost.localdomain"):
         return True
 
-    try:
-        ip = ipaddress.ip_address(hostname)
+    def _is_internal_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
         return (
             ip.is_private or
             ip.is_loopback or
@@ -43,10 +44,26 @@ def _is_internal_address(hostname: str) -> bool:
             ip.is_reserved or
             ip.is_unspecified
         )
+
+    try:
+        ip = ipaddress.ip_address(hostname)
+        return _is_internal_ip(ip)
     except ValueError:
-        # Not an IP address - it's a hostname, allow it
-        # (DNS resolution happens at request time, not validation time)
-        return False
+        # Not an IP address - resolve DNS and check all IPs
+        try:
+            results = socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
+            for family, _, _, _, sockaddr in results:
+                ip_str = sockaddr[0]
+                ip = ipaddress.ip_address(ip_str)
+                # Handle IPv4-mapped IPv6
+                if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
+                    ip = ip.ipv4_mapped
+                if _is_internal_ip(ip):
+                    return True
+            return False
+        except socket.gaierror:
+            # DNS resolution failed - reject as suspicious
+            return True
 
 
 def _validate_endpoint_url(url: str) -> str:
@@ -134,7 +151,7 @@ class FederatedMessage(BaseModel):
     message_type: Literal["pager", "location", "ai_to_ai"] = Field(default="pager")
     from_address: str = Field(description="Sender address (e.g., taylor@local.ourserver.com)")
     to_address: str = Field(description="Recipient address (e.g., alex@remote.otherserver.com)")
-    content: str = Field(description="Message content")
+    content: str = Field(max_length=10000, description="Message content (max 10KB)")
     priority: int = Field(default=0, ge=0, le=2, description="0=normal, 1=high, 2=urgent")
     timestamp: str = Field(default_factory=lambda: utc_now().isoformat())
     sender_fingerprint: str = Field(description="Sender's device fingerprint")
@@ -184,7 +201,7 @@ class DomainQuery(BaseModel):
     query_id: str = Field(description="Unique query identifier")
     domain: str = Field(description="Domain to resolve (e.g., other-server.com)")
     requester: str = Field(description="Server making the query")
-    max_hops: int = Field(default=5, ge=1, le=50, description="Maximum hops for query")
+    max_hops: int = Field(default=5, ge=1, le=10, description="Maximum hops for query (limited to prevent amplification)")
     timestamp: str = Field(default_factory=lambda: utc_now().isoformat())
 
     @field_validator('domain')
@@ -221,9 +238,30 @@ class PeerExchange(BaseModel):
     signature: str = Field(description="Signature of peer list")
 
 
+class KeyRotation(BaseModel):
+    """Request to rotate a server's public key (signed with OLD key)."""
+    version: str = Field(default="1.0")
+    server_uuid: str = Field(description="Permanent server UUID")
+    old_public_key: str = Field(description="Current public key being rotated out")
+    new_public_key: str = Field(description="New public key to use")
+    reason: Literal["scheduled", "compromise_suspected", "upgrade"] = Field(default="scheduled")
+    timestamp: str = Field(default_factory=lambda: utc_now().isoformat())
+    signature: str = Field(description="Signature using OLD private key")
+
+
+class IdentityRevocation(BaseModel):
+    """Permanently revoke a server identity (cyanide pill)."""
+    version: str = Field(default="1.0")
+    server_uuid: str = Field(description="UUID being permanently revoked")
+    server_id: str = Field(description="Current server_id for logging")
+    reason: str = Field(description="Revocation reason")
+    timestamp: str = Field(default_factory=lambda: utc_now().isoformat())
+    signature: str = Field(description="Signature using server's private key")
+
+
 class GossipMessage(BaseModel):
     """Wrapper for gossip protocol messages."""
-    message_type: Literal["announcement", "peer_exchange", "domain_query", "domain_response"]
+    message_type: Literal["announcement", "peer_exchange", "domain_query", "domain_response", "key_rotation", "identity_revocation"]
     payload: Dict[str, Any] = Field(description="Message payload")
     from_server: str = Field(description="Server sending the gossip")
     timestamp: str = Field(default_factory=lambda: utc_now().isoformat())

@@ -130,8 +130,7 @@ class DiscoveryService:
         self.last_gossip_time = None
         self.bootstrap_servers: List[str] = []
 
-        # Circuit breaker: Track consecutive failures per peer
-        self._circuit_breaker: Dict[str, Dict[str, Any]] = {}
+        # Circuit breaker settings (state persisted in lattice_peers table)
         self._circuit_breaker_threshold = 5  # failures
         self._circuit_breaker_timeout = timedelta(minutes=15)
 
@@ -415,7 +414,7 @@ class DiscoveryService:
 
     def _check_circuit_breaker(self, server_id: str) -> bool:
         """
-        Check if circuit breaker is open for a peer.
+        Check if circuit breaker is open for a peer (from database).
 
         Args:
             server_id: Peer server ID
@@ -423,43 +422,54 @@ class DiscoveryService:
         Returns:
             True if circuit is closed (can send), False if open (should skip)
         """
-        if server_id not in self._circuit_breaker:
+        peer = self.db.execute_single(
+            "SELECT circuit_open_until FROM lattice_peers WHERE server_id = %s",
+            (server_id,)
+        )
+
+        if not peer or not peer['circuit_open_until']:
             return True
 
-        breaker = self._circuit_breaker[server_id]
-
-        # Check if timeout expired - close circuit
-        if breaker['open_until'] <= utc_now():
+        if peer['circuit_open_until'] <= utc_now():
+            # Timeout expired - reset circuit
+            self.db.execute_update(
+                "UPDATE lattice_peers SET circuit_failures = 0, circuit_open_until = NULL WHERE server_id = %s",
+                (server_id,)
+            )
             logger.info(f"Circuit breaker timeout expired for {server_id} - closing circuit")
-            del self._circuit_breaker[server_id]
             return True
 
-        logger.warning(f"Circuit breaker OPEN for {server_id} - skipping delivery until {breaker['open_until']}")
+        logger.warning(f"Circuit breaker OPEN for {server_id} - skipping delivery until {peer['circuit_open_until']}")
         return False
 
     def _record_delivery_success(self, server_id: str) -> None:
-        """Record successful delivery - resets circuit breaker."""
-        if server_id in self._circuit_breaker:
-            logger.info(f"Delivery succeeded to {server_id} - closing circuit breaker")
-            del self._circuit_breaker[server_id]
+        """Record successful delivery - resets circuit breaker (in database)."""
+        self.db.execute_update(
+            "UPDATE lattice_peers SET circuit_failures = 0, circuit_open_until = NULL WHERE server_id = %s",
+            (server_id,)
+        )
 
     def _record_delivery_failure(self, server_id: str) -> None:
-        """Record delivery failure - may open circuit breaker."""
-        if server_id not in self._circuit_breaker:
-            self._circuit_breaker[server_id] = {
-                'failures': 1,
-                'open_until': None
-            }
-        else:
-            self._circuit_breaker[server_id]['failures'] += 1
+        """Record delivery failure - may open circuit breaker (in database)."""
+        result = self.db.execute_returning(
+            """
+            UPDATE lattice_peers
+            SET circuit_failures = circuit_failures + 1
+            WHERE server_id = %s
+            RETURNING circuit_failures
+            """,
+            (server_id,)
+        )
 
-        breaker = self._circuit_breaker[server_id]
-
-        if breaker['failures'] >= self._circuit_breaker_threshold:
-            breaker['open_until'] = utc_now() + self._circuit_breaker_timeout
+        if result and result[0]['circuit_failures'] >= self._circuit_breaker_threshold:
+            open_until = utc_now() + self._circuit_breaker_timeout
+            self.db.execute_update(
+                "UPDATE lattice_peers SET circuit_open_until = %s WHERE server_id = %s",
+                (open_until, server_id)
+            )
             logger.error(
-                f"Circuit breaker OPENED for {server_id} after {breaker['failures']} "
-                f"consecutive failures - blocking until {breaker['open_until']}"
+                f"Circuit breaker OPENED for {server_id} after {result[0]['circuit_failures']} "
+                f"consecutive failures - blocking until {open_until}"
             )
 
     def _deliver_single_message(self, msg: Dict[str, Any]) -> None:
@@ -527,6 +537,18 @@ class DiscoveryService:
         )
 
         if response and response.get('status') == 'accepted':
+            # Verify signed acknowledgment if present
+            ack = response.get('ack')
+            if ack:
+                from .models import MessageAcknowledgment
+                ack_obj = MessageAcknowledgment(**ack)
+                ack_dict = ack_obj.model_dump(exclude={'signature'})
+                recipient_public_key = peer.get('public_key')
+                if recipient_public_key:
+                    if not self.gossip_protocol.verify_signature(ack_dict, ack_obj.signature, recipient_public_key):
+                        logger.warning(f"Invalid ack signature from {server_id} - possible MITM")
+                        self._record_delivery_failure(server_id)
+                        raise ValueError("Acknowledgment signature verification failed")
             # Mark as delivered and reset circuit breaker
             self._record_delivery_success(server_id)
             self._complete_message(message_id)
@@ -791,13 +813,15 @@ async def handle_domain_query(query: DomainQuery) -> DomainResponse:
             # We have an answer (either found or not found after max hops)
             return response
 
-        # No answer and hops remaining - forward to our neighbors
+        # No answer and hops remaining - forward to subset of neighbors (limit amplification)
         query.max_hops -= 1
         neighbors = discovery_service.peer_manager.get_active_neighbors()
 
+        # Limit fan-out to 3 neighbors to prevent query amplification attacks
         import httpx
+        sampled_neighbors = random.sample(neighbors, min(3, len(neighbors))) if neighbors else []
         with httpx.Client(timeout=3.0) as client:
-            for neighbor in neighbors:
+            for neighbor in sampled_neighbors:
                 try:
                     endpoint = neighbor['endpoints'].get('discovery')
                     if not endpoint:
@@ -901,10 +925,11 @@ async def resolve_route(domain: str) -> RouteQueryResponse:
         # Decrement hops for forwarding
         query.max_hops -= 1
 
-        # Query neighbors (they will forward if needed)
+        # Query subset of neighbors to limit amplification
         import httpx
+        sampled_neighbors = random.sample(neighbors, min(3, len(neighbors)))
         with httpx.Client(timeout=5.0) as client:
-            for neighbor in neighbors:
+            for neighbor in sampled_neighbors:
                 try:
                     endpoint = neighbor['endpoints'].get('discovery')
                     if not endpoint:
@@ -997,7 +1022,12 @@ async def receive_gossip(message: GossipMessage):
                 sender_public_key = sender['public_key']  # Use known public key
             else:
                 # Unknown server - only accept if from bootstrap servers
-                # This prevents arbitrary servers from joining without introduction
+                # NOTE: Bootstrap servers (configured in LATTICE_BOOTSTRAP_SERVERS) are trusted on
+                # first contact - their public keys are accepted without out-of-band verification.
+                # This is a config-time trust decision: only configure bootstrap servers you control
+                # or have verified. If a bootstrap server is compromised at first contact, an
+                # attacker could inject arbitrary identities. Future enhancement: add key pinning
+                # (fingerprint alongside URL in config). Contributions welcome.
                 bootstrap_domains = [urlparse(url).hostname for url in discovery_service.bootstrap_servers if urlparse(url).hostname]
                 if message.from_server not in bootstrap_domains:
                     logger.warning(
@@ -1009,8 +1039,24 @@ async def receive_gossip(message: GossipMessage):
                         detail="Unknown sender - new servers must be introduced via trusted path"
                     )
                 sender_public_key = announcement.public_key  # First contact from bootstrap
+        elif message.message_type == "key_rotation":
+            from .models import KeyRotation
+            rotation = KeyRotation(**message.payload)
+            # Key rotation: verify with OLD key in message (peer_manager validates it matches stored)
+            sender_public_key = rotation.old_public_key
+
+        elif message.message_type == "identity_revocation":
+            from .models import IdentityRevocation
+            revocation = IdentityRevocation(**message.payload)
+            # Revocation must come from known sender with matching UUID
+            if not sender:
+                raise HTTPException(status_code=403, detail="Unknown sender cannot revoke")
+            if str(sender['server_uuid']) != revocation.server_uuid:
+                raise HTTPException(status_code=403, detail="UUID mismatch in revocation")
+            sender_public_key = sender['public_key']
+
         else:
-            # For non-announcement messages, sender must be known
+            # For other messages, sender must be known
             if not sender:
                 logger.warning(f"Received non-announcement gossip from unknown server: {message.from_server}")
                 raise HTTPException(status_code=403, detail="Unknown sender")

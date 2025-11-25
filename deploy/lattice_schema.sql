@@ -45,12 +45,16 @@ CREATE TABLE IF NOT EXISTS lattice_peers (
     is_neighbor BOOLEAN NOT NULL DEFAULT FALSE,
 
     -- Trust status (manual designation)
-    trust_status VARCHAR(50) NOT NULL DEFAULT 'unknown' CHECK (trust_status IN ('unknown', 'trusted', 'untrusted', 'blocked')),
+    trust_status VARCHAR(50) NOT NULL DEFAULT 'unknown' CHECK (trust_status IN ('unknown', 'trusted', 'untrusted', 'blocked', 'revoked')),
 
     -- Rate limiting
     query_count INTEGER DEFAULT 0,
     message_count INTEGER DEFAULT 0,
     rate_limit_reset_at TIMESTAMP WITH TIME ZONE,
+
+    -- Circuit breaker
+    circuit_failures INTEGER DEFAULT 0,
+    circuit_open_until TIMESTAMP WITH TIME ZONE,
 
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
@@ -121,7 +125,7 @@ CREATE TABLE IF NOT EXISTS lattice_messages (
 
     -- Message content
     message_type VARCHAR(50) NOT NULL DEFAULT 'pager',
-    content TEXT NOT NULL,
+    content TEXT NOT NULL CHECK (length(content) <= 10000),
     priority INTEGER DEFAULT 0,
     metadata JSONB DEFAULT '{}'::jsonb,
 
@@ -213,6 +217,37 @@ CREATE INDEX IF NOT EXISTS idx_lattice_blocklist_identifier ON lattice_blocklist
 CREATE INDEX IF NOT EXISTS idx_lattice_blocklist_type ON lattice_blocklist(block_type);
 
 -- =====================================================================
+-- KEY ROTATION HISTORY
+-- =====================================================================
+
+CREATE TABLE IF NOT EXISTS lattice_key_rotations (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    server_uuid UUID NOT NULL,
+    old_key_fingerprint VARCHAR(64) NOT NULL,
+    new_key_fingerprint VARCHAR(64) NOT NULL,
+    reason VARCHAR(50) NOT NULL,
+    rotated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    received_from VARCHAR(255)
+);
+
+CREATE INDEX IF NOT EXISTS idx_key_rotations_uuid ON lattice_key_rotations(server_uuid);
+
+-- =====================================================================
+-- IDENTITY REVOCATIONS (cyanide pill)
+-- =====================================================================
+
+CREATE TABLE IF NOT EXISTS lattice_revocations (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    server_uuid UUID NOT NULL UNIQUE,
+    server_id VARCHAR(255) NOT NULL,
+    reason TEXT NOT NULL,
+    revoked_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    signature TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_revocations_uuid ON lattice_revocations(server_uuid);
+
+-- =====================================================================
 -- SERVER IDENTITY (our own server's federation identity)
 -- =====================================================================
 
@@ -258,7 +293,7 @@ BEGIN
         GRANT SELECT, INSERT, UPDATE, DELETE ON
             global_usernames, lattice_peers, lattice_routes,
             lattice_messages, lattice_received_messages,
-            lattice_blocklist, lattice_identity
+            lattice_blocklist, lattice_key_rotations, lattice_revocations, lattice_identity
         TO lattice_user;
         GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO lattice_user;
     END IF;

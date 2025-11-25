@@ -23,7 +23,9 @@ from .models import (
     PeerExchange,
     GossipMessage,
     DomainQuery,
-    DomainResponse
+    DomainResponse,
+    KeyRotation,
+    IdentityRevocation
 )
 
 logger = logging.getLogger(__name__)
@@ -324,9 +326,26 @@ class GossipProtocol:
                 logger.info(f"Received {len(exchange.peers)} peers from {exchange.from_server}")
                 return True
 
+            elif message.message_type == "key_rotation":
+                rotation = KeyRotation(**message.payload)
+                # Verify signature with OLD public key (the one being rotated out)
+                rotation_dict = rotation.model_dump(exclude={'signature'})
+                if not self.verify_signature(rotation_dict, rotation.signature, rotation.old_public_key):
+                    logger.warning(f"Invalid key rotation signature from {message.from_server}")
+                    return False
+                return self.peer_manager.rotate_peer_key(rotation, message.from_server)
+
+            elif message.message_type == "identity_revocation":
+                revocation = IdentityRevocation(**message.payload)
+                # Verify signature with sender's current public key
+                revocation_dict = revocation.model_dump(exclude={'signature'})
+                if not self.verify_signature(revocation_dict, revocation.signature, sender_public_key):
+                    logger.warning(f"Invalid revocation signature from {message.from_server}")
+                    return False
+                return self.peer_manager.revoke_peer(revocation, message.from_server)
+
             else:
                 # Note: domain_query and domain_response have dedicated endpoints
-                # (/api/v1/domain/query) and should not come through gossip
                 logger.warning(f"Unknown gossip message type: {message.message_type}")
                 return False
 
@@ -446,3 +465,113 @@ class GossipProtocol:
         key_hash = hashlib.sha256(public_key_pem.encode()).digest()
         # Return first 16 bytes as hex (32 chars)
         return key_hash[:16].hex().upper()
+
+    def create_key_rotation(self, new_public_key_pem: str, reason: str = "scheduled") -> Optional[KeyRotation]:
+        """Create signed key rotation request (signed with current/old key)."""
+        if not self._server_uuid or not self._public_key:
+            logger.error("Cannot create key rotation without server identity")
+            return None
+
+        try:
+            old_public_key_pem = self._public_key.public_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PublicFormat.SubjectPublicKeyInfo
+            ).decode('utf-8')
+
+            rotation = KeyRotation(
+                server_uuid=self._server_uuid,
+                old_public_key=old_public_key_pem,
+                new_public_key=new_public_key_pem,
+                reason=reason,
+                signature=""
+            )
+
+            # Sign with current (old) private key
+            rotation_dict = rotation.model_dump(exclude={'signature'})
+            rotation.signature = self.sign_message(rotation_dict)
+
+            return rotation
+
+        except Exception as e:
+            logger.error(f"Error creating key rotation: {e}")
+            return None
+
+    def create_identity_revocation(self, reason: str) -> Optional[IdentityRevocation]:
+        """Create cyanide pill to permanently revoke our identity."""
+        if not self._server_uuid or not self._server_id:
+            logger.error("Cannot create revocation without server identity")
+            return None
+
+        try:
+            revocation = IdentityRevocation(
+                server_uuid=self._server_uuid,
+                server_id=self._server_id,
+                reason=reason,
+                signature=""
+            )
+
+            revocation_dict = revocation.model_dump(exclude={'signature'})
+            revocation.signature = self.sign_message(revocation_dict)
+
+            return revocation
+
+        except Exception as e:
+            logger.error(f"Error creating identity revocation: {e}")
+            return None
+
+    def rotate_own_key(self, reason: str = "scheduled") -> bool:
+        """
+        Rotate this server's keypair (full automation).
+
+        Generates new key, updates Vault and DB, gossips to network.
+        """
+        if not self._server_uuid:
+            logger.error("Cannot rotate key without server identity")
+            return False
+
+        try:
+            from clients.vault_client import _ensure_vault_client
+
+            # Generate new keypair
+            new_private_pem, new_public_pem = self.generate_keypair()
+
+            # Create rotation message signed with OLD key
+            rotation = self.create_key_rotation(new_public_pem, reason)
+            if not rotation:
+                return False
+
+            # Store new private key in Vault
+            vault = _ensure_vault_client()
+            identity = self.db.execute_single(
+                "SELECT private_key_vault_path FROM lattice_identity WHERE id = 1"
+            )
+            vault_path, field_name = identity['private_key_vault_path'].split(':', 1)
+            vault.write_secret(vault_path, {field_name: new_private_pem})
+
+            # Update database
+            self.db.execute_update(
+                "UPDATE lattice_identity SET public_key = %(key)s, rotated_at = NOW() WHERE id = 1",
+                {'key': new_public_pem}
+            )
+
+            # Reload identity
+            self._load_identity()
+
+            # Log rotation locally
+            old_fp = self.generate_fingerprint(rotation.old_public_key)
+            new_fp = self.generate_fingerprint(new_public_pem)
+            self.db.execute_insert(
+                """
+                INSERT INTO lattice_key_rotations
+                (server_uuid, old_key_fingerprint, new_key_fingerprint, reason, received_from)
+                VALUES (%(uuid)s, %(old_fp)s, %(new_fp)s, %(reason)s, 'self')
+                """,
+                {'uuid': self._server_uuid, 'old_fp': old_fp, 'new_fp': new_fp, 'reason': reason}
+            )
+
+            logger.info(f"Key rotation complete: {old_fp[:8]}... -> {new_fp[:8]}...")
+            return True
+
+        except Exception as e:
+            logger.error(f"Error rotating own key: {e}")
+            return False
