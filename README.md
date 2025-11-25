@@ -61,13 +61,13 @@ docker run -d \
 Each Lattice server has a permanent identity:
 
 ```
-server_id:   "acme-medical"          # Human-readable domain name
+server_id:   "acme-corp"              # Human-readable domain name
 server_uuid: "550e8400-e29b-41d4..."  # Permanent UUID (survives renames)
 public_key:  "-----BEGIN PUBLIC..."   # RSA-2048 public key
 fingerprint: "A1B2C3D4E5F6..."        # SHA-256 of public key (first 32 hex chars)
 ```
 
-The `server_uuid` is the true identity. If a server renames from `acme-medical` to `acme-health`, the UUID stays the same, and peers update their records accordingly.
+The `server_uuid` is the true identity. If a server renames from `acme-corp` to `acme-global`, the UUID stays the same, and peers update their records accordingly.
 
 ### Peers vs Neighbors
 
@@ -99,8 +99,8 @@ Neighbors are selected randomly from peers seen within the last 7 days. This ran
 Users are addressed as `username@server_id`:
 
 ```
-taylor@acme-medical     # User "taylor" on server "acme-medical"
-alex@city-hospital      # User "alex" on server "city-hospital"
+taylor@acme-corp        # User "taylor" on server "acme-corp"
+alex@west-office        # User "alex" on server "west-office"
 ```
 
 ---
@@ -114,7 +114,7 @@ Servers periodically announce themselves to neighbors:
 ```json
 {
   "version": "1.0",
-  "server_id": "acme-medical",
+  "server_id": "acme-corp",
   "server_uuid": "550e8400-e29b-41d4-a716-446655440000",
   "public_key": "-----BEGIN PUBLIC KEY-----\nMIIBI...",
   "capabilities": {
@@ -123,8 +123,8 @@ Servers periodically announce themselves to neighbors:
     "supported_versions": ["1.0"]
   },
   "endpoints": {
-    "federation": "https://acme-medical.example.com/api/federation",
-    "discovery": "https://acme-medical.example.com/api/discovery"
+    "federation": "https://acme-corp.example.com/api/federation",
+    "discovery": "https://acme-corp.example.com/api/discovery"
   },
   "timestamp": "2024-01-15T10:30:00Z",
   "signature": "base64-encoded-rsa-signature..."
@@ -146,9 +146,9 @@ Cross-server pager message:
   "version": "1.0",
   "message_id": "MSG-A1B2C3D4E5F6",
   "message_type": "pager",
-  "from_address": "taylor@acme-medical",
-  "to_address": "alex@city-hospital",
-  "content": "Patient in room 302 needs immediate attention",
+  "from_address": "taylor@acme-corp",
+  "to_address": "alex@west-office",
+  "content": "Meeting in conference room 302 - please join ASAP",
   "priority": 2,
   "timestamp": "2024-01-15T10:35:00Z",
   "sender_fingerprint": "A1B2C3D4...",
@@ -169,8 +169,8 @@ When a server doesn't know how to reach a domain:
 ```json
 {
   "query_id": "QUERY-1705312500000",
-  "domain": "city-hospital",
-  "requester": "acme-medical",
+  "domain": "west-office",
+  "requester": "acme-corp",
   "max_hops": 10,
   "timestamp": "2024-01-15T10:35:00Z"
 }
@@ -185,10 +185,10 @@ Answer to a domain query:
 ```json
 {
   "query_id": "QUERY-1705312500000",
-  "domain": "city-hospital",
+  "domain": "west-office",
   "found": true,
-  "server_id": "city-hospital",
-  "endpoint_url": "https://city-hospital.example.com/api/federation",
+  "server_id": "west-office",
+  "endpoint_url": "https://west-office.example.com/api/federation",
   "hop_count": 3,
   "confidence": 0.729,
   "timestamp": "2024-01-15T10:35:01Z"
@@ -204,17 +204,17 @@ Each hop reduces confidence by 10% (multiplied by 0.9). A route discovered 3 hop
 
 ### Example 1: Sending a Pager Message
 
-Taylor on `acme-medical` sends a page to Alex on `city-hospital`:
+Taylor on `acme-corp` sends a page to Alex on `west-office`:
 
 ```
 ┌──────────────────┐                              ┌──────────────────┐
-│   acme-medical   │                              │  city-hospital   │
+│    acme-corp     │                              │   west-office    │
 │                  │                              │                  │
 │  Taylor's pager  │                              │   Alex's pager   │
 │       tool       │                              │                  │
 └────────┬─────────┘                              └────────▲─────────┘
          │                                                 │
-         │ 1. send("alex@city-hospital", "Patient 302")   │
+         │ 1. send("alex@west-office", "Room 302 meeting") │
          ▼                                                 │
 ┌──────────────────┐                              ┌────────┴─────────┐
 │ LatticeAdapter│                              │ LatticeAdapter│
@@ -242,11 +242,11 @@ Taylor on `acme-medical` sends a page to Alex on `city-hospital`:
 **Step-by-Step:**
 
 1. Taylor's pager tool calls `LatticeAdapter.send_federated_message()`
-2. Adapter verifies Taylor owns `taylor@acme-medical`, signs message, queues it
+2. Adapter verifies Taylor owns `taylor@acme-corp`, signs message, queues it
 3. Discovery daemon (every 1 min) picks up pending messages
-4. Resolves `city-hospital` -> looks up in `lattice_peers` table
-5. Checks circuit breaker (is `city-hospital` responsive?)
-6. POSTs signed message to `city-hospital`'s federation endpoint
+4. Resolves `west-office` -> looks up in `lattice_peers` table
+5. Checks circuit breaker (is `west-office` responsive?)
+6. POSTs signed message to `west-office`'s federation endpoint
 7. Remote server verifies signature, checks rate limits, delivers to Alex
 8. Returns `{"status": "accepted"}`
 9. Local daemon marks message as delivered
@@ -289,11 +289,11 @@ If `peer-a` doesn't know about us, they add us to their peer list. Next gossip r
 
 ### Example 3: Domain Resolution
 
-`acme-medical` wants to reach `unknown-hospital` but doesn't know the route:
+`acme-corp` wants to reach `unknown-server` but doesn't know the route:
 
 ```
-┌─────────────────┐     Query: "unknown-hospital"     ┌─────────────────┐
-│  acme-medical   │ ─────────────────────────────────▶│    peer-a       │
+┌─────────────────┐     Query: "unknown-server"       ┌─────────────────┐
+│    acme-corp    │ ─────────────────────────────────▶│    peer-a       │
 │                 │                                    │                 │
 │  "I don't know  │                                    │  "I don't know  │
 │   this domain"  │                                    │   either, let   │
@@ -312,7 +312,7 @@ If `peer-a` doesn't know about us, they add us to their peer list. Next gossip r
                                                                 │
         Response: {found: true, endpoint: "https://..."}        │
 ┌─────────────────┐◀────────────────────────────────────────────┘
-│  acme-medical   │
+│    acme-corp    │
 │                 │
 │  "Got it!       │
 │   Caching for   │
@@ -325,12 +325,12 @@ Each query has a unique `query_id`. If a server sees the same query twice (circu
 
 ### Example 4: New Server Joining
 
-A new server `new-clinic` wants to join the federation:
+A new server `new-branch` wants to join the federation:
 
 ```
 1. BOOTSTRAP
    ┌─────────────────┐                    ┌─────────────────┐
-   │   new-clinic    │  GET /api/v1/      │ bootstrap-server│
+   │   new-branch    │  GET /api/v1/      │ bootstrap-server│
    │                 │  announcement      │  (configured    │
    │  "I'm new here" │ ──────────────────▶│   in Vault)     │
    │                 │                    │                 │
@@ -340,10 +340,10 @@ A new server `new-clinic` wants to join the federation:
 
 2. DOMAIN REGISTRATION
    ┌─────────────────┐
-   │   new-clinic    │
+   │   new-branch    │
    │                 │
    │  "Is 'new-      │──▶ Query all neighbors with max_hops=20
-   │   clinic'       │
+   │   branch'       │
    │   available?"   │◀── Responses: not found (confidence 0.85)
    │                 │
    │  "Registering   │──▶ INSERT INTO lattice_identity
@@ -352,7 +352,7 @@ A new server `new-clinic` wants to join the federation:
 
 3. ANNOUNCE TO NETWORK
    ┌─────────────────┐
-   │   new-clinic    │
+   │   new-branch    │
    │                 │──▶ POST announcement to bootstrap server
    │  "Hello world!" │
    │                 │──▶ Bootstrap forwards to their neighbors
