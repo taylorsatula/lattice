@@ -1,10 +1,10 @@
 """
-Initialize federation services for MIRA.
+Initialize Lattice services.
 
-This module handles federation setup including:
+This module handles setup including:
 - Generating server identity on first run
 - Starting discovery daemon
-- Registering federation jobs with scheduler
+- Registering jobs with scheduler
 """
 
 import logging
@@ -51,19 +51,19 @@ from .domain_registration import DomainRegistrationService
 logger = logging.getLogger(__name__)
 
 
-def ensure_federation_identity() -> Dict[str, Any]:
+def ensure_lattice_identity() -> Dict[str, Any]:
     """
-    Ensure federation identity exists, creating if necessary.
+    Ensure lattice identity exists, creating if necessary.
 
     Returns:
         Dict with server_id, server_uuid, and status
     """
-    db = PostgresClient("mira_service")
+    db = PostgresClient("lattice")
 
     try:
         # Check if identity exists
         identity = db.execute_single(
-            "SELECT server_id, server_uuid, public_key FROM federation_identity WHERE id = 1"
+            "SELECT server_id, server_uuid, public_key FROM lattice_identity WHERE id = 1"
         )
 
         if identity:
@@ -75,7 +75,7 @@ def ensure_federation_identity() -> Dict[str, Any]:
             }
 
         # Need to create new identity
-        logger.info("No federation identity found, generating new identity...")
+        logger.info("No lattice identity found, generating new identity...")
 
         # Generate keypair
         gossip = GossipProtocol()
@@ -83,7 +83,7 @@ def ensure_federation_identity() -> Dict[str, Any]:
         fingerprint = gossip.generate_fingerprint(public_pem)
 
         # Store private key in Vault using CLI
-        vault_path = "mira/federation"
+        vault_path = "lattice/keys"
         try:
             import tempfile
 
@@ -113,7 +113,7 @@ def ensure_federation_identity() -> Dict[str, Any]:
             raise RuntimeError("Cannot initialize federation without Vault access")
 
         # Get suggested domain from environment or generate
-        suggested_domain = os.getenv("FEDERATION_DOMAIN", "mira-" + fingerprint[:8].lower())
+        suggested_domain = os.getenv("LATTICE_DOMAIN", "lattice-" + fingerprint[:8].lower())
 
         # Create identity record with suggested domain
         import uuid
@@ -121,7 +121,7 @@ def ensure_federation_identity() -> Dict[str, Any]:
 
         db.execute_insert(
             """
-            INSERT INTO federation_identity
+            INSERT INTO lattice_identity
             (id, server_id, server_uuid, private_key_vault_path, public_key, fingerprint,
              bootstrap_servers, created_at)
             VALUES (1, %s, %s, %s, %s, %s, %s, NOW())
@@ -136,24 +136,24 @@ def ensure_federation_identity() -> Dict[str, Any]:
             )
         )
 
-        logger.info(f"Created federation identity with domain '{suggested_domain}' and UUID {server_uuid}")
+        logger.info(f"Created lattice identity with domain '{suggested_domain}' and UUID {server_uuid}")
 
         return {
             "exists": False,
             "server_id": suggested_domain,
             "server_uuid": server_uuid,
-            "message": f"New federation identity created with domain '{suggested_domain}'. "
-                      f"To use a different domain, update federation_identity.server_id in the database."
+            "message": f"New lattice identity created with domain '{suggested_domain}'. "
+                      f"To use a different domain, update lattice_identity.server_id in the database."
         }
 
     except Exception as e:
-        logger.error(f"Error ensuring federation identity: {e}")
+        logger.error(f"Error ensuring lattice identity: {e}")
         raise
 
 
-def initialize_federation_services(scheduler_service) -> bool:
+def initialize_lattice_services(scheduler_service) -> bool:
     """
-    Initialize federation services and register scheduled tasks.
+    Initialize lattice services and register scheduled tasks.
 
     Args:
         scheduler_service: The system scheduler service
@@ -162,18 +162,18 @@ def initialize_federation_services(scheduler_service) -> bool:
         bool: True if initialization succeeded
     """
     try:
-        # Ensure federation identity exists
-        identity_info = ensure_federation_identity()
+        # Ensure lattice identity exists
+        identity_info = ensure_lattice_identity()
 
         # Get federation configuration from Vault
         try:
-            bootstrap_servers = get_service_config("mira", "FEDERATION_BOOTSTRAP_SERVERS")
+            bootstrap_servers = get_service_config("lattice", "LATTICE_BOOTSTRAP_SERVERS")
             if bootstrap_servers:
                 # Parse comma-separated list
                 bootstrap_list = [s.strip() for s in bootstrap_servers.split(",")]
-                db = PostgresClient("mira_service")
+                db = PostgresClient("lattice")
                 db.execute_update(
-                    "UPDATE federation_identity SET bootstrap_servers = %(bootstrap_servers)s WHERE id = 1",
+                    "UPDATE lattice_identity SET bootstrap_servers = %(bootstrap_servers)s WHERE id = 1",
                     {'bootstrap_servers': bootstrap_list}
                 )
                 logger.info(f"Configured {len(bootstrap_list)} bootstrap servers from Vault")
@@ -182,7 +182,7 @@ def initialize_federation_services(scheduler_service) -> bool:
 
         # Register scheduled HTTP calls to discovery daemon endpoints
         # The discovery daemon runs as a separate process on port 1113
-        _register_federation_scheduler_jobs(scheduler_service)
+        _register_lattice_scheduler_jobs(scheduler_service)
 
         logger.info(
             f"Federation services initialized for domain '{identity_info['server_id']}' "
@@ -192,11 +192,11 @@ def initialize_federation_services(scheduler_service) -> bool:
         return True
 
     except Exception as e:
-        logger.error(f"Failed to initialize federation services: {e}")
+        logger.error(f"Failed to initialize lattice services: {e}")
         return False
 
 
-def _register_federation_scheduler_jobs(scheduler_service):
+def _register_lattice_scheduler_jobs(scheduler_service):
     """Register scheduled HTTP calls to discovery daemon maintenance endpoints."""
     import httpx
     from apscheduler.triggers.interval import IntervalTrigger
@@ -233,7 +233,7 @@ def _register_federation_scheduler_jobs(scheduler_service):
             with httpx.Client(timeout=10.0) as client:
                 response = client.post(f"{discovery_daemon_url}/api/v1/maintenance/cleanup")
                 if response.status_code == 200:
-                    logger.info("Triggered federation cleanup")
+                    logger.info("Triggered lattice cleanup")
                 else:
                     logger.warning(f"Cleanup endpoint returned {response.status_code}")
         except Exception as e:
@@ -253,49 +253,49 @@ def _register_federation_scheduler_jobs(scheduler_service):
         except Exception as e:
             logger.error(f"Failed to trigger message processing: {e}")
 
-    # Register jobs with main MIRA scheduler
+    # Register jobs with scheduler
     scheduler_service.register_job(
-        job_id="federation_gossip",
+        job_id="lattice_gossip",
         func=call_gossip_endpoint,
         trigger=IntervalTrigger(minutes=10),
-        component="federation",
-        description="Trigger federation gossip round via discovery daemon"
+        component="lattice",
+        description="Trigger lattice gossip round via discovery daemon"
     )
 
     scheduler_service.register_job(
-        job_id="federation_neighbor_update",
+        job_id="lattice_neighbor_update",
         func=call_neighbor_update_endpoint,
         trigger=IntervalTrigger(hours=6),
-        component="federation",
+        component="lattice",
         description="Trigger neighbor selection update via discovery daemon"
     )
 
     scheduler_service.register_job(
-        job_id="federation_cleanup",
+        job_id="lattice_cleanup",
         func=call_cleanup_endpoint,
         trigger=IntervalTrigger(days=1),
-        component="federation",
-        description="Trigger federation cleanup via discovery daemon"
+        component="lattice",
+        description="Trigger lattice cleanup via discovery daemon"
     )
 
     scheduler_service.register_job(
-        job_id="federation_message_delivery",
+        job_id="lattice_message_delivery",
         func=call_message_processing_endpoint,
         trigger=IntervalTrigger(minutes=1),
-        component="federation",
+        component="lattice",
         description="Process pending federated messages for delivery"
     )
 
-    logger.info("Registered 4 federation scheduler jobs (calling discovery daemon endpoints)")
+    logger.info("Registered 4 lattice scheduler jobs (calling discovery daemon endpoints)")
 
 
 def get_federation_status() -> Dict[str, Any]:
     """Get current federation status and configuration."""
     try:
-        db = PostgresClient("mira_service")
+        db = PostgresClient("lattice")
 
         identity = db.execute_single(
-            "SELECT server_id, server_uuid, fingerprint, created_at FROM federation_identity WHERE id = 1"
+            "SELECT server_id, server_uuid, fingerprint, created_at FROM lattice_identity WHERE id = 1"
         )
 
         if not identity:
@@ -312,7 +312,7 @@ def get_federation_status() -> Dict[str, Any]:
                 COUNT(*) FILTER (WHERE is_neighbor = true) as neighbors,
                 COUNT(*) FILTER (WHERE trust_status = 'trusted') as trusted_peers,
                 COUNT(*) FILTER (WHERE last_seen_at > NOW() - INTERVAL '1 day') as active_peers
-            FROM federation_peers
+            FROM lattice_peers
             """
         )
 

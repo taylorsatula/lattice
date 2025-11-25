@@ -9,8 +9,8 @@ import json
 import pytest
 from cryptography.hazmat.primitives import serialization
 
-from federation.gossip_protocol import GossipProtocol
-from federation.models import ServerAnnouncement, ServerEndpoints
+from lattice.gossip_protocol import GossipProtocol
+from lattice.models import ServerAnnouncement, ServerEndpoints
 
 
 def test_announcement_signature_roundtrip():
@@ -18,10 +18,10 @@ def test_announcement_signature_roundtrip():
     # Initialize gossip protocol
     gossip = GossipProtocol()
 
-    # Fail explicitly if federation identity is missing
+    # Fail explicitly if lattice identity is missing
     assert gossip._server_id, (
-        "Federation identity not initialized. "
-        "Run 'python -c \"from federation.init_federation import ensure_federation_identity; ensure_federation_identity()\"' "
+        "Lattice identity not initialized. "
+        "Run 'python -c \"from lattice.init_lattice import ensure_lattice_identity; ensure_lattice_identity()\"' "
         "to create server identity before running tests."
     )
 
@@ -93,7 +93,7 @@ def test_signature_verification_rejects_tampered_message():
     gossip = GossipProtocol()
 
     assert gossip._server_id, (
-        "Federation identity not initialized. Cannot test signature rejection without server keys."
+        "Lattice identity not initialized. Cannot test signature rejection without server keys."
     )
 
     # Create and sign announcement
@@ -133,7 +133,7 @@ def test_signature_verification_with_wrong_key():
     gossip = GossipProtocol()
 
     assert gossip._server_id, (
-        "Federation identity not initialized. Cannot test key mismatch without server keys."
+        "Lattice identity not initialized. Cannot test key mismatch without server keys."
     )
 
     # Generate a different keypair

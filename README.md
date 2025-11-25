@@ -1,10 +1,10 @@
-# MIRA Federation Protocol
+# Lattice
 
-A decentralized protocol for cross-server pager messaging without a central coordinator.
+A decentralized peer-to-peer protocol for cross-server messaging without a central coordinator.
 
 ## Overview
 
-Federation allows MIRA servers to discover each other and exchange pager messages across server boundaries. Users can send messages to `user@remote-server` just like email, but for real-time paging.
+Lattice allows servers to discover each other and exchange messages across server boundaries. Users can send messages to `user@remote-server` just like email, but for real-time messaging.
 
 **Key Properties:**
 - **Decentralized**: No central registry or coordinator
@@ -26,10 +26,10 @@ pip install -e .
 
 ```bash
 # Apply database schema first
-psql -U mira_admin -d mira_service -f deploy/federation_schema.sql
+psql -U lattice_admin -d lattice -f deploy/lattice_schema.sql
 
 # Start daemon
-uvicorn federation.discovery_daemon:app --host 0.0.0.0 --port 1113
+uvicorn lattice.discovery_daemon:app --host 0.0.0.0 --port 1113
 ```
 
 ### Using Docker
@@ -39,7 +39,7 @@ docker run -d \
   -p 1113:1113 \
   -e DATABASE_URL=postgresql://... \
   -e VAULT_ADDR=https://... \
-  gossip-federation:latest
+  lattice:latest
 ```
 
 ### REST Endpoints
@@ -58,7 +58,7 @@ docker run -d \
 
 ### Identity
 
-Each MIRA server has a permanent identity:
+Each Lattice server has a permanent identity:
 
 ```
 server_id:   "acme-medical"          # Human-readable domain name
@@ -217,7 +217,7 @@ Taylor on `acme-medical` sends a page to Alex on `city-hospital`:
          │ 1. send("alex@city-hospital", "Patient 302")   │
          ▼                                                 │
 ┌──────────────────┐                              ┌────────┴─────────┐
-│ FederationAdapter│                              │ FederationAdapter│
+│ LatticeAdapter│                              │ LatticeAdapter│
 │                  │                              │                  │
 │ - Verify Taylor  │                              │ - Verify sig     │
 │   owns address   │                              │ - Filter content │
@@ -226,7 +226,7 @@ Taylor on `acme-medical` sends a page to Alex on `city-hospital`:
 │   delivery       │                              │                  │
 └────────┬─────────┘                              └────────▲─────────┘
          │                                                 │
-         │ 2. INSERT INTO federation_messages              │
+         │ 2. INSERT INTO lattice_messages              │
          ▼                                                 │
 ┌──────────────────┐                              ┌────────┴─────────┐
 │ Discovery Daemon │  3. POST /federation/        │ Discovery Daemon │
@@ -241,10 +241,10 @@ Taylor on `acme-medical` sends a page to Alex on `city-hospital`:
 
 **Step-by-Step:**
 
-1. Taylor's pager tool calls `FederationAdapter.send_federated_message()`
+1. Taylor's pager tool calls `LatticeAdapter.send_federated_message()`
 2. Adapter verifies Taylor owns `taylor@acme-medical`, signs message, queues it
 3. Discovery daemon (every 1 min) picks up pending messages
-4. Resolves `city-hospital` -> looks up in `federation_peers` table
+4. Resolves `city-hospital` -> looks up in `lattice_peers` table
 5. Checks circuit breaker (is `city-hospital` responsive?)
 6. POSTs signed message to `city-hospital`'s federation endpoint
 7. Remote server verifies signature, checks rate limits, delivers to Alex
@@ -346,7 +346,7 @@ A new server `new-clinic` wants to join the federation:
    │   clinic'       │
    │   available?"   │◀── Responses: not found (confidence 0.85)
    │                 │
-   │  "Registering   │──▶ INSERT INTO federation_identity
+   │  "Registering   │──▶ INSERT INTO lattice_identity
    │   domain..."    │
    └─────────────────┘
 
@@ -450,9 +450,7 @@ The first server to claim a domain owns it permanently (tied to UUID).
 
 ### Prompt Injection Filtering
 
-The federation adapter calls `PromptInjectionDefense.filter_text()` before delivering inbound messages. **This filter is part of MIRA and is not included in gossip_federation.**
-
-If using gossip_federation outside of MIRA, you should implement your own content filtering using tools such as:
+The Lattice adapter can call content filtering before delivering inbound messages. Implement your own content filtering using tools such as:
 - LlamaGuard
 - GPT-OSS-20B
 - Custom regex/heuristic filters
@@ -465,12 +463,12 @@ Without filtering, federated message content should be treated as untrusted user
 
 | Table | Purpose |
 |-------|---------|
-| `federation_identity` | Our server's identity (singleton) |
-| `federation_peers` | Known peer servers |
-| `federation_routes` | Cached domain -> endpoint mappings |
-| `federation_messages` | Outbound message queue |
-| `federation_received_messages` | Idempotency tracking (7-day TTL) |
-| `federation_blocklist` | Manual ban list |
+| `lattice_identity` | Our server's identity (singleton) |
+| `lattice_peers` | Known peer servers |
+| `lattice_routes` | Cached domain -> endpoint mappings |
+| `lattice_messages` | Outbound message queue |
+| `lattice_received_messages` | Idempotency tracking (7-day TTL) |
+| `lattice_blocklist` | Manual ban list |
 | `global_usernames` | Local username -> user_id mapping |
 
 ---
@@ -484,7 +482,7 @@ Without filtering, federated message content should be treated as untrusted user
 | Neighbor selection | 6 hours | `POST /api/v1/maintenance/update_neighbors` |
 | Cleanup | Daily | `POST /api/v1/maintenance/cleanup` |
 
-The main MIRA application's scheduler calls these endpoints on the discovery daemon (port 1113).
+The main application's scheduler calls these endpoints on the discovery daemon (port 1113).
 
 ---
 
@@ -510,8 +508,8 @@ Messages expire after 1 hour by default. After max attempts (default 3), the mes
 
 ```bash
 # Clone repository
-git clone https://github.com/taylorsatula/gossip-federation
-cd gossip-federation
+git clone https://github.com/taylorsatula/lattice
+cd lattice
 
 # Install development dependencies
 pip install -e ".[dev]"
@@ -520,15 +518,15 @@ pip install -e ".[dev]"
 pytest
 
 # Start development server
-uvicorn federation.discovery_daemon:app --reload --port 1113
+uvicorn lattice.discovery_daemon:app --reload --port 1113
 ```
 
 ---
 
 ## Deployment
 
-See [docs/FEDERATION_SYSTEMD.md](docs/FEDERATION_SYSTEMD.md) for systemd service setup.
-See [docs/FEDERATION_VAULT_SETUP.md](docs/FEDERATION_VAULT_SETUP.md) for Vault configuration.
+See [docs/LATTICE_SYSTEMD.md](docs/LATTICE_SYSTEMD.md) for systemd service setup.
+See [docs/LATTICE_VAULT_SETUP.md](docs/LATTICE_VAULT_SETUP.md) for Vault configuration.
 
 ---
 

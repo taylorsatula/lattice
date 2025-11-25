@@ -1,17 +1,17 @@
-# Federation Architecture
+# Lattice Architecture
 
 ## Overview
 
-MIRA's federation system enables decentralized cross-server pager messaging using a gossip-based peer discovery protocol. No central servers required.
+Lattice enables decentralized cross-server messaging using a gossip-based peer discovery protocol. No central servers required.
 
 ## Architectural Decision: Async vs Sync
 
 ### Business Logic (Synchronous)
 
-**Modules:** `gossip_protocol.py`, `peer_manager.py`, `federation_adapter.py`, `domain_registration.py`
+**Modules:** `gossip_protocol.py`, `peer_manager.py`, `lattice_adapter.py`, `domain_registration.py`
 
 - All core business logic is **synchronous** (no `async`/`await`)
-- Follows MIRA's "Synchronous Over Async" principle
+- Follows the "Synchronous Over Async" principle
 - Easier to test, debug, and reason about
 - No async overhead for non-I/O operations
 
@@ -24,7 +24,7 @@ MIRA's federation system enables decentralized cross-server pager messaging usin
 - FastAPI endpoints use `async def` for efficient HTTP I/O
 - Allows concurrent request handling without blocking
 - Internal method calls (gossip, delivery) remain synchronous
-- Main MIRA scheduler calls daemon via synchronous `httpx.Client`
+- Main scheduler calls daemon via synchronous `httpx.Client`
 
 **Rationale:** FastAPI async endpoints don't block the event loop during network I/O (incoming gossip messages, domain queries). This is a framework-level optimization, not a business logic concern.
 
@@ -33,7 +33,7 @@ MIRA's federation system enables decentralized cross-server pager messaging usin
 **Outbound:** Always synchronous using `httpx.Client` (not `AsyncClient`)
 - Gossip rounds: `_send_gossip_to_neighbor()` uses `httpx.Client`
 - Message delivery: `_send_to_remote_server()` uses `httpx.Client`
-- Scheduler calls: `init_federation.py` uses `httpx.Client`
+- Scheduler calls: `init_lattice.py` uses `httpx.Client`
 
 **Why synchronous HTTP?**
 1. These operations happen in background tasks where blocking is acceptable
@@ -50,11 +50,11 @@ This gives us FastAPI's concurrency benefits without infecting the entire codeba
 
 ## Database Client Lifecycle
 
-All federation modules create `PostgresClient("mira_service")` in `__init__`:
+All Lattice modules create `PostgresClient("lattice")` in `__init__`:
 
 ```python
 def __init__(self):
-    self.db = PostgresClient("mira_service")
+    self.db = PostgresClient("lattice")
 ```
 
 **Lifecycle:**
@@ -83,8 +83,8 @@ def __init__(self):
 
 ### Local → Remote (Cross-Server)
 1. User sends to federated address (e.g., "bob@other-server.com")
-2. PagerTool detects '@' in recipient, calls `FederationAdapter.send_federated_message()`
-3. Message queued to `federation_messages` table with status='pending'
+2. PagerTool detects '@' in recipient, calls `LatticeAdapter.send_federated_message()`
+3. Message queued to `lattice_messages` table with status='pending'
 4. Scheduler calls discovery daemon every 1 minute
 5. Discovery daemon's `process_message_queue()` reads pending messages
 6. Circuit breaker check - skip if peer has too many failures
@@ -96,7 +96,7 @@ def __init__(self):
 1. Remote server POSTs to `/api/federation/v1/messages/receive`
 2. **Rate limiting check** - 100 messages/minute per peer (sliding window)
 3. Extract sender domain from `from_address`
-4. Look up sender's peer record from `federation_peers` table
+4. Look up sender's peer record from `lattice_peers` table
 5. **Signature verification** - verify RSA signature using sender's public key
 6. **Prompt injection filtering** - all content treated as UNTRUSTED
 7. Username resolution via `global_usernames` table
@@ -132,13 +132,13 @@ def __init__(self):
 See `FEDERATION_VAULT_SETUP.md` and `FEDERATION_SYSTEMD.md` for setup instructions.
 
 **Required:**
-1. Apply database schema (`deploy/federation_schema.sql`)
+1. Apply database schema (`deploy/lattice_schema.sql`)
 2. Configure Vault secrets (APP_URL, private key)
-3. Run discovery daemon (systemd service: `deploy/mira-discovery-daemon.service`)
-4. Main MIRA scheduler automatically handles periodic tasks
+3. Run discovery daemon (systemd service: `deploy/lattice.service`)
+4. Main scheduler automatically handles periodic tasks
 
 **Monitoring:**
 - Discovery daemon health: `http://localhost:1113/api/v1/health`
 - Peer list: `http://localhost:1113/api/v1/peers`
-- Message queue status: Query `federation_messages` table
+- Message queue status: Query `lattice_messages` table
 - Circuit breaker state: Logged when failures occur

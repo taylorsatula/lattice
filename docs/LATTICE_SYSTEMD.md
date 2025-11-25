@@ -1,32 +1,32 @@
-# Federation Discovery Daemon systemd Service
+# Lattice Discovery Daemon systemd Service
 
-This document describes how to set up the federation discovery daemon as a systemd service for production deployment.
+This document describes how to set up the Lattice discovery daemon as a systemd service for production deployment.
 
 ## Service File
 
-Create `/etc/systemd/system/mira-federation-discovery.service`:
+Create `/etc/systemd/system/lattice-discovery.service`:
 
 ```ini
 [Unit]
-Description=MIRA Federation Discovery Daemon
+Description=Lattice Discovery Daemon
 Documentation=https://github.com/yourorg/botwithmemory
 After=network.target postgresql.service vault.service
 Wants=postgresql.service
 
 [Service]
 Type=simple
-User=mira
-Group=mira
-WorkingDirectory=/opt/mira
+User=lattice
+Group=lattice
+WorkingDirectory=/opt/lattice
 
 # Environment variables
 Environment="PYTHONUNBUFFERED=1"
 Environment="VAULT_ADDR=http://localhost:8200"
-EnvironmentFile=/etc/mira/federation.env
+EnvironmentFile=/etc/lattice/lattice.env
 
 # Start discovery daemon on port 1113
-ExecStart=/opt/mira/venv/bin/python -m uvicorn \
-    federation.discovery_daemon:app \
+ExecStart=/opt/lattice/venv/bin/python -m uvicorn \
+    lattice.discovery_daemon:app \
     --host 0.0.0.0 \
     --port 1113 \
     --log-level info
@@ -42,8 +42,8 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/opt/mira/data
-ReadOnlyPaths=/opt/mira
+ReadWritePaths=/opt/lattice/data
+ReadOnlyPaths=/opt/lattice
 
 # Resource limits
 LimitNOFILE=65536
@@ -56,7 +56,7 @@ WantedBy=multi-user.target
 
 ## Environment File
 
-Create `/etc/mira/federation.env`:
+Create `/etc/lattice/lattice.env`:
 
 ```bash
 # Vault configuration (AppRole authentication)
@@ -65,13 +65,13 @@ VAULT_ROLE_ID=your-role-id-here
 VAULT_SECRET_ID=your-secret-id-here
 
 # Optional: Vault namespace (for Vault Enterprise)
-# VAULT_NAMESPACE=mira
+# VAULT_NAMESPACE=lattice
 ```
 
 **Security Note:** This file contains sensitive credentials. Protect it:
 ```bash
-sudo chown root:mira /etc/mira/federation.env
-sudo chmod 640 /etc/mira/federation.env
+sudo chown root:lattice /etc/lattice/lattice.env
+sudo chmod 640 /etc/lattice/lattice.env
 ```
 
 ## Installation Steps
@@ -79,19 +79,19 @@ sudo chmod 640 /etc/mira/federation.env
 ### 1. Create Service User
 
 ```bash
-# Create mira system user if it doesn't exist
-sudo useradd --system --no-create-home --shell /bin/false mira
+# Create lattice system user if it doesn't exist
+sudo useradd --system --no-create-home --shell /bin/false lattice
 
 # Create necessary directories
-sudo mkdir -p /opt/mira/data
-sudo chown -R mira:mira /opt/mira/data
+sudo mkdir -p /opt/lattice/data
+sudo chown -R lattice:lattice /opt/lattice/data
 ```
 
 ### 2. Install Service File
 
 ```bash
 # Copy service file
-sudo cp /path/to/mira-federation-discovery.service /etc/systemd/system/
+sudo cp /path/to/lattice-discovery.service /etc/systemd/system/
 
 # Reload systemd
 sudo systemctl daemon-reload
@@ -101,27 +101,27 @@ sudo systemctl daemon-reload
 
 ```bash
 # Create config directory
-sudo mkdir -p /etc/mira
+sudo mkdir -p /etc/lattice
 
 # Create environment file with your credentials
-sudo nano /etc/mira/federation.env
+sudo nano /etc/lattice/lattice.env
 
 # Set permissions
-sudo chown root:mira /etc/mira/federation.env
-sudo chmod 640 /etc/mira/federation.env
+sudo chown root:lattice /etc/lattice/lattice.env
+sudo chmod 640 /etc/lattice/lattice.env
 ```
 
 ### 4. Enable and Start Service
 
 ```bash
 # Enable service to start on boot
-sudo systemctl enable mira-federation-discovery
+sudo systemctl enable lattice-discovery
 
 # Start service
-sudo systemctl start mira-federation-discovery
+sudo systemctl start lattice-discovery
 
 # Check status
-sudo systemctl status mira-federation-discovery
+sudo systemctl status lattice-discovery
 ```
 
 ## Service Management
@@ -130,32 +130,32 @@ sudo systemctl status mira-federation-discovery
 
 ```bash
 # Follow logs in real-time
-sudo journalctl -u mira-federation-discovery -f
+sudo journalctl -u lattice-discovery -f
 
 # View last 100 lines
-sudo journalctl -u mira-federation-discovery -n 100
+sudo journalctl -u lattice-discovery -n 100
 
 # View logs since boot
-sudo journalctl -u mira-federation-discovery -b
+sudo journalctl -u lattice-discovery -b
 ```
 
 ### Control Service
 
 ```bash
 # Start service
-sudo systemctl start mira-federation-discovery
+sudo systemctl start lattice-discovery
 
 # Stop service
-sudo systemctl stop mira-federation-discovery
+sudo systemctl stop lattice-discovery
 
 # Restart service
-sudo systemctl restart mira-federation-discovery
+sudo systemctl restart lattice-discovery
 
 # Reload configuration (if supported)
-sudo systemctl reload mira-federation-discovery
+sudo systemctl reload lattice-discovery
 
 # Check status
-sudo systemctl status mira-federation-discovery
+sudo systemctl status lattice-discovery
 ```
 
 ### Troubleshooting
@@ -164,16 +164,16 @@ sudo systemctl status mira-federation-discovery
 
 ```bash
 # Check service status for errors
-sudo systemctl status mira-federation-discovery
+sudo systemctl status lattice-discovery
 
 # Check recent logs
-sudo journalctl -u mira-federation-discovery -n 50
+sudo journalctl -u lattice-discovery -n 50
 
 # Verify environment file
-sudo cat /etc/mira/federation.env
+sudo cat /etc/lattice/lattice.env
 
-# Test manually as mira user
-sudo -u mira /opt/mira/venv/bin/python -m uvicorn federation.discovery_daemon:app --port 1113
+# Test manually as lattice user
+sudo -u lattice /opt/lattice/venv/bin/python -m uvicorn lattice.discovery_daemon:app --port 1113
 ```
 
 #### Can't connect to Vault
@@ -186,7 +186,7 @@ sudo systemctl status vault
 vault status
 
 # Check environment variables
-sudo systemctl show mira-federation-discovery | grep Environment
+sudo systemctl show lattice-discovery | grep Environment
 ```
 
 #### Port 1113 already in use
@@ -199,15 +199,15 @@ sudo lsof -i :1113
 sudo netstat -tlnp | grep 1113
 ```
 
-## Integration with Main MIRA
+## Integration with Main Application
 
-The main MIRA application (port 1993) schedules periodic HTTP calls to the discovery daemon:
+The main application schedules periodic HTTP calls to the discovery daemon:
 
 - **Gossip rounds**: `POST http://localhost:1113/api/v1/announce` (every 10 minutes)
 - **Neighbor updates**: `POST http://localhost:1113/api/v1/maintenance/update_neighbors` (every 6 hours)
 - **Cleanup**: `POST http://localhost:1113/api/v1/maintenance/cleanup` (daily)
 
-These are registered automatically when MIRA starts (see `federation/init_federation.py`).
+These are registered automatically when the application starts (see `lattice/init_lattice.py`).
 
 ## Monitoring
 
@@ -224,16 +224,16 @@ curl http://localhost:1113/api/v1/peers
 
 ```bash
 # View service resource usage
-systemctl status mira-federation-discovery
+systemctl status lattice-discovery
 
 # Detailed resource stats
-systemctl show mira-federation-discovery --property=MemoryCurrent,CPUUsage
+systemctl show lattice-discovery --property=MemoryCurrent,CPUUsage
 ```
 
 ## Security Best Practices
 
-1. **Run as non-root user**: Service runs as `mira` user with limited permissions
-2. **Protect credentials**: Environment file is only readable by `root` and `mira` group
+1. **Run as non-root user**: Service runs as `lattice` user with limited permissions
+2. **Protect credentials**: Environment file is only readable by `root` and `lattice` group
 3. **Filesystem restrictions**: Service has read-only access to application code
 4. **Network binding**: Only binds to localhost (use reverse proxy for external access)
 5. **Resource limits**: Memory and CPU limits prevent resource exhaustion
@@ -271,17 +271,17 @@ When deploying new versions:
 
 ```bash
 # Stop service
-sudo systemctl stop mira-federation-discovery
+sudo systemctl stop lattice-discovery
 
 # Update code
-cd /opt/mira
-sudo -u mira git pull
+cd /opt/lattice
+sudo -u lattice git pull
 
 # Restart service
-sudo systemctl start mira-federation-discovery
+sudo systemctl start lattice-discovery
 
 # Verify
-sudo systemctl status mira-federation-discovery
+sudo systemctl status lattice-discovery
 ```
 
 ## Uninstallation
@@ -290,11 +290,11 @@ To remove the service:
 
 ```bash
 # Stop and disable
-sudo systemctl stop mira-federation-discovery
-sudo systemctl disable mira-federation-discovery
+sudo systemctl stop lattice-discovery
+sudo systemctl disable lattice-discovery
 
 # Remove service file
-sudo rm /etc/systemd/system/mira-federation-discovery.service
+sudo rm /etc/systemd/system/lattice-discovery.service
 
 # Reload systemd
 sudo systemctl daemon-reload

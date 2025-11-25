@@ -1,4 +1,4 @@
-"""Setup configuration for gossip-federation."""
+"""Setup configuration for Lattice."""
 
 from setuptools import setup, find_packages
 
@@ -6,13 +6,13 @@ with open("README.md", "r", encoding="utf-8") as fh:
     long_description = fh.read()
 
 setup(
-    name="gossip-federation",
+    name="lattice",
     version="0.1.0",
-    author="MIRA Team",
-    description="Decentralized federation service for cross-server messaging",
+    author="Taylor Satula",
+    description="Decentralized peer-to-peer protocol for cross-server messaging",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/taylorsatula/gossip-federation",
+    url="https://github.com/taylorsatula/lattice",
     packages=find_packages(),
     classifiers=[
         "Development Status :: 3 - Alpha",
@@ -46,7 +46,7 @@ setup(
     },
     entry_points={
         "console_scripts": [
-            "gossip-federation=federation.discovery_daemon:main",
+            "lattice=lattice.discovery_daemon:main",
         ],
     },
 )

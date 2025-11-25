@@ -1,10 +1,9 @@
--- MIRA Federation Schema Extension
--- Adds support for gossip-based federation and cross-server pager messaging
--- Run this after mira_service_schema.sql is applied
+-- Lattice Schema
+-- Database schema for gossip-based peer discovery and cross-server messaging
 --
--- psql -U mira_admin -h localhost -d mira_service -f deploy/federation_schema.sql
+-- psql -U lattice_admin -h localhost -d lattice -f deploy/lattice_schema.sql
 
-\c mira_service
+\c lattice
 
 -- =====================================================================
 -- GLOBAL USERNAME REGISTRY (for local routing)
@@ -29,9 +28,9 @@ CREATE INDEX IF NOT EXISTS idx_global_usernames_userid ON global_usernames(user_
 -- FEDERATION PEER MANAGEMENT
 -- =====================================================================
 
-CREATE TABLE IF NOT EXISTS federation_peers (
+CREATE TABLE IF NOT EXISTS lattice_peers (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    server_id VARCHAR(255) NOT NULL UNIQUE,  -- e.g., "mirah" or "otherserver"
+    server_id VARCHAR(255) NOT NULL UNIQUE,  -- e.g., "myserver" or "otherserver"
     server_uuid UUID NOT NULL UNIQUE,  -- Permanent UUID for collision detection
     public_key TEXT NOT NULL,
     capabilities JSONB NOT NULL DEFAULT '{}'::jsonb,
@@ -57,33 +56,33 @@ CREATE TABLE IF NOT EXISTS federation_peers (
     updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
 );
 
-COMMENT ON TABLE federation_peers IS 'Known peer servers in the federation network';
-COMMENT ON COLUMN federation_peers.server_id IS 'Unique domain identifier for the peer server';
-COMMENT ON COLUMN federation_peers.capabilities IS 'Feature capabilities advertised by peer (paging, ai_messaging, etc)';
-COMMENT ON COLUMN federation_peers.endpoints IS 'Service endpoints (federation, discovery URLs)';
-COMMENT ON COLUMN federation_peers.is_neighbor IS 'Whether this peer is an active gossip neighbor';
-COMMENT ON COLUMN federation_peers.trust_status IS 'Manual trust designation for this peer';
+COMMENT ON TABLE lattice_peers IS 'Known peer servers in the federation network';
+COMMENT ON COLUMN lattice_peers.server_id IS 'Unique domain identifier for the peer server';
+COMMENT ON COLUMN lattice_peers.capabilities IS 'Feature capabilities advertised by peer (paging, ai_messaging, etc)';
+COMMENT ON COLUMN lattice_peers.endpoints IS 'Service endpoints (federation, discovery URLs)';
+COMMENT ON COLUMN lattice_peers.is_neighbor IS 'Whether this peer is an active gossip neighbor';
+COMMENT ON COLUMN lattice_peers.trust_status IS 'Manual trust designation for this peer';
 
-CREATE INDEX IF NOT EXISTS idx_federation_peers_serverid ON federation_peers(server_id);
-CREATE INDEX IF NOT EXISTS idx_federation_peers_uuid ON federation_peers(server_uuid);
-CREATE INDEX IF NOT EXISTS idx_federation_peers_neighbors ON federation_peers(is_neighbor) WHERE is_neighbor = TRUE;
-CREATE INDEX IF NOT EXISTS idx_federation_peers_trust ON federation_peers(trust_status);
+CREATE INDEX IF NOT EXISTS idx_lattice_peers_serverid ON lattice_peers(server_id);
+CREATE INDEX IF NOT EXISTS idx_lattice_peers_uuid ON lattice_peers(server_uuid);
+CREATE INDEX IF NOT EXISTS idx_lattice_peers_neighbors ON lattice_peers(is_neighbor) WHERE is_neighbor = TRUE;
+CREATE INDEX IF NOT EXISTS idx_lattice_peers_trust ON lattice_peers(trust_status);
 
 -- NOTE: Reputation scoring was considered but removed as premature optimization.
 -- If spam/abuse becomes a problem, consider adding:
 -- - reputation_score NUMERIC(5,3) column
 -- - neighbor_score NUMERIC(5,3) column
--- - idx_federation_peers_neighbor_selection index
+-- - idx_lattice_peers_neighbor_selection index
 -- See application code comments for details.
 
 -- =====================================================================
 -- FEDERATION ROUTING CACHE
 -- =====================================================================
 
-CREATE TABLE IF NOT EXISTS federation_routes (
+CREATE TABLE IF NOT EXISTS lattice_routes (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     domain VARCHAR(255) NOT NULL UNIQUE,  -- Target domain to route to
-    server_id VARCHAR(255) NOT NULL REFERENCES federation_peers(server_id) ON DELETE CASCADE,
+    server_id VARCHAR(255) NOT NULL REFERENCES lattice_peers(server_id) ON DELETE CASCADE,
     endpoint_url TEXT NOT NULL,
 
     -- Routing metadata
@@ -98,24 +97,24 @@ CREATE TABLE IF NOT EXISTS federation_routes (
     query_count INTEGER DEFAULT 0
 );
 
-COMMENT ON TABLE federation_routes IS 'Cached routing information for domain resolution';
-COMMENT ON COLUMN federation_routes.domain IS 'Domain name that maps to this server';
-COMMENT ON COLUMN federation_routes.hop_count IS 'Number of hops in discovery chain';
-COMMENT ON COLUMN federation_routes.confidence IS 'Confidence level in this route (0.0-1.0)';
+COMMENT ON TABLE lattice_routes IS 'Cached routing information for domain resolution';
+COMMENT ON COLUMN lattice_routes.domain IS 'Domain name that maps to this server';
+COMMENT ON COLUMN lattice_routes.hop_count IS 'Number of hops in discovery chain';
+COMMENT ON COLUMN lattice_routes.confidence IS 'Confidence level in this route (0.0-1.0)';
 
-CREATE INDEX IF NOT EXISTS idx_federation_routes_domain ON federation_routes(domain);
-CREATE INDEX IF NOT EXISTS idx_federation_routes_expires ON federation_routes(expires_at);
+CREATE INDEX IF NOT EXISTS idx_lattice_routes_domain ON lattice_routes(domain);
+CREATE INDEX IF NOT EXISTS idx_lattice_routes_expires ON lattice_routes(expires_at);
 
 -- =====================================================================
 -- FEDERATION MESSAGE QUEUE (for retries and acknowledgments)
 -- =====================================================================
 
-CREATE TABLE IF NOT EXISTS federation_messages (
+CREATE TABLE IF NOT EXISTS lattice_messages (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     message_id VARCHAR(100) NOT NULL UNIQUE,  -- e.g., "MSG-12345678"
 
     -- Message routing
-    from_address VARCHAR(255) NOT NULL,  -- e.g., "taylor@mirah.example.com"
+    from_address VARCHAR(255) NOT NULL,  -- e.g., "taylor@myserver.example.com"
     to_address VARCHAR(255) NOT NULL,    -- e.g., "alex@other-server.com"
     to_domain VARCHAR(255) NOT NULL,     -- Extracted domain for routing
     to_server_id VARCHAR(255),           -- Resolved server (may be NULL if unresolved)
@@ -153,23 +152,23 @@ CREATE TABLE IF NOT EXISTS federation_messages (
     error_count INTEGER DEFAULT 0
 );
 
-COMMENT ON TABLE federation_messages IS 'Outbound message queue for federation with retry management';
-COMMENT ON COLUMN federation_messages.message_id IS 'Unique message identifier for tracking';
-COMMENT ON COLUMN federation_messages.status IS 'Current delivery status of the message';
-COMMENT ON COLUMN federation_messages.attempt_count IS 'Number of delivery attempts made';
+COMMENT ON TABLE lattice_messages IS 'Outbound message queue for federation with retry management';
+COMMENT ON COLUMN lattice_messages.message_id IS 'Unique message identifier for tracking';
+COMMENT ON COLUMN lattice_messages.status IS 'Current delivery status of the message';
+COMMENT ON COLUMN lattice_messages.attempt_count IS 'Number of delivery attempts made';
 
-CREATE INDEX IF NOT EXISTS idx_federation_messages_status ON federation_messages(status) WHERE status IN ('pending', 'sending');
-CREATE INDEX IF NOT EXISTS idx_federation_messages_next_attempt ON federation_messages(next_attempt_at) WHERE status = 'pending';
-CREATE INDEX IF NOT EXISTS idx_federation_messages_delivery_queue ON federation_messages(to_domain, status, next_attempt_at) WHERE status = 'pending';
-CREATE INDEX IF NOT EXISTS idx_federation_messages_expires ON federation_messages(expires_at);
-CREATE INDEX IF NOT EXISTS idx_federation_messages_priority_queue ON federation_messages(status, next_attempt_at, priority DESC, created_at ASC) WHERE status = 'pending';
+CREATE INDEX IF NOT EXISTS idx_lattice_messages_status ON lattice_messages(status) WHERE status IN ('pending', 'sending');
+CREATE INDEX IF NOT EXISTS idx_lattice_messages_next_attempt ON lattice_messages(next_attempt_at) WHERE status = 'pending';
+CREATE INDEX IF NOT EXISTS idx_lattice_messages_delivery_queue ON lattice_messages(to_domain, status, next_attempt_at) WHERE status = 'pending';
+CREATE INDEX IF NOT EXISTS idx_lattice_messages_expires ON lattice_messages(expires_at);
+CREATE INDEX IF NOT EXISTS idx_lattice_messages_priority_queue ON lattice_messages(status, next_attempt_at, priority DESC, created_at ASC) WHERE status = 'pending';
 
 -- Data integrity constraints
-ALTER TABLE federation_messages
+ALTER TABLE lattice_messages
 ADD CONSTRAINT IF NOT EXISTS chk_delivered_timestamp
 CHECK (status != 'delivered' OR delivered_at IS NOT NULL);
 
-ALTER TABLE federation_messages
+ALTER TABLE lattice_messages
 ADD CONSTRAINT IF NOT EXISTS chk_failed_error
 CHECK (status != 'failed' OR last_error IS NOT NULL);
 
@@ -177,22 +176,22 @@ CHECK (status != 'failed' OR last_error IS NOT NULL);
 -- RECEIVED MESSAGE TRACKING (for idempotency)
 -- =====================================================================
 
-CREATE TABLE IF NOT EXISTS federation_received_messages (
+CREATE TABLE IF NOT EXISTS lattice_received_messages (
     message_id VARCHAR(100) PRIMARY KEY,
     from_address VARCHAR(255) NOT NULL,
     received_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
 );
 
-COMMENT ON TABLE federation_received_messages IS 'Tracks received message IDs to prevent duplicate deliveries (7-day retention for idempotency)';
-COMMENT ON COLUMN federation_received_messages.message_id IS 'Message ID from remote server (ensures idempotent delivery)';
+COMMENT ON TABLE lattice_received_messages IS 'Tracks received message IDs to prevent duplicate deliveries (7-day retention for idempotency)';
+COMMENT ON COLUMN lattice_received_messages.message_id IS 'Message ID from remote server (ensures idempotent delivery)';
 
-CREATE INDEX IF NOT EXISTS idx_received_messages_cleanup ON federation_received_messages(received_at);
+CREATE INDEX IF NOT EXISTS idx_received_messages_cleanup ON lattice_received_messages(received_at);
 
 -- =====================================================================
 -- FEDERATION BLOCKLIST (manual spam control)
 -- =====================================================================
 
-CREATE TABLE IF NOT EXISTS federation_blocklist (
+CREATE TABLE IF NOT EXISTS lattice_blocklist (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     blocked_identifier VARCHAR(255) NOT NULL UNIQUE,  -- Can be domain, server_id, or IP
     block_type VARCHAR(50) NOT NULL CHECK (block_type IN ('domain', 'server', 'ip', 'fingerprint')),
@@ -206,20 +205,20 @@ CREATE TABLE IF NOT EXISTS federation_blocklist (
     block_count INTEGER DEFAULT 0  -- Times this block was enforced
 );
 
-COMMENT ON TABLE federation_blocklist IS 'Manual blocklist for bad actors in the federation';
-COMMENT ON COLUMN federation_blocklist.blocked_identifier IS 'The identifier to block (domain/server/IP)';
-COMMENT ON COLUMN federation_blocklist.block_type IS 'Type of identifier being blocked';
+COMMENT ON TABLE lattice_blocklist IS 'Manual blocklist for bad actors in the federation';
+COMMENT ON COLUMN lattice_blocklist.blocked_identifier IS 'The identifier to block (domain/server/IP)';
+COMMENT ON COLUMN lattice_blocklist.block_type IS 'Type of identifier being blocked';
 
-CREATE INDEX IF NOT EXISTS idx_federation_blocklist_identifier ON federation_blocklist(blocked_identifier);
-CREATE INDEX IF NOT EXISTS idx_federation_blocklist_type ON federation_blocklist(block_type);
+CREATE INDEX IF NOT EXISTS idx_lattice_blocklist_identifier ON lattice_blocklist(blocked_identifier);
+CREATE INDEX IF NOT EXISTS idx_lattice_blocklist_type ON lattice_blocklist(block_type);
 
 -- =====================================================================
 -- SERVER IDENTITY (our own server's federation identity)
 -- =====================================================================
 
-CREATE TABLE IF NOT EXISTS federation_identity (
+CREATE TABLE IF NOT EXISTS lattice_identity (
     id INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),  -- Singleton table
-    server_id VARCHAR(255) NOT NULL,  -- Domain name (e.g., "mirah")
+    server_id VARCHAR(255) NOT NULL,  -- Domain name (e.g., "myserver")
     server_uuid UUID NOT NULL,  -- Permanent UUID for collision detection (set explicitly, not via DEFAULT)
     private_key_vault_path TEXT NOT NULL,  -- Path to private key in Vault
     public_key TEXT NOT NULL,   -- RSA public key
@@ -233,20 +232,20 @@ CREATE TABLE IF NOT EXISTS federation_identity (
     rotated_at TIMESTAMP WITH TIME ZONE
 );
 
-COMMENT ON TABLE federation_identity IS 'This server''s federation identity (singleton)';
-COMMENT ON COLUMN federation_identity.server_id IS 'Our server''s unique identifier in the federation';
-COMMENT ON COLUMN federation_identity.server_uuid IS 'Permanent UUID for detecting domain name collisions';
-COMMENT ON COLUMN federation_identity.private_key_vault_path IS 'Path to private key in HashiCorp Vault';
-COMMENT ON COLUMN federation_identity.bootstrap_servers IS 'List of bootstrap server URLs';
+COMMENT ON TABLE lattice_identity IS 'This server''s federation identity (singleton)';
+COMMENT ON COLUMN lattice_identity.server_id IS 'Our server''s unique identifier in the federation';
+COMMENT ON COLUMN lattice_identity.server_uuid IS 'Permanent UUID for detecting domain name collisions';
+COMMENT ON COLUMN lattice_identity.private_key_vault_path IS 'Path to private key in HashiCorp Vault';
+COMMENT ON COLUMN lattice_identity.bootstrap_servers IS 'List of bootstrap server URLs';
 
 -- =====================================================================
 -- TRIGGERS
 -- =====================================================================
 
 -- Update trigger for federation tables
-DROP TRIGGER IF EXISTS update_federation_peers_updated_at ON federation_peers;
-CREATE TRIGGER update_federation_peers_updated_at
-BEFORE UPDATE ON federation_peers
+DROP TRIGGER IF EXISTS update_lattice_peers_updated_at ON lattice_peers;
+CREATE TRIGGER update_lattice_peers_updated_at
+BEFORE UPDATE ON lattice_peers
 FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
 -- =====================================================================
@@ -255,13 +254,13 @@ FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
 DO $$
 BEGIN
-    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'mira_dbuser') THEN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'lattice_user') THEN
         GRANT SELECT, INSERT, UPDATE, DELETE ON
-            global_usernames, federation_peers, federation_routes,
-            federation_messages, federation_received_messages,
-            federation_blocklist, federation_identity
-        TO mira_dbuser;
-        GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO mira_dbuser;
+            global_usernames, lattice_peers, lattice_routes,
+            lattice_messages, lattice_received_messages,
+            lattice_blocklist, lattice_identity
+        TO lattice_user;
+        GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO lattice_user;
     END IF;
 END
 $$;

@@ -1,7 +1,7 @@
 """
-Client interface for communicating with gossip-federation service.
+Client interface for communicating with Lattice service.
 
-This module provides a clean API for MIRA to interact with the federation
+This module provides a clean API to interact with the Lattice
 service without direct imports.
 """
 
@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 
 class FederatedMessage(BaseModel):
-    """Message model for federation protocol."""
+    """Message model for Lattice protocol."""
     to_address: str
     from_address: str
     content: str
@@ -26,19 +26,19 @@ class FederatedMessage(BaseModel):
     federation_metadata: Dict[str, Any] = {}
 
 
-class FederationClient:
+class LatticeClient:
     """
-    Client for interacting with gossip-federation service.
+    Client for interacting with Lattice service.
 
-    This replaces direct imports of federation modules in MIRA.
+    HTTP client for interacting with Lattice service.
     """
 
     def __init__(self, base_url: str = "http://localhost:1113", timeout: int = 30):
         """
-        Initialize federation client.
+        Initialize Lattice client.
 
         Args:
-            base_url: URL of the federation service
+            base_url: URL of the Lattice service
             timeout: Request timeout in seconds
         """
         self.base_url = base_url.rstrip("/")
@@ -68,9 +68,9 @@ class FederationClient:
             logger.error(f"Failed to send federated message: {e}")
             raise
 
-    def get_federation_status(self) -> Dict[str, Any]:
+    def get_lattice_status(self) -> Dict[str, Any]:
         """
-        Get current federation service status.
+        Get current Lattice service status.
 
         Returns:
             Status dictionary with health info
@@ -83,12 +83,12 @@ class FederationClient:
             return {
                 "status": "unavailable",
                 "enabled": False,
-                "error": "Cannot connect to federation service"
+                "error": "Cannot connect to Lattice service"
             }
 
     def list_peers(self) -> Dict[str, Any]:
         """
-        List known federation peers.
+        List known Lattice peers.
 
         Returns:
             Dictionary with peer information

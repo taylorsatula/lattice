@@ -11,8 +11,8 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from .base import BaseHandler, APIResponse, create_success_response, create_error_response
-from federation.federation_adapter import FederationAdapter
-from federation.models import FederatedMessage
+from lattice.lattice_adapter import LatticeAdapter
+from lattice.models import FederatedMessage
 
 logger = logging.getLogger(__name__)
 
@@ -24,9 +24,9 @@ class MessageReceiveEndpoint(BaseHandler):
 
     def __init__(self):
         super().__init__()
-        self.federation_adapter = FederationAdapter()
+        self.lattice_adapter = LatticeAdapter()
         from clients.postgres_client import PostgresClient
-        self.db = PostgresClient("mira_service")
+        self.db = PostgresClient("lattice")
 
     def _check_rate_limit(self, sender_domain: str) -> bool:
         """
@@ -45,7 +45,7 @@ class MessageReceiveEndpoint(BaseHandler):
         peer = self.db.execute_single(
             """
             SELECT message_count, rate_limit_reset_at
-            FROM federation_peers
+            FROM lattice_peers
             WHERE server_id = %s
             """,
             (sender_domain,)
@@ -61,7 +61,7 @@ class MessageReceiveEndpoint(BaseHandler):
         # This prevents race conditions by checking and incrementing in single DB operation
         result = self.db.execute_returning(
             """
-            UPDATE federation_peers
+            UPDATE lattice_peers
             SET message_count = CASE
                     WHEN rate_limit_reset_at IS NULL OR rate_limit_reset_at <= %s THEN 1
                     ELSE message_count + 1
@@ -118,7 +118,7 @@ class MessageReceiveEndpoint(BaseHandler):
                     status_code=429
                 )
 
-            result = self.federation_adapter.receive_federated_message(message)
+            result = self.lattice_adapter.receive_federated_message(message)
 
             return create_success_response(
                 data=result,

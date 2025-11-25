@@ -34,7 +34,7 @@ class GossipProtocol:
 
     def __init__(self):
         """Initialize gossip protocol handler."""
-        self.db = PostgresClient("mira_service")
+        self.db = PostgresClient("lattice")
         self._private_key = None
         self._public_key = None
         self._server_id = None
@@ -48,7 +48,7 @@ class GossipProtocol:
         """Load server identity from database and Vault."""
         try:
             identity = self.db.execute_single(
-                "SELECT server_id, server_uuid, private_key_vault_path, public_key FROM federation_identity WHERE id = 1"
+                "SELECT server_id, server_uuid, private_key_vault_path, public_key FROM lattice_identity WHERE id = 1"
             )
 
             if identity:
@@ -221,7 +221,7 @@ class GossipProtocol:
             from clients.vault_client import get_service_config
 
             # Get APP_URL from Vault
-            app_url = get_service_config("mira", "APP_URL")
+            app_url = get_service_config("lattice", "APP_URL")
             if not app_url:
                 logger.error("No APP_URL configured in Vault")
                 return None
@@ -345,7 +345,7 @@ class GossipProtocol:
             route = self.db.execute_single(
                 """
                 SELECT r.server_id, r.endpoint_url, r.hop_count, r.confidence
-                FROM federation_routes r
+                FROM lattice_routes r
                 WHERE r.domain = %(domain)s
                   AND r.expires_at > NOW()
                 ORDER BY r.confidence DESC
@@ -404,7 +404,7 @@ class GossipProtocol:
             # Cache the route
             self.db.execute_insert(
                 """
-                INSERT INTO federation_routes
+                INSERT INTO lattice_routes
                 (domain, server_id, endpoint_url, hop_count, confidence, expires_at)
                 VALUES (%(domain)s, %(server_id)s, %(endpoint_url)s, %(hop_count)s, %(confidence)s, %(expires_at)s)
                 ON CONFLICT (domain) DO UPDATE

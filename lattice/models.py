@@ -1,5 +1,5 @@
 """
-Federation message models for MIRA pager system.
+Lattice protocol models.
 
 Defines the protocol for gossip-based server discovery and message federation.
 All messages are cryptographically signed for authenticity.

@@ -1,0 +1,38 @@
+[Unit]
+Description=Lattice Discovery Service
+Documentation=https://github.com/taylorsatula/lattice
+After=network.target postgresql.service vault.service
+Requires=postgresql.service vault.service
+
+[Service]
+Type=simple
+User=lattice
+Group=lattice
+WorkingDirectory=/opt/lattice
+Environment="PATH=/opt/lattice/venv/bin:/usr/local/bin:/usr/bin"
+Environment="PYTHONUNBUFFERED=1"
+
+# Lattice discovery daemon runs on port 1113
+ExecStart=/opt/lattice/venv/bin/python -m uvicorn lattice.discovery_daemon:app \
+    --host 0.0.0.0 \
+    --port 1113 \
+    --workers 1 \
+    --log-level info
+
+# Restart policy
+Restart=always
+RestartSec=10
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/opt/lattice/logs /opt/lattice/data
+
+# Resource limits
+LimitNOFILE=65536
+MemoryMax=2G
+
+[Install]
+WantedBy=multi-user.target

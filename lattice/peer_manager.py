@@ -34,7 +34,7 @@ class PeerManager:
             max_neighbors: Maximum number of active gossip neighbors
         """
         self.max_neighbors = max_neighbors
-        self.db = PostgresClient("mira_service")
+        self.db = PostgresClient("lattice")
         logger.info(f"PeerManager initialized with max_neighbors={max_neighbors}")
 
     def add_or_update_peer(self, announcement: ServerAnnouncement) -> bool:
@@ -53,13 +53,13 @@ class PeerManager:
         try:
             # Check if peer exists by UUID first (permanent identity)
             existing_by_uuid = self.db.execute_single(
-                "SELECT id, server_id, trust_status FROM federation_peers WHERE server_uuid = %(server_uuid)s",
+                "SELECT id, server_id, trust_status FROM lattice_peers WHERE server_uuid = %(server_uuid)s",
                 {'server_uuid': announcement.server_uuid}
             )
 
             # Check if server_id is already taken
             existing_by_id = self.db.execute_single(
-                "SELECT id, server_uuid, trust_status FROM federation_peers WHERE server_id = %(server_id)s",
+                "SELECT id, server_uuid, trust_status FROM lattice_peers WHERE server_id = %(server_id)s",
                 {'server_id': announcement.server_id}
             )
 
@@ -90,7 +90,7 @@ class PeerManager:
                 # Update existing peer (UUID match means it's the same server, possibly renamed)
                 self.db.execute_update(
                     """
-                    UPDATE federation_peers
+                    UPDATE lattice_peers
                     SET server_id = %(server_id)s,
                         public_key = %(public_key)s,
                         capabilities = %(capabilities)s::jsonb,
@@ -107,7 +107,7 @@ class PeerManager:
                 peer_data['first_seen_at'] = peer_data['last_seen_at']
                 self.db.execute_insert(
                     """
-                    INSERT INTO federation_peers
+                    INSERT INTO lattice_peers
                     (server_id, server_uuid, public_key, capabilities, endpoints,
                      first_seen_at, last_seen_at, last_announcement)
                     VALUES (%(server_id)s, %(server_uuid)s, %(public_key)s, %(capabilities)s::jsonb,
@@ -135,7 +135,7 @@ class PeerManager:
             neighbors = self.db.execute_query(
                 """
                 SELECT server_id, endpoints, public_key, last_seen_at
-                FROM federation_peers
+                FROM lattice_peers
                 WHERE is_neighbor = true
                   AND trust_status != 'blocked'
                   AND last_seen_at > %(cutoff_time)s
@@ -155,7 +155,7 @@ class PeerManager:
         try:
             # Get current neighbor count
             current_neighbors = self.db.execute_single(
-                "SELECT COUNT(*) as count FROM federation_peers WHERE is_neighbor = true"
+                "SELECT COUNT(*) as count FROM lattice_peers WHERE is_neighbor = true"
             )
             current_count = current_neighbors['count'] if current_neighbors else 0
 
@@ -177,7 +177,7 @@ class PeerManager:
             candidates = self.db.execute_query(
                 """
                 SELECT server_id
-                FROM federation_peers
+                FROM lattice_peers
                 WHERE is_neighbor = false
                   AND trust_status != 'blocked'
                   AND last_seen_at > %(cutoff_time)s
@@ -195,7 +195,7 @@ class PeerManager:
             for peer in selected:
                 self.db.execute_update(
                     """
-                    UPDATE federation_peers
+                    UPDATE lattice_peers
                     SET is_neighbor = true
                     WHERE server_id = %(server_id)s
                     """,
@@ -219,7 +219,7 @@ class PeerManager:
             current_neighbor = self.db.execute_single(
                 """
                 SELECT server_id
-                FROM federation_peers
+                FROM lattice_peers
                 WHERE is_neighbor = true
                 ORDER BY RANDOM()
                 LIMIT 1
@@ -233,7 +233,7 @@ class PeerManager:
             candidate = self.db.execute_single(
                 """
                 SELECT server_id
-                FROM federation_peers
+                FROM lattice_peers
                 WHERE is_neighbor = false
                   AND trust_status != 'blocked'
                   AND last_seen_at > %(cutoff_time)s
@@ -250,13 +250,13 @@ class PeerManager:
             if random.random() < 0.2:
                 # Remove old neighbor
                 self.db.execute_update(
-                    "UPDATE federation_peers SET is_neighbor = false WHERE server_id = %(server_id)s",
+                    "UPDATE lattice_peers SET is_neighbor = false WHERE server_id = %(server_id)s",
                     {'server_id': current_neighbor['server_id']}
                 )
 
                 # Add new neighbor
                 self.db.execute_update(
-                    "UPDATE federation_peers SET is_neighbor = true WHERE server_id = %(server_id)s",
+                    "UPDATE lattice_peers SET is_neighbor = true WHERE server_id = %(server_id)s",
                     {'server_id': candidate['server_id']}
                 )
 
@@ -283,7 +283,7 @@ class PeerManager:
             peer = self.db.execute_single(
                 """
                 SELECT server_id, endpoints, public_key, trust_status
-                FROM federation_peers
+                FROM lattice_peers
                 WHERE server_id = %s
                 """,
                 (domain.lower(),)
@@ -296,8 +296,8 @@ class PeerManager:
             route = self.db.execute_single(
                 """
                 SELECT p.server_id, p.endpoints, p.public_key, p.trust_status
-                FROM federation_routes r
-                JOIN federation_peers p ON r.server_id = p.server_id
+                FROM lattice_routes r
+                JOIN lattice_peers p ON r.server_id = p.server_id
                 WHERE r.domain = %s
                   AND r.expires_at > NOW()
                 ORDER BY r.confidence DESC
@@ -317,7 +317,7 @@ class PeerManager:
         try:
             # Check peer blocklist
             peer_blocked = self.db.execute_single(
-                "SELECT 1 FROM federation_peers WHERE server_id = %s AND trust_status = 'blocked'",
+                "SELECT 1 FROM lattice_peers WHERE server_id = %s AND trust_status = 'blocked'",
                 (server_id,)
             )
 
@@ -327,7 +327,7 @@ class PeerManager:
             # Check general blocklist
             blocked = self.db.execute_single(
                 """
-                SELECT 1 FROM federation_blocklist
+                SELECT 1 FROM lattice_blocklist
                 WHERE blocked_identifier = %s
                   AND block_type IN ('server', 'domain')
                   AND (expires_at IS NULL OR expires_at > NOW())
@@ -354,7 +354,7 @@ class PeerManager:
         try:
             result = self.db.execute_returning(
                 """
-                UPDATE federation_peers
+                UPDATE lattice_peers
                 SET is_neighbor = false
                 WHERE last_seen_at < %(cutoff_time)s
                   AND is_neighbor = true
@@ -370,7 +370,7 @@ class PeerManager:
             # Also delete peers not seen in 90+ days (prevents unbounded table growth)
             deleted = self.db.execute_returning(
                 """
-                DELETE FROM federation_peers
+                DELETE FROM lattice_peers
                 WHERE last_seen_at < %(cutoff_time)s
                 RETURNING server_id
                 """,

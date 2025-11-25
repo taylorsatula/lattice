@@ -1,8 +1,8 @@
 """
-Discovery Daemon for MIRA Federation.
+Lattice Discovery Daemon.
 
-Standalone FastAPI service that handles federation discovery via gossip protocol.
-Provides REST API for local tools to query federation routes.
+Standalone FastAPI service that handles peer discovery via gossip protocol.
+Provides REST API for local tools to query routes.
 """
 
 import asyncio
@@ -126,7 +126,7 @@ class DiscoveryService:
         self.peer_manager = PeerManager()
         self.gossip_protocol = GossipProtocol()
         self.domain_registration = DomainRegistrationService()
-        self.db = PostgresClient("mira_service")
+        self.db = PostgresClient("lattice")
         self.last_gossip_time = None
         self.bootstrap_servers: List[str] = []
 
@@ -144,7 +144,7 @@ class DiscoveryService:
         """Initialize the discovery service."""
         # Load bootstrap servers from database
         identity = self.db.execute_single(
-            "SELECT bootstrap_servers FROM federation_identity WHERE id = 1"
+            "SELECT bootstrap_servers FROM lattice_identity WHERE id = 1"
         )
         if identity and identity['bootstrap_servers']:
             self.bootstrap_servers = identity['bootstrap_servers']
@@ -160,7 +160,7 @@ class DiscoveryService:
         if self.bootstrap_servers:
             await self._connect_to_bootstrap_servers()
 
-        logger.info("Discovery service initialized (scheduling handled by main MIRA)")
+        logger.info("Discovery service initialized")
 
     async def _connect_to_bootstrap_servers(self):
         """Connect to bootstrap servers on startup (parallel for speed)."""
@@ -270,17 +270,17 @@ class DiscoveryService:
 
         # Clean up expired routes
         self.db.execute_delete(
-            "DELETE FROM federation_routes WHERE expires_at < NOW()"
+            "DELETE FROM lattice_routes WHERE expires_at < NOW()"
         )
 
         # Clean up old messages
         self.db.execute_delete(
-            "DELETE FROM federation_messages WHERE expires_at < NOW() AND status IN ('delivered', 'failed', 'expired')"
+            "DELETE FROM lattice_messages WHERE expires_at < NOW() AND status IN ('delivered', 'failed', 'expired')"
         )
 
         # Clean up received message tracking (keep 7 days for debugging)
         self.db.execute_delete(
-            "DELETE FROM federation_received_messages WHERE received_at < NOW() - INTERVAL '7 days'"
+            "DELETE FROM lattice_received_messages WHERE received_at < NOW() - INTERVAL '7 days'"
         )
 
         # Reset stuck messages
@@ -305,7 +305,7 @@ class DiscoveryService:
         try:
             result = self.db.execute_returning(
                 """
-                UPDATE federation_messages
+                UPDATE lattice_messages
                 SET status = 'pending',
                     next_attempt_at = NOW(),
                     last_status_change_at = NOW()
@@ -361,7 +361,7 @@ class DiscoveryService:
 
     def process_message_queue(self, max_messages: int = 10) -> Dict[str, Any]:
         """
-        Process pending messages from the federation_messages queue.
+        Process pending messages from the lattice_messages queue.
 
         Args:
             max_messages: Maximum number of messages to process in one batch
@@ -374,7 +374,7 @@ class DiscoveryService:
             messages = self.db.execute_query(
                 """
                 SELECT *
-                FROM federation_messages
+                FROM lattice_messages
                 WHERE status = 'pending'
                   AND next_attempt_at <= NOW()
                   AND expires_at > NOW()
@@ -467,7 +467,7 @@ class DiscoveryService:
         Deliver a single message to its destination.
 
         Args:
-            msg: Message record from federation_messages table
+            msg: Message record from lattice_messages table
 
         Raises:
             Exception: If delivery fails
@@ -494,7 +494,7 @@ class DiscoveryService:
 
         # Update status to sending
         self.db.execute_update(
-            "UPDATE federation_messages SET status = 'sending', last_status_change_at = NOW() WHERE message_id = %s",
+            "UPDATE lattice_messages SET status = 'sending', last_status_change_at = NOW() WHERE message_id = %s",
             (message_id,)
         )
 
@@ -587,7 +587,7 @@ class DiscoveryService:
 
             self.db.execute_update(
                 """
-                UPDATE federation_messages
+                UPDATE lattice_messages
                 SET status = 'pending',
                     attempt_count = %s,
                     next_attempt_at = %s,
@@ -605,7 +605,7 @@ class DiscoveryService:
         """Mark message as successfully delivered."""
         self.db.execute_update(
             """
-            UPDATE federation_messages
+            UPDATE lattice_messages
             SET status = 'delivered',
                 delivered_at = NOW(),
                 last_status_change_at = NOW()
@@ -618,7 +618,7 @@ class DiscoveryService:
         """Mark message as permanently failed."""
         self.db.execute_update(
             """
-            UPDATE federation_messages
+            UPDATE lattice_messages
             SET status = 'failed',
                 last_error = %s,
                 last_status_change_at = NOW()
@@ -649,8 +649,8 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="MIRA Discovery Daemon",
-    description="Federation discovery service for MIRA pager system",
+    title="Lattice Discovery Daemon",
+    description="Decentralized peer discovery service",
     version="1.0.0",
     lifespan=lifespan
 )
@@ -729,7 +729,7 @@ async def list_peers(
         query = """
             SELECT server_id, is_neighbor, trust_status,
                    last_seen_at, endpoints
-            FROM federation_peers
+            FROM lattice_peers
             WHERE 1=1
         """
         params = []
@@ -953,7 +953,7 @@ async def receive_gossip(message: GossipMessage):
     try:
         # Get sender's existing peer record
         sender = discovery_service.db.execute_single(
-            "SELECT public_key, server_uuid FROM federation_peers WHERE server_id = %s",
+            "SELECT public_key, server_uuid FROM lattice_peers WHERE server_id = %s",
             (message.from_server,)
         )
 
@@ -961,7 +961,7 @@ async def receive_gossip(message: GossipMessage):
         if sender:
             rate_check = discovery_service.db.execute_single(
                 """
-                UPDATE federation_peers
+                UPDATE lattice_peers
                 SET query_count = CASE
                         WHEN rate_limit_reset_at IS NULL OR rate_limit_reset_at < NOW()
                         THEN 1
@@ -1096,7 +1096,7 @@ async def register_domain(request: DomainRegistrationRequest):
 # DNS root servers - a trusted list of entry points.
 #
 # USE CASE:
-# - New MIRA server wants to join large existing federation
+# - New server wants to join large existing network
 # - Bootstrap servers are offline or unavailable
 # - Admin has trusted peer list from another source
 #
@@ -1124,9 +1124,9 @@ async def trigger_neighbor_update(
     background_tasks: BackgroundTasks = None
 ):
     """
-    Trigger neighbor selection update (called by main MIRA scheduler, localhost only).
+    Trigger neighbor selection update (called by scheduler, localhost only).
 
-    This endpoint is designed to be called by the main MIRA application's
+    This endpoint is designed to be called by the main application's
     scheduler service rather than having the discovery daemon manage its own scheduling.
     """
     try:
@@ -1143,9 +1143,9 @@ async def trigger_neighbor_update(
 @app.post("/api/v1/maintenance/process_messages")
 async def process_message_queue(_: str = Depends(localhost_only)):
     """
-    Process pending federated messages for delivery (called by main MIRA scheduler, localhost only).
+    Process pending federated messages for delivery (called by scheduler, localhost only).
 
-    This endpoint processes messages queued in the federation_messages table
+    This endpoint processes messages queued in the lattice_messages table
     and attempts to deliver them to remote servers.
     """
     try:
@@ -1162,9 +1162,9 @@ async def process_message_queue(_: str = Depends(localhost_only)):
 @app.post("/api/v1/maintenance/cleanup")
 async def trigger_cleanup(_: str = Depends(localhost_only)):
     """
-    Trigger cleanup of stale data (called by main MIRA scheduler, localhost only).
+    Trigger cleanup of stale data (called by scheduler, localhost only).
 
-    This endpoint is designed to be called by the main MIRA application's
+    This endpoint is designed to be called by the main application's
     scheduler service rather than having the discovery daemon manage its own scheduling.
     """
     try:
@@ -1180,5 +1180,5 @@ async def trigger_cleanup(_: str = Depends(localhost_only)):
 
 if __name__ == "__main__":
     import uvicorn
-    # Port 1113 for gossip federation (all deployments)
+    # Port 1113 for Lattice (all deployments)
     uvicorn.run(app, host="0.0.0.0", port=1113, log_level="info")

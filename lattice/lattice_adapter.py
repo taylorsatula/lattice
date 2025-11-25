@@ -1,8 +1,8 @@
 """
-Federation Adapter for MIRA Pager System.
+Lattice Federation Adapter.
 
 Handles message routing between local and remote servers.
-Fully synchronous - follows MIRA's "Synchronous Over Async" principle.
+Fully synchronous - follows the "Synchronous Over Async" principle.
 """
 
 import json
@@ -21,7 +21,7 @@ from .peer_manager import PeerManager
 logger = logging.getLogger(__name__)
 
 
-class FederationAdapter:
+class LatticeAdapter:
     """
     Handles federated message routing (fully synchronous).
 
@@ -34,7 +34,7 @@ class FederationAdapter:
     """
 
     def __init__(self):
-        self.db = PostgresClient("mira_service")
+        self.db = PostgresClient("lattice")
         self.gossip_protocol = GossipProtocol()
         self.peer_manager = PeerManager()
         self.injection_defense = PromptInjectionDefense()
@@ -186,7 +186,7 @@ class FederationAdapter:
             # Insert into queue (discovery daemon will handle delivery)
             self.db.execute_insert(
                 """
-                INSERT INTO federation_messages
+                INSERT INTO lattice_messages
                 (message_id, from_address, to_address, to_domain, message_type,
                  content, priority, metadata, signature, sender_fingerprint,
                  status, created_at, expires_at, next_attempt_at)
@@ -229,7 +229,7 @@ class FederationAdapter:
 
             # Check for duplicate message (idempotency)
             existing = self.db.execute_single(
-                "SELECT 1 FROM federation_received_messages WHERE message_id = %s",
+                "SELECT 1 FROM lattice_received_messages WHERE message_id = %s",
                 (message.message_id,)
             )
 
@@ -307,7 +307,7 @@ class FederationAdapter:
                 # Record successful delivery for idempotency tracking
                 self.db.execute_insert(
                     """
-                    INSERT INTO federation_received_messages (message_id, from_address, received_at)
+                    INSERT INTO lattice_received_messages (message_id, from_address, received_at)
                     VALUES (%s, %s, NOW())
                     ON CONFLICT (message_id) DO NOTHING
                     """,

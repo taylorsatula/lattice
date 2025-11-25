@@ -1,5 +1,5 @@
 """
-Domain registration and verification for MIRA federation.
+Domain registration and verification for Lattice.
 
 Implements the protocol for verifying domain name uniqueness before registration.
 """
@@ -39,7 +39,7 @@ class DomainRegistrationService:
     """Handles domain name registration and uniqueness verification."""
 
     def __init__(self):
-        self.db = PostgresClient("mira_service")
+        self.db = PostgresClient("lattice")
         self.peer_manager = PeerManager()
         self.gossip_protocol = GossipProtocol()
 
@@ -117,7 +117,7 @@ class DomainRegistrationService:
 
         # Track network visibility with COUNT instead of full table scans
         peer_count_before = self.db.execute_single(
-            "SELECT COUNT(*) as count FROM federation_peers"
+            "SELECT COUNT(*) as count FROM lattice_peers"
         )['count']
 
         import httpx
@@ -152,7 +152,7 @@ class DomainRegistrationService:
 
         # Check network visibility after queries using COUNT
         peer_count_after = self.db.execute_single(
-            "SELECT COUNT(*) as count FROM federation_peers"
+            "SELECT COUNT(*) as count FROM lattice_peers"
         )['count']
 
         # Calculate confidence based on network visibility saturation
@@ -271,7 +271,7 @@ class DomainRegistrationService:
             # Use ON CONFLICT to handle concurrent registration attempts
             result = self.db.execute_returning(
                 """
-                INSERT INTO federation_identity (id, server_id, server_uuid, private_key_vault_path, public_key, fingerprint)
+                INSERT INTO lattice_identity (id, server_id, server_uuid, private_key_vault_path, public_key, fingerprint)
                 VALUES (1, %(server_id)s, %(server_uuid)s, %(private_key_vault_path)s, %(public_key)s, %(fingerprint)s)
                 ON CONFLICT (id) DO NOTHING
                 RETURNING server_id, server_uuid
@@ -279,7 +279,7 @@ class DomainRegistrationService:
                 {
                     'server_id': domain,
                     'server_uuid': server_uuid,
-                    'private_key_vault_path': "mira/federation/private_key",
+                    'private_key_vault_path': "lattice/keys/private_key",
                     'public_key': public_key,
                     'fingerprint': self.gossip_protocol.generate_fingerprint(public_key)
                 }
@@ -288,7 +288,7 @@ class DomainRegistrationService:
             if not result:
                 # Conflict occurred - identity already exists
                 existing = self.db.execute_single(
-                    "SELECT server_id, server_uuid FROM federation_identity WHERE id = 1"
+                    "SELECT server_id, server_uuid FROM lattice_identity WHERE id = 1"
                 )
                 logger.error(
                     f"Cannot register domain '{domain}': federation identity already exists "

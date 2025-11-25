@@ -1,7 +1,7 @@
 """
-MIRA Federation System
+Lattice
 
-Implements gossip-based federation for cross-server pager messaging.
+Decentralized peer-to-peer protocol for cross-server messaging.
 """
 
 from .models import (
