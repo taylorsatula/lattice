@@ -16,7 +16,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa, padding
 from cryptography.hazmat.backends import default_backend
 from cryptography.exceptions import InvalidSignature
 
-from clients.postgres_client import PostgresClient
+from .sqlite_client import SQLiteClient
 from utils.timezone_utils import utc_now, parse_utc_time_string
 from .models import (
     ServerAnnouncement,
@@ -36,7 +36,7 @@ class GossipProtocol:
 
     def __init__(self):
         """Initialize gossip protocol handler."""
-        self.db = PostgresClient("lattice")
+        self.db = SQLiteClient()
         self._private_key = None
         self._public_key = None
         self._server_id = None
@@ -366,7 +366,7 @@ class GossipProtocol:
                 SELECT r.server_id, r.endpoint_url, r.hop_count, r.confidence
                 FROM lattice_routes r
                 WHERE r.domain = %(domain)s
-                  AND r.expires_at > NOW()
+                  AND r.expires_at > datetime('now')
                 ORDER BY r.confidence DESC
                 LIMIT 1
                 """,
@@ -420,27 +420,26 @@ class GossipProtocol:
                 logger.info(f"Domain {response.domain} not found")
                 return True
 
-            # Cache the route
+            # Cache the route (use INSERT OR REPLACE for SQLite upsert)
+            import uuid as uuid_module
+            expires_at = (utc_now() + timedelta(hours=24)).isoformat()
             self.db.execute_insert(
                 """
-                INSERT INTO lattice_routes
-                (domain, server_id, endpoint_url, hop_count, confidence, expires_at)
-                VALUES (%(domain)s, %(server_id)s, %(endpoint_url)s, %(hop_count)s, %(confidence)s, %(expires_at)s)
-                ON CONFLICT (domain) DO UPDATE
-                SET server_id = EXCLUDED.server_id,
-                    endpoint_url = EXCLUDED.endpoint_url,
-                    hop_count = EXCLUDED.hop_count,
-                    confidence = EXCLUDED.confidence,
-                    expires_at = EXCLUDED.expires_at,
-                    last_used_at = NOW()
+                INSERT OR REPLACE INTO lattice_routes
+                (id, domain, server_id, endpoint_url, hop_count, confidence, expires_at, last_used_at)
+                VALUES (
+                    COALESCE((SELECT id FROM lattice_routes WHERE domain = %(domain)s), %(new_id)s),
+                    %(domain)s, %(server_id)s, %(endpoint_url)s, %(hop_count)s, %(confidence)s, %(expires_at)s, datetime('now')
+                )
                 """,
                 {
+                    'new_id': str(uuid_module.uuid4()),
                     'domain': response.domain,
                     'server_id': response.server_id,
                     'endpoint_url': response.endpoint_url,
                     'hop_count': response.hop_count,
                     'confidence': response.confidence,
-                    'expires_at': utc_now() + timedelta(hours=24)
+                    'expires_at': expires_at
                 }
             )
 
@@ -550,7 +549,7 @@ class GossipProtocol:
 
             # Update database
             self.db.execute_update(
-                "UPDATE lattice_identity SET public_key = %(key)s, rotated_at = NOW() WHERE id = 1",
+                "UPDATE lattice_identity SET public_key = %(key)s, rotated_at = datetime('now') WHERE id = 1",
                 {'key': new_public_pem}
             )
 
@@ -558,15 +557,16 @@ class GossipProtocol:
             self._load_identity()
 
             # Log rotation locally
+            import uuid as uuid_module
             old_fp = self.generate_fingerprint(rotation.old_public_key)
             new_fp = self.generate_fingerprint(new_public_pem)
             self.db.execute_insert(
                 """
                 INSERT INTO lattice_key_rotations
-                (server_uuid, old_key_fingerprint, new_key_fingerprint, reason, received_from)
-                VALUES (%(uuid)s, %(old_fp)s, %(new_fp)s, %(reason)s, 'self')
+                (id, server_uuid, old_key_fingerprint, new_key_fingerprint, reason, received_from)
+                VALUES (%(id)s, %(uuid)s, %(old_fp)s, %(new_fp)s, %(reason)s, 'self')
                 """,
-                {'uuid': self._server_uuid, 'old_fp': old_fp, 'new_fp': new_fp, 'reason': reason}
+                {'id': str(uuid_module.uuid4()), 'uuid': self._server_uuid, 'old_fp': old_fp, 'new_fp': new_fp, 'reason': reason}
             )
 
             logger.info(f"Key rotation complete: {old_fp[:8]}... -> {new_fp[:8]}...")

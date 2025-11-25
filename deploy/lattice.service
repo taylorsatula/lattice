@@ -1,8 +1,8 @@
 [Unit]
 Description=Lattice Discovery Service
 Documentation=https://github.com/taylorsatula/lattice
-After=network.target postgresql.service vault.service
-Requires=postgresql.service vault.service
+After=network.target vault.service
+Wants=vault.service
 
 [Service]
 Type=simple

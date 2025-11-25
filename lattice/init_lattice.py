@@ -12,7 +12,7 @@ import os
 import subprocess
 from typing import Dict, Any
 
-from clients.postgres_client import PostgresClient
+from .sqlite_client import SQLiteClient
 
 
 def _secure_delete(filepath: str) -> None:
@@ -58,7 +58,7 @@ def ensure_lattice_identity() -> Dict[str, Any]:
     Returns:
         Dict with server_id, server_uuid, and status
     """
-    db = PostgresClient("lattice")
+    db = SQLiteClient()
 
     try:
         # Check if identity exists
@@ -119,12 +119,13 @@ def ensure_lattice_identity() -> Dict[str, Any]:
         import uuid
         server_uuid = str(uuid.uuid4())
 
+        import json
         db.execute_insert(
             """
             INSERT INTO lattice_identity
             (id, server_id, server_uuid, private_key_vault_path, public_key, fingerprint,
              bootstrap_servers, created_at)
-            VALUES (1, %s, %s, %s, %s, %s, %s, NOW())
+            VALUES (1, ?, ?, ?, ?, ?, ?, datetime('now'))
             """,
             (
                 suggested_domain,
@@ -132,7 +133,7 @@ def ensure_lattice_identity() -> Dict[str, Any]:
                 f"{vault_path}:private_key",
                 public_pem,
                 fingerprint,
-                []  # Bootstrap servers can be added later
+                json.dumps([])  # Bootstrap servers can be added later
             )
         )
 
@@ -171,10 +172,11 @@ def initialize_lattice_services(scheduler_service) -> bool:
             if bootstrap_servers:
                 # Parse comma-separated list
                 bootstrap_list = [s.strip() for s in bootstrap_servers.split(",")]
-                db = PostgresClient("lattice")
+                import json as json_module
+                db = SQLiteClient()
                 db.execute_update(
-                    "UPDATE lattice_identity SET bootstrap_servers = %(bootstrap_servers)s WHERE id = 1",
-                    {'bootstrap_servers': bootstrap_list}
+                    "UPDATE lattice_identity SET bootstrap_servers = ? WHERE id = 1",
+                    (json_module.dumps(bootstrap_list),)
                 )
                 logger.info(f"Configured {len(bootstrap_list)} bootstrap servers from Vault")
         except Exception as e:
@@ -292,7 +294,7 @@ def _register_lattice_scheduler_jobs(scheduler_service):
 def get_federation_status() -> Dict[str, Any]:
     """Get current federation status and configuration."""
     try:
-        db = PostgresClient("lattice")
+        db = SQLiteClient()
 
         identity = db.execute_single(
             "SELECT server_id, server_uuid, fingerprint, created_at FROM lattice_identity WHERE id = 1"
@@ -309,9 +311,9 @@ def get_federation_status() -> Dict[str, Any]:
             """
             SELECT
                 COUNT(*) as total_peers,
-                COUNT(*) FILTER (WHERE is_neighbor = true) as neighbors,
-                COUNT(*) FILTER (WHERE trust_status = 'trusted') as trusted_peers,
-                COUNT(*) FILTER (WHERE last_seen_at > NOW() - INTERVAL '1 day') as active_peers
+                SUM(CASE WHEN is_neighbor = 1 THEN 1 ELSE 0 END) as neighbors,
+                SUM(CASE WHEN trust_status = 'trusted' THEN 1 ELSE 0 END) as trusted_peers,
+                SUM(CASE WHEN last_seen_at > datetime('now', '-1 day') THEN 1 ELSE 0 END) as active_peers
             FROM lattice_peers
             """
         )
@@ -321,7 +323,7 @@ def get_federation_status() -> Dict[str, Any]:
             "server_id": identity['server_id'],
             "server_uuid": identity['server_uuid'],
             "fingerprint": identity['fingerprint'],
-            "created_at": identity['created_at'].isoformat(),
+            "created_at": identity['created_at'],
             "peers": peer_stats or {"total_peers": 0, "neighbors": 0, "trusted_peers": 0, "active_peers": 0},
             "discovery_daemon_url": "http://localhost:1113"
         }

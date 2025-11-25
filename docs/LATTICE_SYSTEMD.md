@@ -9,9 +9,9 @@ Create `/etc/systemd/system/lattice-discovery.service`:
 ```ini
 [Unit]
 Description=Lattice Discovery Daemon
-Documentation=https://github.com/yourorg/botwithmemory
-After=network.target postgresql.service vault.service
-Wants=postgresql.service
+Documentation=https://github.com/taylorsatula/lattice
+After=network.target vault.service
+Wants=vault.service
 
 [Service]
 Type=simple

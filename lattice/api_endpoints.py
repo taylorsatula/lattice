@@ -27,8 +27,8 @@ class MessageReceiveEndpoint(BaseHandler):
         super().__init__()
         self.lattice_adapter = LatticeAdapter()
         self.gossip_protocol = GossipProtocol()
-        from clients.postgres_client import PostgresClient
-        self.db = PostgresClient("lattice")
+        from .sqlite_client import SQLiteClient
+        self.db = SQLiteClient()
 
     def _check_rate_limit(self, sender_domain: str) -> bool:
         """
@@ -57,7 +57,8 @@ class MessageReceiveEndpoint(BaseHandler):
             # Unknown peer - will be rejected by signature verification anyway
             return True
 
-        now = utc_now()
+        now = utc_now().isoformat()
+        reset_time = (utc_now() + timedelta(minutes=1)).isoformat()
 
         # Atomic increment with limit check using UPDATE with WHERE clause
         # This prevents race conditions by checking and incrementing in single DB operation
@@ -78,7 +79,7 @@ class MessageReceiveEndpoint(BaseHandler):
                    OR message_count < 100)
             RETURNING message_count
             """,
-            (now, now, now + timedelta(minutes=1), sender_domain, now)
+            (now, now, reset_time, sender_domain, now)
         )
 
         if not result:

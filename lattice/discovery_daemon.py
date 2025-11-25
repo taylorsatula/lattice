@@ -18,7 +18,7 @@ from urllib.parse import urlparse
 from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks, Request
 from pydantic import BaseModel, Field
 
-from clients.postgres_client import PostgresClient
+from .sqlite_client import SQLiteClient
 from utils.timezone_utils import utc_now
 from .models import (
     ServerAnnouncement,
@@ -126,7 +126,7 @@ class DiscoveryService:
         self.peer_manager = PeerManager()
         self.gossip_protocol = GossipProtocol()
         self.domain_registration = DomainRegistrationService()
-        self.db = PostgresClient("lattice")
+        self.db = SQLiteClient()
         self.last_gossip_time = None
         self.bootstrap_servers: List[str] = []
 
@@ -269,17 +269,17 @@ class DiscoveryService:
 
         # Clean up expired routes
         self.db.execute_delete(
-            "DELETE FROM lattice_routes WHERE expires_at < NOW()"
+            "DELETE FROM lattice_routes WHERE expires_at < datetime('now')"
         )
 
         # Clean up old messages
         self.db.execute_delete(
-            "DELETE FROM lattice_messages WHERE expires_at < NOW() AND status IN ('delivered', 'failed', 'expired')"
+            "DELETE FROM lattice_messages WHERE expires_at < datetime('now') AND status IN ('delivered', 'failed', 'expired')"
         )
 
         # Clean up received message tracking (keep 7 days for debugging)
         self.db.execute_delete(
-            "DELETE FROM lattice_received_messages WHERE received_at < NOW() - INTERVAL '7 days'"
+            "DELETE FROM lattice_received_messages WHERE received_at < datetime('now', '-7 days')"
         )
 
         # Reset stuck messages
@@ -306,10 +306,10 @@ class DiscoveryService:
                 """
                 UPDATE lattice_messages
                 SET status = 'pending',
-                    next_attempt_at = NOW(),
-                    last_status_change_at = NOW()
+                    next_attempt_at = datetime('now'),
+                    last_status_change_at = datetime('now')
                 WHERE status = 'sending'
-                  AND last_status_change_at < NOW() - INTERVAL '5 minutes'
+                  AND last_status_change_at < datetime('now', '-5 minutes')
                 RETURNING message_id
                 """
             )
@@ -375,8 +375,8 @@ class DiscoveryService:
                 SELECT *
                 FROM lattice_messages
                 WHERE status = 'pending'
-                  AND next_attempt_at <= NOW()
-                  AND expires_at > NOW()
+                  AND next_attempt_at <= datetime('now')
+                  AND expires_at > datetime('now')
                 ORDER BY priority DESC, created_at ASC
                 LIMIT %s
                 """,
@@ -504,7 +504,7 @@ class DiscoveryService:
 
         # Update status to sending
         self.db.execute_update(
-            "UPDATE lattice_messages SET status = 'sending', last_status_change_at = NOW() WHERE message_id = %s",
+            "UPDATE lattice_messages SET status = 'sending', last_status_change_at = datetime('now') WHERE message_id = %s",
             (message_id,)
         )
 
@@ -517,6 +517,8 @@ class DiscoveryService:
 
         # Construct federated message
         from .models import FederatedMessage
+        # created_at is already a string in SQLite
+        timestamp = msg['created_at'] if isinstance(msg['created_at'], str) else msg['created_at'].isoformat()
         message = FederatedMessage(
             message_id=msg['message_id'],
             message_type=msg['message_type'],
@@ -524,7 +526,7 @@ class DiscoveryService:
             to_address=msg['to_address'],
             content=msg['content'],
             priority=msg['priority'],
-            timestamp=msg['created_at'].isoformat(),
+            timestamp=timestamp,
             sender_fingerprint=msg['sender_fingerprint'],
             signature=msg['signature'],
             metadata=msg.get('metadata', {})
@@ -615,10 +617,10 @@ class DiscoveryService:
                     next_attempt_at = %s,
                     last_error = %s,
                     error_count = error_count + 1,
-                    last_status_change_at = NOW()
+                    last_status_change_at = datetime('now')
                 WHERE message_id = %s
                 """,
-                (attempt_count, next_attempt, error, message_id)
+                (attempt_count, next_attempt.isoformat(), error, message_id)
             )
 
             logger.info(f"Message {message_id} retry scheduled for {next_attempt} (attempt {attempt_count}/{max_attempts})")
@@ -629,8 +631,8 @@ class DiscoveryService:
             """
             UPDATE lattice_messages
             SET status = 'delivered',
-                delivered_at = NOW(),
-                last_status_change_at = NOW()
+                delivered_at = datetime('now'),
+                last_status_change_at = datetime('now')
             WHERE message_id = %s
             """,
             (message_id,)
@@ -643,7 +645,7 @@ class DiscoveryService:
             UPDATE lattice_messages
             SET status = 'failed',
                 last_error = %s,
-                last_status_change_at = NOW()
+                last_status_change_at = datetime('now')
             WHERE message_id = %s
             """,
             (error, message_id)
@@ -984,17 +986,17 @@ async def receive_gossip(message: GossipMessage):
 
         # Rate limiting: 100 gossip messages per minute per peer
         if sender:
-            rate_check = discovery_service.db.execute_single(
+            rate_check = discovery_service.db.execute_returning(
                 """
                 UPDATE lattice_peers
                 SET query_count = CASE
-                        WHEN rate_limit_reset_at IS NULL OR rate_limit_reset_at < NOW()
+                        WHEN rate_limit_reset_at IS NULL OR rate_limit_reset_at < datetime('now')
                         THEN 1
                         ELSE query_count + 1
                     END,
                     rate_limit_reset_at = CASE
-                        WHEN rate_limit_reset_at IS NULL OR rate_limit_reset_at < NOW()
-                        THEN NOW() + INTERVAL '1 minute'
+                        WHEN rate_limit_reset_at IS NULL OR rate_limit_reset_at < datetime('now')
+                        THEN datetime('now', '+1 minute')
                         ELSE rate_limit_reset_at
                     END
                 WHERE server_id = %s
@@ -1002,7 +1004,7 @@ async def receive_gossip(message: GossipMessage):
                 """,
                 (message.from_server,)
             )
-            if rate_check and rate_check['query_count'] > 100:
+            if rate_check and len(rate_check) > 0 and rate_check[0]['query_count'] > 100:
                 logger.warning(f"Rate limit exceeded for gossip from {message.from_server}")
                 raise HTTPException(status_code=429, detail="Rate limit exceeded")
 

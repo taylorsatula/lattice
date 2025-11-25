@@ -32,7 +32,6 @@ setup(
         "httpx>=0.24.0",
         "pydantic>=2.0.0",
         "cryptography>=41.0.0",
-        "psycopg2-binary>=2.9.0",
         "python-dateutil>=2.8.2",
     ],
     extras_require={

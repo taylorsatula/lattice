@@ -9,7 +9,7 @@ import time
 from typing import Dict, Any, Optional
 from pydantic import BaseModel, Field
 
-from clients.postgres_client import PostgresClient
+from .sqlite_client import SQLiteClient
 from .models import DomainQuery, DomainResponse
 from .peer_manager import PeerManager
 from .gossip_protocol import GossipProtocol
@@ -39,7 +39,7 @@ class DomainRegistrationService:
     """Handles domain name registration and uniqueness verification."""
 
     def __init__(self):
-        self.db = PostgresClient("lattice")
+        self.db = SQLiteClient()
         self.peer_manager = PeerManager()
         self.gossip_protocol = GossipProtocol()
 
@@ -267,29 +267,13 @@ class DomainRegistrationService:
 
         # Register in local database
         try:
-            # Atomic insert with race condition protection
-            # Use ON CONFLICT to handle concurrent registration attempts
-            result = self.db.execute_returning(
-                """
-                INSERT INTO lattice_identity (id, server_id, server_uuid, private_key_vault_path, public_key, fingerprint)
-                VALUES (1, %(server_id)s, %(server_uuid)s, %(private_key_vault_path)s, %(public_key)s, %(fingerprint)s)
-                ON CONFLICT (id) DO NOTHING
-                RETURNING server_id, server_uuid
-                """,
-                {
-                    'server_id': domain,
-                    'server_uuid': server_uuid,
-                    'private_key_vault_path': "lattice/keys/private_key",
-                    'public_key': public_key,
-                    'fingerprint': self.gossip_protocol.generate_fingerprint(public_key)
-                }
+            # Check if identity already exists
+            existing = self.db.execute_single(
+                "SELECT server_id, server_uuid FROM lattice_identity WHERE id = 1"
             )
 
-            if not result:
-                # Conflict occurred - identity already exists
-                existing = self.db.execute_single(
-                    "SELECT server_id, server_uuid FROM lattice_identity WHERE id = 1"
-                )
+            if existing:
+                # Identity already exists
                 logger.error(
                     f"Cannot register domain '{domain}': federation identity already exists "
                     f"(current: {existing['server_id']}, UUID: {existing['server_uuid']})"
@@ -300,6 +284,21 @@ class DomainRegistrationService:
                     "reason": f"Federation identity already registered as '{existing['server_id']}'. "
                              "Cannot register new domain without destroying existing identity."
                 }
+
+            # Insert new identity
+            self.db.execute_insert(
+                """
+                INSERT INTO lattice_identity (id, server_id, server_uuid, private_key_vault_path, public_key, fingerprint)
+                VALUES (1, %(server_id)s, %(server_uuid)s, %(private_key_vault_path)s, %(public_key)s, %(fingerprint)s)
+                """,
+                {
+                    'server_id': domain,
+                    'server_uuid': server_uuid,
+                    'private_key_vault_path': "lattice/keys/private_key",
+                    'public_key': public_key,
+                    'fingerprint': self.gossip_protocol.generate_fingerprint(public_key)
+                }
+            )
 
             logger.info(f"Registered domain '{domain}' with UUID {server_uuid}")
 

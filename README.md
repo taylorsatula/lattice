@@ -25,8 +25,8 @@ pip install -e .
 ### Start the Discovery Daemon
 
 ```bash
-# Apply database schema first
-psql -U lattice_admin -d lattice -f deploy/lattice_schema.sql
+# Database schema is automatically created on first run
+# Default SQLite database: lattice.db (configure with LATTICE_DB_PATH env var)
 
 # Start daemon
 uvicorn lattice.discovery_daemon:app --host 0.0.0.0 --port 1113
@@ -37,7 +37,8 @@ uvicorn lattice.discovery_daemon:app --host 0.0.0.0 --port 1113
 ```bash
 docker run -d \
   -p 1113:1113 \
-  -e DATABASE_URL=postgresql://... \
+  -v /path/to/data:/data \
+  -e LATTICE_DB_PATH=/data/lattice.db \
   -e VAULT_ADDR=https://... \
   lattice:latest
 ```

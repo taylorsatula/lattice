@@ -16,7 +16,7 @@ import random
 from datetime import timedelta
 from typing import List, Dict, Any, Optional
 
-from clients.postgres_client import PostgresClient
+from .sqlite_client import SQLiteClient
 from utils.timezone_utils import utc_now
 from .models import ServerAnnouncement, KeyRotation, IdentityRevocation
 
@@ -34,7 +34,7 @@ class PeerManager:
             max_neighbors: Maximum number of active gossip neighbors
         """
         self.max_neighbors = max_neighbors
-        self.db = PostgresClient("lattice")
+        self.db = SQLiteClient()
         logger.info(f"PeerManager initialized with max_neighbors={max_neighbors}")
 
     def add_or_update_peer(self, announcement: ServerAnnouncement) -> bool:
@@ -86,14 +86,17 @@ class PeerManager:
                 logger.warning(f"Ignoring announcement from blocked peer: {announcement.server_id}")
                 return False
 
+            import json
+            import uuid as uuid_module
+            last_seen = utc_now().isoformat()
             peer_data = {
                 'server_id': announcement.server_id,
                 'server_uuid': announcement.server_uuid,
                 'public_key': announcement.public_key,
-                'capabilities': announcement.capabilities.model_dump(),
-                'endpoints': announcement.endpoints.model_dump(),
-                'last_seen_at': utc_now(),
-                'last_announcement': announcement.model_dump()
+                'capabilities': json.dumps(announcement.capabilities.model_dump()),
+                'endpoints': json.dumps(announcement.endpoints.model_dump()),
+                'last_seen_at': last_seen,
+                'last_announcement': json.dumps(announcement.model_dump())
             }
 
             if existing_by_uuid:
@@ -103,28 +106,29 @@ class PeerManager:
                     UPDATE lattice_peers
                     SET server_id = %(server_id)s,
                         public_key = %(public_key)s,
-                        capabilities = %(capabilities)s::jsonb,
-                        endpoints = %(endpoints)s::jsonb,
+                        capabilities = %(capabilities)s,
+                        endpoints = %(endpoints)s,
                         last_seen_at = %(last_seen_at)s,
-                        last_announcement = %(last_announcement)s::jsonb
+                        last_announcement = %(last_announcement)s
                     WHERE server_uuid = %(server_uuid)s
                     """,
-                    {**peer_data, 'last_announcement': announcement.model_dump()}
+                    peer_data
                 )
                 logger.info(f"Updated peer: {announcement.server_id} (UUID: {announcement.server_uuid})")
             else:
                 # Add new peer
-                peer_data['first_seen_at'] = peer_data['last_seen_at']
+                peer_data['id'] = str(uuid_module.uuid4())
+                peer_data['first_seen_at'] = last_seen
                 self.db.execute_insert(
                     """
                     INSERT INTO lattice_peers
-                    (server_id, server_uuid, public_key, capabilities, endpoints,
+                    (id, server_id, server_uuid, public_key, capabilities, endpoints,
                      first_seen_at, last_seen_at, last_announcement)
-                    VALUES (%(server_id)s, %(server_uuid)s, %(public_key)s, %(capabilities)s::jsonb,
-                            %(endpoints)s::jsonb, %(first_seen_at)s, %(last_seen_at)s,
-                            %(last_announcement)s::jsonb)
+                    VALUES (%(id)s, %(server_id)s, %(server_uuid)s, %(public_key)s, %(capabilities)s,
+                            %(endpoints)s, %(first_seen_at)s, %(last_seen_at)s,
+                            %(last_announcement)s)
                     """,
-                    {**peer_data, 'last_announcement': announcement.model_dump()}
+                    peer_data
                 )
                 logger.info(f"Added new peer: {announcement.server_id} (UUID: {announcement.server_uuid})")
 
@@ -142,16 +146,17 @@ class PeerManager:
             List of neighbor peer records
         """
         try:
+            cutoff_time = (utc_now() - timedelta(hours=24)).isoformat()
             neighbors = self.db.execute_query(
                 """
                 SELECT server_id, endpoints, public_key, last_seen_at
                 FROM lattice_peers
-                WHERE is_neighbor = true
+                WHERE is_neighbor = 1
                   AND trust_status != 'blocked'
                   AND last_seen_at > %(cutoff_time)s
                 ORDER BY last_seen_at DESC
                 """,
-                {'cutoff_time': utc_now() - timedelta(hours=24)}
+                {'cutoff_time': cutoff_time}
             )
 
             return neighbors
@@ -165,7 +170,7 @@ class PeerManager:
         try:
             # Get current neighbor count
             current_neighbors = self.db.execute_single(
-                "SELECT COUNT(*) as count FROM lattice_peers WHERE is_neighbor = true"
+                "SELECT COUNT(*) as count FROM lattice_peers WHERE is_neighbor = 1"
             )
             current_count = current_neighbors['count'] if current_neighbors else 0
 
@@ -184,15 +189,16 @@ class PeerManager:
         """Add new neighbors from available peers (random selection from recent peers)."""
         try:
             # Get all candidate peers (not blocked, recently seen, not already neighbors)
+            cutoff_time = (utc_now() - timedelta(days=7)).isoformat()
             candidates = self.db.execute_query(
                 """
                 SELECT server_id
                 FROM lattice_peers
-                WHERE is_neighbor = false
+                WHERE is_neighbor = 0
                   AND trust_status != 'blocked'
                   AND last_seen_at > %(cutoff_time)s
                 """,
-                {'cutoff_time': utc_now() - timedelta(days=7)}
+                {'cutoff_time': cutoff_time}
             )
 
             if not candidates:
@@ -206,7 +212,7 @@ class PeerManager:
                 self.db.execute_update(
                     """
                     UPDATE lattice_peers
-                    SET is_neighbor = true
+                    SET is_neighbor = 1
                     WHERE server_id = %(server_id)s
                     """,
                     {'server_id': peer['server_id']}
@@ -230,7 +236,7 @@ class PeerManager:
                 """
                 SELECT server_id
                 FROM lattice_peers
-                WHERE is_neighbor = true
+                WHERE is_neighbor = 1
                 ORDER BY RANDOM()
                 LIMIT 1
                 """
@@ -240,17 +246,18 @@ class PeerManager:
                 return
 
             # Get a random non-neighbor candidate
+            cutoff_time = (utc_now() - timedelta(days=7)).isoformat()
             candidate = self.db.execute_single(
                 """
                 SELECT server_id
                 FROM lattice_peers
-                WHERE is_neighbor = false
+                WHERE is_neighbor = 0
                   AND trust_status != 'blocked'
                   AND last_seen_at > %(cutoff_time)s
                 ORDER BY RANDOM()
                 LIMIT 1
                 """,
-                {'cutoff_time': utc_now() - timedelta(days=7)}
+                {'cutoff_time': cutoff_time}
             )
 
             if not candidate:
@@ -260,13 +267,13 @@ class PeerManager:
             if random.random() < 0.2:
                 # Remove old neighbor
                 self.db.execute_update(
-                    "UPDATE lattice_peers SET is_neighbor = false WHERE server_id = %(server_id)s",
+                    "UPDATE lattice_peers SET is_neighbor = 0 WHERE server_id = %(server_id)s",
                     {'server_id': current_neighbor['server_id']}
                 )
 
                 # Add new neighbor
                 self.db.execute_update(
-                    "UPDATE lattice_peers SET is_neighbor = true WHERE server_id = %(server_id)s",
+                    "UPDATE lattice_peers SET is_neighbor = 1 WHERE server_id = %(server_id)s",
                     {'server_id': candidate['server_id']}
                 )
 
@@ -309,7 +316,7 @@ class PeerManager:
                 FROM lattice_routes r
                 JOIN lattice_peers p ON r.server_id = p.server_id
                 WHERE r.domain = %s
-                  AND r.expires_at > NOW()
+                  AND r.expires_at > datetime('now')
                 ORDER BY r.confidence DESC
                 LIMIT 1
                 """,
@@ -340,7 +347,7 @@ class PeerManager:
                 SELECT 1 FROM lattice_blocklist
                 WHERE blocked_identifier = %s
                   AND block_type IN ('server', 'domain')
-                  AND (expires_at IS NULL OR expires_at > NOW())
+                  AND (expires_at IS NULL OR expires_at > datetime('now'))
                 """,
                 (server_id,)
             )
@@ -362,15 +369,16 @@ class PeerManager:
             Number of peers cleaned up
         """
         try:
+            cutoff_time = (utc_now() - timedelta(days=days)).isoformat()
             result = self.db.execute_returning(
                 """
                 UPDATE lattice_peers
-                SET is_neighbor = false
+                SET is_neighbor = 0
                 WHERE last_seen_at < %(cutoff_time)s
-                  AND is_neighbor = true
+                  AND is_neighbor = 1
                 RETURNING server_id
                 """,
-                {'cutoff_time': utc_now() - timedelta(days=days)}
+                {'cutoff_time': cutoff_time}
             )
 
             count = len(result) if result else 0
@@ -378,13 +386,14 @@ class PeerManager:
                 logger.info(f"Cleaned up {count} stale neighbors")
 
             # Also delete peers not seen in 90+ days (prevents unbounded table growth)
+            cutoff_time_90 = (utc_now() - timedelta(days=90)).isoformat()
             deleted = self.db.execute_returning(
                 """
                 DELETE FROM lattice_peers
                 WHERE last_seen_at < %(cutoff_time)s
                 RETURNING server_id
                 """,
-                {'cutoff_time': utc_now() - timedelta(days=90)}
+                {'cutoff_time': cutoff_time_90}
             )
 
             deleted_count = len(deleted) if deleted else 0
@@ -432,13 +441,14 @@ class PeerManager:
             )
 
             # Log the rotation
+            import uuid as uuid_module
             self.db.execute_insert(
                 """
                 INSERT INTO lattice_key_rotations
-                (server_uuid, old_key_fingerprint, new_key_fingerprint, reason, received_from)
-                VALUES (%(uuid)s, %(old_fp)s, %(new_fp)s, %(reason)s, %(from_server)s)
+                (id, server_uuid, old_key_fingerprint, new_key_fingerprint, reason, received_from)
+                VALUES (%(id)s, %(uuid)s, %(old_fp)s, %(new_fp)s, %(reason)s, %(from_server)s)
                 """,
-                {'uuid': rotation.server_uuid, 'old_fp': old_fp, 'new_fp': new_fp,
+                {'id': str(uuid_module.uuid4()), 'uuid': rotation.server_uuid, 'old_fp': old_fp, 'new_fp': new_fp,
                  'reason': rotation.reason, 'from_server': from_server}
             )
 
@@ -466,18 +476,19 @@ class PeerManager:
                 return True
 
             # Add to revocations table
+            import uuid as uuid_module
             self.db.execute_insert(
                 """
-                INSERT INTO lattice_revocations (server_uuid, server_id, reason, signature)
-                VALUES (%(uuid)s, %(server_id)s, %(reason)s, %(signature)s)
+                INSERT INTO lattice_revocations (id, server_uuid, server_id, reason, signature)
+                VALUES (%(id)s, %(uuid)s, %(server_id)s, %(reason)s, %(signature)s)
                 """,
-                {'uuid': revocation.server_uuid, 'server_id': revocation.server_id,
+                {'id': str(uuid_module.uuid4()), 'uuid': revocation.server_uuid, 'server_id': revocation.server_id,
                  'reason': revocation.reason, 'signature': revocation.signature}
             )
 
             # Update peer trust_status and remove from neighbors
             self.db.execute_update(
-                "UPDATE lattice_peers SET trust_status = 'revoked', is_neighbor = false WHERE server_uuid = %(uuid)s",
+                "UPDATE lattice_peers SET trust_status = 'revoked', is_neighbor = 0 WHERE server_uuid = %(uuid)s",
                 {'uuid': revocation.server_uuid}
             )
 

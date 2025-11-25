@@ -11,7 +11,7 @@ import uuid
 from datetime import timedelta
 from typing import Dict, Any, Optional
 
-from clients.postgres_client import PostgresClient
+from .sqlite_client import SQLiteClient
 from utils.timezone_utils import utc_now
 from utils.prompt_injection_defense import PromptInjectionDefense, TrustLevel
 from .models import FederatedMessage
@@ -34,7 +34,7 @@ class LatticeAdapter:
     """
 
     def __init__(self):
-        self.db = PostgresClient("lattice")
+        self.db = SQLiteClient()
         self.gossip_protocol = GossipProtocol()
         self.peer_manager = PeerManager()
         self.injection_defense = PromptInjectionDefense()
@@ -42,6 +42,8 @@ class LatticeAdapter:
     def _resolve_local_username(self, username: str) -> Optional[str]:
         """
         Resolve a local username to a user_id.
+
+        Uses the pluggable username resolver configured by the external system.
 
         Args:
             username: The username to resolve (e.g., "taylor")
@@ -51,6 +53,7 @@ class LatticeAdapter:
 
         Raises:
             ValueError: If username is invalid format
+            RuntimeError: If no username resolver is configured
         """
         if not username:
             raise ValueError("Username cannot be empty")
@@ -63,23 +66,20 @@ class LatticeAdapter:
             raise ValueError(f"Username '{username}' must be 3-20 characters")
 
         try:
-            result = self.db.execute_single(
-                """
-                SELECT user_id
-                FROM global_usernames
-                WHERE username = %(username)s
-                  AND active = true
-                """,
-                {'username': username.lower()}
-            )
+            from .username_resolver import resolve_username
+            user_id = resolve_username(username.lower())
 
-            if result:
-                logger.debug(f"Resolved username '{username}' to user_id {result['user_id']}")
-                return str(result['user_id'])
+            if user_id:
+                logger.debug(f"Resolved username '{username}' to user_id {user_id}")
+                return str(user_id)
 
             logger.warning(f"Username '{username}' not found or inactive")
             return None
 
+        except RuntimeError as e:
+            # No resolver configured
+            logger.error(f"Cannot resolve username: {e}")
+            raise
         except Exception as e:
             logger.error(f"Error resolving username '{username}': {e}")
             return None
@@ -166,7 +166,10 @@ class LatticeAdapter:
             if location:
                 metadata_dict['location'] = location
 
+            import uuid as uuid_module
+            now = utc_now()
             queue_data = {
+                'id': str(uuid_module.uuid4()),
                 'message_id': message.message_id,
                 'from_address': message.from_address,
                 'to_address': message.to_address,
@@ -178,20 +181,20 @@ class LatticeAdapter:
                 'signature': message.signature,
                 'sender_fingerprint': message.sender_fingerprint,
                 'status': 'pending',
-                'created_at': utc_now(),
-                'expires_at': utc_now() + timedelta(hours=1),
-                'next_attempt_at': utc_now()
+                'created_at': now.isoformat(),
+                'expires_at': (now + timedelta(hours=1)).isoformat(),
+                'next_attempt_at': now.isoformat()
             }
 
             # Insert into queue (discovery daemon will handle delivery)
             self.db.execute_insert(
                 """
                 INSERT INTO lattice_messages
-                (message_id, from_address, to_address, to_domain, message_type,
+                (id, message_id, from_address, to_address, to_domain, message_type,
                  content, priority, metadata, signature, sender_fingerprint,
                  status, created_at, expires_at, next_attempt_at)
-                VALUES (%(message_id)s, %(from_address)s, %(to_address)s, %(to_domain)s,
-                        %(message_type)s, %(content)s, %(priority)s, %(metadata)s::jsonb,
+                VALUES (%(id)s, %(message_id)s, %(from_address)s, %(to_address)s, %(to_domain)s,
+                        %(message_type)s, %(content)s, %(priority)s, %(metadata)s,
                         %(signature)s, %(sender_fingerprint)s, %(status)s,
                         %(created_at)s, %(expires_at)s, %(next_attempt_at)s)
                 """,
@@ -307,9 +310,8 @@ class LatticeAdapter:
                 # Record successful delivery for idempotency tracking
                 self.db.execute_insert(
                     """
-                    INSERT INTO lattice_received_messages (message_id, from_address, received_at)
-                    VALUES (%s, %s, NOW())
-                    ON CONFLICT (message_id) DO NOTHING
+                    INSERT OR IGNORE INTO lattice_received_messages (message_id, from_address, received_at)
+                    VALUES (%s, %s, datetime('now'))
                     """,
                     (message.message_id, message.from_address)
                 )

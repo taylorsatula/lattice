@@ -50,25 +50,24 @@ This gives us FastAPI's concurrency benefits without infecting the entire codeba
 
 ## Database Client Lifecycle
 
-All Lattice modules create `PostgresClient("lattice")` in `__init__`:
+All Lattice modules create `SQLiteClient()` in `__init__`:
 
 ```python
 def __init__(self):
-    self.db = PostgresClient("lattice")
+    self.db = SQLiteClient()
 ```
 
 **Lifecycle:**
 - Client created once per service instance (e.g., one per `GossipProtocol` object)
-- Uses connection pooling internally (`ThreadedConnectionPool`)
-- Connections automatically managed by pool (no explicit open/close needed)
-- Safe to create multiple clients - they share the same pool
+- SQLite database file created automatically on first access
+- Default path: `lattice.db` (configurable via `LATTICE_DB_PATH` env var)
+- Schema auto-initialized from `lattice/schema.sql`
 
-**Why this works:**
-- PostgresClient manages a **class-level connection pool** shared across all instances
-- Each query checks out a connection, uses it, returns it to pool
-- Pool handles connection lifecycle, timeout, and cleanup
-
-**No explicit cleanup required** - Python garbage collection and pool management handle everything.
+**Why SQLite:**
+- Lattice is a single-daemon service - no need for external database server
+- Simpler deployment and operational overhead
+- Sufficient performance for peer discovery and message queuing
+- File-level locking handles concurrency
 
 ---
 
@@ -76,7 +75,7 @@ def __init__(self):
 
 ### Local → Local (Same Server)
 1. User sends to recipient using username only (e.g., "alice" not "alice@server")
-2. PagerTool queries `global_usernames` table for username
+2. PagerTool uses external username resolver (configured via `set_username_resolver()`)
 3. If found locally, resolves username → user_id
 4. Message delivered directly via PagerTool's normal delivery mechanism
 5. **No federation involved** - stays entirely within local server
@@ -99,7 +98,7 @@ def __init__(self):
 4. Look up sender's peer record from `lattice_peers` table
 5. **Signature verification** - verify RSA signature using sender's public key
 6. **Prompt injection filtering** - all content treated as UNTRUSTED
-7. Username resolution via `global_usernames` table
+7. Username resolution via external resolver (configured via `set_username_resolver()`)
 8. Create PagerTool instance for recipient user
 9. `PagerTool.deliver_federated_message()` writes message to user's local pager (write-only)
 10. Return 200 OK with acceptance status
@@ -129,16 +128,17 @@ def __init__(self):
 
 ## Production Deployment
 
-See `FEDERATION_VAULT_SETUP.md` and `FEDERATION_SYSTEMD.md` for setup instructions.
+See `LATTICE_VAULT_SETUP.md` and `LATTICE_SYSTEMD.md` for setup instructions.
 
 **Required:**
-1. Apply database schema (`deploy/lattice_schema.sql`)
+1. Database schema auto-created on startup (SQLite)
 2. Configure Vault secrets (APP_URL, private key)
 3. Run discovery daemon (systemd service: `deploy/lattice.service`)
-4. Main scheduler automatically handles periodic tasks
+4. Configure username resolver for message delivery to local users
+5. Main scheduler automatically handles periodic tasks
 
 **Monitoring:**
 - Discovery daemon health: `http://localhost:1113/api/v1/health`
 - Peer list: `http://localhost:1113/api/v1/peers`
-- Message queue status: Query `lattice_messages` table
+- Message queue status: Query `lattice_messages` table in SQLite
 - Circuit breaker state: Logged when failures occur
