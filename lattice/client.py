@@ -4,7 +4,7 @@ HTTP client for the Lattice federation service.
 
 import logging
 import os
-from typing import Dict, Any, Optional, Literal
+from typing import Any, Dict, List, Literal, Optional
 from datetime import datetime
 
 import httpx
@@ -97,7 +97,7 @@ class LatticeClient:
             Status dictionary with health info
         """
         try:
-            response = self.client.get(f"{self.base_url}/api/v1/health", headers=self._admin_headers())
+            response = self.client.get(f"{self.base_url}/health", headers=self._admin_headers())
             response.raise_for_status()
             return response.json()
         except httpx.HTTPError:
@@ -107,20 +107,28 @@ class LatticeClient:
                 "error": "Cannot connect to Lattice service"
             }
 
-    def list_peers(self) -> Dict[str, Any]:
-        """
-        List known Lattice peers.
+    def list_peers(self) -> List[Dict[str, Any]]:
+        """List known peers with their trust level. Raises httpx.HTTPError on failure."""
+        response = self.client.get(f"{self.base_url}/api/v1/peers", headers=self._admin_headers())
+        response.raise_for_status()
+        return response.json()
 
-        Returns:
-            Dictionary with peer information
-        """
-        try:
-            response = self.client.get(f"{self.base_url}/api/v1/peers", headers=self._admin_headers())
-            response.raise_for_status()
-            return response.json()
-        except httpx.HTTPError as e:
-            logger.error(f"Failed to list peers: {e}")
-            return {"peers": [], "error": str(e)}
+    def create_invite(self, ttl_hours: int = 24) -> Dict[str, Any]:
+        """Issue a single-use invite token to hand to another server's admin out of band."""
+        return self._admin_post("/api/v1/invites", {"ttl_hours": ttl_hours})
+
+    def accept_invite(self, token: str) -> Dict[str, Any]:
+        """Pair with the server that issued an invite token."""
+        return self._admin_post("/api/v1/invites/accept", {"token": token})
+
+    def block_peer(self, server_id: str) -> Dict[str, Any]:
+        """Block a peer and forget the servers only it introduced."""
+        return self._admin_post(f"/api/v1/peers/{server_id}/block", None)
+
+    def _admin_post(self, path: str, body: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        response = self.client.post(f"{self.base_url}{path}", json=body, headers=self._admin_headers())
+        response.raise_for_status()
+        return response.json()
 
     def close(self):
         """Close the HTTP client."""

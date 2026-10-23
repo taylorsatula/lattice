@@ -133,7 +133,7 @@ def load_config(key: str) -> Optional[str]:
     2. /etc/lattice/config.env file
 
     Args:
-        key: Configuration key (e.g., "APP_URL", "BOOTSTRAP_SERVERS")
+        key: Configuration key (e.g., "APP_URL", "ADMIN_TOKEN")
 
     Returns:
         Configuration value or None if not found
@@ -205,23 +205,3 @@ def save_private_key(private_key_pem: str, path: Path = None) -> Path:
         )
     except Exception as e:
         raise RuntimeError(f"Failed to save private key: {e}")
-
-
-def get_private_key_path() -> Path:
-    """
-    Get the path where the private key is stored.
-
-    Returns the first existing path from:
-    1. $CREDENTIALS_DIRECTORY/private_key (systemd)
-    2. /etc/lattice/private_key.pem (default)
-
-    Returns:
-        Path to private key file
-    """
-    creds_dir = os.environ.get("CREDENTIALS_DIRECTORY")
-    if creds_dir:
-        cred_path = Path(creds_dir) / "private_key"
-        if cred_path.exists():
-            return cred_path
-
-    return DEFAULT_PRIVATE_KEY_PATH

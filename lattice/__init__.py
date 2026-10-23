@@ -5,23 +5,19 @@ Decentralized peer-to-peer protocol for cross-server messaging.
 """
 
 from .models import (
-    ServerAnnouncement,
     FederatedMessage,
+    GossipMessage,
+    Introduction,
     MessageAcknowledgment,
-    DomainQuery,
-    DomainResponse,
-    PeerExchangeFile,
-    ServerCapabilities,
-    ServerEndpoints
+    PeerRecord,
+    ServerAnnouncement,
 )
 
 __all__ = [
-    'ServerAnnouncement',
-    'FederatedMessage',
-    'MessageAcknowledgment',
-    'DomainQuery',
-    'DomainResponse',
-    'PeerExchangeFile',
-    'ServerCapabilities',
-    'ServerEndpoints'
+    "FederatedMessage",
+    "GossipMessage",
+    "Introduction",
+    "MessageAcknowledgment",
+    "PeerRecord",
+    "ServerAnnouncement",
 ]
