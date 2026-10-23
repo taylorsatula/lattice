@@ -49,12 +49,7 @@ if [ -z "$APP_URL" ]; then
     exit 1
 fi
 
-read -p "Bootstrap servers (comma-separated, blank for none): " BOOTSTRAP
-read -p "Bootstrap pins (host=fingerprint, comma-separated, required when bootstrap is set): " BOOTSTRAP_PINS
-if [ -n "$BOOTSTRAP" ] && [ -z "$BOOTSTRAP_PINS" ]; then
-    echo "Error: Bootstrap fingerprint pins are required for bootstrap servers"
-    exit 1
-fi
+read -p "Server name, used in addresses like user@name (blank for random): " DOMAIN
 
 ADMIN_TOKEN="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
 
@@ -62,27 +57,30 @@ sudo mkdir -p /etc/lattice
 sudo chown -R "$(whoami)" /etc/lattice
 cat > /etc/lattice/config.env <<EOF
 APP_URL=$APP_URL
-LATTICE_BOOTSTRAP_SERVERS=$BOOTSTRAP
-LATTICE_BOOTSTRAP_PINS=$BOOTSTRAP_PINS
 LATTICE_ADMIN_TOKEN=$ADMIN_TOKEN
 EOF
+if [ -n "$DOMAIN" ]; then
+    echo "LATTICE_DOMAIN=$DOMAIN" >> /etc/lattice/config.env
+fi
 chmod 600 /etc/lattice/config.env
 echo "Config written to /etc/lattice/config.env"
 
 # Phase 5: Identity
 echo "Initializing Lattice identity..."
 
-./venv/bin/python3 -c "
-from lattice.init_lattice import ensure_lattice_identity
-result = ensure_lattice_identity()
-print(f\"Server ID: {result['server_id']}\")
-print(f\"UUID: {result['server_uuid']}\")
+mkdir -p "$INSTALL_DIR/data" "$INSTALL_DIR/logs"
+LATTICE_DB_PATH="$INSTALL_DIR/data/lattice.db" ./venv/bin/python3 -c "
+from lattice.identity import Identity
+from lattice.sqlite_client import SQLiteClient
+identity = Identity.load_or_create(SQLiteClient())
+print(f'Server ID:  {identity.server_id}')
+print(f'UUID:       {identity.server_uuid}')
+print(f'Public key: {identity.public_key}')
 "
 
 # Phase 6: Systemd
 echo "Setting up systemd service..."
 
-sudo mkdir -p "$INSTALL_DIR/data" "$INSTALL_DIR/logs"
 if command -v useradd >/dev/null 2>&1; then
     if ! id -u lattice >/dev/null 2>&1; then
         sudo useradd --system --home "$INSTALL_DIR" --shell /usr/sbin/nologin lattice
@@ -138,5 +136,14 @@ else
     echo "Warning: Service may not be running. Check: journalctl -u lattice -n 20"
 fi
 
+# Phase 8: Pair
+echo ""
+echo "Lattice servers trust each other only through invites carried out of band."
+read -p "Paste an invite token from an existing Lattice server (blank to skip): " INVITE
+if [ -n "$INVITE" ]; then
+    LATTICE_ADMIN_TOKEN="$ADMIN_TOKEN" ./venv/bin/python3 -m lattice accept "$INVITE" || echo "Warning: pairing failed; retry with: python3 -m lattice accept TOKEN"
+fi
+
 echo ""
 echo "Done. Manage with: sudo systemctl {start|stop|status} lattice"
+echo "Invite another server: sudo -u $SERVICE_USER $INSTALL_DIR/venv/bin/python3 -m lattice invite"

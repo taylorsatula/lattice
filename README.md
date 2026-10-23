@@ -2,56 +2,83 @@
 
 A decentralized peer-to-peer protocol for cross-server messaging without a central coordinator.
 
-Primarily developed to allow [taylorsatula/mira-OSS]([docs/ARCHITECTURE.md](https://github.com/taylorsatula/mira-OSS)) instances to communicate in airgapped systems and after the root servers at [miraos.org](https://miraos.org) are shut down someday in the far-future.
+Primarily developed to allow [taylorsatula/mira-OSS](https://github.com/taylorsatula/mira-OSS) instances to communicate in airgapped systems and after the root servers at [miraos.org](https://miraos.org) are shut down someday in the far-future.
 
 ## Overview
 
-Lattice allows servers to discover each other and exchange messages across server boundaries. Users can send messages to `user@remote-server` just like email, but for real-time messaging.
+Lattice lets servers exchange messages across server boundaries. Users send messages to `user@remote-server` just like email, but for real-time messaging.
 
 **Key Properties:**
-- **Decentralized**: No central registry or coordinator
-- **Cryptographically Secure**: All messages signed with RSA-2048
-- **Resilient**: Gossip protocol ensures eventual consistency
-- **Spam-Resistant**: Rate limiting, circuit breakers, trust levels
+- **Decentralized**: No central registry, coordinator or certificate authority
+- **Out-of-band trust**: Servers authenticate each other with invite tokens carried by people, not by trusting the network
+- **Cryptographically signed**: Every protocol message is signed with Ed25519
+- **Spam-resistant**: Unknown servers are rejected outright; rate limits and circuit breakers protect known ones
 
 ---
 
 ## Quick Start
 
-### Installation
-
 ```bash
-pip install -e .
-```
+pip install -r requirements.txt
 
-### Start the Discovery Daemon
-
-```bash
-# Database schema is automatically created on first run
-# Default SQLite database: lattice.db (configure with LATTICE_DB_PATH env var)
-
-# Start daemon
 export LATTICE_ADMIN_TOKEN="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
+# /etc/lattice/config.env must set APP_URL, this server's public https base URL.
+# The identity and Ed25519 key are generated on first start.
 uvicorn lattice.discovery_daemon:app --host 0.0.0.0 --port 1113
 ```
 
+For a production install with systemd, run `./runme.sh` (see `docs/LATTICE_SYSTEMD.md`).
+
+### Pairing two servers
+
+On the server that already belongs to the network:
+
+```bash
+python -m lattice invite
+# lattice1:6vx4aAM3OGSRjwMLrZVXJ232e9H59UYrhsTnJt5-JchCcAsnkc7fylfrewjCDEzHaHR0cHM6Ly8xLjEuMS4x
+```
+
+Carry the token to the other server's admin over a channel you trust: in person, on paper, a USB stick, or an end-to-end encrypted messenger. Then on the new server:
+
+```bash
+python -m lattice accept 'lattice1:...'
+# Paired with alpha (550e8400-e29b-41d4-a716-446655440000)
+```
+
+Both servers now trust each other directly, and within one gossip round each is introduced to the other's direct peers.
+
+### CLI
+
+| Command | Description |
+|---------|-------------|
+| `python -m lattice invite [--ttl HOURS]` | Print a single-use invite token (default 24h) |
+| `python -m lattice accept TOKEN` | Pair with the server that issued `TOKEN` |
+| `python -m lattice peers` | List known peers with their trust level |
+| `python -m lattice block SERVER_ID` | Block a peer and forget the servers only it introduced |
+
+The CLI talks to the local daemon (`LATTICE_URL`, default `http://localhost:1113`) with the admin token from `LATTICE_ADMIN_TOKEN` or `/etc/lattice/config.env`.
 
 ### REST Endpoints
 
-Admin endpoints require `X-Lattice-Admin-Token: <token>` and should not be exposed by a reverse proxy.
+Admin endpoints require `X-Lattice-Admin-Token: <token>` and must not be exposed by a reverse proxy.
 
-| Endpoint | Description |
-|----------|-------------|
-| `GET /status` | Public liveness status |
-| `GET /api/v1/announcement` | Public signed server announcement |
-| `POST /api/v1/gossip/receive` | Receive announcements |
-| `POST /api/v1/domain/query` | Receive signed route query from a known peer |
-| `POST /api/v1/federation/messages/receive` | Receive signed federated message |
-| `GET /health` | Admin health check |
-| `GET /api/v1/identity` | Admin server federation identity |
-| `GET /api/v1/peers` | Admin peer list |
-| `POST /api/v1/announce` | Admin trigger gossip round |
-| `POST /api/v1/route/{domain}` | Admin resolve domain to endpoint |
+| Endpoint | Access | Description |
+|----------|--------|-------------|
+| `GET /status` | Public | Liveness status |
+| `GET /api/v1/announcement` | Public | This server's self-signed announcement |
+| `POST /api/v1/pair` | Public | Complete an invite (invitee proves it holds the secret) |
+| `POST /api/v1/gossip/receive` | Peers | Announcements, introductions, key rotations, revocations |
+| `POST /api/v1/keys/query` | Peers | Signed answer: which key do you hold for server X? |
+| `POST /api/v1/federation/messages/receive` | Peers | Receive a signed federated message |
+| `GET /health` | Admin | Operational health |
+| `GET /api/v1/identity` | Admin | This server's identity and public key |
+| `GET /api/v1/peers` | Admin | Peer list |
+| `POST /api/v1/peers/{server_id}/block` | Admin | Block a peer |
+| `POST /api/v1/invites` | Admin | Issue an invite token |
+| `POST /api/v1/invites/accept` | Admin | Pair using an invite token |
+| `POST /api/v1/announce` | Admin | Trigger a gossip round |
+| `POST /api/v1/messages/send` | Admin | Sign, queue and deliver a message |
+| `POST /api/v1/maintenance/*` | Admin | `process_messages`, `update_neighbors`, `cleanup` |
 
 ### Integration with External Systems
 
@@ -61,13 +88,13 @@ External systems (like MIRA) must configure the username resolver before federat
 from lattice.username_resolver import set_username_resolver
 
 def resolve_username(username: str) -> Optional[str]:
-    # Query your user database for username -> user_id mapping
     result = your_db.query("SELECT user_id FROM users WHERE username = ?", username)
     return str(result.user_id) if result else None
 
-# Call at application startup
 set_username_resolver(resolve_username)
 ```
+
+Inbound messages are POSTed to `LATTICE_DELIVERY_WEBHOOK`. Periodic work (gossip, delivery, cleanup) is driven by the host application's scheduler via `lattice.init_lattice.initialize_lattice_services()`.
 
 ---
 
@@ -78,38 +105,63 @@ set_username_resolver(resolve_username)
 Each Lattice server has a permanent identity:
 
 ```
-server_id:   "acme-corp"              # Human-readable domain name
-server_uuid: "550e8400-e29b-41d4..."  # Permanent UUID (survives renames)
-public_key:  "-----BEGIN PUBLIC..."   # RSA-2048 public key
-fingerprint: "A1B2C3D4E5F6..."        # SHA-256 of public key (first 32 hex chars)
+server_id:   "acme-corp"                                      # Name used in addresses; may be renamed
+server_uuid: "550e8400-e29b-41d4-a716-446655440000"           # Permanent identity
+public_key:  "6vx4aAM3OGSRjwMLrZVXJ232e9H59UYrhsTnJt5-Jcg"    # Ed25519, raw 32 bytes, base64url
+endpoint:    "https://acme-corp.example.com"                  # Base URL for all protocol paths
 ```
 
-The `server_uuid` is the true identity. If a server renames from `acme-corp` to `acme-global`, the UUID stays the same, and peers update their records accordingly.
+The `server_uuid` is the true identity. A server can rename (`acme-corp` to `acme-global`) by announcing the new name under its key. Its key changes only by a rotation signed with the old key.
+
+### Trust
+
+A server accepts protocol messages only from servers whose key it trusts. Every peer record carries how its key was learned:
+
+| Trust | How | Can introduce others |
+|-------|-----|----------------------|
+| `direct` | Paired with an invite carried out of band | Yes |
+| `introduced` | Vouched for by direct peers, then cross-checked | No |
+| `blocked` | Blocked by this server's admin | - |
+| `revoked` | Revoked by its owner | - |
+
+There is no trust-on-first-use: a server that is neither paired nor introduced gets `403`.
+
+**Invites** carry the inviter's public key, a 128-bit single-use secret and the inviter's endpoint:
+
+```
+lattice1: base64url( public_key[32] || secret[16] || endpoint )
+```
+
+```
+   alpha (inviter)                                  bravo (invitee)
+   ───────────────                                  ───────────────
+   python -m lattice invite
+   ── token carried out of band (person, paper, USB, E2E chat) ──▶
+                                                    python -m lattice accept TOKEN
+          ◀── GET /api/v1/announcement ──────────────
+          ─── alpha's signed announcement ──────────▶  key == key in token?
+                                                       signature valid?
+          ◀── POST /api/v1/pair ─────────────────────
+              { bravo's signed announcement,
+                proof = HMAC(secret, alpha_key ‖ bravo_key) }
+   proof valid? invite unused?
+   consume invite, store bravo: direct
+          ─── 200 ──────────────────────────────────▶  store alpha: direct
+```
+
+A man-in-the-middle on the first leg cannot present a key that matches the token. On the second leg it cannot bind its own key to the secret without knowing it. One token, moved one way, authenticates both directions.
+
+**Introductions** spread trust one hop. Every gossip round, each server sends each direct peer the complete list of its other direct peers, signed. A receiver accepts a vouched-for server as `introduced` when:
+
+1. at least `LATTICE_INTRODUCTION_QUORUM` (default 1) direct peers vouch for it,
+2. all vouching direct peers agree on its key, and
+3. no other direct peer, asked over its own channel with a signed nonce-bound `POST /api/v1/keys/query`, reports a different key for it (up to 3 are asked).
+
+Introduced servers never introduce further; reaching friends-of-friends-of-friends takes another invite. If a voucher stops vouching for a server, or is blocked, servers it alone introduced are forgotten.
 
 ### Peers vs Neighbors
 
-**Peers**: All servers we know about (could be thousands)
-**Neighbors**: Subset of peers we actively gossip with (max 8)
-
-```
-┌─────────────────────────────────────────┐
-│              All Known Peers            │
-│  ┌───────────────────────────────────┐  │
-│  │         Active Neighbors          │  │
-│  │  (max 8, randomly selected)       │  │
-│  │                                   │  │
-│  │   [peer-a] [peer-b] [peer-c]     │  │
-│  │   [peer-d] [peer-e] [peer-f]     │  │
-│  │                                   │  │
-│  └───────────────────────────────────┘  │
-│                                         │
-│  [peer-g] [peer-h] [peer-i] [peer-j]   │
-│  [peer-k] [peer-l] ... (inactive)      │
-│                                         │
-└─────────────────────────────────────────┘
-```
-
-Neighbors are selected randomly from peers seen within the last 7 days. This random selection provides network diversity and resilience against partitioning.
+**Peers** are all servers whose key we trust. **Neighbors** are a random subset of up to 8 recently seen peers, rotated over time for diversity. Each gossip round goes to every direct peer plus 3 random other neighbors.
 
 ### Addresses
 
@@ -124,354 +176,74 @@ alex@west-office        # User "alex" on server "west-office"
 
 ## Protocol Messages
 
-### 1. Server Announcement
+Every message is signed over `lattice/1/<kind>\n` followed by its canonical JSON (sorted keys, no whitespace) without the `signature` field. The kind prefix means a signature for one message type never verifies as another.
 
-Servers periodically announce themselves to neighbors:
+### Gossip
+
+`POST /api/v1/gossip/receive` carries `{"kind": ..., "payload": {...}}`. The payload's `server_uuid` is its author, which must be a known peer, and the payload must be signed with the key on record for it and be less than an hour old.
 
 ```json
 {
-  "version": "1.0",
-  "server_id": "acme-corp",
-  "server_uuid": "550e8400-e29b-41d4-a716-446655440000",
-  "public_key": "-----BEGIN PUBLIC KEY-----\nMIIBI...",
-  "capabilities": {
-    "paging": true,
-    "ai_messaging": false,
-    "supported_versions": ["1.0"]
-  },
-  "endpoints": {
-    "federation": "https://acme-corp.example.com/api/federation",
-    "discovery": "https://acme-corp.example.com/api/discovery"
-  },
-  "timestamp": "2024-01-15T10:30:00Z",
-  "signature": "base64-encoded-rsa-signature..."
+  "kind": "announcement",
+  "payload": {
+    "server_uuid": "550e8400-e29b-41d4-a716-446655440000",
+    "server_id": "acme-corp",
+    "public_key": "6vx4aAM3OGSRjwMLrZVXJ232e9H59UYrhsTnJt5-Jcg",
+    "endpoint": "https://acme-corp.example.com",
+    "timestamp": "2026-01-15T10:30:00+00:00",
+    "signature": "base64url-ed25519-signature"
+  }
 }
 ```
 
-**Validation Rules:**
-- Timestamp must be within 1 hour (prevents replay attacks)
-- Clock skew tolerance: +/-5 minutes
-- Signature must verify against included public key
-- If server_id already known with different UUID -> collision, reject
+| Kind | Payload | Effect |
+|------|---------|--------|
+| `announcement` | identity + endpoint | Updates name, endpoint and last-seen. The key must match the one on record |
+| `introduction` | list of `{server_uuid, server_id, public_key, endpoint}` | Direct peers only. Replaces the sender's vouches |
+| `key_rotation` | `old_public_key`, `new_public_key`, `reason` | Signed with the old key, which must match the one on record |
+| `revocation` | `reason` | Permanently revokes the author |
 
-### 2. Federated Message
-
-Cross-server pager message:
+### Federated Message
 
 ```json
 {
-  "version": "1.0",
-  "message_id": "MSG-A1B2C3D4E5F6",
+  "message_id": "6f1c0e8a-0d5e-4a9e-9a43-6d1f3b2f9a10",
   "message_type": "pager",
   "from_address": "taylor@acme-corp",
   "to_address": "alex@west-office",
   "content": "Meeting in conference room 302 - please join ASAP",
   "priority": 2,
-  "timestamp": "2024-01-15T10:35:00Z",
-  "sender_fingerprint": "A1B2C3D4...",
-  "signature": "base64-encoded-rsa-signature...",
-  "metadata": {}
+  "timestamp": "2026-01-15T10:35:00+00:00",
+  "location": null,
+  "metadata": {},
+  "signature": "base64url-ed25519-signature"
 }
 ```
 
-**Priority Levels:**
-- `0`: Normal
-- `1`: High
-- `2`: Urgent
-
-### 3. Domain Query
-
-When a server doesn't know how to reach a domain:
-
-```json
-{
-  "query_id": "QUERY-1705312500000",
-  "domain": "west-office",
-  "requester": "acme-corp",
-  "max_hops": 10,
-  "timestamp": "2024-01-15T10:35:00Z",
-  "signature": "base64-encoded-rsa-signature..."
-}
-```
-
-The query propagates through the network (up to `max_hops`) until someone knows the answer. Each hop re-signs the query as the immediate requester, and receivers reject unsigned or stale queries.
-Route answers are accepted only when they match an already-known, non-blocked peer and its trusted federation endpoint; this avoids unauthenticated route insertion in the current protocol.
-
-### 4. Domain Response
-
-Answer to a domain query:
-
-```json
-{
-  "query_id": "QUERY-1705312500000",
-  "domain": "west-office",
-  "found": true,
-  "server_id": "west-office",
-  "endpoint_url": "https://west-office.example.com/api/federation",
-  "hop_count": 3,
-  "confidence": 0.729,
-  "timestamp": "2024-01-15T10:35:01Z"
-}
-```
-
-**Confidence Decay:**
-Each hop reduces confidence by 10% (multiplied by 0.9). A route discovered 3 hops away has confidence `0.9^3 = 0.729`.
+The recipient verifies the signature with the key it holds for the sender's domain and returns a signed acknowledgment (`delivered` or `rejected`). Priority levels: `0` normal, `1` high, `2` urgent.
 
 ---
 
-## Message Flow Examples
-
-### Example 1: Sending a Pager Message
+## Message Flow
 
 Taylor on `acme-corp` sends a page to Alex on `west-office`:
 
 ```
 ┌──────────────────┐                              ┌──────────────────┐
-│    acme-corp     │                              │   west-office    │
-│                  │                              │                  │
-│  Taylor's pager  │                              │   Alex's pager   │
-│       tool       │                              │                  │
-└────────┬─────────┘                              └────────▲─────────┘
-         │                                                 │
-         │ 1. send("alex@west-office", "Room 302 meeting") │
-         ▼                                                 │
-┌──────────────────┐                              ┌────────┴─────────┐
-│ LatticeAdapter│                              │ LatticeAdapter│
-│                  │                              │                  │
-│ - Verify Taylor  │                              │ - Verify sig     │
-│   owns address   │                              │ - Filter content │
-│ - Sign message   │                              │ - Resolve "alex" │
-│ - Queue for      │                              │ - Deliver locally│
-│   delivery       │                              │                  │
-└────────┬─────────┘                              └────────▲─────────┘
-         │                                                 │
-         │ 2. INSERT INTO lattice_messages              │
-         ▼                                                 │
-┌──────────────────┐                              ┌────────┴─────────┐
-│ Discovery Daemon │  3. POST /federation/        │ Discovery Daemon │
-│                  │     messages/receive         │                  │
-│ - Resolve domain │ ─────────────────────────▶   │ - Rate limit chk │
-│ - Check circuit  │                              │ - Accept message │
-│   breaker        │  4. {"status": "accepted"}   │                  │
-│ - HTTP POST      │ ◀─────────────────────────   │                  │
-│ - Update status  │                              │                  │
+│ acme-corp daemon │  POST /api/v1/federation/    │west-office daemon│
+│                  │       messages/receive       │                  │
+│ - Sign message   │ ───────────────────────────▶ │ - Known peer?    │
+│ - Queue          │                              │ - Rate limit     │
+│ - Look up peer   │                              │ - Verify sig     │
+│ - Circuit check  │   { status, signed ack }     │ - Resolve "alex" │
+│ - Verify ack     │ ◀─────────────────────────── │ - POST webhook   │
 └──────────────────┘                              └──────────────────┘
 ```
 
-**Step-by-Step:**
-
-1. Taylor's pager tool calls `LatticeAdapter.send_federated_message()`
-2. Adapter verifies Taylor owns `taylor@acme-corp`, signs message, queues it
-3. Discovery daemon (every 1 min) picks up pending messages
-4. Resolves `west-office` -> looks up in `lattice_peers` table
-5. Checks circuit breaker (is `west-office` responsive?)
-6. POSTs signed message to `west-office`'s federation endpoint
-7. Remote server verifies signature, checks rate limits, delivers to Alex
-8. Returns `{"status": "accepted"}`
-9. Local daemon marks message as delivered
-
-### Example 2: Gossip Round
-
-Every 10 minutes, servers announce themselves to neighbors:
-
-```
-                    ┌─────────────┐
-                    │   peer-a    │
-                    └──────▲──────┘
-                           │
-        ┌──────────────────┼──────────────────┐
-        │                  │                  │
-        │         1. Select 3 random          │
-        │            neighbors                │
-        │                  │                  │
-┌───────▼───────┐  ┌───────┴───────┐  ┌───────▼───────┐
-│    peer-b     │  │  OUR SERVER   │  │    peer-c     │
-└───────────────┘  │               │  └───────────────┘
-                   │ 2. Create     │
-                   │    signed     │
-                   │    announce-  │
-                   │    ment       │
-                   │               │
-                   │ 3. POST to    │
-                   │    each       │
-                   └───────────────┘
-
-Each recipient:
-- Validates timestamp (< 1h old)
-- Verifies signature
-- Updates peer record (last_seen_at, endpoints, etc.)
-- May forward to their neighbors (epidemic spread)
-```
-
-**Epidemic Spread:**
-If `peer-a` doesn't know about us, they add us to their peer list. Next gossip round, they might tell `peer-d` about us. Information spreads exponentially.
-
-### Example 3: Domain Resolution
-
-`acme-corp` wants to reach `unknown-server` but doesn't know the route:
-
-```
-┌─────────────────┐     Query: "unknown-server"       ┌─────────────────┐
-│    acme-corp    │ ─────────────────────────────────▶│    peer-a       │
-│                 │                                    │                 │
-│  "I don't know  │                                    │  "I don't know  │
-│   this domain"  │                                    │   either, let   │
-│                 │                                    │   me forward"   │
-└─────────────────┘                                    └────────┬────────┘
-                                                                │
-                                                                │ Forward
-                                                                ▼
-                                                       ┌─────────────────┐
-                                                       │    peer-b       │
-                                                       │                 │
-                                                       │  "I know them!  │
-                                                       │   Here's the    │
-                                                       │   endpoint"     │
-                                                       └────────┬────────┘
-                                                                │
-        Response: {found: true, endpoint: "https://..."}        │
-┌─────────────────┐◀────────────────────────────────────────────┘
-│    acme-corp    │
-│                 │
-│  "Got it!       │
-│   Caching for   │
-│   24 hours"     │
-└─────────────────┘
-```
-
-**Query Deduplication:**
-Each query has a unique `query_id`. If a server sees the same query twice (circular topology), it ignores the duplicate.
-
-### Example 4: New Server Joining
-
-A new server `new-branch` wants to join the federation:
-
-```
-1. BOOTSTRAP
-   ┌─────────────────┐                    ┌─────────────────┐
-   │   new-branch    │  GET /api/v1/      │ bootstrap-server│
-   │                 │  announcement      │  (configured in │
-   │  "I'm new here" │ ──────────────────▶│   config.env)   │
-   │                 │                    │                 │
-   │                 │ ◀────────────────  │  "Here's my     │
-   │                 │  ServerAnnouncement│   identity"     │
-   └─────────────────┘                    └─────────────────┘
-
-2. DOMAIN REGISTRATION
-   ┌─────────────────┐
-   │   new-branch    │
-   │                 │
-   │  "Is 'new-      │──▶ Query all neighbors with max_hops=20
-   │   branch'       │
-   │   available?"   │◀── Responses: not found (confidence 0.85)
-   │                 │
-   │  "Registering   │──▶ INSERT INTO lattice_identity
-   │   domain..."    │
-   └─────────────────┘
-
-3. ANNOUNCE TO NETWORK
-   ┌─────────────────┐
-   │   new-branch    │
-   │                 │──▶ POST announcement to bootstrap server
-   │  "Hello world!" │
-   │                 │──▶ Bootstrap forwards to their neighbors
-   └─────────────────┘    (epidemic spread begins)
-```
-
-**Domain Collision Protection:**
-- Before registration, query network with high hop count (20)
-- Calculate confidence based on network visibility
-- If confidence < 0.8, block registration (unless manual override)
-- UUID prevents hijacking: same domain + different UUID = rejected
-
----
-
-## Network Topology Confidence
-
-The system uses a **network visibility saturation model** to determine when it has a strong view of the federation topology. This prevents domain collisions and ensures reliable routing.
-
-- Queries propagate through the network, tracking how many new peers are discovered
-- Few new peers = high confidence (we've seen most of the network)
-- Many new peers = low confidence (unexplored regions exist)
-- Domain registration requires ≥ 0.8 confidence to prevent collisions
-
-**Strong topology** is detected when:
-1. **Confidence ≥ 0.8** - Few or no new peers discovered during queries
-2. **High query coverage** - Most neighbors responded to verification
-3. **Multiple hops completed** - Query propagated through multiple network layers
-
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for confidence calculation details and thresholds.
-
----
-
-## Security Model
-
-| Component | Details |
-|-----------|---------|
-| **Cryptography** | RSA-2048 keypairs, RSA-PSS with SHA-256 signatures |
-| **Key Storage** | systemd credentials (encrypted) or file-based (/etc/lattice/) |
-| **Message Signing** | All protocol messages cryptographically signed |
-| **Rate Limiting** | Per-peer limits prevent spam and abuse |
-| **Circuit Breaker** | Automatic backoff from unresponsive peers |
-| **Collision Detection** | UUID-based domain ownership prevents hijacking |
-
-### Trust Levels
-
-| Level | Description |
-|-------|-------------|
-| `trusted` | Manually verified peer |
-| `unknown` | Default for new peers |
-| `untrusted` | Suspicious behavior |
-| `blocked` | Banned from federation |
-
-All federated content is treated as untrusted and should be filtered for prompt injection attacks before delivery.
-
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for implementation details.
-
----
-
-## Development
-
-```bash
-# Clone repository
-git clone https://github.com/taylorsatula/lattice
-cd lattice
-
-# Install development dependencies
-pip install -e ".[dev]"
-
-# Run tests
-pytest
-
-# Start development server
-uvicorn lattice.discovery_daemon:app --reload --port 1113
-```
-
----
-
-## Deployment
-
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for database schema, scheduled tasks, and internals.
-See [docs/LATTICE_SYSTEMD.md](docs/LATTICE_SYSTEMD.md) for systemd service setup.
-
----
-
-## Glossary
-
-| Term | Definition |
-|------|------------|
-| **Gossip** | Epidemic protocol where servers randomly share info with neighbors |
-| **Neighbor** | A peer we actively communicate with (max 8) |
-| **Peer** | Any server we know about |
-| **Announcement** | Signed message declaring a server's identity and endpoints |
-| **Circuit Breaker** | Pattern that stops trying unresponsive peers temporarily |
-| **Hop** | One step in query forwarding; `hop_count` limits propagation depth |
-| **Fingerprint** | Short hash of public key for identification |
-| **Confidence** | 0.0-1.0 score indicating route reliability (decays 10% per hop) or network visibility (based on new peer discovery during queries) |
-| **Network Visibility** | How much of the federation topology is known; high visibility (few new peers discovered) yields high confidence |
-
----
-
-## License
-
-MIT
+1. The host application calls `POST /api/v1/messages/send` (admin)
+2. The daemon checks the sender is on this server, signs the message, queues it, and attempts delivery immediately
+3. It looks up `west-office` among its trusted peers and checks the circuit breaker
+4. It POSTs the signed message to `west-office`'s endpoint
+5. `west-office` verifies the sender's signature, deduplicates by `message_id`, resolves the recipient and delivers through its webhook
+6. `west-office` returns a signed acknowledgment, and `acme-corp` marks the message delivered
+7. Failures retry with exponential backoff; a signed rejection fails the message permanently

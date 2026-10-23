@@ -2,151 +2,109 @@
 
 ## Overview
 
-Lattice enables decentralized cross-server messaging using a gossip-based peer discovery protocol. No central servers required.
+Lattice enables decentralized cross-server messaging. Servers learn each other's keys out of band (invites) or from servers they already trust (introductions), then gossip and deliver signed messages directly. No central servers are required.
 
-## Architectural Decision: Async vs Sync
+## Modules
 
-### Business Logic (Synchronous)
+| Module | Responsibility |
+|--------|----------------|
+| `crypto.py` | Ed25519 keys, canonical signing bytes, sign/verify |
+| `models.py` | Protocol messages (all `SignedModel`), validation helpers |
+| `identity.py` | This server's name, UUID, endpoint and signing key |
+| `peer_manager.py` | Peer records, trust levels, rate limits, neighbor selection |
+| `trust.py` | Invites, pairing, introductions, key cross-checks |
+| `discovery_daemon.py` | `DiscoveryService` (gossip, delivery) and the FastAPI endpoints |
+| `init_lattice.py` | Scheduler hooks for the host application |
+| `client.py`, `__main__.py` | HTTP client and admin CLI for the local daemon |
 
-**Modules:** `gossip_protocol.py`, `peer_manager.py`, `lattice_adapter.py`, `domain_registration.py`
+## Sync Core, Threadpool Endpoints
 
-- All core business logic is **synchronous** (no `async`/`await`)
-- Follows the "Synchronous Over Async" principle
-- Easier to test, debug, and reason about
-- No async overhead for non-I/O operations
+All business logic is synchronous. The FastAPI endpoints are plain `def` functions, which FastAPI runs in its threadpool, so blocking SQLite and HTTP calls never stall the event loop. Outbound HTTP uses one shared `httpx.Client` per service, which tests replace with a transport that routes between in-process nodes.
 
-**Rationale:** Cryptographic operations (signing/verification), database queries, and peer selection algorithms are CPU-bound or use connection pooling. Async adds complexity without benefit.
-
-### I/O Layer (Async)
-
-**Module:** `discovery_daemon.py` - FastAPI endpoints
-
-- FastAPI endpoints use `async def` for efficient HTTP I/O
-- Allows concurrent request handling without blocking
-- Internal method calls (gossip, delivery) remain synchronous
-- Main scheduler calls daemon via synchronous `httpx.Client`
-
-**Rationale:** FastAPI async endpoints don't block the event loop during network I/O (incoming gossip messages, domain queries). This is a framework-level optimization, not a business logic concern.
-
-### HTTP Calls
-
-**Outbound:** Always synchronous using `httpx.Client` (not `AsyncClient`)
-- Gossip rounds: `_send_gossip_to_neighbor()` uses `httpx.Client`
-- Message delivery: `_send_to_remote_server()` uses `httpx.Client`
-- Scheduler calls: `init_lattice.py` uses `httpx.Client`
-
-**Why synchronous HTTP?**
-1. These operations happen in background tasks where blocking is acceptable
-2. Simpler error handling and timeout management
-3. No need to propagate `async`/`await` through call chains
-
-## Key Principle
-
-> **Async at the edges (HTTP I/O), sync in the core (business logic).**
-
-This gives us FastAPI's concurrency benefits without infecting the entire codebase with async complexity.
+`create_app(service)` builds an app around a `DiscoveryService`. The module-level `app` is what uvicorn serves; tests build several apps to run multi-server scenarios in one process.
 
 ---
 
-## Database Client Lifecycle
+## Trust Model
 
-All Lattice modules create `SQLiteClient()` in `__init__`:
+### Goals
 
-```python
-def __init__(self):
-    self.db = SQLiteClient()
-```
+- A man-in-the-middle on any network path cannot get its key accepted for a server.
+- Trust can be established on an airgapped network with nothing but people moving short strings.
+- A single compromised peer cannot silently inject keys.
 
-**Lifecycle:**
-- Client created once per service instance (e.g., one per `GossipProtocol` object)
-- SQLite database file created automatically on first access
-- Default path: `lattice.db` (configurable via `LATTICE_DB_PATH` env var)
-- Schema auto-initialized from `lattice/schema.sql`
+### Direct trust: invites
 
-**Why SQLite:**
-- Lattice is a single-daemon service - no need for external database server
-- Simpler deployment and operational overhead
-- Sufficient performance for peer discovery and message queuing
-- File-level locking handles concurrency
+An invite token is `lattice1:` + base64url(inviter public key ‖ 16-byte secret ‖ endpoint), about 90 characters, small enough for a QR code. It is single use, expires (default 24h, max 7 days), and the inviter stores only the secret and its expiry.
+
+Pairing has two legs:
+
+1. The invitee fetches the inviter's announcement and accepts it only if it is signed by the key in the token, for the endpoint in the token.
+2. The invitee POSTs its own self-signed announcement with `proof = HMAC-SHA256(secret, "lattice/1/pair\n" + {"inviter": key, "invitee": key})`, plus `invite_id = SHA-256(secret)[:16]` so the inviter can find the invite. The inviter verifies the proof, then atomically consumes the invite.
+
+The proof binds the invitee's key to both the secret and the inviter's key, so a man-in-the-middle cannot swap in its own key or replay the proof to another inviter. A failed proof does not consume the invite; a name or key conflict is rejected before it is consumed.
+
+### Introduced trust: vouches
+
+Each gossip round, a server sends every direct peer a signed `introduction` listing all its other direct peers. Receivers accept introductions only from direct peers and store each one as that voucher's complete current set of vouches, replacing the previous set.
+
+A vouched-for server we do not know is evaluated after each introduction:
+
+1. Count vouches from servers that are currently direct peers. All of them must name the same key, and there must be at least `quorum` (`LATTICE_INTRODUCTION_QUORUM`, default 1).
+2. Its `server_id` must not belong to another UUID.
+3. **Cross-check.** Up to 3 other direct peers (not the vouchers) are asked `POST /api/v1/keys/query`, a signed request with a random nonce. Each answers with a signed `{subject, public_key or null, nonce}`. If any answers with a different key, the server is not admitted and the dissent is logged as a possible MITM or compromised voucher.
+
+Introductions travel one hop: introduced servers cannot introduce others. That keeps every accepted key within one step of a server a human verified.
+
+Trust is withdrawn as well as granted. When a voucher drops a server from its list, is blocked or revoked, or has not refreshed its vouches in 30 days, any introduced server left below quorum is forgotten.
+
+### What this does and does not protect against
+
+| Threat | Outcome |
+|--------|---------|
+| MITM during pairing (either leg) | Rejected: key does not match the token, or proof fails |
+| MITM between already-paired servers | Rejected: every message is signed with keys on record |
+| Unknown server announcing itself | `403`; no trust on first use |
+| Lying direct peer, quorum 1 | Can introduce a forged key for a server we have not met, unless another direct peer knows the real key (cross-check). Raise the quorum to require collusion |
+| Disagreeing vouchers | Not admitted |
+| Stolen invite token | Whoever redeems it first pairs as the invitee. Treat tokens like passwords, keep TTLs short |
+| Attacker blocking cross-check traffic | Cross-checks are best-effort: they detect disagreement but do not require agreement |
+
+### Keys
+
+Ed25519 keys travel as raw 32-byte public keys in unpadded base64url. Every signature covers `lattice/1/<kind>\n` + canonical JSON (sorted keys, compact separators, UTF-8) of the message without its signature, so a signature for one message kind cannot be replayed as another. A rotation is signed with the old key and accepted only if that key matches the one on record. A revocation is permanent.
 
 ---
 
 ## Message Flow
 
-### Local → Local (Same Server)
-1. User sends to recipient using username only (e.g., "alice" not "alice@server")
-2. PagerTool uses external username resolver (configured via `set_username_resolver()`)
-3. If found locally, resolves username → user_id
-4. Message delivered directly via PagerTool's normal delivery mechanism
-5. **No federation involved** - stays entirely within local server
+### Local → Remote
+1. The host application POSTs to `/api/v1/messages/send` with the admin token
+2. The daemon checks the sender's domain is ours, builds and signs a `FederatedMessage`, and stores the signed JSON in `lattice_messages`
+3. Immediate delivery is attempted in the background; the scheduler retries pending messages every minute
+4. Delivery looks up the recipient's domain among trusted peers, checks the circuit breaker, and POSTs the stored message verbatim to `{endpoint}/api/v1/federation/messages/receive`
+5. The recipient returns a signed acknowledgment, verified against the recipient's key on record
+6. Failures retry with exponential backoff (2, 4, 8, 16 minutes) up to 5 attempts; signed rejections fail permanently; 5 consecutive failures open the circuit for 15 minutes
 
-### Local → Remote (Cross-Server)
-1. User sends to federated address (e.g., "bob@other-server.com")
-2. PagerTool detects '@' in recipient, calls `LatticeAdapter.send_federated_message()`
-3. Message queued to `lattice_messages` table with status='pending'
-4. Scheduler calls discovery daemon every 1 minute
-5. Discovery daemon's `process_message_queue()` reads pending messages
-6. Circuit breaker check - skip if peer has too many failures
-7. `_deliver_single_message()` sends HTTP POST to remote server's federation endpoint
-8. Remote server returns a signed delivery acknowledgment
-9. Status updated to 'delivered' or retried with exponential backoff (2, 4, 8 minutes)
-10. After 5 consecutive failures, circuit breaker opens for 15 minutes
-
-### Remote → Local (Inbound)
-1. Remote server POSTs to `/api/federation/v1/messages/receive`
-2. **Rate limiting check** - 100 messages/minute per peer (sliding window)
-3. Extract sender domain from `from_address`
-4. Look up sender's peer record from `lattice_peers` table
-5. **Signature verification** - verify RSA signature using sender's public key
-6. **Recipient domain check** - reject messages not addressed to this server
-7. **Prompt injection filtering** - all content treated as UNTRUSTED
-8. Username resolution via external resolver (configured via `set_username_resolver()`)
-9. Create PagerTool instance for recipient user
-10. `PagerTool.deliver_federated_message()` writes message to user's local pager (write-only)
-11. Return 200 OK with a signed acknowledgment
+### Remote → Local
+1. Recipient domain must be ours; timestamp within 24 hours
+2. Sender's domain must be a trusted peer, within its rate limit
+3. Signature verified with the sender's key on record
+4. Duplicate `message_id`s return the recorded acknowledgment
+5. Username resolved via the resolver set by `set_username_resolver()`
+6. Delivered to `LATTICE_DELIVERY_WEBHOOK`; 2xx is delivered, 4xx is a signed rejection, 5xx or a timeout makes the sender retry
 
 ---
 
 ## Security
 
-- **All federated content treated as UNTRUSTED** - filtered for prompt injection
-- **Signature verification** - RSA-2048 signatures on all messages
-- **Rate limiting** - 100 messages/minute per peer (sliding window)
-- **Circuit breaker** - 5 failures → 15 minute timeout per peer
-- **Write-only delivery** - Federation can't read user data, only write messages
-- **Secure credential storage** - Private keys via systemd credentials (encrypted) or file-based with 600 permissions
-- **Admin token** - Internal endpoints require `X-Lattice-Admin-Token`
-- **Pinned bootstrap** - Bootstrap servers require out-of-band public key fingerprint pins by default
-- **Signed route queries** - Domain queries are signed and stale queries are rejected
-
----
-
-## Performance
-
-- **Message delivery**: Every 1 minute (configurable via scheduler)
-- **Gossip rounds**: Every 10 minutes
-- **Neighbor updates**: Every 6 hours
-- **Cleanup**: Daily
-- **Crash recovery**: On daemon startup, all 'sending' → 'pending'
-
----
-
-## Production Deployment
-
-See `LATTICE_SYSTEMD.md` for systemd setup instructions.
-
-**Required:**
-1. Database schema auto-created on startup (SQLite)
-2. Configure secrets in `/etc/lattice/` (APP_URL in config.env, private key)
-3. Run discovery daemon (systemd service: `deploy/lattice.service`)
-4. Configure username resolver for message delivery to local users
-5. Main scheduler automatically handles periodic tasks
-
-**Monitoring:**
-- Discovery daemon health: `http://localhost:1113/api/v1/health`
-- Peer list: `http://localhost:1113/api/v1/peers`
-- Message queue status: Query `lattice_messages` table in SQLite
-- Circuit breaker state: Logged when failures occur
+- **Federated content is untrusted**: the host application must filter it before it reaches users or models
+- **No trust on first use**: keys come only from invites or cross-checked introductions
+- **Signed everything**: gossip, pairing, key queries, messages and acknowledgments
+- **Rate limiting**: 100 requests/minute per peer across gossip, key queries and messages
+- **SSRF protection**: peer endpoints must be https and must not resolve to private, loopback, link-local or reserved addresses
+- **Admin token**: admin endpoints require `X-Lattice-Admin-Token`; never expose them through a proxy
+- **Secrets**: the private key is loaded from systemd credentials or `/etc/lattice/private_key.pem` (mode 600)
 
 ---
 
@@ -154,13 +112,14 @@ See `LATTICE_SYSTEMD.md` for systemd setup instructions.
 
 | Table | Purpose |
 |-------|---------|
-| `lattice_identity` | Our server's identity (singleton) |
-| `lattice_peers` | Known peer servers |
-| `lattice_routes` | Cached domain → endpoint mappings |
-| `lattice_messages` | Outbound message queue |
-| `lattice_received_messages` | Idempotency tracking (7-day TTL) |
-| `lattice_blocklist` | Manual ban list |
-| `global_usernames` | Local username → user_id mapping |
+| `lattice_identity` | Our server's name and UUID (singleton) |
+| `lattice_peers` | Known servers, their keys, endpoints and trust |
+| `lattice_invites` | Outstanding invites we issued |
+| `lattice_vouches` | Direct peers' current vouches |
+| `lattice_messages` | Outbound queue holding signed messages |
+| `lattice_received_messages` | Inbound idempotency (7-day TTL) |
+
+The schema is created on first use from `lattice/schema.sql`.
 
 ---
 
@@ -173,164 +132,4 @@ See `LATTICE_SYSTEMD.md` for systemd setup instructions.
 | Neighbor selection | 6 hours | `POST /api/v1/maintenance/update_neighbors` |
 | Cleanup | Daily | `POST /api/v1/maintenance/cleanup` |
 
-The main application's scheduler calls these admin endpoints on the discovery daemon (port 1113) with `X-Lattice-Admin-Token`.
-
----
-
-## Network Topology Confidence
-
-The system uses a **network visibility saturation model** to determine when it has a strong view of the federation topology.
-Domain responses are used only to validate routes for peers already known locally; new peer trust is established through signed announcements, not domain-query answers.
-
-### Confidence Calculation
-
-During domain verification queries, the system tracks how many **new peers** are discovered:
-
-```
-New Peers Discovered → Base Confidence
-─────────────────────────────────────
-0 peers              → 0.95 (full visibility)
-1-2 peers            → 0.80 (good visibility)
-3-5 peers            → 0.60 (moderate visibility)
-6+ peers             → 0.40 (limited visibility)
-```
-
-**Intuition:** If a query traverses the network and discovers no new peers, the system has likely seen the entire reachable topology. Discovering many new peers indicates unexplored network regions.
-
-Final confidence is adjusted by query coverage:
-```
-confidence = base_confidence × (servers_queried / total_neighbors)
-```
-
-### Query Termination
-
-Queries terminate when any of these conditions are met:
-
-| Condition | Description |
-|-----------|-------------|
-| **Domain found** | Immediate return with endpoint info |
-| **Max hops reached** | Query exhausted its hop budget |
-| **Duplicate query** | Same query_id seen before (loop prevention) |
-
-**Hop limits vary by use case:**
-
-| Operation | Max Hops | Rationale |
-|-----------|----------|-----------|
-| Domain verification (registration) | 20 | Thorough federation-wide search |
-| Route resolution (messaging) | 10 | Balance between coverage and latency |
-| Default query | 5 | Quick lookups for known domains |
-
-### Strong Topology Detection
-
-The system considers itself to have a **strong topology view** when:
-
-1. **Confidence ≥ 0.8** - Few or no new peers discovered during queries
-2. **Query coverage is high** - Most neighbors responded to verification
-3. **Multiple hops completed** - Query propagated through multiple network layers
-
-```
-                    Query with max_hops=20
-                            │
-           ┌────────────────┼────────────────┐
-           ▼                ▼                ▼
-       neighbor-1       neighbor-2       neighbor-3
-           │                │                │
-     (no new peers)   (1 new peer)    (no new peers)
-           │                │                │
-           └────────────────┼────────────────┘
-                            ▼
-                  Confidence = 0.95 × (3/3) = 0.95
-                            │
-                            ▼
-                  "Strong topology - safe to register"
-```
-
-### Query Deduplication
-
-Prevents infinite loops in circular topologies:
-
-- Each query has a unique `query_id`
-- Servers cache seen query IDs for 5 minutes
-- Duplicate queries are ignored (return "not found")
-- Cache uses LRU eviction (max 1000 entries)
-
-### Confidence Thresholds
-
-| Threshold | Action |
-|-----------|--------|
-| ≥ 0.8 | Domain registration allowed |
-| 0.6 - 0.79 | Registration blocked (insufficient visibility) |
-| < 0.6 | Registration blocked, recommend more bootstrap servers |
-
-**Manual Override:** Low-confidence registration can be forced with `allow_low_confidence=True`, but this risks domain collisions if the network has unseen partitions.
-
----
-
-## Security Implementation Details
-
-### Message Signing
-
-All protocol messages are signed:
-
-```python
-# Signing
-canonical_json = json.dumps(message_dict, sort_keys=True)
-signature = private_key.sign(canonical_json, PSS_SHA256)
-
-# Verification
-canonical_json = json.dumps(message_dict, sort_keys=True)
-public_key.verify(signature, canonical_json, PSS_SHA256)
-```
-
-**Why sorted keys?** JSON object key order isn't guaranteed. Sorting ensures identical bytes for signing and verification.
-
-### Rate Limiting
-
-| Endpoint | Limit | Window |
-|----------|-------|--------|
-| Federated messages | 100/peer | 1 minute |
-| Gossip messages | 100/peer | 1 minute |
-
-Rate limits use atomic database operations to prevent race conditions.
-
-### Circuit Breaker
-
-Protects against unresponsive peers:
-
-```
-Failures: 0 -> 1 -> 2 -> 3 -> 4 -> 5
-                              │
-                              ▼
-                    CIRCUIT OPEN (15 min)
-                              │
-                    (timeout expires)
-                              │
-                              ▼
-                    CIRCUIT CLOSED (retry)
-```
-
-After 5 consecutive failures, the circuit opens for 15 minutes. All messages to that peer are skipped until the timeout expires.
-
-### Collision Detection
-
-Prevents domain hijacking:
-
-```
-Existing peer:  server_id="acme"  server_uuid="UUID-A"
-
-Attacker tries: server_id="acme"  server_uuid="UUID-B"
-                                        │
-                                        ▼
-                              REJECTED (UUID mismatch)
-```
-
-The first server to claim a domain owns it permanently (tied to UUID).
-
-### Prompt Injection Filtering
-
-The Lattice adapter can call content filtering before delivering inbound messages. Implement your own content filtering using tools such as:
-- LlamaGuard
-- GPT-OSS-20B
-- Custom regex/heuristic filters
-
-Without filtering, federated message content should be treated as untrusted user input.
+The host application's scheduler calls these on the daemon (port 1113) with `X-Lattice-Admin-Token`. Cleanup expires invites, vouches, messages and received-message records, and forgets introduced peers that are no longer vouched for or have not been seen in 90 days. Direct and blocked peers are never removed automatically.

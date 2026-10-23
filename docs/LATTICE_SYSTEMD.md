@@ -10,7 +10,7 @@ The easiest way to deploy is using the deploy script:
 ./runme.sh
 ```
 
-This handles secrets setup, identity generation, and systemd configuration automatically.
+This handles secrets setup, identity generation, systemd configuration, and optionally pairing with an existing server using an invite token.
 
 ## Manual Setup
 
@@ -36,14 +36,34 @@ sudo chmod 700 /etc/lattice
 sudo tee /etc/lattice/config.env > /dev/null <<EOF
 APP_URL=https://your-server.com
 LATTICE_ADMIN_TOKEN=$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')
-# Optional bootstrap requires an out-of-band fingerprint pin:
-# LATTICE_BOOTSTRAP_SERVERS=https://bootstrap.example.com
-# LATTICE_BOOTSTRAP_PINS=bootstrap.example.com=ABCD1234...
+# Optional: name used in addresses (user@name). Random if unset.
+# LATTICE_DOMAIN=your-server
+# Optional: direct peers that must agree before an introduced server is trusted.
+# LATTICE_INTRODUCTION_QUORUM=1
 EOF
 sudo chmod 600 /etc/lattice/config.env
 ```
 
-The private key is auto-generated on first run at `/etc/lattice/private_key.pem`.
+The Ed25519 private key is generated at `/etc/lattice/private_key.pem` on first run. `LoadCredential=` requires that file to exist before the service starts, so generate the identity once before enabling the service (`runme.sh` does this):
+
+```bash
+LATTICE_DB_PATH=/opt/lattice/data/lattice.db ./venv/bin/python3 -c \
+  "from lattice.identity import Identity; from lattice.sqlite_client import SQLiteClient; Identity.load_or_create(SQLiteClient())"
+```
+
+### Joining a Network
+
+Servers trust each other only through invites. On a server already in the network:
+
+```bash
+sudo -u lattice /opt/lattice/venv/bin/python3 -m lattice invite
+```
+
+Carry the printed `lattice1:...` token to the new server's admin over a channel you trust, then on the new server:
+
+```bash
+sudo -u lattice /opt/lattice/venv/bin/python3 -m lattice accept 'lattice1:...'
+```
 
 ### systemd Credentials (systemd 250+)
 
@@ -178,15 +198,19 @@ location = /api/v1/gossip/receive {
     proxy_pass http://localhost:1113/api/v1/gossip/receive;
 }
 
-location = /api/v1/domain/query {
-    proxy_pass http://localhost:1113/api/v1/domain/query;
+location = /api/v1/pair {
+    proxy_pass http://localhost:1113/api/v1/pair;
+}
+
+location = /api/v1/keys/query {
+    proxy_pass http://localhost:1113/api/v1/keys/query;
 }
 
 location = /api/v1/federation/messages/receive {
     proxy_pass http://localhost:1113/api/v1/federation/messages/receive;
 }
 
-location ~ ^/(health|api/v1/(identity|peers|announce|route|domain/(verify|register)|messages/send|maintenance/)) {
+location ~ ^/(health|api/v1/(identity|peers|invites|announce|messages/send|maintenance/)) {
     return 404;
 }
 
