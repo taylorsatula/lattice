@@ -149,6 +149,7 @@ publish only a hive record.
 - The KEL is valid (§2), not abandoned, and not behind the KEL head already
   known for this identifier (§2, monotonic history).
 - `sig` verifies under the current key in the KEL.
+- `csig` verifies under the channel key, over the same preimage as `sig`.
 - `id` matches the KEL's inception.
 - `exp` is in the future and within the record horizon (§1).
 - Fields match the mode: no `ep` or `ln` on a private record, no `gw` on a
@@ -335,9 +336,42 @@ exactly a bucket size is refused. Frame types:
 | 23 | wary | `{2: [id, …], 3: exp}` (optional, §8) |
 | 60 | ping | `{2: nonce}`, answered with the same frame. Replaces WebSocket ping/pong, which is not used |
 | 61 | dummy | `{2: echo}` (bool). Discarded on receipt; if `echo` is true, answered with a dummy (§ Snow) |
+| 62 | attest | `{2: id, 3: sig}`. Channel attestation, below |
 
 - **Large gossip** that doesn't fit one 32 KB frame is split across several
   `reconcile` or `records` frames.
+
+### Attestation
+
+Attribution of a link to an identity must not rest on a third party's
+record claim alone: anyone can gossip a record claiming any channel key,
+and the cross-signed record (§3) stops a *forged* claim, but a node still
+has no proof that the peer on a given link is the key holder it claims to
+be. The `attest` frame closes that gap for connected peers.
+
+On link-up, each side sends an `attest` frame:
+
+- `id` is the sender's KEL identifier.
+- `sig` is an Ed25519 signature by the sender's current KEL signing key over
+  `H("lattice attestation v1" ‖ signer_channel_key ‖ verifier_channel_key)`,
+  where `signer_channel_key` is the sender's Ed25519 channel key from its
+  record and `verifier_channel_key` is the verifier's X25519 channel key
+  (the Noise static key of this channel). Binding the verifier's key makes
+  the attestation single-channel: it cannot be replayed onto another link.
+
+The receiver verifies, in order:
+
+1. A record for `id` exists in either scope.
+2. The record's channel key, converted Edwards→Montgomery, equals this
+   link's remote channel key.
+3. `sig` verifies under the record's current KEL signing key.
+
+If all three hold, the link is bound to `id` for routing and attribution,
+and this binding takes precedence over record-claim binding. If any check
+fails, the attestation is discarded and the link falls back to record-claim
+binding. An attestation that fails verification never displaces a valid one
+already stored for the link. Attestations are per-link and are not
+transferable; a new link requires a new attestation.
 
 ### Reconciliation (design §5)
 

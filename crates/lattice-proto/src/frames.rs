@@ -17,6 +17,7 @@ pub const T_RECORDS: u64 = 22;
 pub const T_WARY: u64 = 23;
 pub const T_PING: u64 = 60;
 pub const T_DUMMY: u64 = 61;
+pub const T_ATTEST: u64 = 62;
 
 /// Maximum ranges in a single reconcile frame; anything larger is rejected
 /// at decode. Mirrors lattice-core's responder cap.
@@ -121,6 +122,17 @@ pub struct DummyFrame {
     pub echo: bool,
 }
 
+/// Proof that the sender holds the KEL signing key for `id`, bound to this
+/// channel: `sig` signs H("lattice attestation v1" || signer_channel_key ||
+/// verifier_channel_key), where the signer's key is the Ed25519 channel key
+/// in its record and the verifier's key is the X25519 key from the Noise
+/// handshake. Lets a peer attribute a link without trusting record claims.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AttestFrame {
+    pub id: [u8; 32],
+    pub sig: [u8; 64],
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Frame {
     Init(InitFrame),
@@ -134,6 +146,7 @@ pub enum Frame {
     Wary(WaryFrame),
     Ping(PingFrame),
     Dummy(DummyFrame),
+    Attest(AttestFrame),
 }
 
 fn bound_value(b: &([u8; 32], u8)) -> Value {
@@ -300,6 +313,7 @@ impl Frame {
             Frame::Wary(_) => T_WARY,
             Frame::Ping(_) => T_PING,
             Frame::Dummy(_) => T_DUMMY,
+            Frame::Attest(_) => T_ATTEST,
         }
     }
 
@@ -388,6 +402,11 @@ impl Frame {
             Frame::Dummy(f) => Value::map(vec![
                 (Value::UInt(0), Value::UInt(T_DUMMY)),
                 (Value::UInt(2), Value::Bool(f.echo)),
+            ]),
+            Frame::Attest(f) => Value::map(vec![
+                (Value::UInt(0), Value::UInt(T_ATTEST)),
+                (Value::UInt(2), Value::Bytes(f.id.to_vec())),
+                (Value::UInt(3), Value::Bytes(f.sig.to_vec())),
             ]),
         }
     }
@@ -521,6 +540,13 @@ impl Frame {
                 v.deny_unknown_keys(&[0, 2])?;
                 Ok(Frame::Dummy(DummyFrame {
                     echo: v.req_bool(2)?,
+                }))
+            }
+            T_ATTEST => {
+                v.deny_unknown_keys(&[0, 2, 3])?;
+                Ok(Frame::Attest(AttestFrame {
+                    id: fixed_bytes(v, 2)?,
+                    sig: fixed_bytes(v, 3)?,
                 }))
             }
             _ => Err(ProtoError::Invalid("unknown frame type")),

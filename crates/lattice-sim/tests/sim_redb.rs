@@ -33,6 +33,20 @@ fn full_mesh(sim: &mut Sim<RedbStore>, n: usize) {
     }
 }
 
+/// Run the sim until `from` has a route to `to` (records converge), or
+/// panic. Fixed sleeps are not enough: gossip order is random, and a send
+/// before the route exists fails permanently with ERR_NO_RECORD.
+fn wait_for_path(sim: &mut Sim<RedbStore>, from: usize, to: usize) {
+    let to_id = sim.ids[to];
+    for _ in 0..30 {
+        if sim.nodes[from].has_path(&to_id) {
+            return;
+        }
+        sim.run_for(1);
+    }
+    panic!("node {from} never learned a path to node {to}");
+}
+
 #[test]
 fn redb_records_converge_after_gossip() {
     let dir = tempfile::tempdir().unwrap();
@@ -57,7 +71,7 @@ fn redb_message_delivers_end_to_end_and_sender_sees_receipt() {
         sim.add_node();
     }
     full_mesh(&mut sim, 4);
-    sim.run_for(5);
+    wait_for_path(&mut sim, 0, 3);
     let mid = sim.app_send(0, 3, b"hello mesh");
     sim.run_for(20);
     let got: Vec<_> = sim.deliveries.iter().filter(|d| d.mid == mid).collect();
@@ -134,7 +148,7 @@ fn redb_duplicate_mid_is_not_delivered_twice() {
         sim.add_node();
     }
     sim.connect(0, 1);
-    sim.run_for(4);
+    wait_for_path(&mut sim, 0, 1);
     let mid = [0xABu8; 16];
     let to_id = sim.ids[1];
     let make = || lattice_core::AppSend {
@@ -168,7 +182,7 @@ fn redb_contested_channel_key_claim_unbinds_link() {
     let att = sim.add_node();
     sim.connect_unpinned(a, b);
     sim.connect_unpinned(a, att);
-    sim.run_for(5);
+    wait_for_path(&mut sim, a, b);
 
     let mid = sim.app_send(a, b, b"before contest");
     sim.run_for(10);
@@ -179,7 +193,7 @@ fn redb_contested_channel_key_claim_unbinds_link() {
     );
 
     let b_ck = sim.channel_key_of(b);
-    let attacker = lattice_core::Identity::generate();
+    let attacker = lattice_core::Identity::from_seed(&[0xA7; 32]);
     let attacker_channel_seed = lattice_crypto::generate_seed();
     let forged = PeerRecord::build(
         RecordParams {

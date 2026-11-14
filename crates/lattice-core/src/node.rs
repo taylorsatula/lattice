@@ -119,6 +119,32 @@ impl Identity {
         }
     }
 
+    /// Build an identity deterministically from a 32-byte seed. Used by the
+    /// simulator so runs are reproducible; production uses `generate`.
+    pub fn from_seed(seed: &[u8; 32]) -> Self {
+        let derive = |tag: &[u8]| {
+            let mut v = Vec::with_capacity(32 + tag.len());
+            v.extend_from_slice(seed);
+            v.extend_from_slice(tag);
+            lattice_crypto::hash(&v)
+        };
+        let signing_seed = derive(b"signing");
+        let next_seed = derive(b"next");
+        let inception = KeyEvent::inception(&signing_seed, hash_next(&next_seed));
+        let channel_seed = derive(b"channel");
+        let xwing_seed = derive(b"xwing");
+        let xwing_secret = lattice_crypto::XWingSecretKey::from_bytes(xwing_seed);
+        let xwing_public = xwing_secret.public_key();
+        Identity {
+            signing_seed,
+            kel: vec![inception],
+            channel_seed,
+            xwing_secret: xwing_seed,
+            xwing_public,
+            retired_xwing: Vec::new(),
+        }
+    }
+
     pub fn id(&self) -> [u8; 32] {
         kel::identifier(&self.kel).expect("inception validates")
     }
@@ -126,6 +152,18 @@ impl Identity {
 
 fn hash_next(seed: &[u8; 32]) -> [u8; 32] {
     lattice_crypto::hash(&lattice_crypto::public_key(seed))
+}
+
+/// Preimage for a channel attestation: binds the signer's Ed25519 channel
+/// key and the verifier's X25519 channel key. Both sides can compute it:
+/// the signer knows both keys, the verifier knows the signer's (from the
+/// record) and its own (from its seed).
+fn attestation_preimage(signer_ed_ck: &[u8; 32], verifier_x_ck: &[u8; 32]) -> [u8; 32] {
+    let mut h = Vec::with_capacity(22 + 64);
+    h.extend_from_slice(b"lattice attestation v1");
+    h.extend_from_slice(signer_ed_ck);
+    h.extend_from_slice(verifier_x_ck);
+    lattice_crypto::hash(&h)
 }
 
 struct PendingOffer {
@@ -154,6 +192,9 @@ struct LinkState {
     /// True when the peer id was pinned by operator config (root `id`); pinned
     /// bindings are never re-derived from records or revoked by contest.
     pinned: bool,
+    /// The peer's attestation (id, signature), received on this link.
+    /// Verified against our records in `reevaluate_link_bindings`.
+    attestation: Option<([u8; 32], [u8; 64])>,
 }
 
 pub struct Node<S: Store> {
@@ -375,7 +416,7 @@ impl<S: Store> Node<S> {
                 seq,
                 exp,
                 channel_key: lattice_crypto::channel_public(&self.identity.channel_seed),
-            channel_seed: self.identity.channel_seed,
+                channel_seed: self.identity.channel_seed,
                 envelope_key: self.identity.xwing_public,
                 mode: self.config.mode,
                 scope: self.scope,
@@ -416,6 +457,7 @@ impl<S: Store> Node<S> {
                 peer,
                 remote_ck,
                 pinned: peer.is_some(),
+                attestation: None,
             },
         );
         self.next_link_order.push(link);
@@ -428,7 +470,26 @@ impl<S: Store> Node<S> {
         self.own_seq += 1;
         let _ = self.publish_record(at);
         self.reevaluate_link_bindings(at);
-        Vec::new()
+        // Prove possession of our KEL key to the peer, bound to this
+        // channel. The peer folds this into its link binding; without it
+        // the link is attributed only from record claims.
+        vec![self.attestation_frame(link, remote_ck)]
+    }
+
+    /// Build the attestation frame for a link: proof that we hold the KEL
+    /// signing key for our id, bound to this channel.
+    fn attestation_frame(&self, link: LinkId, remote_ck: [u8; 32]) -> Action {
+        let own_ck = lattice_crypto::channel_public(&self.identity.channel_seed);
+        let preimage = attestation_preimage(&own_ck, &remote_ck);
+        let sig = lattice_crypto::sign(&self.identity.signing_seed, &preimage);
+        Action::SendFrame {
+            pad_to: None,
+            link,
+            frame: Frame::Attest(lattice_proto::frames::AttestFrame {
+                id: self.own_id,
+                sig,
+            }),
+        }
     }
 
     fn on_link_down(&mut self, at: u64, link: LinkId) -> Vec<Action> {
@@ -625,10 +686,57 @@ impl<S: Store> Node<S> {
     /// The cryptographic fix (attestation over the handshake) is tracked
     /// separately; until then, contested links are dead weight, not
     /// misrouted traffic.
+    /// Verify a peer's attestation against our records. The record for
+    /// `id` must claim this link's channel key, and the signature must
+    /// verify under that record's KEL key.
+    fn attestation_valid(&self, remote_ck: &[u8; 32], id: &[u8; 32], sig: &[u8; 64]) -> bool {
+        let own_x = lattice_crypto::channel_x25519_public(&self.identity.channel_seed);
+        for scope in [Scope::Wan, Scope::Hive] {
+            let Ok(Some((bytes, _))) = self.store.record_get(id, scope) else {
+                continue;
+            };
+            let Ok((rec, _)) = PeerRecord::from_bytes(&bytes, self.now, None) else {
+                continue;
+            };
+            let Some(x) = lattice_crypto::channel_x25519_public_from_ed25519(&rec.channel_key)
+            else {
+                continue;
+            };
+            if &x != remote_ck {
+                continue;
+            }
+            let preimage = attestation_preimage(&rec.channel_key, &own_x);
+            if lattice_crypto::verify(&rec.current_signing_key(), &preimage, sig) {
+                return true;
+            }
+        }
+        false
+    }
+
     fn reevaluate_link_bindings(&mut self, at: u64) {
-        let mut changed = false;
-        for link in self.links.values_mut() {
+        // Pass 1: attestation wins over record claims — it is direct proof
+        // of KEL possession, not a third-party claim about a channel key.
+        let mut attested: HashMap<LinkId, [u8; 32]> = HashMap::new();
+        for (link_id, link) in &self.links {
             if link.pinned {
+                continue;
+            }
+            if let Some((id, sig)) = &link.attestation {
+                if self.attestation_valid(&link.remote_ck, id, sig) {
+                    attested.insert(*link_id, *id);
+                }
+            }
+        }
+        let mut changed = false;
+        for (link_id, link) in self.links.iter_mut() {
+            if link.pinned {
+                continue;
+            }
+            if let Some(id) = attested.get(link_id) {
+                if link.peer != Some(*id) {
+                    link.peer = Some(*id);
+                    changed = true;
+                }
                 continue;
             }
             let binding = match self.ck_claims.get(&link.remote_ck).map(|s| s.len()) {
@@ -1998,6 +2106,11 @@ impl<S: Store> Node<S> {
             self.frames_since_snow_tick = 0;
             return actions;
         }
+        if self.config.snow_per_min <= 0.0 {
+            // Snow disabled: never originate dummies (echo replies above
+            // still work).
+            return actions;
+        }
         if let Some(link) = self.random_link() {
             self.frames_since_snow_tick = 0;
             let echo = self.rng.chance(self.config.echo_share);
@@ -2071,8 +2184,32 @@ impl<S: Store> Node<S> {
                 Vec::new()
             }
             Frame::Wary(w) => self.on_wary(at, &w),
+            Frame::Attest(a) => self.on_attest(at, link, &a),
             Frame::Init(_) | Frame::Cookie(_) | Frame::Resp(_) => Vec::new(),
         }
+    }
+
+    fn on_attest(
+        &mut self,
+        now: u64,
+        link: LinkId,
+        a: &lattice_proto::frames::AttestFrame,
+    ) -> Vec<Action> {
+        // Never let an invalid attestation displace a valid one: a peer
+        // that already proved itself keeps its binding even if the peer
+        // (or a MITM replaying on the link) sends garbage afterwards.
+        let existing = self.links.get(&link).map(|l| (l.remote_ck, l.attestation));
+        let keep_old = match existing {
+            Some((remote_ck, Some((id, sig)))) => self.attestation_valid(&remote_ck, &id, &sig),
+            _ => false,
+        };
+        if !keep_old {
+            if let Some(l) = self.links.get_mut(&link) {
+                l.attestation = Some((a.id, a.sig));
+            }
+        }
+        self.reevaluate_link_bindings(now);
+        Vec::new()
     }
 
     fn on_wary(&mut self, now: u64, w: &WaryFrame) -> Vec<Action> {
@@ -2147,6 +2284,12 @@ impl<S: Store> Node<S> {
     #[doc(hidden)]
     pub fn debug_contested(&self) -> u64 {
         self.contested
+    }
+
+    /// Peer id a link is currently bound to, if any. Test/diagnostic only.
+    #[doc(hidden)]
+    pub fn debug_link_peer(&self, link: u64) -> Option<Option<[u8; 32]>> {
+        self.links.get(&link).map(|l| l.peer)
     }
 
     /// Test/diagnostic accessors (not part of the daemon API).

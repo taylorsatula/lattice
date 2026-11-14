@@ -97,7 +97,7 @@ fn private_record_with_private_endpoints_rejected() {
                 seq: 1,
                 exp: NOW + 86_400,
                 channel_key: f.channel,
-            channel_seed: f.channel_seed,
+                channel_seed: f.channel_seed,
                 envelope_key: f.envelope,
                 mode: Mode::Private,
                 scope: Scope::Wan,

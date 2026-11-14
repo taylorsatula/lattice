@@ -97,7 +97,11 @@ impl<S: Store> Sim<S> {
         let mut cfg = self.configs_prototype();
         cfg.rng_seed = seed;
         let store = (self.store_factory)(self.nodes.len());
-        let identity = lattice_core::Identity::generate();
+        let idx = self.nodes.len() as u64;
+        let mut seed = [0u8; 32];
+        seed[..8].copy_from_slice(&idx.to_le_bytes());
+        seed[8..16].copy_from_slice(&0x5EED_5EED_5EED_5EED_u64.to_le_bytes());
+        let identity = lattice_core::Identity::from_seed(&seed);
         let channel_key = lattice_crypto::channel_x25519_public(&identity.channel_seed);
         let node = Node::new(cfg.clone(), identity, store, self.now).expect("node construction");
         let id = node.own_id;
@@ -132,20 +136,8 @@ impl<S: Store> Sim<S> {
             up: true,
             latency_ticks: 0,
         });
-        self.nodes[a].handle(Event::LinkUp {
-            at: self.now,
-            link: id,
-            peer: Some(self.ids[b]),
-            remote_ck: self.channel_keys[&self.ids[b]],
-            wan: true,
-        });
-        self.nodes[b].handle(Event::LinkUp {
-            at: self.now,
-            link: id,
-            peer: Some(self.ids[a]),
-            remote_ck: self.channel_keys[&self.ids[a]],
-            wan: true,
-        });
+        self.link_up(a, id, Some(self.ids[b]), self.channel_keys[&self.ids[b]]);
+        self.link_up(b, id, Some(self.ids[a]), self.channel_keys[&self.ids[a]]);
         id
     }
 
@@ -162,15 +154,23 @@ impl<S: Store> Sim<S> {
             latency_ticks: 0,
         });
         for (from, to) in [(a, b), (b, a)] {
-            self.nodes[from].handle(Event::LinkUp {
-                at: self.now,
-                link: id,
-                peer: None,
-                remote_ck: self.channel_keys[&self.ids[to]],
-                wan: true,
-            });
+            self.link_up(from, id, None, self.channel_keys[&self.ids[to]]);
         }
         id
+    }
+
+    /// Fire a LinkUp at a node and apply the actions it returns (the
+    /// attestation frame, in particular). LinkUp's return value carries the
+    /// attestation; dropping it would leave the link unattested.
+    fn link_up(&mut self, node: NodeIndex, link: u64, peer: Option<[u8; 32]>, remote_ck: [u8; 32]) {
+        let actions = self.nodes[node].handle(Event::LinkUp {
+            at: self.now,
+            link,
+            peer,
+            remote_ck,
+            wan: true,
+        });
+        self.apply_actions(node, actions);
     }
 
     pub fn set_link(&mut self, link_id: u64, up: bool) {
@@ -185,20 +185,18 @@ impl<S: Store> Sim<S> {
         self.links[idx].up = up;
         let (a, b) = (self.links[idx].a, self.links[idx].b);
         if up {
-            self.nodes[a].handle(Event::LinkUp {
-                at: self.now,
-                link: link_id,
-                peer: Some(self.ids[b]),
-                remote_ck: self.channel_keys[&self.ids[b]],
-                wan: true,
-            });
-            self.nodes[b].handle(Event::LinkUp {
-                at: self.now,
-                link: link_id,
-                peer: Some(self.ids[a]),
-                remote_ck: self.channel_keys[&self.ids[a]],
-                wan: true,
-            });
+            self.link_up(
+                a,
+                link_id,
+                Some(self.ids[b]),
+                self.channel_keys[&self.ids[b]],
+            );
+            self.link_up(
+                b,
+                link_id,
+                Some(self.ids[a]),
+                self.channel_keys[&self.ids[a]],
+            );
         } else {
             self.nodes[a].handle(Event::LinkDown {
                 at: self.now,
@@ -364,6 +362,7 @@ impl<S: Store> Sim<S> {
                         Frame::Dummy(_) => "dummy",
                         Frame::Wary(_) => "wary",
                         Frame::Init(_) | Frame::Cookie(_) | Frame::Resp(_) => "handshake",
+                        Frame::Attest(_) => "attest",
                     };
                     *self.frame_counts.entry(tag).or_insert(0) += 1;
                     self.route_frame(from, link, frame)
@@ -420,41 +419,19 @@ impl<S: Store> Sim<S> {
         let node = Node::restore(cfg, identity, store, self.now).expect("restore");
         self.nodes[idx] = node;
         // re-announce links
-        for link in &self.links {
-            if !link.up {
-                continue;
-            }
-            let (a, b, lid) = (link.a, link.b, link.id);
+        let up_links: Vec<(usize, usize, u64)> = self
+            .links
+            .iter()
+            .filter(|l| l.up)
+            .map(|l| (l.a, l.b, l.id))
+            .collect();
+        for (a, b, lid) in up_links {
             if a == idx {
-                self.nodes[a].handle(Event::LinkUp {
-                    at: self.now,
-                    link: lid,
-                    peer: Some(self.ids[b]),
-                    remote_ck: self.channel_keys[&self.ids[b]],
-                    wan: true,
-                });
-                self.nodes[b].handle(Event::LinkUp {
-                    at: self.now,
-                    link: lid,
-                    peer: Some(self.ids[a]),
-                    remote_ck: self.channel_keys[&self.ids[a]],
-                    wan: true,
-                });
+                self.link_up(a, lid, Some(self.ids[b]), self.channel_keys[&self.ids[b]]);
+                self.link_up(b, lid, Some(self.ids[a]), self.channel_keys[&self.ids[a]]);
             } else if b == idx {
-                self.nodes[b].handle(Event::LinkUp {
-                    at: self.now,
-                    link: lid,
-                    peer: Some(self.ids[a]),
-                    remote_ck: self.channel_keys[&self.ids[a]],
-                    wan: true,
-                });
-                self.nodes[a].handle(Event::LinkUp {
-                    at: self.now,
-                    link: lid,
-                    peer: Some(self.ids[b]),
-                    remote_ck: self.channel_keys[&self.ids[b]],
-                    wan: true,
-                });
+                self.link_up(b, lid, Some(self.ids[a]), self.channel_keys[&self.ids[a]]);
+                self.link_up(a, lid, Some(self.ids[b]), self.channel_keys[&self.ids[b]]);
             }
         }
     }
@@ -464,7 +441,7 @@ impl<S: Store> Sim<S> {
         cfg.rng_seed = u64::MAX;
         Node::new(
             cfg,
-            lattice_core::Identity::generate(),
+            lattice_core::Identity::from_seed(&[0xFF; 32]),
             (self.store_factory)(usize::MAX),
             self.now,
         )

@@ -243,16 +243,6 @@ impl Runtime {
         let id = self.next_link;
         self.next_link += 1;
         let (outbound_tx, outbound_rx) = mpsc::unbounded_channel();
-        {
-            let mut node = self.node.lock().unwrap();
-            let _ = node.handle(Event::LinkUp {
-                at: now_secs(),
-                link: id,
-                peer,
-                remote_ck,
-                wan: true,
-            });
-        }
         let inbound = self.link_tx.clone();
         let task = tokio::spawn(link_task(id, io, inbound, outbound_rx));
         self.links.insert(
@@ -263,6 +253,19 @@ impl Runtime {
                 task: task.abort_handle(),
             },
         );
+        // The link is registered, so the actions returned by LinkUp (the
+        // attestation frame) can be routed to it.
+        let actions = {
+            let mut node = self.node.lock().unwrap();
+            node.handle(Event::LinkUp {
+                at: now_secs(),
+                link: id,
+                peer,
+                remote_ck,
+                wan: true,
+            })
+        };
+        self.apply_actions(actions);
         id
     }
 

@@ -20,6 +20,32 @@ fn full_mesh(sim: &mut Sim, n: usize) {
     }
 }
 
+/// Run the sim until `from` has a route to `to` (records converge), or
+/// panic. Fixed sleeps are not enough: gossip order is random, and a send
+/// before the route exists fails permanently with ERR_NO_RECORD.
+fn wait_for_path(sim: &mut Sim, from: usize, to: usize) {
+    let to_id = sim.ids[to];
+    for _ in 0..30 {
+        if sim.nodes[from].has_path(&to_id) {
+            return;
+        }
+        sim.run_for(1);
+    }
+    panic!("node {from} never learned a path to node {to}");
+}
+
+/// Run the sim until `node`'s link is bound to `id` (attestation or record
+/// claims, whichever lands first), or panic.
+fn wait_for_binding(sim: &mut Sim, node: usize, link: u64, id: [u8; 32]) {
+    for _ in 0..30 {
+        if sim.nodes[node].debug_link_peer(link) == Some(Some(id)) {
+            return;
+        }
+        sim.run_for(1);
+    }
+    panic!("node {node} never bound link {link} to the expected peer");
+}
+
 #[test]
 fn records_converge_after_gossip() {
     let mut sim = Sim::new(fast_config());
@@ -42,7 +68,7 @@ fn message_delivers_end_to_end_and_sender_sees_receipt() {
         sim.add_node();
     }
     full_mesh(&mut sim, 4);
-    sim.run_for(5);
+    wait_for_path(&mut sim, 0, 3);
     let mid = sim.app_send(0, 3, b"hello mesh");
     sim.run_for(20);
     let got: Vec<_> = sim.deliveries.iter().filter(|d| d.mid == mid).collect();
@@ -274,6 +300,7 @@ fn duplicate_mid_is_not_delivered_twice() {
         priority: 1,
         route: 0,
     };
+    wait_for_path(&mut sim, 0, 1);
     sim.force_app_send(0, make());
     sim.run_for(5);
     sim.force_app_send(0, make());
@@ -297,7 +324,7 @@ fn equivocating_records_converge_to_lower_hash() {
 
     // Craft two validly-signed records for the same identity with the same
     // seq but different capabilities — an equivocation by the key holder.
-    let attacker = lattice_core::Identity::generate();
+    let attacker = lattice_core::Identity::from_seed(&[0xA7; 32]);
     let kel = attacker.kel.clone();
     let id = lattice_proto::kel::identifier(&kel).unwrap();
     let attacker_channel_seed = lattice_crypto::generate_seed();
@@ -467,7 +494,7 @@ fn custody_drains_after_delivery() {
         sim.add_node();
     }
     full_mesh(&mut sim, 4);
-    sim.run_for(5);
+    wait_for_path(&mut sim, 0, 3);
     let to = sim.ids[3];
     let send = lattice_core::AppSend {
         service: "test".into(),
@@ -504,7 +531,7 @@ fn contested_channel_key_claim_unbinds_link() {
     let att = sim.add_node();
     sim.connect_unpinned(a, b);
     sim.connect_unpinned(a, att);
-    sim.run_for(5);
+    wait_for_path(&mut sim, a, b);
 
     // With only honest records in flight, `a` binds both links by channel key
     // and can route to `b`.
@@ -521,9 +548,9 @@ fn contested_channel_key_claim_unbinds_link() {
     // produced: the attacker cannot sign with b's channel key. It must be
     // rejected at admission, the link must stay bound to b, and traffic
     // must flow.
-    let att_id = sim.ids[att];
+    let _att_id = sim.ids[att];
     let b_ck = sim.channel_key_of(b);
-    let attacker = lattice_core::Identity::generate();
+    let attacker = lattice_core::Identity::from_seed(&[0xA7; 32]);
     let attacker_channel_seed = lattice_crypto::generate_seed();
     let forged = PeerRecord::build(
         RecordParams {
@@ -545,7 +572,9 @@ fn contested_channel_key_claim_unbinds_link() {
     // build() does not cross-check channel_key against channel_seed (the
     // admission check is the enforcement point), so this produces a record
     // whose channel signature cannot verify under b's key.
-    let forged_bytes = forged.expect("build does not cross-check channel_key").encode();
+    let forged_bytes = forged
+        .expect("build does not cross-check channel_key")
+        .encode();
 
     let att_link = sim.link_between(a, att).unwrap();
     sim.inject_frame(
@@ -680,5 +709,61 @@ fn buffer_class_isolates_full_classes() {
     assert!(
         classes.contains(&1),
         "class-1 message must be accepted while class 2 is full, got {classes:?}"
+    );
+}
+
+#[test]
+fn attestation_binds_unpinned_link() {
+    // Two nodes connect without pinning each other's id. After the link-up
+    // attestation exchange, each side must bind the link to the peer's id
+    // without any configured peer id.
+    let mut sim = Sim::new(fast_config());
+    let a = sim.add_node();
+    let b = sim.add_node();
+    let link = sim.connect_unpinned(a, b);
+    let (id_a, id_b) = (sim.ids[a], sim.ids[b]);
+    wait_for_binding(&mut sim, a, link, id_b);
+    wait_for_binding(&mut sim, b, link, id_a);
+    assert_eq!(
+        sim.nodes[a].debug_link_peer(link),
+        Some(Some(sim.ids[b])),
+        "a must bind the link to b's id"
+    );
+    assert_eq!(
+        sim.nodes[b].debug_link_peer(link),
+        Some(Some(sim.ids[a])),
+        "b must bind the link to a's id"
+    );
+}
+
+#[test]
+fn forged_attestation_does_not_bind() {
+    // A forged attestation — an id with no record, and a garbage signature —
+    // must never bind the link to the forged id. The honest attestation (or
+    // failing that, record claims) binds it to the real peer.
+    let mut sim = Sim::new(fast_config());
+    let a = sim.add_node();
+    let b = sim.add_node();
+    let link = sim.connect_unpinned(a, b);
+    let id_b = sim.ids[b];
+    let forged_id = [0xEE; 32];
+    sim.inject_frame(
+        a,
+        link,
+        lattice_proto::frames::Frame::Attest(lattice_proto::frames::AttestFrame {
+            id: forged_id,
+            sig: [0u8; 64],
+        }),
+    );
+    wait_for_binding(&mut sim, a, link, id_b);
+    assert_ne!(
+        sim.nodes[a].debug_link_peer(link),
+        Some(Some(forged_id)),
+        "forged attestation must not bind the link"
+    );
+    assert_eq!(
+        sim.nodes[a].debug_link_peer(link),
+        Some(Some(sim.ids[b])),
+        "link must bind to the real peer"
     );
 }
