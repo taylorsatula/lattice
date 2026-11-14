@@ -142,9 +142,10 @@ bytes, both validly signed.
 
 ## 4. Sealed layers (§1, §6)
 
-The gateway layer and the envelope are both sealed with **X-Wing**, the
-standardized hybrid of X25519 and ML-KEM-768 (IETF CFRG X-Wing draft). It
-yields a 32-byte shared secret and a 1120-byte KEM ciphertext.
+Hop layers (waypoint and gateway) and the envelope are all sealed with
+**X-Wing**, the standardized hybrid of X25519 and ML-KEM-768 (IETF CFRG
+X-Wing draft). It yields a 32-byte shared secret and a 1120-byte KEM
+ciphertext.
 
 | Key | Name | Type |
 |---|---|---|
@@ -152,33 +153,61 @@ yields a 32-byte shared secret and a 1120-byte KEM ciphertext.
 | 1 | ct | bstr: ChaCha20-Poly1305 ciphertext |
 
 - **AEAD key** = BLAKE3 key derivation from the X-Wing shared secret, with a
-  context string per layer (`"lattice v1 envelope"`, `"lattice v1 gateway"`).
-  The nonce is zero, since each key is single-use.
-- **Associated data** is the encoded routing header. This binds the header
-  to both layers: a hop that alters the header makes decryption fail at the
-  gateway or recipient, so no copy of the header is needed inside the
-  envelope.
+  context string per kind of layer (`"lattice v1 envelope"`,
+  `"lattice v1 hop"`). The nonce is zero, since each key is single-use.
+- **Associated data** is the encoded header that travels alongside the layer
+  in the same message array. A hop that alters a header makes decryption fail
+  at the next node that opens a layer, so no copy of a header is needed
+  inside any layer.
 
 ## 5. Message (§6)
 
 The wire form is a CBOR array:
-`[header, gateway_layer or null, envelope, padding]`.
+`[header, hop_layer or null, envelope, padding]`.
 
-### Routing header
+- **Direct to a public recipient:** `header.dst` is the recipient, and
+  `hop_layer` is null.
+- **To a private recipient:** `header.dst` is a gateway, and `hop_layer` is a
+  gateway layer.
+- **Through a waypoint:** `header` is an outer header with its own leg id,
+  `header.dst` is the waypoint, and `hop_layer` is a waypoint layer that
+  contains the real header and, for a private recipient, the gateway layer.
+
+The node named in `header.dst` opens `hop_layer` if present. Its kind says
+what to do. Hops that aren't `dst` never learn which case applies, beyond
+whether `hop_layer` is null.
+
+### Header
+
+Used for both the routing header and the outer header.
 
 | Key | Name | Type | Notes |
 |---|---|---|---|
 | 0 | v | uint | |
 | 1 | t | uint | 30 |
-| 2 | mid | mid | |
-| 3 | dst | id | The recipient, or a gateway of a private recipient |
-| 4 | exp | time | Within the message horizon (§1) |
+| 2 | mid | mid | The message id; in an outer header, a separate random leg id |
+| 3 | dst | id | Recipient, gateway or waypoint |
+| 4 | exp | time | Within the message horizon (§1). An outer header's expiry is no later than the real header's |
 
-### Gateway layer plaintext
+**Each leg has its own id.** A node can be on both legs of a waypoint route.
+If the legs shared an id, that node would answer `already have` to the second
+leg.
 
-| Key | Name | Type |
-|---|---|---|
-| 0 | rcpt | id: the private recipient |
+### Hop layer plaintext
+
+| Key | Name | Type | Notes |
+|---|---|---|---|
+| 0 | kind | uint | 0 = waypoint, 1 = gateway |
+| 1 | hdr | header | Waypoint: the real routing header |
+| 2 | inner | sealed layer or absent | Waypoint: the gateway layer, for a private recipient |
+| 3 | rcpt | id | Gateway: the private recipient |
+
+**At a waypoint:** the waypoint replaces the outer header with `hdr`, and
+`hop_layer` with `inner` (or null). It re-pads to the **same bucket** the
+message arrived in, so the leg change isn't visible by size. Then it forwards
+toward `hdr.dst` as a new custody unit under `hdr.mid`.
+
+**At a gateway:** forward over the direct link to `rcpt`, unchanged.
 
 ### Envelope plaintext
 
@@ -194,7 +223,7 @@ The wire form is a CBOR array:
 | 7 | body | bstr | Kind 0: the application payload, opaque to Lattice |
 | 8 | ref | mid | Kinds 1 and 2: the message being answered |
 | 9 | reason | uint | Kind 2: 1 = unknown service, 2 = invalid |
-| 10 | sig | sig | By `from`'s current signing key, over the encoded header followed by this map without `sig` |
+| 10 | sig | sig | By `from`'s current signing key, over the encoded routing header (the real one, never an outer header) followed by this map without `sig` |
 
 **Padding:** zero bytes filling the encoded message to the smallest bucket
 that fits it. A message that fits no bucket is refused at send.
@@ -268,6 +297,18 @@ exactly a bucket size is refused. Frame types:
   (answer `busy`), then durable storage (answer `accepted`).
 - **Check order for a new connection:** frame size, then mac1, then mac2 when
   under load, then the Noise handshake.
+- **Next-hop choice** for a message held in custody, toward its current
+  destination *d*, with *dist* the hop count to *d* over the current graph:
+  - With probability *p_side* (default 15%), choose uniformly among links to
+    neighbors with *dist* equal to or greater than this node's own that
+    haven't answered `already have` for this id.
+  - Otherwise, or if there are none, choose uniformly among links to
+    neighbors with *dist* less than this node's own.
+  - On `already have`, exclude that link for this id and choose again.
+- **Waypoint choice** at the sender: uniformly among public instances with a
+  valid record, excluding the sender's own links and the recipient (and its
+  gateways). A share *w* of messages use one (default 0%). Retries always use
+  a waypoint not used by earlier attempts.
 - **Equivocation proofs** need no frame of their own. Conflicting records
   travel in an ordinary `records` frame, and the receiver detects the
   conflict.
@@ -357,7 +398,7 @@ The local API is how any application, MIRA or otherwise, uses Lattice.
 | Op | Args | Result |
 |---|---|---|
 | `hello` | service, secret | Own identifier and service; the session is bound to that service |
-| `send` | to (id), tsvc, tmbx, fmbx, body, exp (optional, within the horizon), priority (optional, 0–3) | mid. The message is accepted into the durable outbound queue. Priority orders only this instance's outbound queue and never goes on the wire |
+| `send` | to (id), tsvc, tmbx, fmbx, body, exp (optional, within the horizon), priority (optional, 0–3), route (optional: `default`, `waypoint` or `direct`) | mid. The message is accepted into the durable outbound queue. Priority orders only this instance's outbound queue and never goes on the wire. `default` uses a waypoint with the configured waypoint share |
 | `status` | mid | `queued`, `in_transit`, `delivered`, `failed` (with reason) or `expired` |
 | `fetch` | max | Deliveries: delivery id, mid, from, fsvc, fmbx, tmbx, body, received |
 | `ack` | delivery ids | Removes them from the inbox |
@@ -408,8 +449,8 @@ redb tables, derived from the objects above:
 | `meta` | singleton | Schema version |
 | `identity` | singleton | Own KEL, current secret keys, configuration hash |
 | `records` | (id, scope) | Peer record bytes, received time |
-| `outbound` | mid | Message bytes, priority, state, attempt, next attempt, receipt deadline, expected path |
-| `custody` | mid | Message bytes, upstream link, destination, lease |
+| `outbound` | mid | Message bytes, priority, state, attempt, next attempt, receipt deadline, waypoints used |
+| `custody` | mid (or leg id) | Message bytes, upstream link, current destination, lease |
 | `shares` | (destination, upstream link) | Count held, for fair-share custody |
 | `seen` | BLAKE3(mid) | Expiry |
 | `inbox` | delivery id | Service, delivery fields, received |

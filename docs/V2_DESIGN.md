@@ -279,36 +279,80 @@ designated relays and no per-message flooding.
 - **A link counts only if both ends list each other.** A node that lies can
   invent links only to nodes that also claim it, so it can't make itself look
   adjacent to everyone to attract traffic.
-- **Paths are computed locally** with shortest-path over the current graph.
-  At thousands of nodes this takes milliseconds, even on low-power hardware.
+- **Distances are computed locally** over the current graph: each node
+  knows how many hops every neighbor is from any destination. At thousands
+  of nodes this takes milliseconds, even on low-power hardware.
+
+### Randomized routes
+
+Messages don't take the same path every time. Varied routes spread traffic
+across more nodes, which adds to the natural hum that covers everyone, and
+they deny a watcher a predictable path to sit on. Randomness enters at two
+levels.
+
+**Random turns at every hop.**
+- **Progress:** a hop chooses uniformly at random among all neighbors closer
+  to the destination than itself, not always the single shortest one.
+- **Sideways:** with a small probability (15% by default), it instead takes
+  a neighbor that is *no closer*.
+- **No loops:** dedup already answers "already have it" when a message
+  reaches a node that has seen it, so a wandering message can never revisit
+  a node. If every sideways choice has already seen it, the hop takes a
+  progress step, which is always available while a path exists.
+- **Cost:** the message is unchanged, and on average the route grows by well
+  under one hop. Hops dispatch immediately, so responsiveness holds.
+
+**Waypoints: the sender takes the long way round.** This is Valiant load
+balancing (Valiant 1982). The sender routes a message to a randomly chosen
+public waypoint first, and from there on to the recipient.
+- **The sender builds everything in advance:** an outer header addressed to
+  waypoint W, a layer sealed to W containing the real header (and the
+  gateway layer, if any), and the envelope bound to the real header.
+- **Hops on the first leg** see only "for W."
+- **W opens its layer,** replaces the outer header with the real one, and
+  forwards toward the recipient. Everything W sends on was built by the
+  sender, so nothing becomes mutable or unverifiable.
+- **Each leg has its own message id.** A node can easily land on both legs,
+  and with a single id it would answer "already have it" to the second leg.
+- **Privacy:** first-leg hops never learn the destination. W learns the
+  recipient but not the sender. Second-leg hops learn the recipient but not
+  where the message came from.
+- **Cost:** the route roughly doubles, and so does the transit it creates.
+  That extra transit is real traffic covering everyone. Waypoints are a
+  per-message share the operator turns up, like snow: 0% by default, set per
+  instance, or requested per message through `send`.
 
 ### The message
 
 | Part | Readable by | Contents |
 |---|---|---|
-| Routing header | Every hop | Message id, routing destination (the recipient, or a gateway of a private recipient), expiry |
+| Outer header | First-leg hops | Leg message id, the waypoint, expiry. Present only when a waypoint is used |
+| Waypoint layer | That waypoint only (sealed to its envelope key) | The routing header and the gateway layer. Present only when a waypoint is used |
+| Routing header | Every hop after the waypoint, or every hop if there is none | Message id, routing destination (the recipient, or a gateway of a private recipient), expiry |
 | Gateway layer | That gateway only (sealed to its envelope key) | The private recipient's identifier. Present only for private recipients |
 | Envelope | Recipient only (sealed to its envelope key) | Sender identifier, sending and receiving service and mailbox, created time, an opaque application payload, and the sender's signature over the header and all of it |
 | Padding | Nobody | Fills the message to its size bucket (§7) |
 
-- **Immutable end to end.** The sender builds the whole message, and nothing
-  changes in transit.
+- **Built entirely by the sender.** Nothing in the message is created or
+  changed in transit. The one transformation, at a waypoint, uncovers a
+  header the sender sealed in advance.
 - **The payload is opaque.** Lattice never interprets it, so applications
   define and change their own schemas freely.
 - **Hops learn nothing about the sender.** The sender's signature sits inside
   the envelope, so only the recipient can see who sent the message and check
   that it's genuine.
-- **The header is bound to both sealed layers.** It is the associated data
-  of their encryption, so a hop that alters it makes decryption fail at the
-  gateway or the recipient.
+- **Headers are bound to their sealed layers.** The routing header is the
+  associated data of the gateway layer and the envelope, and the outer
+  header is the associated data of the waypoint layer. A hop that alters a
+  header makes decryption fail at the next node that opens a layer.
 - **Hops judge traffic by the link it arrived on.** A hop checks that a
   message is well formed, fits a size bucket, hasn't expired, and doesn't
   carry an expiry beyond the maximum horizon (§9). Whether it takes custody
   is then decided by fair-share custody for the link the message arrived on
   (step 3 below).
 - **Overhead.** Each hybrid-encrypted layer carries about 1.1 KB of KEM
-  ciphertext, so the smallest size bucket is at least 2 KB (more for
-  messages to private instances, which carry two encrypted layers).
+  ciphertext, so the smallest size bucket is at least 2 KB. A message with a
+  waypoint, or to a private instance, carries an extra layer for each.
 
 ### Forwarding
 
@@ -322,12 +366,16 @@ designated relays and no per-message flooding.
    - If it is the routing destination and the final recipient, it opens the
      envelope, verifies the sender's signature, hands the message to the
      application, and sends a receipt.
+   - If it is the waypoint, it opens the waypoint layer, replaces the outer
+     header with the routing header it finds there, and forwards toward the
+     routing destination.
    - If it is a gateway, it opens the gateway layer, learns which private
      instance the message is for, and forwards it over its direct link to
      that instance.
-   - Otherwise it computes the next hop toward the routing destination on
-     its own current view of the graph. The route isn't fixed by the sender,
-     so each hop uses the freshest information available.
+   - Otherwise it chooses the next hop toward the current destination on its
+     own current view of the graph, with random turns (above). The route
+     isn't fixed by the sender, so each hop uses the freshest information
+     available.
    - **Loops are prevented by dedup.** A node that already holds or has held
      the message id answers "already have it" and takes no further action.
      The forwarding hop then picks its next-best hop. This holds even while
@@ -370,10 +418,13 @@ designated relays and no per-message flooding.
   the receipt tells the sender the message arrived. Whether the application
   read or accepted it is application-level and goes in the application's own
   messages.
-- **Retry on a disjoint path.** If no receipt arrives within the receipt
-  timeout, the sender sends the message again over a path that avoids the
-  intermediate nodes it expected earlier attempts to use. This routes
-  around a node that accepts custody and then silently drops messages.
+- **Retry through a fresh waypoint.** If no receipt arrives within the
+  receipt timeout, the sender sends the message again through a different,
+  randomly chosen waypoint, whatever the waypoint share. A new waypoint
+  takes the message over a largely different route by construction, which
+  routes around a node that accepts custody and then silently drops
+  messages. The retry keeps the same real message id, so the recipient
+  dedups it if an earlier attempt did arrive.
 - **Idempotent receive by message id.** Every hop and the recipient keep a
   hash of each message id they have seen until the message expires, not
   merely until they have forwarded it. This one rule makes retries and
@@ -410,21 +461,24 @@ that limit, it minimizes what any node can learn or keep.
    peers. Senders route to a gateway, and only the gateway can open the
    layer that names the real recipient. This is a one-layer form of
    Lightning's blinded paths.
-3. **Only the public backbone is published.** Endpoints and links come only
+3. **Randomized routes.** Random turns at each hop, and optional waypoints,
+   vary the path every time (§6). With a waypoint, first-leg hops never
+   learn the destination.
+4. **Only the public backbone is published.** Endpoints and links come only
    from public instances. Hive-scoped data never leaves the hive (§2).
-4. **Size buckets for every frame.** Every frame on a link (messages,
+5. **Size buckets for every frame.** Every frame on a link (messages,
    receipts, custody replies, gossip, keepalives and dummies) is padded to
    one of a few fixed sizes (2, 8 and 32 KB). Size distinguishes nothing,
    and the gossip that flows constantly becomes indistinguishable from
    messages.
-5. **Snow: cover traffic that fills the quiet.** See below.
-6. **Receipts look like messages.** Same format, same padding, no separate
+6. **Snow: cover traffic that fills the quiet.** See below.
+7. **Receipts look like messages.** Same format, same padding, no separate
    channel.
-7. **Minimal retention.** After handing off custody, a hop deletes the
+8. **Minimal retention.** After handing off custody, a hop deletes the
    message and keeps only a hash of its id for dedup. By default nothing
    logs senders or destinations per message, so a seized or compromised
    server reveals little.
-8. **No names on the network.** Records carry no display names (§1), so the
+9. **No names on the network.** Records carry no display names (§1), so the
    mesh learns nothing about what an instance calls itself.
 
 ### Cover traffic: snow
@@ -487,7 +541,8 @@ cover.
 | Party | Learns | Does not learn |
 |---|---|---|
 | Any node, from gossip | The public backbone, which identities exist, which gateways private instances use | Private instances' locations, hive-internal links, any names |
-| A hop relaying a message | The neighbor it came from, the neighbor it goes to, the routing destination, its size bucket, a rough time | The sender, the content, the full path |
+| A hop relaying a message | The neighbor it came from, the neighbor it goes to, the current destination (a waypoint, the recipient, or a gateway), its size bucket, a rough time | The sender, the content, the full path; on a first leg, the recipient |
+| A waypoint | The above, plus the routing destination after it | The sender, the content |
 | A gateway | The above, plus which of its private instances the message is for | The sender, the content |
 | The recipient | The sender instance and user, the content | The path |
 
@@ -520,6 +575,9 @@ cover.
   Cloudflare or the tailnet.
 - **Gateways see their private instances' traffic.** That's why instances
   choose their own gateways, usually within their hive.
+- **A waypoint knows the recipient,** just as a gateway does, though not the
+  sender. Waypoints are chosen at random per message, so no single waypoint
+  sees a pattern.
 - **The set of identities is public** within the mesh, though not their
   locations.
 - **Envelopes have no forward secrecy.** They are encrypted to the
@@ -614,7 +672,7 @@ principle).
   identifiers it's wary of, based on its own observations, to the gossip
   exchange that already happens. There is no new message type. Observations
   include a neighbor abusing rate limits or sending invalid data, senders its
-  users report as spam, and a node on whose expected paths messages
+  users report as spam, and a waypoint or neighbor through which messages
   repeatedly fail to produce receipts.
 - **Rule.** When peers from *k* distinct network ranges list the same
   identifier, the server applies a much tighter rate limit to it, stops
@@ -764,8 +822,11 @@ principle).
   the Noise handshake later, so routing headers are covered too.
 - **Routing details:**
   - The path metric: hop count, or something weighted by link quality.
-  - The receipt timeout and how many disjoint-path retries to make.
-  - Whether a sender may send over two disjoint paths at once for
+  - How waypoints are chosen: uniformly among public instances, or
+    excluding nodes too close to the sender or recipient to add diversity.
+  - The sideways probability, tuned in the simulator.
+  - The receipt timeout and how many fresh-waypoint retries to make.
+  - Whether a sender may send through two waypoints at once for
     high-priority messages.
 - **Privacy details:**
   - The exact size buckets. Messages larger than the largest bucket are
@@ -802,6 +863,7 @@ principle).
 - Perlman, "Network Layer Protocols with Byzantine Robustness," MIT PhD thesis, 1988 (MIT-LCS-TR-429).
 - Moy, "OSPF Version 2," RFC 2328, 1998.
 - Kleinberg, "Geographic Routing Using Hyperbolic Space," INFOCOM 2007.
+- Valiant, "A Scheme for Fast Parallel Communication," SIAM Journal on Computing, 1982 (routing via a random intermediate).
 - Yggdrasil network whitepaper and Ironwood routing library (greedy tree routing).
 - Danezis & Goldberg, "Sphinx: A Compact and Provably Secure Mix Format," IEEE S&P 2009 (the onion format Lattice deliberately doesn't adopt).
 - Lightning Network BOLT 4, onion routing and route blinding (the full form of the gateway layer).

@@ -111,9 +111,10 @@ fails the build.
    horizons.
 5. **Sealed layers:** X-Wing sealing with the routing header as associated
    data.
-6. **Messages:** building with an optional gateway layer, padding to size
-   buckets, refusing oversize messages, and opening at the gateway and the
-   recipient. Receipts and negative receipts.
+6. **Messages:** building with optional waypoint and gateway layers,
+   padding to size buckets, refusing oversize messages, and opening at the
+   waypoint (re-padding to the same bucket), the gateway and the recipient.
+   Receipts and negative receipts.
 7. **Channel frames and local API frames:** encode and decode only; behavior
    comes later.
 8. **Test vectors** for every object, written to `vectors/` for the Python
@@ -165,8 +166,11 @@ invariants passing:
    - secret-salted keyed sampling
    - anchor peers
    - test before evicting
-3. **The graph and routing:** links counted only when both ends claim them,
-   and shortest-path routing.
+3. **The graph and routing:**
+   - links counted only when both ends claim them
+   - distances to each destination
+   - random choice among neighbors that make progress, with sideways turns
+   - waypoints, with a separate leg id per leg
 4. **Custody:**
    - accept only after a durable store, and keep a dedup set until expiry
    - "already have it"
@@ -174,7 +178,7 @@ invariants passing:
 5. **Outbound queue and receipts:**
    - the queue, ordered by priority
    - receipts and negative receipts
-   - the receipt timeout, and retry over a disjoint path
+   - the receipt timeout, and retry through a fresh waypoint
 6. **Fair-share custody:**
    - a per-destination allowance shared across upstream links, with busy
      answers
@@ -221,7 +225,14 @@ invariants passing:
   and latency for senders outside the abuser's branch stay within a set
   bound of the no-flood baseline.
 - **Routing around droppers:** with a node that drops messages after taking
-  custody, messages still arrive through disjoint-path retries.
+  custody, messages still arrive through fresh-waypoint retries.
+- **Random routes terminate:** every message reaches its destination or
+  expiry without revisiting a node, and the average route length with
+  sideways turns stays within a set bound of the shortest path.
+- **Route diversity:** repeated messages between the same pair take
+  measurably different paths.
+- **Waypoint privacy:** no node on a first leg ever holds the recipient's
+  identifier together with that message.
 - **Privacy:** no node other than a private instance's gateways ever holds
   that instance's identifier together with a message addressed to it; no
   hop's state contains a message's sender; hive-scoped records never reach
@@ -309,6 +320,7 @@ subset on redb.
   | `services` | Name and secret for each application |
   | `status` | Public status endpoint on or off (default on) |
   | `snow` | Snow level, echo share, hold |
+  | `routing` | Sideways probability, waypoint share |
   | `hive_interfaces` | Interfaces where multicast discovery runs; none by default |
   | `dns` | Encrypted resolver to use when a hostname must be resolved |
   | `limits` | Overrides for the defaults below |
@@ -372,13 +384,15 @@ from the soak test.
 | Message expiry | 3 days (horizon 14 days) |
 | Retry backoff | 30 s doubling, capped at 30 min |
 | Receipt timeout | 15 min |
-| Disjoint-path retries | 3 |
+| Fresh-waypoint retries | 3 |
 | Custody allowance per destination | 4 MB |
 | Transit storage cap | 256 MB |
 | Inbox cap per service | 64 MB |
 | Snow level | 2 frames per minute per node |
 | Echo share / bucket minimum | 25% / 10% each |
 | Hold | 0 ms (immediate dispatch) |
+| Sideways probability | 15% |
+| Waypoint share | 0% (retries always use a fresh waypoint) |
 | Wary rule *k* / wary list size | 3 / 32 |
 | Size buckets | 2, 8, 32 KB |
 
