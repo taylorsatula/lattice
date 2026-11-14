@@ -287,6 +287,34 @@ impl Client {
             .ok_or(Error::BadResponse("link: missing result"))
     }
 
+    /// Rotate the signing key using the pre-committed next key.
+    /// `next_key_file` overrides the daemon's default location.
+    pub async fn rotate(&mut self, next_key_file: Option<&str>) -> Result<String> {
+        let args = match next_key_file {
+            Some(p) => Value::map(vec![(Value::UInt(0), Value::Text(p.to_string()))]),
+            None => Value::map(vec![]),
+        };
+        let result = self.call(OP_ROTATE, args).await?;
+        text_at(&result, 0)
+    }
+
+    /// Permanently abandon the identity (a rotation with no next-key commitment).
+    pub async fn abandon(&mut self, next_key_file: Option<&str>) -> Result<String> {
+        let args = match next_key_file {
+            Some(p) => Value::map(vec![(Value::UInt(0), Value::Text(p.to_string()))]),
+            None => Value::map(vec![]),
+        };
+        let result = self.call(OP_ABANDON, args).await?;
+        text_at(&result, 0)
+    }
+
+    /// Rotate the envelope (X-Wing) key; the old key is kept decrypt-only
+    /// for a grace period, then deleted.
+    pub async fn rotate_envelope(&mut self) -> Result<String> {
+        let result = self.call(OP_ROTATE_ENVELOPE, Value::map(vec![])).await?;
+        text_at(&result, 0)
+    }
+
     /// Drop every link to the given peer id. Returns true if any were open.
     pub async fn unlink(&mut self, id: &[u8; 32]) -> Result<bool> {
         let args = Value::map(vec![(Value::UInt(0), Value::Bytes(id.to_vec()))]);
@@ -350,6 +378,13 @@ impl Client {
             }
         }
     }
+}
+
+fn text_at(v: &Value, key: u64) -> Result<String> {
+    lattice_proto::cbor::map_get(v, key)
+        .and_then(Value::as_text)
+        .map(String::from)
+        .ok_or(Error::BadResponse("expected text field"))
 }
 
 fn uint_at(v: &Value, key: u64) -> Result<u64> {

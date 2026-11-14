@@ -8,6 +8,9 @@
 //!   link <addr> [--key HEX] [--path STR] [--id HEX]
 //!                              dial a peer (key = channel key for IK, path = upgrade path for XX)
 //!   unlink <id-hex>            drop and demote all links to this peer
+//!   rotate [--next-key-file P] rotate the signing key (uses the pre-committed next key)
+//!   abandon [--next-key-file P] permanently abandon the identity
+//!   rotate-envelope            rotate the envelope (X-Wing) key
 
 #![forbid(unsafe_code)]
 
@@ -181,12 +184,56 @@ async fn run(socket: &Path, args: &[String]) -> ExitCode {
                 }
             }
         }
+        Some("rotate") | Some("abandon") => {
+            let abandon = args[0] == "abandon";
+            let mut next_key_file = None;
+            let mut i = 1;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--next-key-file" => {
+                        let Some(p) = args.get(i + 1) else {
+                            eprintln!("--next-key-file needs a path");
+                            return ExitCode::from(2);
+                        };
+                        next_key_file = Some(p.clone());
+                        i += 2;
+                    }
+                    other => {
+                        eprintln!("unknown flag {other:?}");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            let result = if abandon {
+                client.abandon(next_key_file.as_deref()).await
+            } else {
+                client.rotate(next_key_file.as_deref()).await
+            };
+            match result {
+                Ok(msg) => {
+                    println!("{msg}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => fail(e),
+            }
+        }
+        Some("rotate-envelope") => match client.rotate_envelope().await {
+            Ok(msg) => {
+                println!("{msg}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => fail(e),
+        },
         Some(other) => {
-            eprintln!("unknown command {other:?}; expected node|drain|link|unlink");
+            eprintln!(
+                "unknown command {other:?}; expected node|drain|link|unlink|rotate|abandon|rotate-envelope"
+            );
             ExitCode::from(2)
         }
         None => {
-            eprintln!("usage: latticectl [--socket PATH] <node|drain|link|unlink> [args]");
+            eprintln!(
+                "usage: latticectl [--socket PATH] <node|drain|link|unlink|rotate|abandon|rotate-envelope> [args]"
+            );
             ExitCode::from(2)
         }
     }

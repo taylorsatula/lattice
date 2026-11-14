@@ -62,6 +62,16 @@ pub enum ApiCmd {
         draining: Option<bool>,
         respond: tokio::sync::oneshot::Sender<(bool, usize)>,
     },
+    /// Rotate the signing key. `next_key_file` overrides the default location.
+    Rotate {
+        next_key_file: Option<String>,
+        abandon: bool,
+        respond: tokio::sync::oneshot::Sender<Result<String, String>>,
+    },
+    /// Rotate the envelope (X-Wing) key; old key kept decrypt-only for 2 days.
+    RotateEnvelope {
+        respond: tokio::sync::oneshot::Sender<Result<String, String>>,
+    },
     UnlinkByPeer {
         peer: [u8; 32],
         respond: tokio::sync::oneshot::Sender<bool>,
@@ -101,6 +111,7 @@ pub struct Runtime {
     pub node: Arc<std::sync::Mutex<Node<RedbStore>>>,
     pub draining: Arc<AtomicBool>,
     mode: &'static str,
+    identity_dir: std::path::PathBuf,
     channel_seed: [u8; 32],
     links: HashMap<u64, LinkHandle>,
     peer_rx: Option<mpsc::UnboundedReceiver<lattice_net::PeerIo>>,
@@ -203,6 +214,7 @@ impl Runtime {
             } else {
                 "public"
             },
+            identity_dir: cfg.identity_dir.clone(),
             channel_seed,
             links: HashMap::new(),
             link_rx: Some(link_rx),
@@ -454,6 +466,55 @@ impl Runtime {
                     });
                 }
                 let _ = respond.send(ok);
+            }
+            ApiCmd::Rotate {
+                next_key_file,
+                abandon,
+                respond,
+            } => {
+                let result = (|| {
+                    let dir = self.identity_dir.clone();
+                    let rotation = crate::keys::rotate_signing_key(
+                        &dir,
+                        next_key_file.as_deref().map(std::path::Path::new),
+                        abandon,
+                    )
+                    .map_err(|e| e.to_string())?;
+                    let now = now_secs();
+                    let mut node = self.node.lock().unwrap();
+                    node.reload_identity(rotation.identity, now, !abandon)
+                        .map_err(|e| e.to_string())?;
+                    if abandon {
+                        node.set_draining(true);
+                        self.draining.store(true, Ordering::Relaxed);
+                        let _ = node.store_mut().drain_set(true);
+                    }
+                    Ok(if abandon {
+                        "identity abandoned".to_string()
+                    } else {
+                        format!(
+                            "rotated; next key written to {}",
+                            rotation
+                                .next_key_path
+                                .map(|p| p.display().to_string())
+                                .unwrap_or_else(|| "<none>".into())
+                        )
+                    })
+                })();
+                let _ = respond.send(result);
+            }
+            ApiCmd::RotateEnvelope { respond } => {
+                let result = (|| {
+                    let dir = self.identity_dir.clone();
+                    let identity = crate::keys::rotate_envelope_key(&dir, 2 * 24 * 3600)
+                        .map_err(|e| e.to_string())?;
+                    let now = now_secs();
+                    let mut node = self.node.lock().unwrap();
+                    node.reload_identity(identity, now, true)
+                        .map_err(|e| e.to_string())?;
+                    Ok("envelope key rotated; old key kept decrypt-only for 2 days".to_string())
+                })();
+                let _ = respond.send(result);
             }
             ApiCmd::UnlinkByPeer { peer, respond } => {
                 let before = self.links.len();

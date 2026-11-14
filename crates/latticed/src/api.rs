@@ -501,6 +501,57 @@ async fn dispatch_admin(api: &mpsc::UnboundedSender<ApiCmd>, req: &Request) -> V
                 Err(_) => resp_err(req.id, ERR_INTERNAL),
             }
         }
+        OP_ROTATE | OP_ABANDON => {
+            if deny_unknown_args(&req.args, &[0]).is_err() {
+                return resp_err(req.id, ERR_BAD_ARGS);
+            }
+            let next_key_file = match args_get(&req.args, 0) {
+                None => None,
+                Some(Value::Text(t)) => Some(t.clone()),
+                Some(_) => return resp_err(req.id, ERR_BAD_ARGS),
+            };
+            let abandon = req.op == OP_ABANDON;
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            if api
+                .send(ApiCmd::Rotate {
+                    next_key_file,
+                    abandon,
+                    respond: tx,
+                })
+                .is_err()
+            {
+                return resp_err(req.id, ERR_INTERNAL);
+            }
+            match rx.await {
+                Ok(Ok(msg)) => {
+                    resp_ok(req.id, Value::map(vec![(Value::UInt(0), Value::Text(msg))]))
+                }
+                Ok(Err(e)) => {
+                    eprintln!("lattice: rotate failed: {e}");
+                    resp_err(req.id, ERR_FAILED)
+                }
+                Err(_) => resp_err(req.id, ERR_INTERNAL),
+            }
+        }
+        OP_ROTATE_ENVELOPE => {
+            if deny_unknown_args(&req.args, &[]).is_err() {
+                return resp_err(req.id, ERR_BAD_ARGS);
+            }
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            if api.send(ApiCmd::RotateEnvelope { respond: tx }).is_err() {
+                return resp_err(req.id, ERR_INTERNAL);
+            }
+            match rx.await {
+                Ok(Ok(msg)) => {
+                    resp_ok(req.id, Value::map(vec![(Value::UInt(0), Value::Text(msg))]))
+                }
+                Ok(Err(e)) => {
+                    eprintln!("lattice: envelope rotation failed: {e}");
+                    resp_err(req.id, ERR_FAILED)
+                }
+                Err(_) => resp_err(req.id, ERR_INTERNAL),
+            }
+        }
         OP_UNLINK => {
             if deny_unknown_args(&req.args, &[0]).is_err() {
                 return resp_err(req.id, ERR_BAD_ARGS);

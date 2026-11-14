@@ -24,6 +24,11 @@ pub struct Identity {
     pub channel_seed: [u8; 32],
     pub xwing_secret: [u8; 32],
     pub xwing_public: [u8; 1216],
+    /// Retired envelope (X-Wing) private keys kept for decryption only,
+    /// each with the unix time after which it must be deleted. Rotation
+    /// replaces the active key; retired keys decrypt envelopes that were
+    /// in flight when the rotation happened.
+    pub retired_xwing: Vec<([u8; 32], u64)>,
 }
 
 impl Identity {
@@ -42,6 +47,75 @@ impl Identity {
             channel_seed: lattice_crypto::os_bytes::<32>(),
             xwing_secret: kp.secret,
             xwing_public: kp.public,
+            retired_xwing: Vec::new(),
+        }
+    }
+
+    /// Rotate the signing key using the pre-committed next key.
+    ///
+    /// `next_seed` must hash to the current head's `next` commitment.
+    /// `new_next_seed` is the next-next key to commit to; `None` abandons
+    /// the identity permanently (a rotation with no next-key commitment).
+    pub fn rotate(
+        &mut self,
+        next_seed: &[u8; 32],
+        new_next_seed: Option<[u8; 32]>,
+    ) -> Result<(), String> {
+        let head = self.kel.last().ok_or("empty key event log")?;
+        let committed = head
+            .next
+            .ok_or("identity is abandoned; it cannot rotate further")?;
+        if hash_next(next_seed) != committed {
+            return Err("next key does not match the committed pre-rotation hash".into());
+        }
+        let next_hash = new_next_seed.as_ref().map(hash_next);
+        let event = KeyEvent::rotation(head, next_seed, next_hash);
+        self.kel.push(event);
+        self.signing_seed = *next_seed;
+        Ok(())
+    }
+
+    /// True if the KEL ends in an abandonment (a rotation with no next-key
+    /// commitment). An abandoned identity must not sign or publish.
+    pub fn is_abandoned(&self) -> bool {
+        match self.kel.last() {
+            Some(e) => e.kind == kel::KeyEventKind::Rotation && e.next.is_none(),
+            None => true,
+        }
+    }
+
+    /// Rotate the envelope key: generate a fresh X-Wing keypair, move the
+    /// current private key into the retired set (decrypt-only) until
+    /// `retire_at`, and return the new public key.
+    pub fn rotate_envelope(&mut self, retire_at: u64) -> [u8; 1216] {
+        let kp = lattice_crypto::generate_keypair();
+        self.retired_xwing.push((self.xwing_secret, retire_at));
+        self.xwing_secret = kp.secret;
+        self.xwing_public = kp.public;
+        self.xwing_public
+    }
+
+    /// Drop retired envelope keys whose grace period has elapsed.
+    pub fn sweep_retired_envelope_keys(&mut self, now: u64) {
+        self.retired_xwing.retain(|(_, exp)| *exp > now);
+    }
+
+    /// Try to open an envelope with the current key, then any retired keys
+    /// still within their grace period.
+    pub fn open_envelope_any(
+        &self,
+        msg: &lattice_proto::message::Message,
+    ) -> Result<lattice_proto::message::Envelope, lattice_proto::ProtoError> {
+        match msg.open_envelope(&self.xwing_secret) {
+            Ok(e) => Ok(e),
+            Err(first_err) => {
+                for (seed, _) in &self.retired_xwing {
+                    if let Ok(e) = msg.open_envelope(seed) {
+                        return Ok(e);
+                    }
+                }
+                Err(first_err)
+            }
         }
     }
 
@@ -118,6 +192,9 @@ impl<S: Store> Node<S> {
         if config.mode == Mode::Private && (config.gateways.is_empty() || config.gateways.len() > 3)
         {
             return Err("private mode requires 1-3 gateways".to_string());
+        }
+        if identity.is_abandoned() {
+            return Err("identity is abandoned; refusing to start".to_string());
         }
         if config.mode == Mode::Public && !config.gateways.is_empty() {
             return Err("gateways are only valid in private mode".to_string());
@@ -520,6 +597,7 @@ impl<S: Store> Node<S> {
         let _ = self
             .store
             .kel_head_sweep(now.saturating_sub(KEL_HEAD_MAX_AGE_SECS));
+        self.identity.sweep_retired_envelope_keys(now);
     }
 
     /// Fold a record's (channel_key, id) claim into the claim set.
@@ -1235,7 +1313,7 @@ impl<S: Store> Node<S> {
 
         // Final recipient: open the envelope now (cheap; rejects garbage early),
         // then authenticate the sender before spending any state on the message.
-        let opened = match msg.open_envelope(&self.identity.xwing_secret) {
+        let opened = match self.identity.open_envelope_any(msg) {
             Ok(e) => e,
             Err(_) => {
                 actions.push(self.refuse(link, leg));
@@ -2010,6 +2088,24 @@ impl<S: Store> Node<S> {
         Self::new(config, identity, store, now)
     }
 
+    /// Swap in a new identity (after a rotation) and republish the record.
+    /// The identifier is unchanged by rotation, so the record keeps its id.
+    /// `publish` is false for abandonment: peers reject abandoned records at
+    /// validation, so there is nothing useful to publish.
+    pub fn reload_identity(
+        &mut self,
+        identity: Identity,
+        now: u64,
+        publish: bool,
+    ) -> Result<(), String> {
+        self.identity = identity;
+        if !publish {
+            return Ok(());
+        }
+        self.own_seq += 1;
+        self.publish_record(now)
+    }
+
     /// Enter or leave draining: while draining, every custody offer is
     /// answered `busy` and nothing new starts. Existing custody is finished
     /// and reported via custody count.
@@ -2302,5 +2398,112 @@ mod tests {
             node.store.outbound_get(&mid2).unwrap().unwrap().state,
             OutboundState::Delivered
         );
+    }
+
+    fn test_identity() -> (Identity, [u8; 32], [u8; 32]) {
+        let signing_seed = [1u8; 32];
+        let next_seed = [2u8; 32];
+        let next_next_seed = [3u8; 32];
+        let inception = KeyEvent::inception(&signing_seed, hash_next(&next_seed));
+        let kp = lattice_crypto::generate_keypair();
+        let id = Identity {
+            signing_seed,
+            kel: vec![inception],
+            channel_seed: [4u8; 32],
+            xwing_secret: kp.secret,
+            xwing_public: kp.public,
+            retired_xwing: Vec::new(),
+        };
+        (id, next_seed, next_next_seed)
+    }
+
+    #[test]
+    fn rotate_produces_valid_kel_and_preserves_id() {
+        let (mut id, next_seed, next_next) = test_identity();
+        let id_before = id.id();
+        id.rotate(&next_seed, Some(next_next)).unwrap();
+        assert_eq!(id.id(), id_before, "identifier must survive rotation");
+        assert_eq!(id.kel.len(), 2);
+        assert_eq!(id.signing_seed, next_seed);
+        assert!(!id.is_abandoned());
+        let head = KeyEvent::validate_chain(&id.kel).unwrap();
+        assert!(!head.abandoned);
+        assert_eq!(head.seq, 1);
+    }
+
+    #[test]
+    fn rotate_rejects_wrong_next_key() {
+        let (mut id, _next_seed, next_next) = test_identity();
+        let err = id.rotate(&[9u8; 32], Some(next_next)).unwrap_err();
+        assert!(err.contains("pre-rotation"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn abandon_is_terminal() {
+        let (mut id, next_seed, _) = test_identity();
+        id.rotate(&next_seed, None).unwrap();
+        assert!(id.is_abandoned());
+        let err = id.rotate(&[7u8; 32], None).unwrap_err();
+        assert!(err.contains("abandoned"), "unexpected error: {err}");
+        let head = KeyEvent::validate_chain(&id.kel).unwrap();
+        assert!(head.abandoned);
+    }
+
+    fn sealed_message_to(id: &Identity, body: &[u8]) -> lattice_proto::message::Message {
+        use lattice_proto::message::{BuildParams, Envelope, KIND_MESSAGE, Message};
+        let envelope = Envelope {
+            kind: KIND_MESSAGE,
+            mid: [0x42; 16],
+            from: [0xAA; 32],
+            fsvc: "svc".into(),
+            fmbx: b"out".to_vec(),
+            tsvc: "svc".into(),
+            tmbx: b"in".to_vec(),
+            created: 1,
+            body: Some(body.to_vec()),
+            reference: None,
+            reason: None,
+            sig: [0; 64],
+        };
+        let bytes = Message::build(BuildParams {
+            envelope,
+            sender_seed: &[0xBB; 32],
+            recipient_ek: &id.xwing_public,
+            real_dst: [0xCC; 32],
+            leg: [0xDD; 16],
+            exp: 2_000_000,
+            gateway: None,
+            waypoint: None,
+        })
+        .unwrap();
+        Message::parse(&bytes, 1_000_000).unwrap()
+    }
+
+    #[test]
+    fn envelope_rotation_keeps_old_messages_readable_until_grace_expires() {
+        let (mut id, _n, _n2) = test_identity();
+        let msg = sealed_message_to(&id, b"hello before rotation");
+        // Rotate; old key moves to the retired set with a 2-day grace.
+        let now = 1_000_000u64;
+        let retire_at = now + 2 * 24 * 3600;
+        let old_secret = id.xwing_secret;
+        id.rotate_envelope(retire_at);
+        assert_ne!(id.xwing_secret, old_secret);
+        assert_eq!(id.retired_xwing.len(), 1);
+        // The pre-rotation envelope still opens (via the retired key).
+        let opened = id
+            .open_envelope_any(&msg)
+            .expect("retired key must still open");
+        assert_eq!(opened.body.as_deref(), Some(&b"hello before rotation"[..]));
+        // A new envelope (sealed to the new key) also opens.
+        let msg2 = sealed_message_to(&id, b"after rotation");
+        let opened2 = id
+            .open_envelope_any(&msg2)
+            .expect("new key opens new envelopes");
+        assert_eq!(opened2.body.as_deref(), Some(&b"after rotation"[..]));
+        // After the grace period, the retired key is swept and old mail is unreadable.
+        id.sweep_retired_envelope_keys(retire_at + 1);
+        assert!(id.retired_xwing.is_empty());
+        assert!(id.open_envelope_any(&msg).is_err());
     }
 }

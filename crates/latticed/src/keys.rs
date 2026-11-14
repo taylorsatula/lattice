@@ -101,23 +101,29 @@ pub fn load_identity(dir: &Path) -> io::Result<Identity> {
     let channel_seed = read_seed(dir, "channel_seed")?;
     let envelope_seed = read_seed(dir, "envelope_seed")?;
 
-    let kel = if let Ok(bytes) = fs::read(dir.join("kel.bin")) {
+    let kel = {
+        let bytes = fs::read(dir.join("kel.bin")).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!(
+                    "{}: read kel.bin: {e} (identity is corrupt or incomplete)",
+                    dir.display()
+                ),
+            )
+        })?;
         lattice_proto::kel::decode_kel(&bytes)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
-    } else {
-        // Pre-KEL-file identities: reconstruct from the seeds on disk.
-        let next_seed = read_seed(dir, "next_signing_seed")?;
-        vec![lattice_proto::kel::KeyEvent::inception(
-            &signing_seed,
-            hash(&public_key(&next_seed)),
-        )]
     };
-    // The signing seed must match the KEL's inception key.
-    let expected = public_key(&signing_seed);
-    if kel.first().map(|e| e.key) != Some(expected) {
+    let retired_xwing = load_retired_envelope_keys(dir)?;
+    // The signing seed must match the KEL's current head key. (Before
+    // rotation support this checked the inception key, which broke on the
+    // first rotation.)
+    let head = lattice_proto::kel::KeyEvent::validate_chain(&kel)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    if head.current_key != public_key(&signing_seed) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "signing_seed does not match the KEL",
+            "signing_seed does not match the KEL head",
         ));
     }
     Ok(Identity {
@@ -126,6 +132,7 @@ pub fn load_identity(dir: &Path) -> io::Result<Identity> {
         channel_seed,
         xwing_secret: envelope_seed,
         xwing_public: lattice_crypto::XWingSecretKey::from_bytes(envelope_seed).public_key(),
+        retired_xwing,
     })
 }
 
@@ -149,4 +156,176 @@ pub fn self_test(identity: &Identity) -> io::Result<()> {
         ));
     }
     Ok(())
+}
+
+const RETIRED_ENVELOPE_PREFIX: &str = "envelope_seed.retired.";
+
+/// Load retired envelope keys whose grace period has not elapsed; delete the
+/// rest. Files are named `envelope_seed.retired.<unix-expiry>`.
+fn load_retired_envelope_keys(dir: &Path) -> io::Result<Vec<([u8; 32], u64)>> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut out = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(exp_str) = name.strip_prefix(RETIRED_ENVELOPE_PREFIX) else {
+            continue;
+        };
+        let Ok(exp) = exp_str.parse::<u64>() else {
+            continue;
+        };
+        if exp <= now {
+            let _ = fs::remove_file(entry.path());
+            continue;
+        }
+        let bytes = fs::read(entry.path())?;
+        let seed: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{name}: expected 32 bytes"),
+            )
+        })?;
+        out.push((seed, exp));
+    }
+    Ok(out)
+}
+
+/// Outcome of a signing-key rotation.
+pub struct Rotation {
+    pub identity: lattice_core::Identity,
+    /// Where the new next key was written (for the operator to move offline).
+    pub next_key_path: Option<PathBuf>,
+}
+
+/// Rotate the signing key. `next_key_file` overrides the default location
+/// (`<dir>/next_signing_seed`). `abandon` performs a rotation with no
+/// next-key commitment, permanently ending the identity.
+pub fn rotate_signing_key(
+    dir: &Path,
+    next_key_file: Option<&Path>,
+    abandon: bool,
+) -> io::Result<Rotation> {
+    let mut identity = load_identity(dir)?;
+    let next_path = next_key_file
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| dir.join("next_signing_seed"));
+    let next_seed_bytes = fs::read(&next_path).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!(
+                "read next signing key {}: {e}. The next key is created at init and must be supplied for rotation",
+                next_path.display()
+            ),
+        )
+    })?;
+    let next_seed: [u8; 32] = next_seed_bytes.as_slice().try_into().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "next signing key must be 32 bytes",
+        )
+    })?;
+
+    let new_next = if abandon {
+        None
+    } else {
+        Some(lattice_crypto::generate_seed())
+    };
+    identity
+        .rotate(&next_seed, new_next)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+    // Persist: new KEL, new current signing seed, new next seed (or none).
+    fs::write(
+        dir.join("kel.bin"),
+        lattice_proto::kel::encode_kel(&identity.kel),
+    )?;
+    write_seed(dir, "signing_seed", &identity.signing_seed)?;
+    let next_key_path = if abandon {
+        let _ = fs::remove_file(&next_path);
+        None
+    } else {
+        let new_next = new_next.expect("non-abandon rotation generates a next key");
+        write_seed(dir, "next_signing_seed", &new_next)?;
+        Some(dir.join("next_signing_seed"))
+    };
+    Ok(Rotation {
+        identity,
+        next_key_path,
+    })
+}
+
+/// Rotate the envelope (X-Wing) key. The old private key is kept, decrypt-only,
+/// for `grace_secs`, then deleted by the next load.
+pub fn rotate_envelope_key(dir: &Path, grace_secs: u64) -> io::Result<lattice_core::Identity> {
+    let mut identity = load_identity(dir)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let retire_at = now + grace_secs;
+    // Persist the retired key before swapping, so a crash mid-rotation does
+    // not strand envelopes encrypted to it.
+    let retired_name = format!("{RETIRED_ENVELOPE_PREFIX}{retire_at}");
+    write_seed(dir, &retired_name, &identity.xwing_secret)?;
+    let _ = identity.rotate_envelope(retire_at);
+    write_seed(dir, "envelope_seed", &identity.xwing_secret)?;
+    Ok(identity)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rotate_roundtrip_preserves_identity_and_abandons() {
+        let dir = std::env::temp_dir().join(format!("latticed-rotate-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        init_identity(&dir).unwrap();
+        let before = load_identity(&dir).unwrap();
+        let id_before = before.id();
+
+        // Rotate: identity id is stable, signing key changes, KEL grows.
+        let rotation = rotate_signing_key(&dir, None, false).unwrap();
+        assert!(rotation.next_key_path.is_some());
+        let after = load_identity(&dir).unwrap();
+        assert_eq!(after.id(), id_before);
+        assert_ne!(after.signing_seed, before.signing_seed);
+        assert_eq!(after.kel.len(), before.kel.len() + 1);
+
+        // Abandon: terminal; the node must refuse to start afterwards.
+        let rotation = rotate_signing_key(&dir, None, true).unwrap();
+        assert!(rotation.next_key_path.is_none());
+        let abandoned = load_identity(&dir).unwrap();
+        assert!(abandoned.is_abandoned());
+        let cfg = lattice_core::Config::default();
+        let store = lattice_store::MemStore::new();
+        assert!(lattice_core::Node::new(cfg, abandoned, store, 1_000).is_err());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn envelope_rotation_roundtrip_keeps_retired_key() {
+        let dir =
+            std::env::temp_dir().join(format!("latticed-envelope-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        init_identity(&dir).unwrap();
+        let before = load_identity(&dir).unwrap();
+        let old_public = before.xwing_public;
+
+        let after = rotate_envelope_key(&dir, 2 * 24 * 3600).unwrap();
+        assert_ne!(after.xwing_public, old_public);
+        assert_eq!(after.retired_xwing.len(), 1);
+
+        // Reload: the retired key survives a restart.
+        let reloaded = load_identity(&dir).unwrap();
+        assert_eq!(reloaded.xwing_public, after.xwing_public);
+        assert_eq!(reloaded.retired_xwing.len(), 1);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

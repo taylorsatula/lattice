@@ -901,3 +901,42 @@ async fn unlink_closes_the_connection() {
 
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+#[tokio::test]
+async fn rotate_and_abandon_via_admin() {
+    let tmp = std::env::temp_dir().join(format!("lattice-e2e-rotate-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+
+    let b = boot_node(
+        &tmp,
+        "b",
+        None,
+        &[("test", "test-secret-with-plenty-of-entropy")],
+    );
+    wait_sockets(&b).await;
+    let mut admin = Client::connect_admin(&b.admin)
+        .await
+        .expect("admin connect");
+    let before = admin.node().await.expect("node before");
+
+    // Rotate the signing key; the node must stay up and keep its id.
+    let msg = admin.rotate(None).await.expect("rotate");
+    assert!(msg.contains("rotated"), "unexpected rotate reply: {msg}");
+    let after = admin.node().await.expect("node after rotate");
+    assert_eq!(before.id, after.id, "rotation must not change the node id");
+
+    // Rotate the envelope key; the node must stay up.
+    let msg = admin.rotate_envelope().await.expect("rotate envelope");
+    assert!(msg.contains("envelope"), "unexpected reply: {msg}");
+    let after = admin.node().await.expect("node after envelope rotate");
+    assert_eq!(before.id, after.id);
+
+    // Abandon: the node drains and the identity is dead.
+    let msg = admin.abandon(None).await.expect("abandon");
+    assert!(msg.contains("abandoned"), "unexpected reply: {msg}");
+    let after = admin.node().await.expect("node after abandon");
+    assert!(after.draining, "abandoned node must be draining");
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}

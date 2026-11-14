@@ -38,6 +38,7 @@ pub const ERR_UNKNOWN_OP: u64 = 1;
 pub const ERR_BAD_ARGS: u64 = 2;
 pub const ERR_AUTH: u64 = 3;
 pub const ERR_NOT_FOUND: u64 = 4;
+pub const ERR_FAILED: u64 = 5;
 pub const ERR_INTERNAL: u64 = 5;
 
 pub const EVENT_INBOX: u64 = 1;
