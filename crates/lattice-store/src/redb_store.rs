@@ -161,27 +161,32 @@ impl RedbStore {
             .map_err(|e| StoreError::Backend(e.to_string()))?;
         txn.open_table(WARY)
             .map_err(|e| StoreError::Backend(e.to_string()))?;
-        // Rebuild the custody byte counter from the table so it can never
+        // Rebuild the custody byte counters from the table so they can never
         // drift from the rows actually present.
-        let custody_bytes: u64 = {
+        let mut custody_bytes: u64 = 0;
+        let mut class_bytes = [0u64; 16];
+        {
             let t = txn
                 .open_table(CUSTODY)
                 .map_err(|e| StoreError::Backend(e.to_string()))?;
-            let mut sum = 0u64;
             for entry in t.iter().map_err(|e| StoreError::Backend(e.to_string()))? {
                 let (_, v) = entry.map_err(|e| StoreError::Backend(e.to_string()))?;
                 let e: CustodyEntry = serde_json::from_slice(&v.value())
                     .map_err(|e| StoreError::Backend(e.to_string()))?;
-                sum += e.message.len() as u64;
+                custody_bytes += e.message.len() as u64;
+                class_bytes[(e.class as usize).min(15)] += e.message.len() as u64;
             }
-            sum
-        };
+        }
         {
             let mut meta = txn
                 .open_table(META)
                 .map_err(|e| StoreError::Backend(e.to_string()))?;
             meta.insert("custody_bytes", custody_bytes)
                 .map_err(|e| StoreError::Backend(e.to_string()))?;
+            for (i, b) in class_bytes.iter().enumerate() {
+                meta.insert(format!("custody_class_{i}").as_str(), *b)
+                    .map_err(|e| StoreError::Backend(e.to_string()))?;
+            }
         }
         txn.commit()
             .map_err(|e| StoreError::Backend(e.to_string()))?;
@@ -251,6 +256,12 @@ impl RedbStore {
     }
 }
 
+fn class_of_bytes(bytes: &[u8]) -> usize {
+    serde_json::from_slice::<CustodyEntry>(bytes)
+        .map(|e| e.class.min(15) as usize)
+        .unwrap_or(0)
+}
+
 /// Insert a custody row and bump the byte counter, in the caller's txn.
 fn custody_put_txn(
     txn: &redb::WriteTransaction,
@@ -261,17 +272,23 @@ fn custody_put_txn(
     let mut t = txn
         .open_table(CUSTODY)
         .map_err(|e| StoreError::Backend(e.to_string()))?;
-    // The byte counter tracks message bytes, so recover the old entry's
-    // message length from the stored row if this leg is being overwritten.
-    let old_msg_len = match t.get(leg).map_err(|e| StoreError::Backend(e.to_string()))? {
-        Some(v) => serde_json::from_slice::<CustodyEntry>(&v.value())
-            .map(|e| e.message.len() as i64)
-            .unwrap_or(0),
-        None => 0,
-    };
+    // The byte counters track message bytes, so recover the old entry's
+    // message length and class from the stored row if this leg is overwritten.
+    let (old_msg_len, old_class) =
+        match t.get(leg).map_err(|e| StoreError::Backend(e.to_string()))? {
+            Some(v) => serde_json::from_slice::<CustodyEntry>(&v.value())
+                .map(|e| (e.message.len() as i64, e.class.min(15) as usize))
+                .unwrap_or((0, 0)),
+            None => (0, 0),
+        };
+    let new_class = class_of_bytes(&bytes);
     t.insert(leg, bytes)
         .map_err(|e| StoreError::Backend(e.to_string()))?;
     meta_add(txn, "custody_bytes", msg_len - old_msg_len)?;
+    if old_msg_len > 0 {
+        meta_add(txn, &format!("custody_class_{old_class}"), -old_msg_len)?;
+    }
+    meta_add(txn, &format!("custody_class_{new_class}"), msg_len)?;
     Ok(())
 }
 
@@ -442,6 +459,32 @@ impl Store for RedbStore {
         })
     }
 
+    fn kel_head_sweep(&mut self, older_than: u64) -> Result<usize, StoreError> {
+        self.write(|txn| {
+            let mut t = txn
+                .open_table(KEL_HEADS)
+                .map_err(|e| StoreError::Backend(e.to_string()))?;
+            let stale: Vec<[u8; 32]> = {
+                let mut out = Vec::new();
+                for entry in t.iter().map_err(|e| StoreError::Backend(e.to_string()))? {
+                    let (k, v) = entry.map_err(|e| StoreError::Backend(e.to_string()))?;
+                    let raw = v.value();
+                    let seen = u64::from_le_bytes(raw[40..48].try_into().unwrap());
+                    if seen < older_than {
+                        out.push(k.value());
+                    }
+                }
+                out
+            };
+            let n = stale.len();
+            for k in stale {
+                t.remove(k)
+                    .map_err(|e| StoreError::Backend(e.to_string()))?;
+            }
+            Ok(n)
+        })
+    }
+
     fn kel_head_put(
         &mut self,
         id: &[u8; 32],
@@ -485,6 +528,17 @@ impl Store for RedbStore {
                 out.push((k.value(), v.value().to_string()));
             }
             Ok(out)
+        })
+    }
+
+    fn outbound_remove(&mut self, mid: &[u8; 16]) -> Result<(), StoreError> {
+        self.write(|txn| {
+            let mut t = txn
+                .open_table(OUTBOUND)
+                .map_err(|e| StoreError::Backend(e.to_string()))?;
+            t.remove(mid)
+                .map_err(|e| StoreError::Backend(e.to_string()))?;
+            Ok(())
         })
     }
 
@@ -593,6 +647,7 @@ impl Store for RedbStore {
         let existing = self.custody_get(leg)?;
         if let Some(e) = &existing {
             let msg_len = e.message.len() as i64;
+            let class = e.class.min(15) as usize;
             self.write(|txn| {
                 let mut t = txn
                     .open_table(CUSTODY)
@@ -600,6 +655,7 @@ impl Store for RedbStore {
                 t.remove(leg)
                     .map_err(|e| StoreError::Backend(e.to_string()))?;
                 meta_add(txn, "custody_bytes", -msg_len)?;
+                meta_add(txn, &format!("custody_class_{class}"), -msg_len)?;
                 Ok(())
             })?;
         }
@@ -633,6 +689,23 @@ impl Store for RedbStore {
                 .map_err(|e| StoreError::Backend(e.to_string()))?
                 .map(|v| v.value())
                 .unwrap_or(0))
+        })
+    }
+
+    fn custody_class_bytes(&self) -> Result<[u64; 16], StoreError> {
+        self.read(|txn| {
+            let meta = txn
+                .open_table(META)
+                .map_err(|e| StoreError::Backend(e.to_string()))?;
+            let mut out = [0u64; 16];
+            for (i, slot) in out.iter_mut().enumerate() {
+                *slot = meta
+                    .get(format!("custody_class_{i}").as_str())
+                    .map_err(|e| StoreError::Backend(e.to_string()))?
+                    .map(|v| v.value())
+                    .unwrap_or(0);
+            }
+            Ok(out)
         })
     }
 

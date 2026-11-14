@@ -1,0 +1,4 @@
+# Create the lattice group: members may connect to the application socket.
+# The daemon itself runs as root (see latticed.service); the group exists so
+# application users can reach the app socket without being root.
+g lattice - "Lattice service group"

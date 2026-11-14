@@ -62,10 +62,13 @@ implementation. Administration goes through `latticectl` on the admin socket.
   mode `0600`, owner-only. It carries node control (drain, link, unlink,
   node info) and is root-only in practice.
 - The **application socket** (`app_socket`, default `/run/lattice/app.sock`)
-  is mode `0660`. There is no dedicated `lattice` group yet; with the default
-  root ownership that is effectively root-only as well. Widening access
-  (group `lattice`, tmpfiles.d) is a deliberate decision still pending —
-  until then, run application clients as root or adjust the mode yourself.
+  is mode `0660`, group `lattice`. Members of the `lattice` group may connect;
+  everyone else cannot. Create the group with the shipped sysusers.d snippet
+  (`deploy/lattice.sysusers`), add application users with
+  `usermod -aG lattice <user>`, and let tmpfiles.d manage `/run/lattice`
+  (`deploy/lattice.tmpfiles.conf`). The daemon runs as root with egid
+  `lattice` (`Group=lattice` in the unit), so the socket it creates is
+  group-owned automatically.
 - Delivery to applications is **at least once**: a delivery stays in the
   inbox until acknowledged, and is re-fetched after a crash. Applications
   must dedup by message id (`mid`).

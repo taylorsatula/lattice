@@ -29,8 +29,9 @@ listen = ["0.0.0.0:8443"]
 # this is parsed and reserved.
 # hive = ["10.0.0.0/8"]
 
-# Application socket (0660) and admin socket (0600). systemd provides
-# /run/lattice when using RuntimeDirectory=lattice.
+# Application socket (0660, group lattice) and admin socket (0600, root
+# only). Members of the lattice group may connect to the app socket;
+# see deploy/lattice.sysusers and deploy/lattice.tmpfiles.conf.
 app_socket = "/run/lattice/app.sock"
 admin_socket = "/run/lattice/admin.sock"
 

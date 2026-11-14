@@ -23,7 +23,7 @@ that document; section references (§n) point back to it.
   | Peer record | 3 KB |
   | Frame after the handshake | Exactly one frame bucket: 2, 8 or 32 KB of plaintext (§6) |
   | Message | Exactly one message bucket: its frame bucket minus 64 bytes, so an `offer` frame fits exactly |
-  | Channel frame on the wire | 40 KB, enforced by the WebSocket layer before the frame is assembled |
+  | Channel frame on the wire | 32784 bytes (32 KiB bucket + 16-byte AEAD tag), enforced by the WebSocket layer before the frame is assembled |
   | Local API frame | 64 KB |
 
 - **Decoding limits.** Every decoder of untrusted bytes enforces, before
@@ -297,9 +297,6 @@ Each WebSocket binary frame carries one CBOR value.
   The cookie is not encrypted — it is a PRF output bound to the client
   address, and is useless to any other address. Cookies rotate every two
   hours; the previous key remains valid during the overlap.
-- **mac2** is keyed by the cookie and required only when the responder is
-  under load. A responder under load that receives an init without a valid
-  mac2 answers with a `cookie` frame and keeps no state.
 - **Patterns:** `Noise_IK_25519_ChaChaPoly_BLAKE2s` when the responder's
   channel key is known, `Noise_XX_25519_ChaChaPoly_BLAKE2s` otherwise. BLAKE2s
   is used inside Noise because that's what Noise implementations support;
@@ -332,9 +329,17 @@ exactly a bucket size is refused. Frame types:
 ### Reconciliation (design §5)
 
 Records are ordered by (id, scope). Each entry's item hash is
-BLAKE3(id ‖ scope ‖ seq). A range's fingerprint is the count of entries and
-the sum of their item hashes modulo 2²⁵⁶. Sums can be maintained
-incrementally as records change, and the order of addition doesn't matter.
+BLAKE3(id ‖ scope ‖ seq), with `scope` a single byte and `seq` as 8
+little-endian bytes. A range's fingerprint is the count of entries and
+the sum of their item hashes modulo 2²⁵⁶. The sum is carried as a 32-byte
+big-endian integer. Sums can be maintained incrementally as records change,
+and the order of addition doesn't matter.
+
+- **A bound** (`lower`/`upper`) is `{0: id (32 bytes), 1: scope (uint)}`.
+- **Limits:** at most 64 ranges per reconcile message, at most 32 entries
+  per explicit list, and at most 32 entries echoed per response. A receiver
+  rejects a reconcile frame with more than 64 ranges, and ignores entries
+  beyond the per-range limit.
 
 - **A range** is `{0: lower bound, 1: upper bound, 2: [count, sum]}` or
   `{0: lower, 1: upper, 3: [[id, scope, seq], …]}` (an explicit list,
@@ -457,6 +462,8 @@ The local API is how any application, MIRA or otherwise, uses Lattice.
 
 - **Unix domain sockets** carrying length-prefixed CBOR frames. They are
   never exposed to the network.
+- **Framing:** each frame is a 4-byte big-endian length prefix followed by
+  that many bytes of CBOR. The payload may not exceed 65536 bytes.
 - **Two sockets:**
   - **The application socket** is readable and writable by a configured
     group.
@@ -488,6 +495,24 @@ The local API is how any application, MIRA or otherwise, uses Lattice.
 | `inbox` | Count of unfetched deliveries |
 | `status` | mid and its new status |
 
+Operation, event and error codes are part of the wire contract:
+
+| Op | Code | | Event | Code | | Error | Code |
+|---|---|---|---|---|---|---|---|
+| `hello` | 1 | | `inbox` | 1 | | unknown op | 1 |
+| `send` | 2 | | `status` | 2 | | bad args | 2 |
+| `status` | 3 | | | | | auth failed | 3 |
+| `fetch` | 4 | | | | | not found | 4 |
+| `ack` | 5 | | | | | | |
+| `lookup` | 6 | | | | | | |
+| `node` | 101 | | | | | | |
+| `rotate` | 102 | | | | | | |
+| `abandon` | 103 | | | | | | |
+| `rotate_envelope` | 104 | | | | | | |
+| `link` | 105 | | | | | | |
+| `unlink` | 106 | | | | | | |
+| `drain` | 107 | | | | | | |
+
 **Delivery semantics:**
 - **Lattice to the application is at least once.** A delivery stays in the
   inbox until acknowledged, and is re-fetched after a crash. Applications
@@ -496,6 +521,11 @@ The local API is how any application, MIRA or otherwise, uses Lattice.
   message.** The receipt is sent at that point. Whether the application read
   it, accepted it or acted on it is application-level and goes in its own
   messages (design principle 1).
+- **A receipt is authoritative only from the message's recipient.** The
+  recipient's signature is verified as usual, and the signer must be the
+  `to` of the original message; anything else is discarded.
+- **Terminal states are sticky.** `delivered`, `failed` and `expired` are
+  final; a late receipt never moves a message out of a terminal state.
 - **A negative receipt is sent only for things Lattice itself knows:** no
   such service on this instance (reason 1), or a message that fails
   verification (reason 2). Lattice has no concept of users; mailboxes are

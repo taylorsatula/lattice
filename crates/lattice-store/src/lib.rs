@@ -132,6 +132,8 @@ pub trait Store {
         commitment: [u8; 32],
         seen: u64,
     ) -> Result<(), StoreError>;
+    /// Drop KEL heads last seen before `older_than`. Returns how many were removed.
+    fn kel_head_sweep(&mut self, older_than: u64) -> Result<usize, StoreError>;
 
     // saved peer addresses, kept beyond record expiry
     fn peer_save(&mut self, id: &[u8; 32], address: &str) -> Result<(), StoreError>;
@@ -139,6 +141,7 @@ pub trait Store {
 
     // outbound queue
     fn outbound_push(&mut self, msg: &OutboundMessage) -> Result<(), StoreError>;
+    fn outbound_remove(&mut self, mid: &[u8; 16]) -> Result<(), StoreError>;
     fn outbound_get(&self, mid: &[u8; 16]) -> Result<Option<OutboundMessage>, StoreError>;
     fn outbound_put(&mut self, msg: &OutboundMessage) -> Result<(), StoreError>;
     fn outbound_due(&self, now: u64) -> Result<Vec<OutboundMessage>, StoreError>;
@@ -151,6 +154,8 @@ pub trait Store {
     fn custody_remove(&mut self, leg: &[u8; 16]) -> Result<Option<CustodyEntry>, StoreError>;
     fn custody_all(&self) -> Result<Vec<CustodyEntry>, StoreError>;
     fn custody_bytes(&self) -> Result<u64, StoreError>;
+    /// Bytes held per buffer class (index = class, 0 = closest to destination).
+    fn custody_class_bytes(&self) -> Result<[u64; 16], StoreError>;
 
     // fair-share accounting per (destination, upstream link)
     fn share_add(&mut self, dest: &[u8; 32], upstream: u64, bytes: i64) -> Result<u64, StoreError>;

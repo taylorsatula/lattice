@@ -188,7 +188,10 @@ fn fair_share_caps_a_flooded_upstream() {
     // With the R->D link down, R sees two upstreams; per-upstream share is
     // allowance/2. F floods, H sends two. F may fill its own share only.
     cfg.custody_allowance = 13000;
-    cfg.transit_cap = 100_000;
+    // Per-class slice is transit_cap / 16; keep it well above the combined
+    // fair shares (2 × 6500) so the class cap does not bind and the
+    // fair-share mechanism is what the test observes.
+    cfg.transit_cap = 16 * 20_000;
     let mut sim = Sim::new(cfg);
     let f = sim.add_node();
     let r = sim.add_node();
@@ -589,5 +592,86 @@ fn queued_message_survives_receipt_timeout_and_delivers() {
     assert!(
         sim.deliveries.iter().any(|d| d.mid == mid),
         "message queued past its original receipt deadline must still deliver"
+    );
+}
+
+#[test]
+fn buffer_class_isolates_full_classes() {
+    // A—B—C—D line. B holds transit custody toward D (class 2) and toward C
+    // (class 1). With a per-class cap that fits exactly one message, a
+    // second class-2 message must be refused while a class-1 message is
+    // still accepted.
+    let mut cfg = fast_config();
+    // Per-class slice = transit_cap / 16. A wire message is ~1.5 KB
+    // (KEM ciphertext dominates), so one fits in 2000 and two do not.
+    cfg.transit_cap = 16 * 2000;
+    let mut sim = Sim::new(cfg);
+    let a = sim.add_node();
+    let b = sim.add_node();
+    let c = sim.add_node();
+    let d = sim.add_node();
+    sim.connect(a, b);
+    sim.connect(b, c);
+    sim.connect(c, d);
+    // C is draining: B cannot hand off, so B holds what it accepts.
+    sim.nodes[c].set_draining(true);
+    // Wait until A has a route to D (records gossip through B).
+    let d_id = sim.ids[d];
+    for _ in 0..30 {
+        if sim.nodes[a].has_path(&d_id) {
+            break;
+        }
+        sim.run_for(1);
+    }
+    assert!(sim.nodes[a].has_path(&d_id), "A never learned a path to D");
+
+    let body = vec![7u8; 64];
+    let send = |sim: &mut Sim, to: usize, tag: u8| {
+        let to_id = sim.ids[to];
+        sim.force_app_send(
+            a,
+            lattice_core::AppSend {
+                service: "test".into(),
+                mid_hint: Some([tag; 16]),
+                to: to_id,
+                tsvc: "test".into(),
+                tmbx: b"inbox".to_vec(),
+                fmbx: b"outbox".to_vec(),
+                body: body.clone(),
+                exp: None,
+                priority: 1,
+                route: 0,
+            },
+        );
+    };
+
+    // msg1: A -> D. B is 2 hops from D, so B holds it in class 2.
+    send(&mut sim, d, 0xD1);
+    sim.run_for(4);
+    let classes = sim.nodes[b].debug_custody_classes();
+    assert_eq!(
+        classes,
+        vec![2],
+        "B should hold one class-2 message, got {classes:?}"
+    );
+
+    // msg2: A -> D again. Class 2 is now full at B; the offer must be refused.
+    send(&mut sim, d, 0xD2);
+    sim.run_for(4);
+    let classes = sim.nodes[b].debug_custody_classes();
+    assert_eq!(
+        classes.iter().filter(|&&c| c == 2).count(),
+        1,
+        "second class-2 message must be refused, got {classes:?}"
+    );
+
+    // msg3: A -> C. B is 1 hop from C, so this is class 1 — a different
+    // class, which must still be accepted even though class 2 is full.
+    send(&mut sim, c, 0xC1);
+    sim.run_for(4);
+    let classes = sim.nodes[b].debug_custody_classes();
+    assert!(
+        classes.contains(&1),
+        "class-1 message must be accepted while class 2 is full, got {classes:?}"
     );
 }

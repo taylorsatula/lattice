@@ -109,6 +109,7 @@ pub struct Node<S: Store> {
     /// claims the link's channel key; more than one fails closed.
     ck_claims: HashMap<[u8; 32], std::collections::HashSet<[u8; 32]>>,
     next_claim_sweep_at: u64,
+    next_data_sweep_at: u64,
     contested: u64,
 }
 
@@ -152,6 +153,7 @@ impl<S: Store> Node<S> {
             equivocations: 0,
             ck_claims: HashMap::new(),
             next_claim_sweep_at: now + CLAIM_SWEEP_SECS,
+            next_data_sweep_at: now + DATA_SWEEP_SECS,
             contested: 0,
         };
         // Seed the claim set from records already in the store so links can be
@@ -483,6 +485,43 @@ impl<S: Store> Node<S> {
         }
     }
 
+    /// Retention sweep: drop records and terminal outbound messages past
+    /// expiry + grace, and KEL heads not seen for a year. Records are the
+    /// only unbounded growth left in the store; everything else already
+    /// expires (seen/delivered/wary) or is capped (inbox, custody).
+    fn sweep_expired_data(&mut self, now: u64) {
+        if let Ok(records) = self.store.record_all() {
+            for (id, scope, bytes, _) in records {
+                if id == self.own_id {
+                    continue;
+                }
+                // Parse with now = 0 so expired-but-present records still
+                // decode; anything undecodable is useless and goes too.
+                let expired = match PeerRecord::from_bytes(&bytes, 0, None) {
+                    Ok((rec, _)) => rec.exp.saturating_add(RETENTION_GRACE_SECS) < now,
+                    Err(_) => true,
+                };
+                if expired {
+                    let _ = self.store.record_remove(&id, scope);
+                }
+            }
+        }
+        if let Ok(all) = self.store.outbound_all() {
+            for msg in all {
+                let terminal = matches!(
+                    msg.state,
+                    OutboundState::Delivered | OutboundState::Failed | OutboundState::Expired
+                );
+                if terminal && msg.exp.saturating_add(RETENTION_GRACE_SECS) < now {
+                    let _ = self.store.outbound_remove(&msg.mid);
+                }
+            }
+        }
+        let _ = self
+            .store
+            .kel_head_sweep(now.saturating_sub(KEL_HEAD_MAX_AGE_SECS));
+    }
+
     /// Fold a record's (channel_key, id) claim into the claim set.
     fn note_ck_claim(&mut self, rec: &PeerRecord) {
         self.ck_claims
@@ -598,6 +637,12 @@ enum DispatchResult {
 const CUSTODY_TIMEOUT_SECS: u64 = 30;
 const CLAIM_SWEEP_SECS: u64 = 60;
 const MAX_PENDING_ECHOES: usize = 256;
+/// How often the retention sweep runs.
+const DATA_SWEEP_SECS: u64 = 3600;
+/// Grace period past a record's/message's expiry before it is purged.
+const RETENTION_GRACE_SECS: u64 = 7 * 24 * 3600;
+/// KEL heads not seen for this long are dropped (spec: one year).
+const KEL_HEAD_MAX_AGE_SECS: u64 = 365 * 24 * 3600;
 const BUF_CLASSES: usize = 16;
 
 impl<S: Store> Node<S> {
@@ -992,7 +1037,12 @@ impl<S: Store> Node<S> {
             actions.push(self.busy(link, leg));
             return actions;
         }
-        if self.store.custody_bytes().unwrap_or(0) + msg_len > self.config.transit_cap {
+        // Merlin-Schweitzer buffer classes: each class gets an equal slice
+        // of the transit cap, so a flood in one class cannot starve the
+        // others and waits can't form a cycle (a class-d message only ever
+        // waits on class < d room at the next hop).
+        let class_bytes = self.store.custody_class_bytes().unwrap_or([0; 16]);
+        if class_bytes[class as usize] + msg_len > self.config.transit_cap / BUF_CLASSES as u64 {
             actions.push(self.busy(link, leg));
             return actions;
         }
@@ -1079,7 +1129,10 @@ impl<S: Store> Node<S> {
                         actions.push(self.busy(link, leg));
                         return actions;
                     }
-                    if self.store.custody_bytes().unwrap_or(0) + msg_len > self.config.transit_cap {
+                    let class_bytes = self.store.custody_class_bytes().unwrap_or([0; 16]);
+                    if class_bytes[class as usize] + msg_len
+                        > self.config.transit_cap / BUF_CLASSES as u64
+                    {
                         actions.push(self.busy(link, leg));
                         return actions;
                     }
@@ -1125,7 +1178,10 @@ impl<S: Store> Node<S> {
                         actions.push(self.busy(link, leg));
                         return actions;
                     }
-                    if self.store.custody_bytes().unwrap_or(0) + msg_len > self.config.transit_cap {
+                    let class_bytes = self.store.custody_class_bytes().unwrap_or([0; 16]);
+                    if class_bytes[class as usize] + msg_len
+                        > self.config.transit_cap / BUF_CLASSES as u64
+                    {
                         actions.push(self.busy(link, leg));
                         return actions;
                     }
@@ -1666,6 +1722,11 @@ impl<S: Store> Node<S> {
             self.next_claim_sweep_at = now + CLAIM_SWEEP_SECS;
         }
 
+        if now >= self.next_data_sweep_at {
+            self.sweep_expired_data(now);
+            self.next_data_sweep_at = now + DATA_SWEEP_SECS;
+        }
+
         // Expire originated messages.
         if let Ok(all) = self.store.outbound_all() {
             for mut msg in all {
@@ -1766,7 +1827,10 @@ impl<S: Store> Node<S> {
         }
 
         // Custody entries with nothing in flight get a forwarding attempt.
-        if let Ok(all) = self.store.custody_all() {
+        // Lower classes first: messages closer to their destination drain
+        // first, which is what keeps the class partition deadlock-free.
+        if let Ok(mut all) = self.store.custody_all() {
+            all.sort_by_key(|e| e.class);
             for entry in all {
                 let offer_leg = lattice_proto::Message::parse(&entry.message, now)
                     .map(|m| m.header.leg)
@@ -1986,6 +2050,14 @@ impl<S: Store> Node<S> {
     #[doc(hidden)]
     pub fn debug_custody_count(&self) -> usize {
         self.store.custody_all().map(|v| v.len()).unwrap_or(0)
+    }
+
+    #[doc(hidden)]
+    pub fn debug_custody_classes(&self) -> Vec<u8> {
+        self.store
+            .custody_all()
+            .map(|v| v.into_iter().map(|e| e.class).collect())
+            .unwrap_or_default()
     }
 
     #[doc(hidden)]

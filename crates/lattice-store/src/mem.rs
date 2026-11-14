@@ -19,6 +19,7 @@ pub struct MemStore {
     wary: HashMap<[u8; 32], Vec<(u64, u64)>>, // id -> [(source_range, exp)]
     buckets: [u64; 3],
     custody_bytes: u64,
+    custody_class_bytes: [u64; 16],
     drain: bool,
 }
 
@@ -86,6 +87,11 @@ impl Store for MemStore {
         self.kel_heads.insert(*id, (seq, commitment, seen));
         Ok(())
     }
+    fn kel_head_sweep(&mut self, older_than: u64) -> Result<usize, StoreError> {
+        let before = self.kel_heads.len();
+        self.kel_heads.retain(|_, (_, _, seen)| *seen >= older_than);
+        Ok(before - self.kel_heads.len())
+    }
 
     fn peer_save(&mut self, id: &[u8; 32], address: &str) -> Result<(), StoreError> {
         self.saved_peers.insert(*id, address.to_string());
@@ -101,6 +107,10 @@ impl Store for MemStore {
 
     fn outbound_push(&mut self, msg: &OutboundMessage) -> Result<(), StoreError> {
         self.outbound.insert(msg.mid, msg.clone());
+        Ok(())
+    }
+    fn outbound_remove(&mut self, mid: &[u8; 16]) -> Result<(), StoreError> {
+        self.outbound.remove(mid);
         Ok(())
     }
     fn outbound_get(&self, mid: &[u8; 16]) -> Result<Option<OutboundMessage>, StoreError> {
@@ -144,10 +154,15 @@ impl Store for MemStore {
     }
     fn custody_put(&mut self, entry: CustodyEntry) -> Result<(), StoreError> {
         let new_len = entry.message.len() as u64;
+        let new_class = entry.class.min(15) as usize;
         if let Some(old) = self.custody.insert(entry.leg, entry) {
             self.custody_bytes = self.custody_bytes.saturating_sub(old.message.len() as u64);
+            let old_class = old.class.min(15) as usize;
+            self.custody_class_bytes[old_class] =
+                self.custody_class_bytes[old_class].saturating_sub(old.message.len() as u64);
         }
         self.custody_bytes += new_len;
+        self.custody_class_bytes[new_class] += new_len;
         Ok(())
     }
     fn custody_get(&self, leg: &[u8; 16]) -> Result<Option<CustodyEntry>, StoreError> {
@@ -157,6 +172,9 @@ impl Store for MemStore {
         let removed = self.custody.remove(leg);
         if let Some(e) = &removed {
             self.custody_bytes = self.custody_bytes.saturating_sub(e.message.len() as u64);
+            let class = e.class.min(15) as usize;
+            self.custody_class_bytes[class] =
+                self.custody_class_bytes[class].saturating_sub(e.message.len() as u64);
         }
         Ok(removed)
     }
@@ -165,6 +183,9 @@ impl Store for MemStore {
     }
     fn custody_bytes(&self) -> Result<u64, StoreError> {
         Ok(self.custody_bytes)
+    }
+    fn custody_class_bytes(&self) -> Result<[u64; 16], StoreError> {
+        Ok(self.custody_class_bytes)
     }
 
     fn share_add(&mut self, dest: &[u8; 32], upstream: u64, bytes: i64) -> Result<u64, StoreError> {

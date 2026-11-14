@@ -311,3 +311,66 @@ fn crash_kill_preserves_committed_custody() {
         );
     }
 }
+
+#[test]
+fn custody_class_bytes_track_accept_and_remove() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut s = RedbStore::open(tmp.path().join("class.redb")).unwrap();
+
+    let mk = |leg_byte: u8, class: u8, len: usize| CustodyEntry {
+        leg: [leg_byte; 16],
+        message: vec![7u8; len],
+        upstream: 1,
+        destination: [9; 32],
+        class,
+        exp: u64::MAX / 2,
+        excluded: vec![],
+    };
+
+    s.custody_accept(lattice_store::CustodyAccept {
+        entry: mk(1, 3, 100),
+        share_dest: [9; 32],
+        share_upstream: 1,
+        share_bytes: 100,
+        seen_hash: [1; 32],
+        seen_exp: u64::MAX / 2,
+    })
+    .unwrap();
+    s.custody_accept(lattice_store::CustodyAccept {
+        entry: mk(2, 3, 250),
+        share_dest: [9; 32],
+        share_upstream: 1,
+        share_bytes: 250,
+        seen_hash: [2; 32],
+        seen_exp: u64::MAX / 2,
+    })
+    .unwrap();
+    s.custody_accept(lattice_store::CustodyAccept {
+        entry: mk(3, 7, 40),
+        share_dest: [9; 32],
+        share_upstream: 1,
+        share_bytes: 40,
+        seen_hash: [3; 32],
+        seen_exp: u64::MAX / 2,
+    })
+    .unwrap();
+
+    let classes = s.custody_class_bytes().unwrap();
+    assert_eq!(classes[3], 350);
+    assert_eq!(classes[7], 40);
+    assert_eq!(classes[0], 0);
+    assert_eq!(s.custody_bytes().unwrap(), 390);
+
+    s.custody_remove(&[1; 16]).unwrap();
+    let classes = s.custody_class_bytes().unwrap();
+    assert_eq!(classes[3], 250);
+    assert_eq!(s.custody_bytes().unwrap(), 290);
+
+    // Reopen: counters must be rebuilt from the table, not lost.
+    drop(s);
+    let s = RedbStore::open(tmp.path().join("class.redb")).unwrap();
+    let classes = s.custody_class_bytes().unwrap();
+    assert_eq!(classes[3], 250);
+    assert_eq!(classes[7], 40);
+    assert_eq!(s.custody_bytes().unwrap(), 290);
+}
