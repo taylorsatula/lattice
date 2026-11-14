@@ -31,3 +31,7 @@ build/
 .pi/subagent-schedules/
 fuzz/corpus/
 fuzz/artifacts/
+fuzz/target/
+
+# scratch
+HANDOFF.md

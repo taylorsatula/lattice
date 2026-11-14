@@ -6,7 +6,7 @@ gates, and the points where the agent stops and asks. It is not a substitute
 for `V2_PLAN.md`; where the two disagree, `V2_PLAN.md` wins on protocol and
 this file wins on process.
 
-Status: approved; Phase 0 executed locally (workspace, CI rewrite, `v1-final` verified); GitHub-side CI pending the operator's push. No other phase started.
+Status: Phases 0–5 are implemented locally on `main` (phase tags: Phase 0 `c9aa169` → Phase 4 `6c24519`, Phase 5 `4d676a1`). The full suite, e2e two-node delivery test, clippy, fmt and `cargo deny` pass locally; GitHub-side CI has not run (nothing has been pushed). Phases 6 (Python client) and 7 (release/soak) are not started. Gate details and known gaps (attestation fix, six-node gate, snow buffer-class deadlock-freedom) are tracked in the commit log and in the Phase 5 commit message.
 
 ## Readiness assessment
 

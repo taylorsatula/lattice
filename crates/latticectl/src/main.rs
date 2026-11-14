@@ -9,6 +9,8 @@
 //!                              dial a peer (key = channel key for IK, path = upgrade path for XX)
 //!   unlink <id-hex>            drop and demote all links to this peer
 
+#![forbid(unsafe_code)]
+
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 

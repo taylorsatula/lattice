@@ -1,5 +1,7 @@
 # latticed — lattice node daemon.
-# Install: cp latticed /usr/local/bin/ (or /usr/bin), cp lattice.example.toml /etc/lattice/lattice.toml,
+# Install: cargo build --release && install -Dm755 target/release/latticed /usr/local/bin/latticed
+# install -Dm644 deploy/latticed.service /etc/systemd/system/latticed.service
+# install -Dm600 deploy/lattice.example.toml /etc/lattice/lattice.toml
 # systemctl daemon-reload && systemctl enable --now latticed
 [Unit]
 Description=Lattice node daemon
@@ -29,7 +31,7 @@ RuntimeDirectoryMode=0750
 # LoadCredential=envelope_seed:/etc/lattice/keys/envelope_seed
 # LoadCredential=next_signing_seed:/etc/lattice/keys/next_signing_seed
 
-ExecStart=/usr/bin/latticed run --config /etc/lattice/lattice.toml
+ExecStart=/usr/local/bin/latticed run --config /etc/lattice/lattice.toml
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=15

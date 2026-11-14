@@ -8,6 +8,8 @@
 //! credentials when $CREDENTIALS_DIRECTORY is set). The daemon refuses to
 //! start if key self-tests fail.
 
+#![forbid(unsafe_code)]
+
 mod api;
 mod config;
 mod keys;

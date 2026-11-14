@@ -30,10 +30,14 @@ Lattice is a key-anchored mesh for cross-node messaging. There is no DNS depende
 | `old/lattice-c1-RESUME.md` | Resume note for the abandoned Python effort; historical. |
 | `LICENSE`, `.github/`, `.gitignore`, `.kata.toml`, `.pi/` | License, CI (Rust: fmt/clippy/test/msrv/deny/geiger/forbid-unsafe), ignore rules, tooling config. |
 | `Cargo.toml`, `crates/` | The v2 Rust workspace: virtual manifest at the root, nine member crates under `crates/`, each with `#![forbid(unsafe_code)]`. Laid out in `V2_PLAN.md`. |
+| `vectors/` | CBOR/signature regression anchors and X-Wing KATs; self-generated, see `vectors/README.md`. |
+| `fuzz/` | cargo-fuzz targets for parsers/decoders; not in the workspace. |
+| `deploy/` | systemd unit (`latticed.service`) and annotated example config (`lattice.example.toml`). |
+| `README.md` | Operator quickstart; mirrors `deploy/`. |
 
 ## Mandatory checks before changing code
 
-Until `lattice-core` has behavior, the workspace is scaffolding; the checks already apply: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, `cargo deny check`, and a `cargo geiger` report per crate (CI runs all of these). MSRV is 1.87 (`rust-version` and the msrv CI job). From Phase 2 on, the simulator invariant suite joins these.
+All phases through Phase 5 are on `main` locally. The checks: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --all-targets --locked`, `cargo deny check`, and a `cargo geiger` report per crate (advisory). MSRV is 1.87 (`rust-version` and the msrv CI job; never bump it casually — `ctutils` ≥0.4.4 forces ≥1.87, and redb stays on 2.6.4 because redb 3.x requires 1.89). The simulator invariant suite lives in `lattice-sim`; the loopback end-to-end test is `crates/latticed/tests/e2e.rs`.
 
 - If you change `V2_SPEC.md` objects, keep `V2_PLAN.md` phase exits and the test-vector plan consistent with it.
 - If you change `V2_DESIGN.md` decisions, check `V2_SPEC.md` for dependent spec text in the same edit.
@@ -55,3 +59,4 @@ When asked to make a change, first restate the invariants that apply, then expla
 
 - `docs/AGENTS.md` still presents the v1 documents as normative; it is stale.
 - GitHub has not run the new CI yet; local runs of every step pass. Push is the operator's call.
+- The packaged `latticed` runs as root under the shipped unit; move to a dedicated user when packaging adds one.

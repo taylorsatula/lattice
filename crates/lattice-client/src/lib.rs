@@ -8,6 +8,8 @@
 //! [`Client::call`] stashes them and they can be drained with
 //! [`Client::take_events`] or awaited with [`Client::next_event`].
 
+#![forbid(unsafe_code)]
+
 use std::collections::VecDeque;
 use std::fmt;
 use std::path::Path;

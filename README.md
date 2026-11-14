@@ -1,6 +1,6 @@
 # lattice
 
-Lattice is a DNS-bootstrapped, key-anchored flat mesh for cross-server messaging.
+Lattice is a key-anchored, flat mesh for cross-server messaging.
 A human address such as `mikey@other.network` resolves to a canonical
 `user@lat_…` identity, and messages travel directly between nodes. Bootstrap
 nodes introduce peers but never relay traffic.
@@ -27,7 +27,7 @@ the protocol.
 | `crates/latticectl` | Admin CLI (`node`, `drain`, `link`, `unlink`) |
 | `vectors/` | CBOR/signature test vectors (self-generated; see `vectors/README.md`) |
 | `deploy/` | systemd unit and example configuration |
-| `docs/` | Design documents (start with `V2_DESIGN.md`) |
+| repo root | Design documents (`V2_DESIGN.md` first, then `V2_SPEC.md`, `V2_PLAN.md`) |
 
 ## Build and test
 
@@ -42,10 +42,13 @@ MSRV is 1.87. CI runs fmt, clippy (`-D warnings`), tests, `cargo deny` and a
 ## Running a node
 
 ```sh
+cargo build --release
+sudo install -Dm755 target/release/latticed /usr/local/bin/latticed
+sudo install -Dm644 deploy/latticed.service /etc/systemd/system/latticed.service
 sudo latticed init --dir /var/lib/lattice        # generates keys; prints node id
-sudo install -m 600 deploy/lattice.example.toml /etc/lattice/lattice.toml
+sudo install -Dm600 deploy/lattice.example.toml /etc/lattice/lattice.toml
 sudo $EDITOR /etc/lattice/lattice.toml           # set services, listen, roots
-sudo systemctl enable --now latticed             # unit in deploy/latticed.service
+sudo systemctl daemon-reload && sudo systemctl enable --now latticed
 ```
 
 Applications talk to the node over the local API (length-prefixed CBOR over a
