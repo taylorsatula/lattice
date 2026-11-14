@@ -24,6 +24,7 @@ the protocol.
 | `crates/lattice-net` | WebSocket transport, Noise IK/XX, cookie anti-DoS, sizing caps |
 | `crates/latticed` | The daemon (`init`, `run`) |
 | `crates/lattice-client` | Rust client for the local API |
+| `clients/python` | Python client for the local API (+ hook-in guide) |
 | `crates/latticectl` | Admin CLI (`node`, `drain`, `link`, `unlink`) |
 | `vectors/` | CBOR/signature test vectors (self-generated; see `vectors/README.md`) |
 | `deploy/` | systemd unit and example configuration |
@@ -53,8 +54,9 @@ sudo systemctl daemon-reload && sudo systemctl enable --now latticed
 ```
 
 Applications talk to the node over the local API (length-prefixed CBOR over a
-Unix socket, see `V2_SPEC.md` §7) using `lattice-client` or their own
-implementation. Administration goes through `latticectl` on the admin socket.
+Unix socket, see `V2_SPEC.md` §7) using `lattice-client` (Rust),
+`clients/python` (Python), or their own implementation. Administration goes
+through `latticectl` on the admin socket.
 
 ### Local sockets and access
 
