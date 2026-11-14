@@ -40,51 +40,75 @@ as little as possible to the nodes it passes through.
    any particular network product. Lattice routes messages across whatever
    graph of links exists, so instances with no direct path still reach each
    other through intermediates.
-7. **Don't foreclose non-IP transports.** Objects stay small and
-   self-proving, and nothing depends on a synchronous round trip, so a
-   radio mesh such as Meshtastic remains possible later without designing
-   for it now.
+7. **Don't foreclose non-IP transports.** Objects stay self-proving, and
+   nothing depends on a synchronous round trip, so a radio mesh such as
+   Meshtastic remains possible later without designing for it now.
 8. **Reveal and retain as little as possible.** A node learns only what it
    needs in order to do its job, and keeps it only as long as it needs it.
    Lattice is not an anonymity network (§7), but nothing is published,
    exposed to hops or stored without a reason.
+9. **Identifiers, not names.** Lattice deals only in full cryptographic
+   identifiers. Human-readable naming belongs to the application's address
+   book.
 
-## 1. Identity
+## 1. Identity and cryptography
 
-- **Keys:** Ed25519 for signing, X25519 for encryption.
-- **Pre-rotation (from KERI).** Every key state includes a hash of the
-  *next* key, committed to before it's needed. A rotation is signed by that
-  pre-committed key, and it commits to the hash of the key after that.
-  Someone who steals the current key can sign messages but can't rotate,
-  because the owner's rotation with the committed key always wins.
-- **Abandonment** is a rotation with no next-key commitment. This one
-  mechanism replaces both v1's key rotation and its "cyanide pill."
+### Primitives
+
+| Purpose | Primitive |
+|---|---|
+| Signatures (identity, records, envelopes, receipts) | Ed25519 |
+| Channel (Noise static key) | X25519 |
+| End-to-end encryption (envelope, gateway layer) | Hybrid X25519 + ML-KEM-768 (FIPS 203) |
+| Symmetric encryption | ChaCha20-Poly1305 |
+| Hashes, identifiers, commitments | BLAKE3, full 256 bits, never truncated |
+
+- **Ed25519's 128-bit security level is the current standard** for
+  signatures. Strength against quantum attacks on signatures comes from
+  pre-rotation (below), not from longer curve keys.
+- **The hybrid KEM defends against "harvest now, decrypt later":** recording
+  encrypted messages today to break them with a future quantum computer.
+  Breaking an envelope requires breaking both X25519 and ML-KEM-768. This
+  is the same approach OpenSSH, Signal and Apple's iMessage have adopted.
+- **Each key has exactly one purpose.** The channel key is never used for
+  envelopes, and the signing key is never used for encryption.
+
+### Pre-rotation (from KERI)
+
+- **Every key state publishes the hash of the *next* signing key,**
+  committed to before it's needed. A rotation is signed by that
+  pre-committed key, reveals it, and publishes the hash of the key after
+  that.
+- **Theft can't hijack the identity.** Someone who steals the current key
+  can sign messages but can't rotate, because the owner's rotation with the
+  committed key always wins.
+- **Quantum recovery.** The next key exists publicly only as a hash, which a
+  quantum computer can't invert. If Ed25519 is ever broken, owners can
+  still rotate safely to a post-quantum signature scheme. The KERI
+  specification describes this explicitly.
+- **Abandonment** (the cyanide pill) is a rotation with no next-key
+  commitment. This one mechanism replaces both v1's key rotation and its
+  separate revocation.
 - **The next private key is stored separately from the running daemon.**
   If the current and next keys are both stolen, recovery isn't possible.
-- **Identifier:** the hash of the instance's first key event (initial key
-  plus the first next-key commitment). It stays the same across rotations
-  and replaces v1's separate UUID.
+- **The channel and envelope keys** are listed in the peer record and signed
+  by the current signing key. They change by publishing a new record (§2);
+  pre-rotation guards the signing key, which is the identity's authority.
+
+### Identifier and addresses
+
+- **Identifier:** the BLAKE3 hash of the instance's first key event (the
+  initial signing key plus the first next-key commitment). It stays the
+  same across rotations and replaces v1's separate UUID.
 - **Key event log:** the inception event plus any rotations. It is short,
   append-only and self-verifying.
-
-### Names
-
-- **Readable for display, key underneath** (a petname system). An instance
-  may claim a display name in its signed record. The claim is optional and
-  is never registered or checked network-wide.
-- **A local name table on each instance** maps names to identifiers the
-  first time it sees them, like SSH's `known_hosts`.
-- **Collisions are shown, never silently resolved.** The first identifier
-  an instance saw keeps the plain name; any later one is displayed with a
-  short fingerprint suffix (`rocketcity#k7f3`). A name is never silently
-  rebound to a different key.
-- **Address format:** `user@name`, or `user@name#suffix` when shared out of
-  band, so the recipient pins the correct identity on first contact. An
-  instance that publishes no display name is reachable only by an address
-  shared this way.
-- **Envelopes, replies and contact lists use identifiers.** Names are
-  resolved only at the edges: when a user types an address and when the app
-  displays one. Renames don't break contacts.
+- **Address format:** `user@<identifier>`, with the identifier written as
+  base32, about 52 characters. Addresses are exchanged by copy-paste or QR
+  code, never typed.
+- **No names on the network.** Lattice publishes no display names and keeps
+  no name table. An application establishes a link using the full address
+  and maps its own short name (`west`) to the identifier in its address
+  book. Lattice's local API accepts identifiers only.
 - **Users are the instance's business.** Lattice authenticates instances;
   each instance vouches for its own users, as in email.
 
@@ -100,14 +124,14 @@ refreshes its own. An instance is either **public** or **private**:
 | Field | Present for | Purpose |
 |---|---|---|
 | identifier | All | Stable identity (§1) |
-| current key + key event log | All | Verifies the signature and the rotation history |
+| signing key + key event log | All | Verifies the signature and the rotation history |
 | seq | All | Monotonic; the highest seq for an identifier wins |
-| encryption key | All | X25519 key that messages to this instance are encrypted to |
+| channel key | All | X25519 static key for the Noise handshake |
+| envelope keys | All | X25519 and ML-KEM-768 public keys that messages to this instance are encrypted to |
 | expiry | All | Signed coarse expiry, on the order of days |
-| signature | All | By the current key, over the exact encoded bytes |
-| display name | Optional | Petname claim |
+| signature | All | By the current signing key, over the exact encoded bytes |
 | endpoints | Public | Addresses, each tagged with a scope (hive or WAN) |
-| links | Public | Identifiers this instance has recently proven direct reachability to (capped, about 32) |
+| links | Public | Identifiers this instance is currently linked to (capped, about 32) |
 | gateways | Private | One to three identifiers that accept messages for this instance (§7) |
 | capabilities / protocol version | All | Feature flags and negotiation |
 
@@ -116,7 +140,8 @@ refreshes its own. An instance is either **public** or **private**:
 - **Soft state.** The owner refreshes the record before it expires. A
   record that isn't refreshed fades out everywhere, so no cleanup jobs or
   liveness logic are needed.
-- **Size capped,** on the order of 1 KB.
+- **Size capped** at about 3 KB. The ML-KEM-768 public key alone is about
+  1.2 KB.
 - **Equivocation proof.** Two different records signed by the same key with
   the same seq prove misbehavior or a stolen key. Anyone can verify this
   from the two records alone.
@@ -128,32 +153,42 @@ refreshes its own. An instance is either **public** or **private**:
   replaces v1's fixed SSRF blocklist.
 - **Prove an endpoint before using it.** An endpoint counts as reachable
   only after a handshake at that address proves the far end holds the
-  record's key. That stops anyone using the mesh to aim traffic at a victim.
-- **Links come from proven handshakes.** An instance lists another as a
-  link only after a recent successful handshake with it, and drops the link
-  when it goes stale.
-- **The encryption key** is part of the signed record, so it changes the
-  way everything else in the record does: a new record with a higher seq.
+  record's channel key. That stops anyone using the mesh to aim traffic at a
+  victim.
+- **A link is a live authenticated connection** (§3). An instance lists
+  another as a link while it holds a connection to it, and drops it when
+  the connection goes stale.
 
 ## 3. Transport
 
-- **Channels authenticated by the two instances' keys,** in the style of
-  Noise, WireGuard or SSB's Secret Handshake. There are no certificate
+- **Noise inside a WebSocket.** The WebSocket gets through reverse proxies,
+  Cloudflare Tunnel and plain TCP alike. The Noise channel inside
+  authenticates both instances by key, so there are no certificate
   authorities and no dependence on DNS for trust. Each node always knows
   which neighbor handed it traffic.
-- **WireGuard-style cookies under load.** Normally the handshake proceeds as
-  usual. Under load the server keeps no state and answers with a cookie
-  derived from the sender's address and a rotating secret. The sender must
-  echo it back before the server spends any resources. It costs honest
-  peers one extra round trip, only during an attack. There is no
-  proof-of-work.
+- **Handshake patterns:**
+  - **IK** when the initiator already holds the responder's record, which is
+    the usual case. It takes one round trip and hides the initiator's
+    identity from passive observers.
+  - **XX** for a root given without an identifier, where no key is known in
+    advance.
+- **WireGuard-style cookies under load,** sent before the Noise handshake.
+  Normally the handshake proceeds as usual. Under load the server keeps no
+  state and answers with a cookie derived from the client's address and a
+  rotating secret. The client must echo it back before the server spends
+  any resources. It costs honest peers one extra round trip, only during an
+  attack. There is no proof-of-work.
+- **Connections are long-lived and bounded.** Each instance holds
+  authenticated connections to a bounded set of neighbors (about 8 to 32).
+  Those connections are its links, and they carry gossip, routing traffic
+  and custody alike.
 - **Every protocol object is self-proving.** Peer records are signed
   publicly. Messages are authenticated end to end inside their encryption
   (§6). Either way, objects stay independent of the transport that carries
   them.
-- **Two layers of encryption.** The channel is encrypted hop by hop. Each
-  message's content is also encrypted end to end, to the recipient's
-  encryption key, so intermediate nodes never see it.
+- **Two layers of encryption.** The Noise channel is encrypted hop by hop.
+  Each message's content is also encrypted end to end with the hybrid KEM,
+  so intermediate nodes never see it.
 
 ## 4. Bootstrap and discovery
 
@@ -162,10 +197,11 @@ The layers, tried in order:
 1. **Saved peers** from previous runs. A node that has ever been connected
    never needs its root again.
 2. **A configured root or roots.** Any instance can be any other instance's
-   root. A root is given as an address with an optional fingerprint.
-   - Without a fingerprint, the first contact is trusted on first use.
-   - With a fingerprint, the root's identity is verified.
-   - A missing fingerprint is allowed but logged as a warning.
+   root. A root is given as an address with an optional identifier.
+   - Without an identifier, the first contact is trusted on first use, using
+     the XX handshake.
+   - With an identifier, the root's identity is verified, using IK.
+   - A missing identifier is allowed but logged as a warning.
 3. **Multicast discovery on the hive.** On a LAN, members find each other
    with no configuration.
 
@@ -194,7 +230,7 @@ merges them.
   - A few anchor peers are persisted across restarts.
   - A peer is tested before being evicted.
 - **Relay only what you would accept.**
-- **Per-peer push limits** on unsolicited records.
+- **Per-neighbor push limits** on unsolicited records.
 
 ## 6. Routing and delivery
 
@@ -220,8 +256,8 @@ designated relays and no per-message flooding.
 | Part | Readable by | Contents |
 |---|---|---|
 | Routing header | Every hop | Message id, routing destination (the recipient, or a gateway of a private recipient), expiry |
-| Gateway layer | That gateway only (encrypted to its key) | The private recipient's identifier. Present only for private recipients |
-| Envelope | Recipient only (encrypted to its key) | Sender identifier and user, recipient user, content, metadata, created time, a copy of the header fields, and the sender instance's signature over all of it |
+| Gateway layer | That gateway only (hybrid-encrypted to its envelope keys) | The private recipient's identifier. Present only for private recipients |
+| Envelope | Recipient only (hybrid-encrypted to its envelope keys) | Sender identifier and user, recipient user, content, metadata, created time, a copy of the header fields, and the sender's signature over all of it |
 | Padding | Nobody | Fills the message to its size bucket (§7) |
 
 - **Immutable end to end.** The sender builds the whole message, and nothing
@@ -234,6 +270,9 @@ designated relays and no per-message flooding.
   message is well formed, fits a size bucket and hasn't expired. Whether it
   takes custody is then decided by fair-share custody for the link the
   message arrived on (step 3 below).
+- **Overhead.** Each hybrid-encrypted layer carries about 1.1 KB of KEM
+  ciphertext, so the smallest size bucket is at least 2 KB (more for
+  messages to private instances, which carry two encrypted layers).
 
 ### Forwarding
 
@@ -326,7 +365,7 @@ that limit, it minimizes what any node can learn or keep.
 3. **Only the public backbone is published.** Endpoints and links come only
    from public instances. Hive-scoped data never leaves the hive (§2).
 4. **Size buckets.** Every message, receipts included, is padded to one of a
-   few fixed sizes (for example 1, 4 and 16 KB), so size doesn't
+   few fixed sizes (for example 2, 8 and 32 KB), so size doesn't
    distinguish messages.
 5. **Random per-hop delay.** Each hop holds a message for a small random
    time before forwarding, a few seconds by default and set per server.
@@ -338,14 +377,14 @@ that limit, it minimizes what any node can learn or keep.
    message and keeps only a hash of its id for dedup. By default nothing
    logs senders or destinations per message, so a seized or compromised
    server reveals little.
-8. **Optional display names.** An instance shared only by
-   address-with-suffix doesn't need to announce a name to the whole mesh.
+8. **No names on the network.** Records carry no display names (§1), so the
+   mesh learns nothing about what an instance calls itself.
 
 ### Who learns what
 
 | Party | Learns | Does not learn |
 |---|---|---|
-| Any node, from gossip | The public backbone, which identities exist, which gateways private instances use | Private instances' locations, hive-internal links |
+| Any node, from gossip | The public backbone, which identities exist, which gateways private instances use | Private instances' locations, hive-internal links, any names |
 | A hop relaying a message | The neighbor it came from, the neighbor it goes to, the routing destination, its size bucket, a rough time | The sender, the content, the full path |
 | A gateway | The above, plus which of its private instances the message is for | The sender, the content |
 | The recipient | The sender instance and user, the content | The path |
@@ -361,6 +400,15 @@ that limit, it minimizes what any node can learn or keep.
   choose their own gateways, usually within their hive.
 - **The set of identities is public** within the mesh, though not their
   locations.
+- **Envelopes have no forward secrecy.** They are encrypted to the
+  recipient's published envelope keys, so whoever later steals those private
+  keys can decrypt recorded envelopes sent to them. Rotating envelope keys
+  regularly (a new record with a higher seq, deleting the old private keys)
+  limits how much a single theft exposes.
+- **Routing headers are protected only classically.** The hybrid KEM
+  protects envelope content. The Noise channel uses X25519 alone, so a
+  future quantum adversary that recorded traffic could recover routing
+  headers, but not content or senders.
 
 ## 8. Abuse resistance and the immune system
 
@@ -454,44 +502,63 @@ principle).
 - **The only timestamps are coarse signed expiries,** on peer records and
   messages, measured in days. Clocks only need to be right to within hours.
 
-## 10. Operations (carried forward from v1)
+## 10. Implementation and operations
+
+### Implementation
+
+- **Rust, with `unsafe` forbidden.** Every Lattice crate declares
+  `#![forbid(unsafe_code)]`, enforced in CI.
+- **Dependencies:** that rule covers Lattice's own code, not its
+  dependencies, so dependencies are chosen deliberately:
+  - Prefer pure-Rust crates.
+  - Audit what is pulled in.
+  - Track the remaining `unsafe` with `cargo-geiger`.
+- **Async runtime:** Tokio, with no blocking calls on async tasks.
+- **Storage:** redb, a pure-Rust ACID embedded database, in a single file.
+  It keeps C code out of the stack.
+- **A simulated mesh is built first.** A test harness runs many nodes in one
+  process over in-memory links and injects partitions, dropped and slow
+  links, crashes during custody, and lying or dropping nodes. Every protocol
+  rule is verified there before the real daemon depends on it.
+
+### Operations (carried forward from v1)
 
 - **The daemon runs its own timers.** No external scheduler calls admin
   endpoints.
 - **Secrets** come from systemd credentials (encrypted when available), then
   from files with mode 0600/0700. Never from environment variables.
-- **The private key file is created with mode 0600** from the start.
+- **Private key files are created with mode 0600** from the start.
 - **A hardened systemd unit:** dedicated user, `ProtectSystem=strict`,
   minimal writable paths, resource limits, a single process owning all
   state.
-- **SQLite** in a single file, with an idempotent schema and additive
-  migrations.
-- **Public vs. local control plane.** Admin access requires a token,
-  compared in constant time and failing closed. Exposure behind a reverse
-  proxy is deny-by-default.
-- **Bounded inputs:** caps on request body and field sizes, and timeouts on
-  every outbound call.
-- **A minimal public status endpoint** and a detailed admin health endpoint.
+- **Local control plane.** The application talks to Lattice over a local
+  interface that is never exposed to the network. Admin access fails
+  closed.
+- **Bounded inputs:** caps on frame and field sizes, and timeouts on every
+  network operation.
 - **No per-message logging of senders or destinations by default** (§7).
-- **Lattice doesn't own users.** The application maps users and receives
-  messages.
+- **Lattice doesn't own users.** The application maps users, keeps the
+  address book, and receives messages.
 
 ## 11. Removed from v1
 
 | v1 | v2 |
 |---|---|
+| Python, FastAPI, SQLite | Rust with `unsafe` forbidden, Tokio, redb |
+| HTTPS JSON endpoints | Noise channel inside a WebSocket |
 | Server UUID + name + key | Identifier derived from key events |
-| RSA-2048, fingerprint of PEM text | Ed25519, fingerprint of key bytes |
+| RSA-2048, fingerprint of PEM text, truncated fingerprints | Ed25519, hybrid X25519 + ML-KEM-768, full 256-bit BLAKE3 |
 | Signing re-serialized JSON | Signing the exact encoded bytes |
-| Network-wide name registration, confidence scores | Local petname table |
+| Network-wide name registration, confidence scores | No names on the network; the application's address book |
 | Domain queries, route cache, hop counts, confidence decay | Full-membership gossip; link-state routing over it |
 | Direct delivery to the recipient's endpoint only | Hop-by-hop forwarding with custody across the mesh |
-| Plaintext content; sender visible to the receiving daemon's path | Content and sender encrypted end to end; hops see neither |
+| Plaintext content; sender visible along the way | Content and sender encrypted end to end; hops see neither |
 | Every server's endpoints published | Endpoints published only by public instances |
 | Admission only via pinned bootstrap | Any valid record from any peer; root as introducer |
-| Mandatory bootstrap pins | Optional fingerprint, trust on first use otherwise |
+| Mandatory bootstrap pins | Optional identifier, trust on first use otherwise |
 | Peer exchange defined but unused | Anti-entropy is the core mechanism |
 | Trust levels (`trusted`/`untrusted`/…) | Local policy + immune system |
+| Per-peer rate limits and circuit breakers | Fair-share custody |
 | Signed delivery acks from the receiving server | Custody per hop + end-to-end receipt from the recipient |
 | Separate key rotation and cyanide pill | Pre-rotation; abandonment is a rotation |
 | Tiered peer aging, cleanup jobs | Soft-state expiry |
@@ -502,35 +569,36 @@ principle).
 
 ## 12. Open questions
 
-- **Wire transport:** HTTP(S) carrying the objects, or a Noise-style channel
-  over TCP or UDP. This determines how the handshake and cookie mechanism
-  are built.
-- **Encoding:** deterministic CBOR or another canonical binary encoding, or
-  signing raw payload bytes inside a simple envelope.
-- **Handoff to the application:** whether the app pulls from Lattice's
-  inbox or Lattice pushes to a webhook. This determines when the recipient
-  learns a user is unknown and sends its negative receipt.
-- **Hive configuration:** how an operator declares hive networks, and which
-  multicast discovery mechanism to use (mDNS or a minimal custom
-  announcement).
+- **Encoding:** deterministic CBOR (RFC 8949 §4.2) or plain length-prefixed
+  binary fields. Either way the exact bytes are signed, and every object
+  carries a version field.
+- **Object schemas:** exact layouts for the key event log, the public and
+  private peer record, the message, the receipt and the gossip exchange.
+- **The application interface:** a local socket offering send, inbox fetch
+  and acknowledge, with the application pulling from Lattice's inbox. Also
+  whether to add an optional push notification. This determines when the
+  recipient learns a user is unknown and sends its negative receipt.
+- **Configuration surface:** roots, hive networks, public or private,
+  endpoints to advertise, gateways, limit overrides.
+- **Hive multicast discovery:** mDNS or a minimal custom announcement.
 - **Parameters:** record and message expiry, gossip cadence, the
   per-destination custody allowance, the transit storage cap, push caps,
-  rate limits, the *k* threshold for the wary rule, wary list size.
+  rate limits, the *k* threshold for the wary rule, wary list size, neighbor
+  count.
 - **Keeping the next key offline in practice:** where it lives and how a
   rotation is performed.
-- **Protocol versioning and capability negotiation.**
+- **Envelope key rotation cadence,** which limits exposure from the lack of
+  forward secrecy.
+- **Post-quantum protection for the channel:** whether to add a hybrid KEM to
+  the Noise handshake later, so routing headers are covered too.
 - **Routing details:**
   - The path metric: hop count, or something weighted by link quality.
-  - How often links are re-proven and when a stale link is dropped.
   - The receipt timeout and how many disjoint-path retries to make.
   - Whether a sender may send over two disjoint paths at once for
     high-priority messages.
-- **End-to-end encryption scheme:** a sealed-box construction to X25519, or
-  a ratcheting session between instances that talk often. The first is
-  simpler and doesn't need a round trip.
 - **Privacy details:**
-  - The size buckets, and whether messages larger than the largest bucket
-    are split or refused.
+  - The exact size buckets. Messages larger than the largest bucket are
+    refused in v2.0; attachments come later.
   - The default per-hop delay range.
   - How a private instance chooses its gateways, how many it lists, and what
     a private instance with no hive uses as a gateway.
@@ -545,13 +613,15 @@ principle).
 - Saltzer, Reed & Clark, "End-to-End Arguments in System Design," ACM TOCS 1984.
 - Douceur, "The Sybil Attack," IPTPS 2002.
 - Demers et al., "Epidemic Algorithms for Replicated Database Maintenance," PODC 1987.
+- Demers, Keshav & Shenker, "Analysis and Simulation of a Fair Queueing Algorithm," SIGCOMM 1989.
 - Meyer, "Range-Based Set Reconciliation," arXiv:2212.13567.
 - Heilman, Kendler, Zohar & Goldberg, "Eclipse Attacks on Bitcoin's Peer-to-Peer Network," USENIX Security 2015.
 - Bortnikov et al., "Brahms: Byzantine Resilient Random Membership Sampling," PODC 2008.
-- Smith, "Key Event Receipt Infrastructure (KERI)," arXiv:1907.02143.
+- Smith, "Key Event Receipt Infrastructure (KERI)," arXiv:1907.02143; Trust over IP KERI specification v1.1 (pre-rotation, quantum attack recovery).
+- NIST FIPS 203, "Module-Lattice-Based Key-Encapsulation Mechanism Standard" (ML-KEM), 2024.
+- Perrin, "The Noise Protocol Framework."
 - Tarr, Lavoie, Meyer & Tschudin, "Secure Scuttlebutt," ACM ICN 2019.
 - Fall, "A Delay-Tolerant Network Architecture for Challenged Internets," SIGCOMM 2003.
-- Demers, Keshav & Shenker, "Analysis and Simulation of a Fair Queueing Algorithm," SIGCOMM 1989.
 - Perlman, "Network Layer Protocols with Byzantine Robustness," MIT PhD thesis, 1988 (MIT-LCS-TR-429).
 - Moy, "OSPF Version 2," RFC 2328, 1998.
 - Kleinberg, "Geographic Routing Using Hyperbolic Space," INFOCOM 2007.
@@ -562,5 +632,4 @@ principle).
 - BitTorrent BEP 5 (DHT), BEP 9 (metadata exchange), BEP 11 (PEX), BEP 14 (LSD), BEP 44 (mutable items).
 - Donenfeld, "WireGuard: Next Generation Kernel Network Tunnel," NDSS 2017 (cookie mechanism).
 - Laurie & Clayton, "Proof-of-Work Proves Not to Work," WEIS 2004.
-- Stiegler, "An Introduction to Petname Systems," 2005.
 - Nesse, "The Smoke-Detector Principle," Annals of the NY Academy of Sciences, 2001.
