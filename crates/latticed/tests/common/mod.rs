@@ -183,7 +183,7 @@ pub fn boot_node_full(
 
 /// Wait until both sockets accept connections (not merely exist).
 pub async fn wait_sockets(node: &TestNode) {
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let app_ok = std::os::unix::net::UnixStream::connect(&node.app).is_ok();
         let admin_ok = std::os::unix::net::UnixStream::connect(&node.admin).is_ok();

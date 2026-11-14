@@ -30,6 +30,7 @@ Lattice is a key-anchored mesh for cross-node messaging. There is no DNS depende
 | `old/lattice-c1-RESUME.md` | Resume note for the abandoned Python effort; historical. |
 | `LICENSE`, `.github/`, `.gitignore`, `.kata.toml`, `.pi/` | License, CI (Rust: fmt/clippy/test/msrv/deny/geiger/workspace-lints), ignore rules, tooling config. |
 | `Cargo.toml`, `crates/` | The v2 Rust workspace: virtual manifest at the root, nine member crates under `crates/`, each with `#![forbid(unsafe_code)]`. Laid out in `V2_PLAN.md`. |
+| `clients/python/` | Python client for the local API (`lattice-client`): framing, hello, send/status/fetch/ack/lookup, events, admin ops. Passes `vectors/`; has an integration test against a live daemon. |
 | `vectors/` | CBOR/signature regression anchors and X-Wing KATs; self-generated, see `vectors/README.md`. |
 | `fuzz/` | cargo-fuzz targets for parsers/decoders; not in the workspace. |
 | `deploy/` | systemd unit (`latticed.service`) and annotated example config (`lattice.example.toml`). |
@@ -37,7 +38,7 @@ Lattice is a key-anchored mesh for cross-node messaging. There is no DNS depende
 
 ## Mandatory checks before changing code
 
-All phases through Phase 5 are on `main` locally. The checks: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --all-targets --locked`, `cargo deny check`, and a `cargo geiger` report per crate (advisory). MSRV is 1.87 (`rust-version` and the msrv CI job; never bump it casually — `ctutils` ≥0.4.4 forces ≥1.87, and redb stays on 2.6.4 because redb 3.x requires 1.89). The simulator invariant suite lives in `lattice-sim`; the loopback end-to-end test is `crates/latticed/tests/e2e.rs`.
+All phases through Phase 6 are on `main` locally. The checks: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --all-targets --locked`, `cargo deny check`, and a `cargo geiger` report per crate (advisory). MSRV is 1.87 (`rust-version` and the msrv CI job; never bump it casually — `ctutils` ≥0.4.4 forces ≥1.87, and redb stays on 2.6.4 because redb 3.x requires 1.89). The simulator invariant suite lives in `lattice-sim`; the loopback end-to-end tests are `crates/latticed/tests/e2e.rs` and the six-node gate `crates/latticed/tests/six_node.rs`. The Python client has its own suite under `clients/python/tests/` (vectors + live-daemon integration).
 
 - If you change `V2_SPEC.md` objects, keep `V2_PLAN.md` phase exits and the test-vector plan consistent with it.
 - If you change `V2_DESIGN.md` decisions, check `V2_SPEC.md` for dependent spec text in the same edit.
@@ -58,5 +59,6 @@ When asked to make a change, first restate the invariants that apply, then expla
 ## Pending items
 
 - `docs/AGENTS.md` still presents the v1 documents as normative; it is stale.
+- Phase 7 (release/soak/runbook) is not started; `v2.0.0` is untagged.
 - GitHub has not run the new CI yet; local runs of every step pass. Push is the operator's call.
 - The packaged `latticed` runs as root under the shipped unit; move to a dedicated user when packaging adds one.

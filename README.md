@@ -8,9 +8,9 @@ nodes introduce peers but never relay traffic.
 This repository is the v2 rewrite (Rust). The v1 Python implementation lives
 under `old/` for reference only.
 
-**Status: in progress — Phase 5 (daemon, local API, CLI).** Not ready for
-production use. See `V2_PLAN.md` for the full roadmap and `V2_SPEC.md` for
-the protocol.
+**Status: Phases 0–6 complete (through the Python client); Phase 7
+(release/soak) not started.** Not ready for production use. See `V2_PLAN.md`
+for the full roadmap and `V2_SPEC.md` for the protocol.
 
 ## Layout
 

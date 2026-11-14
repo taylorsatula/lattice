@@ -6,7 +6,7 @@ gates, and the points where the agent stops and asks. It is not a substitute
 for `V2_PLAN.md`; where the two disagree, `V2_PLAN.md` wins on protocol and
 this file wins on process.
 
-Status: Phases 0–5 are implemented locally on `main` (Phase 0 `c9aa169` → Phase 4 `6c24519`, Phase 5 `4d676a1`, plus the 2026-11-14 review-sweep fixes `c39069f`, `733d4a8`, `ba66051`). The full suite, the two-node e2e, clippy (`-D warnings`), fmt, and `cargo deny check` pass locally; GitHub-side CI has not run (nothing has been pushed). Phase 5's gate — the six-node scenario — is NOT met; what exists is a two-node loopback e2e and a redb-backed simulator suite. Phases 6 (Python client) and 7 (release/soak) are not started. A full-repo review (six passes, 2026-11-14) produced a fix list; the mechanical items are done (see git log), the design-level items (wss vs ws, rotation feature set, six-node gate scope, handshake attestation, buffer classes, fair-share accounting, `lease_until`, record/claim expiry, spec back-ports, status monotonicity winner, resolver policy, connection-limit numbers, drain-on-restart semantics) are pending operator decisions.
+Status: Phases 0–6 are implemented locally on `main` (Phase 0 `c9aa169` → Phase 4 `6c24519`, Phase 5 `4d676a1`, the 2026-11-14 review-sweep fixes `c39069f`, `733d4a8`, `ba66051`, the operator-ruling work `83119d8`…`b75830c`, the gateway→private delivery fix `1f388c3`, the six-node gate `49fb0e2`, and the Phase 6 Python client `71929d9`). The full suite, the two-node e2e, the six-node gate, the Python vector + integration suites, clippy (`-D warnings`), fmt, and `cargo deny check` pass locally; GitHub-side CI has not run (nothing has been pushed). Phase 5's gate — the six-node scenario — IS met (`crates/latticed/tests/six_node.rs`). Phase 6 is complete (Python client in `clients/python/`, vectors pass, integration test green). Phase 7 (release/soak) is not started.
 
 ## Readiness assessment
 
@@ -156,8 +156,28 @@ soak with churn and injected faults; external crypto and dependency review;
   ~14,300 accepts/s group-committed (~58x). The production path uses one
   transaction per accept (custody + share + dedup marker), which is the
   durability requirement; group commit remains available for bulk load.
-- 2026-11-14 — Phase 5 gate (six-node scenario) is NOT met. What exists is
-  the two-node loopback e2e. Do not describe Phase 5 as gated.
+- 2026-11-14 — Phase 5 gate (six-node scenario) is MET. `crates/latticed/tests/six_node.rs`
+  boots six real daemons on loopback — a hive (h1–h3), a WAN node, and a
+  private instance behind a gateway — and drives applications through the
+  local API throughout: WAN→private delivery through the gateway and back,
+  hive-internal delivery, a SIGKILL partition that heals (queued message
+  delivered after restart), a mid-run signing-key rotation, and a drain
+  (new custody refused, delivered after un-drain). The gate surfaced a real
+  defect: gateway→private delivery was impossible (the gateway forwarded
+  the message with the gateway layer attached, and the routing graph could
+  not reach a private instance, which publishes no links). Fixed in
+  `1f388c3` (gateway strips the layer; the graph gains a private↔gateway
+  pseudo-edge; the recipient recognizes a gateway-forwarded message by its
+  envelope). The daemon also gained `reconcile_interval_secs` in `[limits]`
+  (was hardcoded 60s) so gossip converges fast enough for the gate.
+- 2026-11-14 — Phase 6 complete. `clients/python/`: a synchronous Python
+  client for the local API (framing, hello, send/status/fetch/ack/lookup,
+  events, admin ops), the shared vectors pass (`tests/test_vectors.py`,
+  including a single-byte-flip rejection sweep), an integration test boots
+  two daemons and drives the full roundtrip (`tests/test_integration.py`),
+  and `clients/python/README.md` is the hook-in guide (services, mailboxes,
+  opaque payloads, at-least-once + mid dedup, what "delivered" means).
+  MIRA can be hooked in without changes to Lattice.
 
 ## Parameter defaults
 

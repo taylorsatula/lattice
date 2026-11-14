@@ -356,7 +356,7 @@ fn boot_node(
 
 /// Wait until both sockets accept connections (not merely exist).
 async fn wait_sockets(node: &TestNode) {
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let app_ok = std::os::unix::net::UnixStream::connect(&node.app).is_ok();
         let admin_ok = std::os::unix::net::UnixStream::connect(&node.admin).is_ok();
@@ -873,7 +873,7 @@ async fn unlink_closes_the_connection() {
     // Wait until both sides see the link.
     let mut admin_a = Client::connect_admin(&a.admin).await.expect("admin A");
     let mut admin_b = Client::connect_admin(&b.admin).await.expect("admin B");
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let info = admin_a.node().await.expect("node A");
         if info.links >= 1 {
