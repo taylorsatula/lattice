@@ -179,6 +179,23 @@ async fn cmd_run(args: &[String]) -> std::process::ExitCode {
     ));
     let cfg = Arc::new(cfg);
 
+    // Install signal handlers before binding any socket, so SIGTERM/SIGINT
+    // at any point after startup is caught and drains before exit.
+    #[cfg(unix)]
+    let shutdown = async {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+        let mut int = signal(SignalKind::interrupt()).expect("install SIGINT handler");
+        tokio::select! {
+            _ = term.recv() => {},
+            _ = int.recv() => {},
+        }
+    };
+    #[cfg(not(unix))]
+    let shutdown = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+
     // Inbound listener: accept connections, hand peers to the runtime.
     let (peer_tx, peer_rx) = tokio::sync::mpsc::unbounded_channel::<lattice_net::PeerIo>();
     for addr in &cfg.listen {
@@ -256,6 +273,6 @@ async fn cmd_run(args: &[String]) -> std::process::ExitCode {
         }
     });
 
-    runtime.run().await;
+    runtime.run(shutdown).await;
     std::process::ExitCode::SUCCESS
 }

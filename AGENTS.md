@@ -28,7 +28,7 @@ Lattice is a key-anchored mesh for cross-node messaging. There is no DNS depende
 | `docs/` | v1-era normative docs (`PROTOCOL.md`, `THREAT_MODEL.md`, ...). Superseded by the V2 documents; read only for historical behavior. `docs/AGENTS.md` still presents them as normative and is stale. |
 | `old/` | The pre-v2 Python tree as it stood at the move (largely the unmerged Python v2 rewrite; its tests and packaging moved with it). Not built, not maintained, not a base for new work. Frozen at commit `d652a8f`. |
 | `old/lattice-c1-RESUME.md` | Resume note for the abandoned Python effort; historical. |
-| `LICENSE`, `.github/`, `.gitignore`, `.kata.toml`, `.pi/` | License, CI (Rust: fmt/clippy/test/msrv/deny/geiger/forbid-unsafe), ignore rules, tooling config. |
+| `LICENSE`, `.github/`, `.gitignore`, `.kata.toml`, `.pi/` | License, CI (Rust: fmt/clippy/test/msrv/deny/geiger/workspace-lints), ignore rules, tooling config. |
 | `Cargo.toml`, `crates/` | The v2 Rust workspace: virtual manifest at the root, nine member crates under `crates/`, each with `#![forbid(unsafe_code)]`. Laid out in `V2_PLAN.md`. |
 | `vectors/` | CBOR/signature regression anchors and X-Wing KATs; self-generated, see `vectors/README.md`. |
 | `fuzz/` | cargo-fuzz targets for parsers/decoders; not in the workspace. |

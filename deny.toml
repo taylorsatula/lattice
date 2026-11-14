@@ -1,5 +1,6 @@
 [advisories]
 version = 2
+yanked = "deny"
 
 [licenses]
 version = 2
@@ -9,6 +10,8 @@ allow = [
     "Apache-2.0 WITH LLVM-exception",
     "BSD-3-Clause",
     "CC0-1.0",
+    # ISC: required by ring (Apache-2.0 AND ISC), pulled in via snow's
+    # default `std` feature; snow's crypto itself is pure Rust.
     "ISC",
     "Unicode-3.0",
 ]

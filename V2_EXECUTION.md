@@ -6,23 +6,25 @@ gates, and the points where the agent stops and asks. It is not a substitute
 for `V2_PLAN.md`; where the two disagree, `V2_PLAN.md` wins on protocol and
 this file wins on process.
 
-Status: Phases 0–5 are implemented locally on `main` (phase tags: Phase 0 `c9aa169` → Phase 4 `6c24519`, Phase 5 `4d676a1`). The full suite, e2e two-node delivery test, clippy, fmt and `cargo deny` pass locally; GitHub-side CI has not run (nothing has been pushed). Phases 6 (Python client) and 7 (release/soak) are not started. Gate details and known gaps (attestation fix, six-node gate, snow buffer-class deadlock-freedom) are tracked in the commit log and in the Phase 5 commit message.
+Status: Phases 0–5 are implemented locally on `main` (Phase 0 `c9aa169` → Phase 4 `6c24519`, Phase 5 `4d676a1`, plus the 2026-11-14 review-sweep fixes `c39069f`, `733d4a8`, `ba66051`). The full suite, the two-node e2e, clippy (`-D warnings`), fmt, and `cargo deny check` pass locally; GitHub-side CI has not run (nothing has been pushed). Phase 5's gate — the six-node scenario — is NOT met; what exists is a two-node loopback e2e and a redb-backed simulator suite. Phases 6 (Python client) and 7 (release/soak) are not started. A full-repo review (six passes, 2026-11-14) produced a fix list; the mechanical items are done (see git log), the design-level items (wss vs ws, rotation feature set, six-node gate scope, handshake attestation, buffer classes, fair-share accounting, `lease_until`, record/claim expiry, spec back-ports, status monotonicity winner, resolver policy, connection-limit numbers, drain-on-restart semantics) are pending operator decisions.
 
 ## Readiness assessment
 
 Environment, verified 2026-11 (this machine):
 
-- Rust 1.98.1 stable (aarch64-apple-darwin), rustup present, `cargo` on PATH.
-- crates.io sparse index reachable; crate file downloads reachable (sampled).
-  The crates.io web API is not reachable from here (403) — irrelevant to
-  building, relevant to anything that scrapes it.
-- Not installed: `cargo-deny`, `cargo-geiger`, `cargo-fuzz`, `cargo-nextest`.
-  All are installable with `cargo install`; Phase 0 installs them.
+- Rust 1.98.1 stable (aarch64-apple-darwin); MSRV is 1.87 (`rust-version`,
+  the `msrv` CI job, and the pinned fmt/clippy jobs). `cargo +1.87.0 fmt`
+  and `cargo +1.87.0 clippy --all-targets --locked` both pass.
+- `cargo-deny` 0.20.2 and `cargo-geiger` 0.14.0 are installed; `cargo deny
+  check` passes (advisories, bans, licenses, sources, yanked).
+- `cargo-fuzz` is installed; the fuzz targets have not been run in this
+  environment and are not wired into CI.
 - `git` identity configured; work happens on `main` (repo has no PR flow yet).
-- The root was docs only; the workspace now lives at the root with `crates/` members; `old/` is frozen.
-- `.github/workflows/` ran the retired Python layout; replaced in Phase 0.
-  Local equivalents of every CI step pass; GitHub has not seen a run yet.
-- `v1-final` tag not yet created.
+- The workspace lives at the root with `crates/` members; `old/` is frozen.
+- `.github/workflows/ci.yml` runs fmt, clippy, tests (+ doc tests), an MSRV
+  check, a workspace-lints check, `cargo deny`, and a `cargo geiger` report.
+  GitHub has not run it yet; everything passes locally.
+- `v1-final` tag exists.
 
 Honest scope statement. This is a multi-month program of work executed by
 one agent across many sessions, not a single run. It is executable exactly
@@ -132,6 +134,30 @@ from soak; operator docs (including what Lattice cannot hide: who you connect
 to, host fingerprints); immune system if not finished in Phase 2; multi-day
 soak with churn and injected faults; external crypto and dependency review;
 `v2.0.0` tag.
+
+## Verification log
+
+- 2026-11-14 — Full local gate green: `cargo fmt --check`, `cargo clippy
+  --workspace --all-targets --locked -- -D warnings` (also on 1.87.0),
+  `cargo test --workspace --all-targets --locked` (30 suites), `cargo deny
+  check` (advisories/bans/licenses/sources/yanked), e2e two-node delivery
+  (`crates/latticed/tests/e2e.rs`, incl. drain, kill -9 recovery, per-service
+  event scoping). GitHub CI has not run.
+- 2026-11-14 — Phase 3 gate items: the simulator invariant suite also runs
+  against redb (`crates/lattice-sim/tests/sim_redb.rs`, 6 scenarios: gossip
+  convergence, end-to-end delivery, partition/heal, crash-during-custody,
+  duplicate-mid suppression, contested-claim unbinding). Crash-consistency:
+  a child process SIGKILLed mid-accept leaves a store that opens, with every
+  journaled accept present, `custody_bytes` equal to the sum of surviving
+  rows, share counters consistent, and a dedup marker per row
+  (`crates/lattice-store/tests/redb.rs::crash_kill_preserves_committed_custody`).
+  Group-commit bench (`cargo run --release -p lattice-store --example
+  group_commit`, this machine): ~245 accepts/s one-transaction-each vs
+  ~14,300 accepts/s group-committed (~58x). The production path uses one
+  transaction per accept (custody + share + dedup marker), which is the
+  durability requirement; group commit remains available for bulk load.
+- 2026-11-14 — Phase 5 gate (six-node scenario) is NOT met. What exists is
+  the two-node loopback e2e. Do not describe Phase 5 as gated.
 
 ## Parameter defaults
 

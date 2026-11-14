@@ -36,8 +36,9 @@ cargo build --workspace
 cargo test --workspace
 ```
 
-MSRV is 1.87. CI runs fmt, clippy (`-D warnings`), tests, `cargo deny` and a
-`forbid(unsafe_code)` check.
+MSRV is 1.87. CI runs fmt and clippy (`-D warnings`, both pinned to 1.87.0),
+tests (including doc tests), an MSRV check, `cargo deny`, and a check that
+every crate opts into the workspace `unsafe_code = "forbid"` lint.
 
 ## Running a node
 

@@ -285,25 +285,11 @@ impl Runtime {
         eprintln!("lattice: draining (refusing new custody); exiting");
     }
 
-    pub async fn run(mut self) {
+    pub async fn run(mut self, shutdown: impl std::future::Future<Output = ()>) {
         let mut link_rx = self.link_rx.take().expect("run once");
         let mut api_rx = self.api_rx.take().expect("run once");
         let mut peer_rx = self.peer_rx.take().expect("run once");
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
-        #[cfg(unix)]
-        let shutdown = async {
-            use tokio::signal::unix::{SignalKind, signal};
-            let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
-            let mut int = signal(SignalKind::interrupt()).expect("install SIGINT handler");
-            tokio::select! {
-                _ = term.recv() => {},
-                _ = int.recv() => {},
-            }
-        };
-        #[cfg(not(unix))]
-        let shutdown = async {
-            let _ = tokio::signal::ctrl_c().await;
-        };
         tokio::pin!(shutdown);
         loop {
             tokio::select! {
