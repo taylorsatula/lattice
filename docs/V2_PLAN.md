@@ -181,12 +181,11 @@ invariants passing:
    - the transit storage cap
    - per-service inbox caps
    - drain
-7. **Send schedule and cover:**
-   - one Poisson schedule per node, with the rate set from the floor and
-     the long-window average plus headroom
-   - real frames replacing dummies
-   - dummy sizes drawn from the recent real mix
-   - a separate hive floor
+7. **Snow:**
+   - immediate dispatch of real frames, with the optional hold
+   - Poisson snow ticks per node, skipped when real traffic went out
+   - dummy sizes from the recent real mix with per-bucket minimums
+   - echoes that mimic request and reply
 8. **Private instances and gateways.**
 9. **Key lifecycle across the mesh:**
    - spreading rotations and abandonments
@@ -204,13 +203,18 @@ invariants passing:
 - **No silent loss:** a message is either delivered or reported failed or
   expired to its sender. If a path exists for long enough before expiry, it
   is delivered.
-- **Cover hides timing:** within one averaging window, the stream of frame
-  times and sizes an outside observer sees on a node's uplink is
-  statistically indistinguishable (by a two-sample test) between runs where
-  the node sends real messages and runs where it doesn't.
-- **Cover cost:** an idle node's sent bytes stay within its floor budget,
-  and a node whose real traffic exceeds the floor sends only headroom-level
-  dummies.
+- **Snow hides activity below the snow level:** for traffic below a node's
+  snow level, the frame rate and size distribution an outside observer sees
+  on the node's uplink are statistically indistinguishable (by a two-sample
+  test) between runs where the node sends real messages and runs where it
+  doesn't.
+- **Dummies don't stand out by reply pattern:** the share of frames answered
+  within a short interval is the same for real and dummy frames, within a
+  set tolerance.
+- **Snow cost:** an idle node's sent bytes stay within its snow budget, and a
+  node whose real traffic exceeds its snow level sends almost no snow.
+- **Quick dispatch:** with hold at 0, the delay snow adds to a real frame is
+  negligible.
 - **Custody is durable:** no node answers `accepted` for a message it would
   lose in a crash.
 - **Flood containment:** under a flood from one attached node, delivery rate
@@ -266,10 +270,14 @@ subset on redb.
    is public.
 8. **Status endpoint** on the same listener, with its flag, and the generic
    404 for anything else.
-9. **Frame padding and the send schedule on real sockets:**
-   - every post-handshake frame padded to a frame bucket
+9. **Padding, snow and probe resistance on real sockets:**
+   - every frame padded to a bucket, handshake frames included
    - no WebSocket control frames
-   - socket writes driven only by the core's send schedule
+   - snow and the optional hold driven by the core
+   - the upgrade path derived from the channel key, with a generic 404 for
+     anything else
+   - endpoint IP addresses preferred over hostnames, with encrypted DNS
+     (DoH or DoT) and caching when a lookup is needed
 10. Plumb all of this into the core's events and actions.
 
 **Exit:**
@@ -280,6 +288,8 @@ subset on redb.
   keeps serving existing links.
 - A WAN record whose hostname resolves to a private address is never
   connected to.
+- A scanner without the record gets only generic 404s, and the status
+  endpoint disappears when disabled.
 
 ## Phase 5: Daemon, local API and CLI
 
@@ -298,7 +308,9 @@ subset on redb.
   | `gateways` | For private mode |
   | `services` | Name and secret for each application |
   | `status` | Public status endpoint on or off (default on) |
-  | `cover` | Floor, averaging window, headroom, hive floor |
+  | `snow` | Snow level, echo share, hold |
+  | `hive_interfaces` | Interfaces where multicast discovery runs; none by default |
+  | `dns` | Encrypted resolver to use when a hostname must be resolved |
   | `limits` | Overrides for the defaults below |
 
 - **Startup:** load secrets (systemd credentials first, then files with mode
@@ -333,9 +345,12 @@ MIRA can be hooked in without changes to Lattice.
 
 ## Phase 7: Remaining features and release
 
-- Hive multicast discovery.
-- Cover defaults confirmed from the soak test: idle cost per node, busy-node
-  dummy fraction, and added latency per hop.
+- Hive multicast discovery, only on configured hive interfaces.
+- Snow defaults confirmed from the soak test: idle cost per node and the
+  dummy share on busy nodes.
+- **Operator documentation on what Lattice can't hide:** who a node connects
+  to (use WARP, Tailscale or similar if that matters), and host-level
+  fingerprints such as TCP timestamps.
 - The immune system, if it wasn't finished in Phase 2.
 - **Soak test:** the real mesh runs for days with churn and injected faults,
   watching memory, storage growth and delivery rates.
@@ -361,8 +376,9 @@ from the soak test.
 | Custody allowance per destination | 4 MB |
 | Transit storage cap | 256 MB |
 | Inbox cap per service | 64 MB |
-| Cover floor / hive floor | One frame per 15 s / one per 2 s |
-| Cover averaging window / headroom | 6 hours / 25% |
+| Snow level | 2 frames per minute per node |
+| Echo share / bucket minimum | 25% / 10% each |
+| Hold | 0 ms (immediate dispatch) |
 | Wary rule *k* / wary list size | 3 / 32 |
 | Size buckets | 2, 8, 32 KB |
 

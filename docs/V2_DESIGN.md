@@ -159,6 +159,10 @@ An instance is either **public** or **private**:
   never over the WAN. Private and overlay addresses (RFC 1918,
   100.64.0.0/10 and similar) arriving over the WAN are dropped. This
   replaces v1's fixed SSRF blocklist.
+- **IP addresses are preferred to hostnames.** An endpoint may list IP
+  addresses alongside its URL, and connecting nodes use them when present,
+  so no DNS lookup reveals which peer is being contacted. When a lookup is
+  unavoidable it uses encrypted DNS (DoH or DoT) and is cached.
 - **The scope rule is applied to resolved addresses at connect time.** A
   hostname in a WAN record can later resolve to a private address (DNS
   rebinding), so every connection attempt resolves the name, checks every
@@ -195,12 +199,18 @@ An instance is either **public** or **private**:
   authenticated connections to a bounded set of neighbors (about 8 to 32).
   Those connections are its links, and they carry gossip, routing traffic
   and custody alike.
-- **One send schedule per node.** Every frame a node sends after a handshake,
-  on any link, goes out through a single random send schedule, with real
-  frames replacing dummies and every frame padded to a size bucket. To an
-  outside observer, a node's links carry a steady hum that doesn't reveal
-  when it is talking (§7). No unencrypted WebSocket control frames are used;
-  keepalives are encrypted frames on the same schedule.
+- **Real frames go out immediately; snow fills the gaps.** Every frame after
+  a handshake is padded to a size bucket. Real frames are sent as soon as
+  they're ready. Dummy frames ("snow") fall at random in the quiet moments
+  between them (§7). No unencrypted WebSocket control frames are used;
+  keepalives are encrypted frames like any other.
+- **Probe-resistant listener.** The WebSocket upgrade path is derived from
+  the responder's channel key. Anyone holding the responder's record can
+  compute it; a scanner can't, and a wrong path gets the same generic 404 as
+  any web server. With the status endpoint disabled, an internet scan finds
+  an ordinary web server and nothing more.
+- **Handshake frames are padded** to a size bucket too, so the handshake
+  pattern in use (IK, XX, cookie) isn't visible from message sizes.
 - **Every protocol object is self-proving.** Peer records are signed
   publicly. Messages are authenticated end to end inside their encryption
   (§6). Either way, objects stay independent of the transport that carries
@@ -222,7 +232,9 @@ The layers, tried in order:
    - With an identifier, the root's identity is verified, using IK.
    - A missing identifier is allowed but logged as a warning.
 3. **Multicast discovery on the hive.** On a LAN, members find each other
-   with no configuration.
+   with no configuration. Multicast runs only on interfaces explicitly
+   configured as hive, never by default, so a node on café Wi-Fi doesn't
+   announce itself.
 
 The root is an introducer only. After first contact it is an ordinary peer
 with no special standing. Admission is never tied to "is this my root."
@@ -320,8 +332,8 @@ designated relays and no per-message flooding.
      the message id answers "already have it" and takes no further action.
      The forwarding hop then picks its next-best hop. This holds even while
      hops' views of the graph disagree.
-   - **The forward waits for the hop's next send slot** (§7). That wait is
-     random, so it also serves as a per-hop delay.
+   - **The forward goes out immediately.** An operator can optionally add a
+     small random hold before forwarding (§7); the default is none.
 3. **Custody transfer** (Fall 2003) **with fair shares.** The next hop
    accepts only after durably storing the message. Responsibility then
    passes to it, and the previous hop deletes its copy. Acceptance follows
@@ -405,8 +417,7 @@ that limit, it minimizes what any node can learn or keep.
    one of a few fixed sizes (2, 8 and 32 KB). Size distinguishes nothing,
    and the gossip that flows constantly becomes indistinguishable from
    messages.
-5. **Cover traffic: one send schedule per node, sized by the crowd.** See
-   below.
+5. **Snow: cover traffic that fills the quiet.** See below.
 6. **Receipts look like messages.** Same format, same padding, no separate
    channel.
 7. **Minimal retention.** After handing off custody, a hop deletes the
@@ -416,59 +427,60 @@ that limit, it minimizes what any node can learn or keep.
 8. **No names on the network.** Records carry no display names (§1), so the
    mesh learns nothing about what an instance calls itself.
 
-### Cover traffic
+### Cover traffic: snow
 
-An outside observer sees only encrypted frames on each link. Each link has
-its own Noise keys, so the same message is different ciphertext on every
-link, and the observer has nothing to go on but sizes and timing. Size
-buckets remove size. The send schedule removes timing.
+Lattice is built for quick delivery first. Cover traffic is snow thrown in
+around real traffic, never a metronome that real traffic has to wait for.
 
-**The rule.** Each node sends on one random schedule, a Poisson process.
-Its rate is the larger of a low floor and the node's own recent traffic,
-transit included, averaged over a long window (hours), plus some headroom.
-At each slot:
+**Most cover is natural.** Every node relays other nodes' traffic, so an
+outside observer watching a node's uplink already sees a stream that is
+mostly not that node's own. Store-and-forward is constantly moving data
+through every node, and none of it can be attributed. Snow only matters when
+that natural traffic is thin.
 
-- **A real frame is waiting:** send it, on the link it belongs to.
-- **Nothing is waiting:** send a dummy on a random link, padded to a bucket
-  size drawn from the node's recent real mix.
+**Snow tops up the quiet.** Each node emits dummy frames at random times,
+as a Poisson process at the node's *snow level*. A snow tick is skipped if a
+real frame went out since the previous tick. The node's observed rate is
+then roughly whichever is higher, its snow level or its real traffic:
 
-Real frames replace dummies; they never add to them. That's what makes the
-observable stream independent of when the node talks. If real traffic were
-added on top of cover, volume would rise whenever the node is active, which
-is exactly the signal being hidden. Every post-handshake frame goes through
-this schedule, including gossip, custody replies and keepalives, so even a
-request and its reply don't appear as a timing pair.
+- **Below the snow level,** an observer sees the same random fall of frames
+  whether the node is idle or active. Activity is hidden.
+- **Above it,** snow stops entirely, because real and transit traffic
+  already provide the cover. A busy node emits almost no snow.
 
-**The crowd is the cover.** Every node relays other nodes' traffic, so
-transit already hides a node's own messages. Cover traffic is needed only to
-keep the background from falling too low:
+The snow level therefore has a plain meaning: it's the rate below which a
+node's activity is invisible. To hide a daily rhythm, an operator sets it at
+or above the node's typical daytime traffic. The default is light: enough to
+blur a quiet node's occasional messages, without real cost.
 
-> dummies ≈ desired background − real traffic already present
+**Snow looks like real traffic.**
+- **Sizes:** dummies draw their size from the node's recent real mix, but
+  every bucket keeps a guaranteed minimum share (10% each). A single large
+  frame on a quiet node is then unremarkable.
+- **Exchanges:** a real offer gets a custody reply, so a frame that never
+  gets an answer would mark itself as a dummy. A share of snow frames
+  (25% by default) asks for an echo, and the receiving neighbor answers with
+  a dummy after a short random delay, mimicking a request and its reply.
+- **Links:** each snow frame goes out on a random current link.
 
-In a quiet network the floor does the work at a small fixed cost. In a busy
-network, transit fills the slots, and dummies shrink to the headroom. The
-bigger and busier the mesh, the less synthetic noise it needs.
+**Snow is per node, not per link.** An outside observer watches a node's
+uplink and sees all its links at once, so per-link cover would multiply the
+cost for no added protection. A node's snow cost doesn't depend on network
+size.
 
-**The floor is per node, not per link.** An outside observer watches a
-node's uplink and sees all its links at once, so a separate floor on each
-link would multiply the cost with no added protection. Each node's cost is
-therefore constant, however large the network grows. Precedent: Crowds
-(Reiter & Rubin 1998) hides a node's traffic in traffic it relays for
-others; Tarzan (Freedman & Morris 2002) confines cover to a node's fixed
-neighbor set.
+**What it costs.** At the default snow level of two frames a minute, an idle
+node sends roughly 15 MB a day and receives about the same. A node whose real
+traffic is above its snow level pays nothing.
 
-**What it costs.** With a floor of one frame every 15 seconds and an average
-frame of about 3 KB, an idle node sends about 17 MB a day and receives about
-the same. On a busy node the cost rounds to nothing, because the hum is
-mostly real traffic. Setting the floor to zero turns synthetic cover off; the
-schedule still randomizes timing.
+**Turning it up.** Someone who wants a really snowy network raises the snow
+level. Someone who also wants timing blurred sets a *hold*: a random delay of
+up to that many milliseconds before each real frame goes out. Both default
+to off-or-light, because Lattice favors quick dispatch.
 
-**The slot wait is the per-hop delay.** A real frame waits for its next
-slot, and that wait is random. No separate per-hop delay exists.
-
-**Hives.** Links across a hive LAN can run at a higher floor at little cost,
-and a gateway's WAN uplink then carries the aggregated traffic of its whole
-hive.
+**Precedent:** Crowds (Reiter & Rubin 1998) hides a node's traffic in traffic
+it relays for others; Tarzan (Freedman & Morris 2002) confines cover to a
+node's neighbor set; Loopix (Piotrowska et al. 2017) uses Poisson-timed
+cover.
 
 ### Who learns what
 
@@ -487,18 +499,25 @@ hive.
   insiders only; outside observers see different ciphertext on every link.
 - **Neighbors know which frames are dummies.** Cover traffic hides activity
   from outside observers, not from the node at the other end of the link.
-- **Average volume over hours is visible.** The send rate follows a node's
-  real traffic, transit included, over a long window. An observer can
-  roughly estimate how much a node handles on average, but not when it sent
-  anything or which traffic is its own. A burst that exceeds the headroom
-  waits in the queue or nudges the rate up gradually rather than appearing as
-  a spike.
-- **That a node runs Lattice is visible.** A steady random hum on a WebSocket
-  is a fingerprint of its own. So are handshakes when links open and links
-  opening and closing.
+- **Activity above the snow level is visible.** When a node's traffic
+  exceeds its snow level, an observer sees more frames, though not which are
+  the node's own and which are transit.
+- **Bursts have a shape.** Real frames go out immediately, so a burst of
+  them looks different from Poisson-timed snow even below the snow level.
+  A hold setting blurs this, at the cost of latency.
+- **A daily rhythm is visible** unless the snow level is set above daytime
+  traffic.
+- **That a node runs Lattice is visible.** Fixed frame sizes and a random
+  fall of encrypted WebSocket frames are a fingerprint of their own, as are
+  links opening and closing. Lattice aims for "you can tell it's Lattice,
+  but not what it's doing," not for disguising itself as other traffic.
 - **An observer who sees the whole network** can still attempt timing
-  correlation. Independent random send schedules at every hop make it much
-  harder, but not impossible.
+  correlation. Store-and-forward re-times traffic at every hop, and that
+  also erases timing patterns an active observer might impose (traffic
+  watermarking), but it doesn't make correlation impossible.
+- **Who a node connects to is visible** to its ISP. Hiding that is the job of
+  the reachability layer: behind WARP or Tailscale, the ISP sees only
+  Cloudflare or the tailnet.
 - **Gateways see their private instances' traffic.** That's why instances
   choose their own gateways, usually within their hive.
 - **The set of identities is public** within the mesh, though not their
@@ -751,8 +770,8 @@ principle).
 - **Privacy details:**
   - The exact size buckets. Messages larger than the largest bucket are
     refused in v2.0; attachments come later.
-  - Cover parameters: the floor, the averaging window, the headroom, and
-    the hive floor.
+  - Snow parameters: the default snow level, echo share, bucket minimums,
+    and hold.
   - Loop messages: cover messages a node routes through the mesh back to
     itself. They would look real even to hops, and their failure to return
     would be evidence for the immune system. Deferred.
@@ -786,7 +805,7 @@ principle).
 - Yggdrasil network whitepaper and Ironwood routing library (greedy tree routing).
 - Danezis & Goldberg, "Sphinx: A Compact and Provably Secure Mix Format," IEEE S&P 2009 (the onion format Lattice deliberately doesn't adopt).
 - Lightning Network BOLT 4, onion routing and route blinding (the full form of the gateway layer).
-- Piotrowska et al., "The Loopix Anonymity System," USENIX Security 2017 (Poisson send schedules, real traffic replacing cover).
+- Piotrowska et al., "The Loopix Anonymity System," USENIX Security 2017 (Poisson-timed cover traffic).
 - Reiter & Rubin, "Crowds: Anonymity for Web Transactions," ACM TISSEC 1998.
 - Freedman & Morris, "Tarzan: A Peer-to-Peer Anonymizing Network Layer," ACM CCS 2002.
 - Das et al., "Anonymity Trilemma: Strong Anonymity, Low Bandwidth Overhead, Low Latency — Choose Two," IEEE S&P 2018.

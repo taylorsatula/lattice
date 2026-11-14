@@ -114,7 +114,7 @@ Each event is a signed map.
 | 7 | ck | x25519 | All | Noise static key |
 | 8 | ek | xwing_pk | All | Envelope key (§4) |
 | 9 | mode | uint | All | 0 = public, 1 = private |
-| 10 | ep | array of endpoint | Public | Endpoint = `{0: url}` (a `wss://` URL) |
+| 10 | ep | array of endpoint | Public | Endpoint = `{0: url, 1: [ip address, …] or absent}`. `url` is `wss://` or `ws://` (hive). Connecting nodes prefer the listed IPs, using the URL's host only for TLS and the `Host` header |
 | 11 | ln | array of id | Public | Current links, at most 32 |
 | 12 | gw | array of id | Private | One to three gateways |
 | 13 | cap | uint | All | Capability bitset |
@@ -211,9 +211,18 @@ Each WebSocket binary frame carries one CBOR value.
 
 | t | Frame | Contents |
 |---|---|---|
-| 40 | init | `{2: noise msg, 3: mac1, 4: mac2 or absent}` |
-| 41 | cookie | `{2: nonce, 3: encrypted cookie}` |
-| 42 | resp | `{2: noise msg}` |
+| 40 | init | `{2: noise msg, 3: mac1, 4: mac2 or absent, 5: padding}` |
+| 41 | cookie | `{2: nonce, 3: encrypted cookie, 5: padding}` |
+| 42 | resp | `{2: noise msg, 5: padding}` |
+
+- **Handshake frames are padded** to the 2 KB bucket, so IK, XX and cookie
+  exchanges are indistinguishable by size.
+- **The upgrade path** is `/` followed by the base32 encoding of the first
+  16 bytes of BLAKE3 keyed-derivation (context `"lattice v1 path"`) over the
+  responder's channel key. Any upgrade request to another path, and any
+  non-upgrade request other than an enabled `/status`, gets a generic `404`.
+  A root given without an identifier publishes its path alongside its
+  address, since its key isn't known in advance.
 
 - **mac1** is keyed by the responder's channel key. A responder discards any
   init whose mac1 is wrong, at negligible cost.
@@ -244,7 +253,7 @@ exactly a bucket size is refused. Frame types:
 | 22 | records | `{2: [peer record, …]}` |
 | 23 | wary | `{2: [id, …], 3: exp}` (optional, §8) |
 | 60 | ping | `{2: nonce}`, answered with the same frame. Replaces WebSocket ping/pong, which is not used |
-| 61 | dummy | `{}`. Discarded on receipt |
+| 61 | dummy | `{2: echo}` (bool). Discarded on receipt; if `echo` is true, answered with a dummy (§ Snow) |
 
 - **Large gossip** that doesn't fit one 32 KB frame is split across several
   `digest` or `records` frames.
@@ -263,38 +272,37 @@ exactly a bucket size is refused. Frame types:
   travel in an ordinary `records` frame, and the receiver detects the
   conflict.
 
-### Send schedule (design §7)
+### Snow (design §7)
 
-Every post-handshake frame a node sends, on any link, goes out through one
-per-node schedule:
+Real frames are sent as soon as they are ready. Snow is added around them:
 
-- **Slot times** follow a Poisson process at rate *r* (exponentially
-  distributed gaps drawn from OS randomness).
-- **Rate:** *r* = max(*floor*, *recent* × (1 + *headroom*)).
-  - *recent* is the node's own rate of real frames sent, transit included,
-    averaged over the window *W*.
-  - *r* is recomputed at most once per *W*/12, never in response to an
-    individual frame.
-- **At each slot:**
-  - If any link has a real frame queued, send the oldest one by priority,
-    choosing the link at random among links with frames queued.
-  - Otherwise send a `dummy` on a uniformly random current link, at a bucket
-    drawn from the distribution of real frame buckets sent over *W*. Use 2 KB
-    when there is no history.
-- **Handshake frames** (40–42) are not scheduled, since they occur only when
-  a link opens.
-- **Hive links** may use a separate, higher *floor_hive*, scheduled on its
-  own Poisson process, so cheap LAN cover doesn't raise WAN cost.
+- **Snow ticks** follow a Poisson process at the node's snow level *s*
+  frames per minute, with exponentially distributed gaps drawn from OS
+  randomness.
+- **At each tick:**
+  - If any real frame went out on any link since the previous tick, skip.
+  - Otherwise send a `dummy` on a uniformly random current link.
+- **Dummy size:** drawn from the node's mix of real frame buckets over the
+  last 6 hours, with every bucket held to a minimum share of 10%. Use an
+  equal mix when there is no history.
+- **Echoes:** a dummy has `echo` set with probability *e*. A node receiving
+  an echo request answers with a dummy (echo unset) after a random delay
+  drawn from the same distribution as its custody reply times, so dummy
+  exchanges look like an offer and its reply.
+- **Hold (optional):** if *h* > 0, each real frame waits a uniformly random
+  0–*h* ms before sending. The default is 0, meaning immediate dispatch.
+- **Handshake frames** (40–42) are not snow and are not held, but they are
+  padded (§6, before the handshake).
 - **Defaults:**
 
   | Parameter | Default |
   |---|---|
-  | *floor* | one frame per 15 s |
-  | *W* | 6 hours |
-  | *headroom* | 25% |
-  | *floor_hive* | one frame per 2 s |
+  | *s*, snow level | 2 per minute per node |
+  | *e*, echo share | 25% |
+  | Bucket minimum share | 10% each |
+  | *h*, hold | 0 ms |
 
-  A *floor* of zero turns synthetic cover off; slot timing stays random.
+  A snow level of 0 turns snow off.
 
 ### Public status (optional)
 
