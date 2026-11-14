@@ -92,9 +92,15 @@ impl<S: Store> Sim<S> {
     }
 
     pub fn add_node(&mut self) -> NodeIndex {
+        self.add_node_with(|_| {})
+    }
+
+    /// Add a node with a tweaked config (e.g. private mode with gateways).
+    pub fn add_node_with(&mut self, f: impl FnOnce(&mut Config)) -> NodeIndex {
+        let mut cfg = self.configs_prototype();
+        f(&mut cfg);
         let seed =
             0x5EED_0000u64.wrapping_add((self.nodes.len() as u64).wrapping_mul(0x9E3779B97F4A7C15));
-        let mut cfg = self.configs_prototype();
         cfg.rng_seed = seed;
         let store = (self.store_factory)(self.nodes.len());
         let idx = self.nodes.len() as u64;

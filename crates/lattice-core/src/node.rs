@@ -503,7 +503,8 @@ impl<S: Store> Node<S> {
     }
 
     fn build_graph(&self) -> Graph {
-        let ids_and_links: Vec<([u8; 32], Vec<[u8; 32]>)> = self
+        type RecordParts = ([u8; 32], Vec<[u8; 32]>, Vec<[u8; 32]>);
+        let records: Vec<RecordParts> = self
             .store
             .record_all()
             .unwrap_or_default()
@@ -511,13 +512,22 @@ impl<S: Store> Node<S> {
             .filter_map(|(id, _scope, bytes, _recv)| {
                 PeerRecord::from_bytes(bytes, self.now, None)
                     .ok()
-                    .map(|(r, _)| (*id, r.links))
+                    .map(|(r, _)| (*id, r.links, r.gateways))
             })
             .collect();
-        Graph::build(
+        let mut graph = Graph::build(
             &self.own_id,
-            ids_and_links.iter().map(|(i, l)| (i, l.as_slice())),
-        )
+            records.iter().map(|(i, l, _)| (i, l.as_slice())),
+        );
+        // A private instance publishes no links, so the mutual-claim rule
+        // would leave it unreachable. Its record names its gateways; add a
+        // pseudo-edge to each so the graph can route to (and from) it.
+        for (id, _, gateways) in &records {
+            for gw in gateways {
+                graph.add_edge(*id, *gw);
+            }
+        }
+        graph
     }
 
     fn record_items(&self) -> Vec<reconcile::Item> {
@@ -1110,6 +1120,14 @@ impl<S: Store> Node<S> {
         exclude: &[(LinkId, u64)],
         now: u64,
     ) -> Option<(LinkId, [u8; 32])> {
+        // A directly connected peer is always one hop away, even when the
+        // record graph has no path to it (a private instance publishes no
+        // links). Honor exclusions like any other hop.
+        if let Some((id, _)) = self.links.iter().find(|(id, l)| {
+            l.peer == Some(*dst) && !exclude.iter().any(|(l, until)| l == *id && *until > now)
+        }) {
+            return Some((*id, *dst));
+        }
         // Distances are measured from the destination; the graph is undirected,
         // so BFS from dst gives each node's distance to the destination.
         let graph = self.build_graph();
@@ -1206,7 +1224,17 @@ impl<S: Store> Node<S> {
         let msg_len = offer.message.len() as u64;
 
         if dst == self.own_id {
-            return self.on_offer_for_us(now, link, &msg, &offer.message, &leg_hash, actions);
+            return self.on_offer_for_us(now, link, &msg, &leg_hash, actions);
+        }
+        // A message forwarded by our gateway arrives with hop_layer null and
+        // dst naming the gateway, not us; the envelope is sealed to us. If it
+        // opens, it is ours regardless of dst. Only pay the decapsulation
+        // when dst is one of our gateways — any other dst is relay traffic.
+        if msg.hop_layer.is_none()
+            && self.config.gateways.iter().any(|g| g == &dst)
+            && self.identity.open_envelope_any(&msg).is_ok()
+        {
+            return self.on_offer_for_us(now, link, &msg, &leg_hash, actions);
         }
 
         // Relay path: buffer class (forwarding priority / wait order), fair
@@ -1291,7 +1319,6 @@ impl<S: Store> Node<S> {
         now: u64,
         link: LinkId,
         msg: &Message,
-        raw: &[u8],
         leg_hash: &[u8; 32],
         mut actions: Vec<Action>,
     ) -> Vec<Action> {
@@ -1363,7 +1390,18 @@ impl<S: Store> Node<S> {
                     return actions;
                 }
                 Ok(HopLayerPlain::Gateway { rcpt }) => {
-                    let msg_len = raw.len() as u64;
+                    // The private recipient cannot open the gateway layer
+                    // (it is sealed to us), so it is stripped before the
+                    // message is stored and forwarded. Header and envelope
+                    // are unchanged: the header is the envelope's AAD.
+                    let stripped = match msg.clone().into_after_gateway() {
+                        Ok(bytes) => bytes,
+                        Err(_) => {
+                            actions.push(self.refuse(link, leg));
+                            return actions;
+                        }
+                    };
+                    let msg_len = stripped.len() as u64;
                     let class = self.class_for(rcpt);
                     let upstream_count = self.links.len().max(1) as u64;
                     let share_limit = self.config.custody_allowance / upstream_count;
@@ -1380,7 +1418,7 @@ impl<S: Store> Node<S> {
                     }
                     let entry = CustodyEntry {
                         leg,
-                        message: raw.to_vec(),
+                        message: stripped,
                         upstream: link,
                         destination: rcpt,
                         class,

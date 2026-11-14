@@ -46,6 +46,14 @@ impl Graph {
         Graph { adjacency }
     }
 
+    /// Add an unconditional edge in both directions. Used for private
+    /// instances, which publish no links but are reachable via the gateways
+    /// named in their record.
+    pub fn add_edge(&mut self, a: [u8; 32], b: [u8; 32]) {
+        self.adjacency.entry(a).or_default().insert(b);
+        self.adjacency.entry(b).or_default().insert(a);
+    }
+
     pub fn neighbors(&self, id: &[u8; 32]) -> impl Iterator<Item = &[u8; 32]> {
         self.adjacency.get(id).into_iter().flatten()
     }

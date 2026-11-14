@@ -510,6 +510,16 @@ impl Message {
             .ok_or(ProtoError::TooBig(self.total_len))
     }
 
+    /// After a gateway opens its layer, the private recipient cannot open
+    /// it (it is sealed to the gateway), so the layer is dropped and the
+    /// message is re-padded to the SAME bucket it arrived in. The routing
+    /// header and the envelope are unchanged: the header is the envelope's
+    /// associated data, so it cannot be rewritten.
+    pub fn into_after_gateway(self) -> Result<Vec<u8>, ProtoError> {
+        assemble(&self.header, &None, &self.envelope, self.total_len)
+            .ok_or(ProtoError::TooBig(self.total_len))
+    }
+
     /// Decrypt the envelope with the recipient's key. The AAD is the routing
     /// header — the header in the same array slot the recipient received.
     pub fn open_envelope(&self, recipient_secret: &[u8; 32]) -> Result<Envelope, ProtoError> {

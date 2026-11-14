@@ -767,3 +767,52 @@ fn forged_attestation_does_not_bind() {
         "link must bind to the real peer"
     );
 }
+
+#[test]
+fn private_instance_receives_via_gateway() {
+    // A private instance publishes no endpoints and no links; senders route
+    // to its gateway, the gateway opens the gateway layer and forwards the
+    // message over the direct link. The private instance must receive it.
+    let mut sim = Sim::new(fast_config());
+    let sender = sim.add_node();
+    let gw = sim.add_node();
+    let gw_id = sim.ids[gw];
+    let priv_node = sim.add_node_with(|c| {
+        c.mode = lattice_proto::record::Mode::Private;
+        c.gateways = vec![gw_id];
+    });
+    let priv_id = sim.ids[priv_node];
+    let sender_id = sim.ids[sender];
+    sim.connect(sender, gw);
+    sim.connect(gw, priv_node);
+    // Wait for records to converge: the sender needs the private instance's
+    // record (to learn it is private and which gateway to use) and the
+    // gateway's record; the private instance needs the sender's record to
+    // verify the envelope signature.
+    for _ in 0..30 {
+        let s = sim.nodes[sender].debug_record_ids();
+        let g = sim.nodes[gw].debug_record_ids();
+        let p = sim.nodes[priv_node].debug_record_ids();
+        if s.contains(&priv_id)
+            && s.contains(&gw_id)
+            && g.contains(&sender_id)
+            && p.contains(&sender_id)
+        {
+            break;
+        }
+        sim.run_for(1);
+    }
+    let mid = sim.app_send(sender, priv_node, b"via gateway");
+    sim.run_for(20);
+    let got: Vec<_> = sim.deliveries.iter().filter(|d| d.mid == mid).collect();
+    assert_eq!(got.len(), 1, "private instance must receive the message");
+    assert_eq!(got[0].node, priv_node);
+    assert_eq!(got[0].body, b"via gateway");
+    // The sender must observe the receipt come back through the gateway.
+    let delivered = sim
+        .statuses
+        .iter()
+        .filter(|(m, s)| *m == mid && *s == 3)
+        .count();
+    assert!(delivered >= 1, "sender should observe Delivered status");
+}
