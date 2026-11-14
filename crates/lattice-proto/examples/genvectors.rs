@@ -118,8 +118,7 @@ fn main() {
         "expect": { "type": "init" },
     }));
     let cookie = Frame::Cookie(CookieFrame {
-        nonce: [0x33; 16],
-        encrypted_cookie: vec![0x44; 64],
+        cookie: [0x44; 24],
         padding: vec![0u8; 8],
     });
     vectors.push(serde_json::json!({

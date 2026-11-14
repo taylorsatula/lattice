@@ -15,6 +15,13 @@ pub fn public_key(seed: &[u8; 32]) -> [u8; 32] {
     SigningKey::from_bytes(seed).verifying_key().to_bytes()
 }
 
+/// X25519 public key for a 32-byte seed (channel/noise static key).
+pub fn x25519_public(seed: &[u8; 32]) -> [u8; 32] {
+    use x25519_dalek::{PublicKey, StaticSecret};
+    let secret = StaticSecret::from(*seed);
+    PublicKey::from(&secret).to_bytes()
+}
+
 /// Sign `message`; returns the 64-byte signature.
 pub fn sign(seed: &[u8; 32], message: &[u8]) -> [u8; 64] {
     SigningKey::from_bytes(seed).sign(message).to_bytes()

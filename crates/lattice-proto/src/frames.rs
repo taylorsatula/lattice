@@ -37,8 +37,8 @@ pub struct InitFrame {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CookieFrame {
-    pub nonce: [u8; 16],
-    pub encrypted_cookie: Vec<u8>,
+    /// Opaque 24-byte cookie issued by the server; echoed back in mac2.
+    pub cookie: [u8; 24],
     pub padding: Vec<u8>,
 }
 
@@ -298,8 +298,7 @@ impl Frame {
             }
             Frame::Cookie(f) => Value::map(vec![
                 (Value::UInt(0), Value::UInt(T_COOKIE)),
-                (Value::UInt(2), Value::Bytes(f.nonce.to_vec())),
-                (Value::UInt(3), Value::Bytes(f.encrypted_cookie.clone())),
+                (Value::UInt(2), Value::Bytes(f.cookie.to_vec())),
                 (Value::UInt(5), Value::Bytes(f.padding.clone())),
             ]),
             Frame::Resp(f) => Value::map(vec![
@@ -392,10 +391,9 @@ impl Frame {
                 }))
             }
             T_COOKIE => {
-                v.deny_unknown_keys(&[0, 2, 3, 5])?;
+                v.deny_unknown_keys(&[0, 2, 5])?;
                 Ok(Frame::Cookie(CookieFrame {
-                    nonce: fixed_bytes(v, 2)?,
-                    encrypted_cookie: v.req_bytes(3)?.to_vec(),
+                    cookie: fixed_bytes(v, 2)?,
                     padding: v.req_bytes(5)?.to_vec(),
                 }))
             }

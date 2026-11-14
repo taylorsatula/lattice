@@ -1,0 +1,49 @@
+[package]
+name = "lattice-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+license = "MIT"
+
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+lattice-proto = { path = "../crates/lattice-proto" }
+lattice-crypto = { path = "../crates/lattice-crypto" }
+
+[[bin]]
+name = "cbor_decode"
+path = "fuzz_targets/cbor_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "message_parse"
+path = "fuzz_targets/message_parse.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "record_parse"
+path = "fuzz_targets/record_parse.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "frame_decode"
+path = "fuzz_targets/frame_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "message_open"
+path = "fuzz_targets/message_open.rs"
+test = false
+doc = false
+
+[profile.release]
+debug = 1

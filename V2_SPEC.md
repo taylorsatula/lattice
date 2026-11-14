@@ -259,11 +259,15 @@ Each WebSocket binary frame carries one CBOR value.
 | t | Frame | Contents |
 |---|---|---|
 | 40 | init | `{2: noise msg, 3: mac1, 4: mac2 or absent, 5: padding}` |
-| 41 | cookie | `{2: nonce, 3: encrypted cookie, 5: padding}` |
+| 41 | cookie | `{2: cookie, 5: padding}` |
 | 42 | resp | `{2: noise msg, 5: padding}` |
 
-- **Handshake frames are padded** to the 2 KB bucket, so IK, XX and cookie
-  exchanges are indistinguishable by size.
+- **Handshake frames are padded** to the 2 KB bucket. This equalizes size for
+  observers that do not parse CBOR; it is not a confidentiality property of
+  the handshake itself. A CBOR-literate observer can still tell an Init from
+  a Resp or Cookie, an IK first message from an XX first message (by the
+  length of `noise msg`), and whether a mac2 field is present. Post-handshake
+  frames carry no type markers at all.
 - **The upgrade path** is `/` followed by the base32 encoding of the first
   16 bytes of BLAKE3 keyed-derivation (context `"lattice v1 path"`) over the
   responder's channel key. Any upgrade request to another path, and any
@@ -272,7 +276,21 @@ Each WebSocket binary frame carries one CBOR value.
   address, since its key isn't known in advance.
 
 - **mac1** is keyed by the responder's channel key. A responder discards any
-  init whose mac1 is wrong, at negligible cost.
+  init whose mac1 is wrong, at negligible cost. The XX pattern cannot use
+  this: an initiator who does not know the channel key cannot compute mac1,
+  so XX messages carry mac1 = zeros and the responder does not check it; the
+  derived upgrade path remains the admission gate for that pattern. IK/XX is
+  distinguished by first-message length (32 bytes = XX, otherwise IK);
+  changing either pattern's message sizes requires changing this rule in the
+  same revision.
+- **mac2** is keyed by the cookie and required only when the responder is
+  under load. A responder under load that receives an init without a valid
+  mac2 answers with a `cookie` frame and keeps no state. The cookie is an
+  opaque 24-byte value, `BLAKE2s-256(rotating server secret, client address)`,
+  recomputed by the server on demand; the server keeps no per-client state.
+  The cookie is not encrypted — it is a PRF output bound to the client
+  address, and is useless to any other address. Cookies rotate every two
+  hours; the previous key remains valid during the overlap.
 - **mac2** is keyed by the cookie and required only when the responder is
   under load. A responder under load that receives an init without a valid
   mac2 answers with a `cookie` frame and keeps no state.

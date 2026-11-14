@@ -180,7 +180,7 @@ impl<S: Store> Node<S> {
                 kel: self.identity.kel.clone(),
                 seq,
                 exp,
-                channel_key: lattice_crypto::public_key(&self.identity.channel_seed),
+                channel_key: lattice_crypto::x25519_public(&self.identity.channel_seed),
                 envelope_key: self.identity.xwing_public,
                 mode: Mode::Public,
                 scope: self.scope,

@@ -28,3 +28,6 @@ build/
 
 # Rust workspace
 /target/
+.pi/subagent-schedules/
+fuzz/corpus/
+fuzz/artifacts/

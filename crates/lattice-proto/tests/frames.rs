@@ -103,8 +103,7 @@ fn handshake_frames_roundtrip() {
     });
     assert_eq!(Frame::from_bytes(&f.encode()).unwrap(), f);
     let f = Frame::Cookie(CookieFrame {
-        nonce: [3; 16],
-        encrypted_cookie: vec![0xAB; 64],
+        cookie: [0xCD; 24],
         padding: vec![0; 10],
     });
     assert_eq!(Frame::from_bytes(&f.encode()).unwrap(), f);
