@@ -18,6 +18,7 @@ pub struct MemStore {
     status: HashMap<[u8; 16], (u64, Option<u64>)>,
     wary: HashMap<[u8; 32], Vec<(u64, u64)>>, // id -> [(source_range, exp)]
     buckets: [u64; 3],
+    custody_bytes: u64,
 }
 
 impl MemStore {
@@ -126,26 +127,54 @@ impl Store for MemStore {
         Ok(self.outbound.values().cloned().collect())
     }
 
+    fn custody_accept(&mut self, accept: CustodyAccept) -> Result<(), StoreError> {
+        let CustodyAccept {
+            entry,
+            share_dest,
+            share_upstream,
+            share_bytes,
+            seen_hash,
+            seen_exp,
+        } = accept;
+        self.custody_put(entry)?;
+        self.share_add(&share_dest, share_upstream, share_bytes)?;
+        self.seen_add(seen_hash, seen_exp)?;
+        Ok(())
+    }
     fn custody_put(&mut self, entry: CustodyEntry) -> Result<(), StoreError> {
-        self.custody.insert(entry.leg, entry);
+        let new_len = entry.message.len() as u64;
+        if let Some(old) = self.custody.insert(entry.leg, entry) {
+            self.custody_bytes = self.custody_bytes.saturating_sub(old.message.len() as u64);
+        }
+        self.custody_bytes += new_len;
         Ok(())
     }
     fn custody_get(&self, leg: &[u8; 16]) -> Result<Option<CustodyEntry>, StoreError> {
         Ok(self.custody.get(leg).cloned())
     }
     fn custody_remove(&mut self, leg: &[u8; 16]) -> Result<Option<CustodyEntry>, StoreError> {
-        Ok(self.custody.remove(leg))
+        let removed = self.custody.remove(leg);
+        if let Some(e) = &removed {
+            self.custody_bytes = self.custody_bytes.saturating_sub(e.message.len() as u64);
+        }
+        Ok(removed)
     }
     fn custody_all(&self) -> Result<Vec<CustodyEntry>, StoreError> {
         Ok(self.custody.values().cloned().collect())
     }
     fn custody_bytes(&self) -> Result<u64, StoreError> {
-        Ok(self.custody.values().map(|e| e.message.len() as u64).sum())
+        Ok(self.custody_bytes)
     }
 
     fn share_add(&mut self, dest: &[u8; 32], upstream: u64, bytes: i64) -> Result<u64, StoreError> {
         let e = self.shares.entry((*dest, upstream)).or_insert(0);
-        *e = (*e as i64 + bytes).max(0) as u64;
+        let next = (*e as i64)
+            .checked_add(bytes)
+            .ok_or(StoreError::Backend("share counter overflow".into()))?;
+        if next < 0 {
+            return Err(StoreError::Backend("share counter underflow".into()));
+        }
+        *e = next as u64;
         Ok(*e)
     }
     fn share_get(&self, dest: &[u8; 32], upstream: u64) -> Result<u64, StoreError> {

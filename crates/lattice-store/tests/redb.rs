@@ -85,7 +85,10 @@ fn exercise<S: Store>(s: &mut S) -> String {
     assert_eq!(s.share_get(&[9; 32], 5).unwrap(), 100);
     s.share_add(&[9; 32], 5, 150).unwrap();
     assert_eq!(s.share_get(&[9; 32], 5).unwrap(), 250);
-    s.share_add(&[9; 32], 5, -300).unwrap();
+    // Underflow is an error, not a silent clamp to zero.
+    assert!(s.share_add(&[9; 32], 5, -300).is_err());
+    assert_eq!(s.share_get(&[9; 32], 5).unwrap(), 250);
+    s.share_add(&[9; 32], 5, -250).unwrap();
     assert_eq!(s.share_get(&[9; 32], 5).unwrap(), 0);
 
     s.seen_add([8; 32], 1000).unwrap();
@@ -205,4 +208,108 @@ fn schema_v1_is_created_fresh() {
     let path = tmp.path().join("fresh.redb");
     let s = RedbStore::open(&path).unwrap();
     assert_eq!(s.record_count().unwrap(), 0);
+}
+
+// --- Crash-kill consistency (B3) -------------------------------------------
+// Re-executes this test binary as a child that performs custody accepts in a
+// loop; the parent SIGKILLs it mid-stream, then reopens the store and checks
+// that everything committed is internally consistent.
+
+fn crash_child(db_path: &str, journal_path: &str) {
+    use lattice_store::CustodyAccept;
+    let mut store = RedbStore::open(db_path).unwrap();
+    let mut journal = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(journal_path)
+        .unwrap();
+    use std::io::Write;
+    for i in 0u64..100_000 {
+        let mut leg = [0u8; 16];
+        leg[..8].copy_from_slice(&i.to_be_bytes());
+        let msg = vec![(i % 251) as u8; 128 + (i % 512) as usize];
+        let mut seen = [0u8; 32];
+        seen[..16].copy_from_slice(&leg);
+        let accept = CustodyAccept {
+            entry: CustodyEntry {
+                leg,
+                message: msg.clone(),
+                upstream: 7,
+                destination: [9; 32],
+                class: 1,
+                exp: u64::MAX / 2,
+                lease_until: u64::MAX / 2,
+                excluded: vec![],
+            },
+            share_dest: [9; 32],
+            share_upstream: 7,
+            share_bytes: msg.len() as i64,
+            seen_hash: seen,
+            seen_exp: u64::MAX / 2,
+        };
+        store.custody_accept(accept).unwrap();
+        writeln!(journal, "{}", i).unwrap();
+        journal.flush().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+#[test]
+fn crash_kill_preserves_committed_custody() {
+    if let Ok(db) = std::env::var("LATTICE_CRASH_CHILD_DB") {
+        let journal = std::env::var("LATTICE_CRASH_CHILD_JOURNAL").unwrap();
+        crash_child(&db, &journal);
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("crash.redb");
+    let journal = tmp.path().join("journal.txt");
+
+    let exe = std::env::current_exe().unwrap();
+    let mut child = std::process::Command::new(exe)
+        .arg("crash_kill_preserves_committed_custody")
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("LATTICE_CRASH_CHILD_DB", &db)
+        .env("LATTICE_CRASH_CHILD_JOURNAL", &journal)
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    child.kill().unwrap(); // SIGKILL — no destructors, no cleanup
+    child.wait().unwrap();
+
+    // Every journaled accept must be present and consistent.
+    let journaled: Vec<u64> = std::fs::read_to_string(&journal)
+        .unwrap_or_default()
+        .lines()
+        .map(|l| l.parse().unwrap())
+        .collect();
+
+    let store = RedbStore::open(&db).expect("store must open after a kill -9");
+    let rows = store.custody_all().expect("custody rows must decode");
+    let custody_legs: std::collections::HashSet<[u8; 16]> = rows.iter().map(|e| e.leg).collect();
+
+    for i in &journaled {
+        let mut leg = [0u8; 16];
+        leg[..8].copy_from_slice(&i.to_be_bytes());
+        assert!(
+            custody_legs.contains(&leg),
+            "journaled accept {i} missing from custody after crash"
+        );
+    }
+
+    // Internal consistency: byte counter and share counter equal the sum of
+    // the surviving rows; every custody row has its seen marker.
+    let total_bytes: u64 = rows.iter().map(|e| e.message.len() as u64).sum();
+    assert_eq!(store.custody_bytes().unwrap(), total_bytes);
+    assert_eq!(store.share_get(&[9; 32], 7).unwrap(), total_bytes);
+    for e in &rows {
+        let mut seen = [0u8; 32];
+        seen[..16].copy_from_slice(&e.leg);
+        assert!(
+            store.seen_contains(&seen, 1).unwrap(),
+            "custody row without its dedup marker — accept was not atomic"
+        );
+    }
 }

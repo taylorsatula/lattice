@@ -49,6 +49,56 @@ fn share_key(dest: &[u8; 32], upstream: u64) -> [u8; 40] {
     k
 }
 
+/// Ordered schema migrations. Each step upgrades the database from version
+/// `n` to `n + 1`. There are no steps yet (v1 is the initial schema); the
+/// framework exists so a future bump fails loudly instead of silently
+/// opening a mismatched database.
+fn migrate(txn: &redb::WriteTransaction, from: u64) -> Result<(), StoreError> {
+    // Ordered steps would go here: 1 => migrate_1_to_2(txn)?, etc.
+    // v1 is the initial schema, so there is nothing to do yet; any other
+    // older version has no path and must fail loudly.
+    if from != 1 {
+        return Err(StoreError::Backend(format!(
+            "no migration path from schema version {from}"
+        )));
+    }
+    let mut meta = txn
+        .open_table(META)
+        .map_err(|e| StoreError::Backend(e.to_string()))?;
+    meta.insert("schema_version", SCHEMA_VERSION)
+        .map_err(|e| StoreError::Backend(e.to_string()))?;
+    Ok(())
+}
+
+/// Read a u64 counter from the meta table inside a write transaction.
+fn meta_u64(txn: &redb::WriteTransaction, key: &str) -> Result<u64, StoreError> {
+    let meta = txn
+        .open_table(META)
+        .map_err(|e| StoreError::Backend(e.to_string()))?;
+    Ok(meta
+        .get(key)
+        .map_err(|e| StoreError::Backend(e.to_string()))?
+        .map(|v| v.value())
+        .unwrap_or(0))
+}
+
+/// Add `delta` (signed) to a u64 counter in the meta table.
+fn meta_add(txn: &redb::WriteTransaction, key: &str, delta: i64) -> Result<u64, StoreError> {
+    let cur = meta_u64(txn, key)?;
+    let next = (cur as i64)
+        .checked_add(delta)
+        .ok_or_else(|| StoreError::Backend(format!("meta counter {key} overflow")))?;
+    if next < 0 {
+        return Err(StoreError::Backend(format!("meta counter {key} underflow")));
+    }
+    let mut meta = txn
+        .open_table(META)
+        .map_err(|e| StoreError::Backend(e.to_string()))?;
+    meta.insert(key, next as u64)
+        .map_err(|e| StoreError::Backend(e.to_string()))?;
+    Ok(next as u64)
+}
+
 pub struct RedbStore {
     db: Database,
 }
@@ -79,7 +129,11 @@ impl RedbStore {
                         "schema version {v} is newer than this build understands ({SCHEMA_VERSION})"
                     )));
                 }
-                Some(_) => {} // older versions migrate in migrate() before use
+                Some(v) if v < SCHEMA_VERSION => {
+                    drop(meta);
+                    migrate(&txn, v)?;
+                }
+                Some(_) => {}
             }
         }
         // Initialize empty tables so reads never fail on a fresh database.
@@ -107,6 +161,28 @@ impl RedbStore {
             .map_err(|e| StoreError::Backend(e.to_string()))?;
         txn.open_table(WARY)
             .map_err(|e| StoreError::Backend(e.to_string()))?;
+        // Rebuild the custody byte counter from the table so it can never
+        // drift from the rows actually present.
+        let custody_bytes: u64 = {
+            let t = txn
+                .open_table(CUSTODY)
+                .map_err(|e| StoreError::Backend(e.to_string()))?;
+            let mut sum = 0u64;
+            for entry in t.iter().map_err(|e| StoreError::Backend(e.to_string()))? {
+                let (_, v) = entry.map_err(|e| StoreError::Backend(e.to_string()))?;
+                let e: CustodyEntry = serde_json::from_slice(&v.value())
+                    .map_err(|e| StoreError::Backend(e.to_string()))?;
+                sum += e.message.len() as u64;
+            }
+            sum
+        };
+        {
+            let mut meta = txn
+                .open_table(META)
+                .map_err(|e| StoreError::Backend(e.to_string()))?;
+            meta.insert("custody_bytes", custody_bytes)
+                .map_err(|e| StoreError::Backend(e.to_string()))?;
+        }
         txn.commit()
             .map_err(|e| StoreError::Backend(e.to_string()))?;
         Ok(Self { db })
@@ -173,6 +249,71 @@ impl RedbStore {
             Ok(())
         })
     }
+}
+
+/// Insert a custody row and bump the byte counter, in the caller's txn.
+fn custody_put_txn(
+    txn: &redb::WriteTransaction,
+    leg: [u8; 16],
+    bytes: Vec<u8>,
+    msg_len: i64,
+) -> Result<(), StoreError> {
+    let mut t = txn
+        .open_table(CUSTODY)
+        .map_err(|e| StoreError::Backend(e.to_string()))?;
+    // The byte counter tracks message bytes, so recover the old entry's
+    // message length from the stored row if this leg is being overwritten.
+    let old_msg_len = match t.get(leg).map_err(|e| StoreError::Backend(e.to_string()))? {
+        Some(v) => serde_json::from_slice::<CustodyEntry>(&v.value())
+            .map(|e| e.message.len() as i64)
+            .unwrap_or(0),
+        None => 0,
+    };
+    t.insert(leg, bytes)
+        .map_err(|e| StoreError::Backend(e.to_string()))?;
+    meta_add(txn, "custody_bytes", msg_len - old_msg_len)?;
+    Ok(())
+}
+
+/// Fair-share accounting with checked arithmetic; no silent clamping.
+fn share_add_txn(
+    txn: &redb::WriteTransaction,
+    dest: &[u8; 32],
+    upstream: u64,
+    bytes: i64,
+) -> Result<u64, StoreError> {
+    let key = share_key(dest, upstream);
+    let mut t = txn
+        .open_table(SHARES)
+        .map_err(|e| StoreError::Backend(e.to_string()))?;
+    let cur = t
+        .get(key)
+        .map_err(|e| StoreError::Backend(e.to_string()))?
+        .map(|v| v.value())
+        .unwrap_or(0);
+    let next = (cur as i64)
+        .checked_add(bytes)
+        .ok_or_else(|| StoreError::Backend("share counter overflow".into()))?;
+    if next < 0 {
+        return Err(StoreError::Backend("share counter underflow".into()));
+    }
+    if next == 0 {
+        t.remove(key)
+            .map_err(|e| StoreError::Backend(e.to_string()))?;
+    } else {
+        t.insert(key, next as u64)
+            .map_err(|e| StoreError::Backend(e.to_string()))?;
+    }
+    Ok(next as u64)
+}
+
+fn seen_add_txn(txn: &redb::WriteTransaction, hash: [u8; 32], exp: u64) -> Result<(), StoreError> {
+    let mut t = txn
+        .open_table(SEEN)
+        .map_err(|e| StoreError::Backend(e.to_string()))?;
+    t.insert(hash, exp)
+        .map_err(|e| StoreError::Backend(e.to_string()))?;
+    Ok(())
 }
 
 impl Store for RedbStore {
@@ -407,16 +548,31 @@ impl Store for RedbStore {
         })
     }
 
-    fn custody_put(&mut self, entry: CustodyEntry) -> Result<(), StoreError> {
+    fn custody_accept(&mut self, accept: CustodyAccept) -> Result<(), StoreError> {
+        let CustodyAccept {
+            entry,
+            share_dest,
+            share_upstream,
+            share_bytes,
+            seen_hash,
+            seen_exp,
+        } = accept;
         let bytes = serde_json::to_vec(&entry).map_err(|e| StoreError::Backend(e.to_string()))?;
+        let msg_len = entry.message.len() as i64;
+        let leg = entry.leg;
         self.write(|txn| {
-            let mut t = txn
-                .open_table(CUSTODY)
-                .map_err(|e| StoreError::Backend(e.to_string()))?;
-            t.insert(entry.leg, bytes)
-                .map_err(|e| StoreError::Backend(e.to_string()))?;
+            custody_put_txn(txn, leg, bytes, msg_len)?;
+            share_add_txn(txn, &share_dest, share_upstream, share_bytes)?;
+            seen_add_txn(txn, seen_hash, seen_exp)?;
             Ok(())
         })
+    }
+
+    fn custody_put(&mut self, entry: CustodyEntry) -> Result<(), StoreError> {
+        let bytes = serde_json::to_vec(&entry).map_err(|e| StoreError::Backend(e.to_string()))?;
+        let leg = entry.leg;
+        let msg_len = entry.message.len() as i64;
+        self.write(|txn| custody_put_txn(txn, leg, bytes, msg_len))
     }
 
     fn custody_get(&self, leg: &[u8; 16]) -> Result<Option<CustodyEntry>, StoreError> {
@@ -435,13 +591,15 @@ impl Store for RedbStore {
 
     fn custody_remove(&mut self, leg: &[u8; 16]) -> Result<Option<CustodyEntry>, StoreError> {
         let existing = self.custody_get(leg)?;
-        if existing.is_some() {
+        if let Some(e) = &existing {
+            let msg_len = e.message.len() as i64;
             self.write(|txn| {
                 let mut t = txn
                     .open_table(CUSTODY)
                     .map_err(|e| StoreError::Backend(e.to_string()))?;
                 t.remove(leg)
                     .map_err(|e| StoreError::Backend(e.to_string()))?;
+                meta_add(txn, "custody_bytes", -msg_len)?;
                 Ok(())
             })?;
         }
@@ -466,34 +624,20 @@ impl Store for RedbStore {
     }
 
     fn custody_bytes(&self) -> Result<u64, StoreError> {
-        Ok(self
-            .custody_all()?
-            .iter()
-            .map(|e| e.message.len() as u64)
-            .sum())
+        self.read(|txn| {
+            let meta = txn
+                .open_table(META)
+                .map_err(|e| StoreError::Backend(e.to_string()))?;
+            Ok(meta
+                .get("custody_bytes")
+                .map_err(|e| StoreError::Backend(e.to_string()))?
+                .map(|v| v.value())
+                .unwrap_or(0))
+        })
     }
 
     fn share_add(&mut self, dest: &[u8; 32], upstream: u64, bytes: i64) -> Result<u64, StoreError> {
-        let key = share_key(dest, upstream);
-        self.write(|txn| {
-            let mut t = txn
-                .open_table(SHARES)
-                .map_err(|e| StoreError::Backend(e.to_string()))?;
-            let cur = t
-                .get(key)
-                .map_err(|e| StoreError::Backend(e.to_string()))?
-                .map(|v| v.value())
-                .unwrap_or(0);
-            let next = (cur as i64 + bytes).max(0) as u64;
-            if next == 0 {
-                t.remove(key)
-                    .map_err(|e| StoreError::Backend(e.to_string()))?;
-            } else {
-                t.insert(key, next)
-                    .map_err(|e| StoreError::Backend(e.to_string()))?;
-            }
-            Ok(next)
-        })
+        self.write(|txn| share_add_txn(txn, dest, upstream, bytes))
     }
 
     fn share_get(&self, dest: &[u8; 32], upstream: u64) -> Result<u64, StoreError> {
@@ -522,14 +666,7 @@ impl Store for RedbStore {
     }
 
     fn seen_add(&mut self, hash: [u8; 32], exp: u64) -> Result<(), StoreError> {
-        self.write(|txn| {
-            let mut t = txn
-                .open_table(SEEN)
-                .map_err(|e| StoreError::Backend(e.to_string()))?;
-            t.insert(hash, exp)
-                .map_err(|e| StoreError::Backend(e.to_string()))?;
-            Ok(())
-        })
+        self.write(|txn| seen_add_txn(txn, hash, exp))
     }
 
     fn delivered_contains(&self, hash: &[u8; 32], now: u64) -> Result<bool, StoreError> {
@@ -786,14 +923,11 @@ impl RedbStore {
     /// the custody path needs for custody throughput.
     pub fn custody_put_batch(&self, entries: &[CustodyEntry]) -> Result<(), StoreError> {
         self.write(|txn| {
-            let mut t = txn
-                .open_table(CUSTODY)
-                .map_err(|e| StoreError::Backend(e.to_string()))?;
             for entry in entries {
                 let bytes =
                     serde_json::to_vec(entry).map_err(|e| StoreError::Backend(e.to_string()))?;
-                t.insert(entry.leg, bytes)
-                    .map_err(|e| StoreError::Backend(e.to_string()))?;
+                let msg_len = entry.message.len() as i64;
+                custody_put_txn(txn, entry.leg, bytes, msg_len)?;
             }
             Ok(())
         })

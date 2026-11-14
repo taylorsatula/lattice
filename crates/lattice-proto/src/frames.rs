@@ -18,6 +18,13 @@ pub const T_WARY: u64 = 23;
 pub const T_PING: u64 = 60;
 pub const T_DUMMY: u64 = 61;
 
+/// Maximum ranges in a single reconcile frame; anything larger is rejected
+/// at decode. Mirrors lattice-core's responder cap.
+pub const MAX_RANGES_PER_MSG: usize = 64;
+
+/// Maximum entries in one range's explicit list.
+pub const MAX_ENTRIES_PER_RANGE: usize = 32;
+
 pub const CUSTODY_ACCEPTED: u64 = 0;
 pub const CUSTODY_ALREADY_HAVE: u64 = 1;
 pub const CUSTODY_BUSY: u64 = 2;
@@ -240,9 +247,11 @@ impl Range {
             });
         }
         if let Some(list) = v.get_key(3)? {
+            let list = list.as_array().ok_or(ProtoError::WrongType(3, "array"))?;
+            if list.len() > MAX_ENTRIES_PER_RANGE {
+                return Err(ProtoError::Invalid("too many entries in range"));
+            }
             let entries = list
-                .as_array()
-                .ok_or(ProtoError::WrongType(3, "array"))?
                 .iter()
                 .map(|e| {
                     let a = e.as_array().ok_or(ProtoError::WrongType(3, "array"))?;
@@ -439,8 +448,11 @@ impl Frame {
             }
             T_RECONCILE => {
                 v.deny_unknown_keys(&[0, 2])?;
-                let ranges = v
-                    .req_array(2)?
+                let raw = v.req_array(2)?;
+                if raw.len() > MAX_RANGES_PER_MSG {
+                    return Err(ProtoError::Invalid("too many reconcile ranges"));
+                }
+                let ranges = raw
                     .iter()
                     .map(Range::from_value)
                     .collect::<Result<Vec<_>, _>>()?;

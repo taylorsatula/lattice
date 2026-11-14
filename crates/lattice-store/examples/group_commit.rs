@@ -1,6 +1,6 @@
 //! Rough throughput comparison: one transaction per custody accept vs one
 //! group-committed transaction. Run with `cargo run --release --example group_commit`.
-use lattice_store::{CustodyEntry, RedbStore, Store};
+use lattice_store::{CustodyAccept, CustodyEntry, RedbStore, Store};
 use std::time::Instant;
 
 fn entry(n: u8) -> CustodyEntry {
@@ -27,7 +27,16 @@ fn main() {
     let mut store = RedbStore::open(&path).unwrap();
     let t0 = Instant::now();
     for i in 0..iterations {
-        store.custody_put(entry(i as u8)).unwrap();
+        let e = entry(i as u8);
+        let accept = CustodyAccept {
+            share_dest: e.destination,
+            share_upstream: e.upstream,
+            share_bytes: e.message.len() as i64,
+            seen_hash: [i as u8; 32],
+            seen_exp: e.exp,
+            entry: e,
+        };
+        store.custody_accept(accept).unwrap();
     }
     let individual = t0.elapsed();
     drop(store);

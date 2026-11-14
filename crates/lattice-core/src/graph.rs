@@ -83,13 +83,14 @@ impl Graph {
         dist: &HashMap<[u8; 32], u32>,
         sideways_prob: f64,
         exclude: &HashSet<[u8; 32]>,
+        up: &HashSet<[u8; 32]>,
         rng: &mut Rng,
     ) -> Option<[u8; 32]> {
         let my_dist = *dist.get(from)?;
         let mut progress: Vec<[u8; 32]> = Vec::new();
         let mut sideways: Vec<[u8; 32]> = Vec::new();
         for n in self.neighbors(from) {
-            if exclude.contains(n) {
+            if exclude.contains(n) || !up.contains(n) {
                 continue;
             }
             match dist.get(n) {

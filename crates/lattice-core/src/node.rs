@@ -11,7 +11,7 @@ use lattice_proto::message::{
     KIND_RECEIPT, Message, WaypointSeal,
 };
 use lattice_proto::record::{Mode, PeerRecord, Scope, compare_lww};
-use lattice_store::{CustodyEntry, InboxEntry, OutboundState, Store};
+use lattice_store::{CustodyAccept, CustodyEntry, InboxEntry, OutboundState, Store};
 
 use crate::graph::Graph;
 use crate::reconcile::{self, ReconcileSession};
@@ -58,6 +58,9 @@ struct PendingOffer {
     origin: PendingOrigin,
     sent_at: u64,
     excluded: Vec<(LinkId, u64)>,
+    /// The link this offer was sent on; excluded on timeout so the retry
+    /// does not immediately re-offer to a peer that never answered.
+    link: LinkId,
 }
 
 enum PendingOrigin {
@@ -88,7 +91,6 @@ pub struct Node<S: Store> {
     own_seq: u64,
     links: HashMap<LinkId, LinkState>,
     next_link_order: Vec<LinkId>,
-    neighbors_dirty: bool,
     reconcile_sessions: HashMap<LinkId, ReconcileSession>,
     pending: HashMap<[u8; 16], PendingOffer>,
     outbound_exclusions: HashMap<[u8; 16], Vec<(LinkId, u64)>>,
@@ -106,6 +108,7 @@ pub struct Node<S: Store> {
     /// Attribution of a link to a peer is allowed only when exactly one id
     /// claims the link's channel key; more than one fails closed.
     ck_claims: HashMap<[u8; 32], std::collections::HashSet<[u8; 32]>>,
+    next_claim_sweep_at: u64,
     contested: u64,
 }
 
@@ -134,7 +137,6 @@ impl<S: Store> Node<S> {
             own_seq: 1,
             links: HashMap::new(),
             next_link_order: Vec::new(),
-            neighbors_dirty: true,
             reconcile_sessions: HashMap::new(),
             pending: HashMap::new(),
             outbound_exclusions: HashMap::new(),
@@ -149,6 +151,7 @@ impl<S: Store> Node<S> {
             draining: false,
             equivocations: 0,
             ck_claims: HashMap::new(),
+            next_claim_sweep_at: now + CLAIM_SWEEP_SECS,
             contested: 0,
         };
         // Seed the claim set from records already in the store so links can be
@@ -178,6 +181,46 @@ impl<S: Store> Node<S> {
     }
 
     pub fn handle(&mut self, event: Event) -> Vec<Action> {
+        let actions = self.handle_inner(event);
+        self.note_outbound_frames(&actions);
+        actions
+    }
+
+    fn note_outbound_frames(&mut self, actions: &[Action]) {
+        for action in actions {
+            if let Action::SendFrame { frame, .. } = action {
+                if matches!(frame, Frame::Dummy(_)) {
+                    continue; // snow does not suppress itself
+                }
+                self.frames_since_snow_tick += 1;
+                let bucket = match frame {
+                    Frame::Offer(o) => {
+                        if o.message.len() <= 2048 {
+                            0
+                        } else if o.message.len() <= 8192 {
+                            1
+                        } else {
+                            2
+                        }
+                    }
+                    Frame::Records(r) => {
+                        let n: usize = r.records.iter().map(|r| r.len()).sum();
+                        if n <= 2048 {
+                            0
+                        } else if n <= 8192 {
+                            1
+                        } else {
+                            2
+                        }
+                    }
+                    _ => 0,
+                };
+                self.store.size_bucket_sample(bucket);
+            }
+        }
+    }
+
+    fn handle_inner(&mut self, event: Event) -> Vec<Action> {
         match event {
             Event::LinkUp {
                 at,
@@ -263,7 +306,6 @@ impl<S: Store> Node<S> {
         self.store
             .record_put(&id, self.scope, &bytes, now)
             .map_err(|e| e.to_string())?;
-        self.neighbors_dirty = true;
         Ok(())
     }
 
@@ -291,7 +333,6 @@ impl<S: Store> Node<S> {
         // Reconcile promptly: the peer needs our record (and we need theirs)
         // for routing to work at all; waiting a full interval stalls delivery.
         self.next_reconcile_at = self.next_reconcile_at.min(at + 1);
-        self.neighbors_dirty = true;
         // Publish the new link set immediately so peers can route via us.
         self.own_seq += 1;
         let _ = self.publish_record(at);
@@ -304,7 +345,6 @@ impl<S: Store> Node<S> {
         self.links.remove(&link);
         self.next_link_order.retain(|l| *l != link);
         self.reconcile_sessions.remove(&link);
-        self.neighbors_dirty = true;
         self.own_seq += 1;
         let _ = self.publish_record(at);
         Vec::new()
@@ -409,10 +449,26 @@ impl<S: Store> Node<S> {
         for bytes in records {
             self.admit_record(at, &bytes);
         }
-        if self.neighbors_dirty {
-            // graph rebuilt lazily at next routing decision; just note it
-        }
         Vec::new()
+    }
+
+    /// Drop claims whose backing record is gone or no longer valid
+    /// (expired). Records are never removed from the store today (record
+    /// lifecycle is a separate decision), so this keys off validity at
+    /// `now`; when a record-expiry sweep lands it will plug in here.
+    fn sweep_ck_claims(&mut self, now: u64) {
+        let mut fresh: HashMap<[u8; 32], std::collections::HashSet<[u8; 32]>> = HashMap::new();
+        if let Ok(records) = self.store.record_all() {
+            for (_, _, bytes, _) in records {
+                if let Ok((rec, _)) = PeerRecord::from_bytes(&bytes, now, None) {
+                    fresh.entry(rec.channel_key).or_default().insert(rec.id);
+                }
+            }
+        }
+        if fresh != self.ck_claims {
+            self.ck_claims = fresh;
+            self.reevaluate_link_bindings(now);
+        }
     }
 
     /// Fold a record's (channel_key, id) claim into the claim set.
@@ -507,7 +563,6 @@ impl<S: Store> Node<S> {
                         .store
                         .kel_head_put(&rec.id, head.seq, head.commitment, at);
                 }
-                self.neighbors_dirty = true;
                 self.note_ck_claim(&rec);
                 self.reevaluate_link_bindings(at);
                 true
@@ -529,6 +584,8 @@ enum DispatchResult {
 }
 
 const CUSTODY_TIMEOUT_SECS: u64 = 30;
+const CLAIM_SWEEP_SECS: u64 = 60;
+const MAX_PENDING_ECHOES: usize = 256;
 const BUF_CLASSES: usize = 16;
 
 impl<S: Store> Node<S> {
@@ -563,8 +620,7 @@ impl<S: Store> Node<S> {
             sig: [0; 64],
         };
 
-        let recipient_private = self.record_mode(&send.to) == Some(Mode::Private);
-        let receipt_timeout = if recipient_private {
+        let receipt_timeout = if self.record_mode(&send.to) == Some(Mode::Private) {
             self.config.receipt_timeout_private
         } else {
             self.config.receipt_timeout_public
@@ -691,13 +747,23 @@ impl<S: Store> Node<S> {
         recipient: &[u8; 32],
         exclude: &[[u8; 32]],
     ) -> Option<([u8; 32], [u8; 1216])> {
+        // Spec: exclude the sender's own links and the recipient's gateways
+        // (a gateway is already the entry point; it is not a waypoint).
+        let own_links: HashSet<[u8; 32]> = self.links.values().filter_map(|l| l.peer).collect();
+        let recipient_gateways: HashSet<[u8; 32]> =
+            self.record_gateways(recipient).into_iter().collect();
         let mut candidates: Vec<([u8; 32], [u8; 1216])> = self
             .store
             .record_all()
             .unwrap_or_default()
             .into_iter()
             .filter_map(|(id, _scope, bytes, _)| {
-                if id == self.own_id || &id == recipient || exclude.contains(&id) {
+                if id == self.own_id
+                    || &id == recipient
+                    || exclude.contains(&id)
+                    || own_links.contains(&id)
+                    || recipient_gateways.contains(&id)
+                {
                     return None;
                 }
                 let (rec, _) = PeerRecord::from_bytes(&bytes, self.now, None).ok()?;
@@ -722,20 +788,24 @@ impl<S: Store> Node<S> {
                 continue;
             }
             let force_waypoint = msg.attempts > 0;
+            // Every pass through the pump is one send attempt; count it in
+            // exactly one place.
+            msg.attempts += 1;
             match self.build_attempt(&msg, force_waypoint) {
                 Ok((wire, _real_dst, used_wp)) => {
                     match self.dispatch_wire(now, &wire, &msg, &mut actions) {
                         DispatchResult::Sent => {
-                            msg.attempts += 1;
                             if let Some(wp) = used_wp {
                                 msg.waypoints_tried.push(wp);
                             }
                             msg.state = OutboundState::InFlight;
                             msg.next_attempt = now + self.config.retry_base_secs;
+                            // The receipt clock starts when the message
+                            // actually goes on the wire, not at enqueue.
+                            msg.receipt_deadline = Some(now + self.receipt_timeout_for(&msg));
                             let _ = self.store.outbound_put(&msg);
                         }
                         DispatchResult::NoRoute => {
-                            msg.attempts += 1;
                             msg.state = OutboundState::Queued;
                             msg.next_attempt = now + self.backoff(msg.attempts);
                             let _ = self.store.outbound_put(&msg);
@@ -743,7 +813,6 @@ impl<S: Store> Node<S> {
                     }
                 }
                 Err(()) => {
-                    msg.attempts += 1;
                     if msg.attempts > self.config.fresh_waypoint_retries + 1 {
                         msg.state = OutboundState::Failed;
                         let _ = self.store.outbound_put(&msg);
@@ -767,47 +836,18 @@ impl<S: Store> Node<S> {
         actions
     }
 
+    fn receipt_timeout_for(&self, msg: &lattice_store::OutboundMessage) -> u64 {
+        if self.record_mode(&msg.recipient) == Some(Mode::Private) {
+            self.config.receipt_timeout_private
+        } else {
+            self.config.receipt_timeout_public
+        }
+    }
+
     fn backoff(&self, attempts: u32) -> u64 {
         let shift = attempts.min(16);
         let base = self.config.retry_base_secs.saturating_mul(1u64 << shift);
         base.min(self.config.retry_max_secs)
-    }
-
-    fn note_frame_sent(&mut self, link: LinkId, action: Action, actions: &mut Vec<Action>) {
-        let bucket = match &action {
-            Action::SendFrame {
-                pad_to: None,
-                frame: Frame::Offer(o),
-                ..
-            } => {
-                if o.message.len() <= 2048 {
-                    0
-                } else if o.message.len() <= 8192 {
-                    1
-                } else {
-                    2
-                }
-            }
-            Action::SendFrame {
-                pad_to: None,
-                frame: Frame::Records(r),
-                ..
-            } => {
-                let n: usize = r.records.iter().map(|r| r.len()).sum();
-                if n <= 2048 {
-                    0
-                } else if n <= 8192 {
-                    1
-                } else {
-                    2
-                }
-            }
-            _ => 0,
-        };
-        self.store.size_bucket_sample(bucket);
-        self.frames_since_snow_tick += 1;
-        actions.push(action);
-        let _ = link;
     }
 
     fn pick_next_hop(
@@ -826,30 +866,20 @@ impl<S: Store> Node<S> {
             .filter_map(|(l, _)| self.links.get(l).and_then(|s| s.peer))
             .collect();
         let up: HashSet<[u8; 32]> = self.links.values().filter_map(|l| l.peer).collect();
-        let mut excluded = excluded_peers;
-        for _ in 0..self.links.len().max(1) + 1 {
-            match graph.next_hop(
-                &self.own_id,
-                &dist,
-                self.config.sideways_prob,
-                &excluded,
-                &mut self.rng,
-            ) {
-                Some(peer) if up.contains(&peer) => {
-                    let link = self
-                        .links
-                        .iter()
-                        .find(|(_, l)| l.peer == Some(peer))
-                        .map(|(id, _)| *id)?;
-                    return Some((link, peer));
-                }
-                Some(peer) => {
-                    excluded.insert(peer);
-                }
-                None => break,
-            }
-        }
-        None
+        let peer = graph.next_hop(
+            &self.own_id,
+            &dist,
+            self.config.sideways_prob,
+            &excluded_peers,
+            &up,
+            &mut self.rng,
+        )?;
+        let link = self
+            .links
+            .iter()
+            .find(|(_, l)| l.peer == Some(peer))
+            .map(|(id, _)| *id)?;
+        Some((link, peer))
     }
 
     fn dispatch_wire(
@@ -877,19 +907,16 @@ impl<S: Store> Node<S> {
                 origin: PendingOrigin::Outbound { mid: msg.mid },
                 sent_at: now,
                 excluded: exclusion,
-            },
-        );
-        self.note_frame_sent(
-            link,
-            Action::SendFrame {
-                pad_to: None,
                 link,
-                frame: Frame::Offer(OfferFrame {
-                    message: wire.to_vec(),
-                }),
             },
-            actions,
         );
+        actions.push(Action::SendFrame {
+            pad_to: None,
+            link,
+            frame: Frame::Offer(OfferFrame {
+                message: wire.to_vec(),
+            }),
+        });
         DispatchResult::Sent
     }
 }
@@ -957,12 +984,18 @@ impl<S: Store> Node<S> {
             lease_until: now + CUSTODY_TIMEOUT_SECS,
             excluded: Vec::new(),
         };
-        if self.store.custody_put(entry).is_err() {
+        let accept = CustodyAccept {
+            entry,
+            share_dest: dst,
+            share_upstream: link,
+            share_bytes: msg_len as i64,
+            seen_hash: leg_hash,
+            seen_exp: msg.header.exp,
+        };
+        if self.store.custody_accept(accept).is_err() {
             actions.push(self.busy(link, leg));
             return actions;
         }
-        let _ = self.store.share_add(&dst, link, msg_len as i64);
-        let _ = self.store.seen_add(leg_hash, msg.header.exp);
         actions.push(Action::SendFrame {
             pad_to: None,
             link,
@@ -1038,12 +1071,18 @@ impl<S: Store> Node<S> {
                         lease_until: now + CUSTODY_TIMEOUT_SECS,
                         excluded: Vec::new(),
                     };
-                    if self.store.custody_put(entry).is_err() {
+                    let accept = CustodyAccept {
+                        entry,
+                        share_dest: hdr_dst,
+                        share_upstream: link,
+                        share_bytes: msg_len as i64,
+                        seen_hash: *leg_hash,
+                        seen_exp: hdr_exp,
+                    };
+                    if self.store.custody_accept(accept).is_err() {
                         actions.push(self.busy(link, leg));
                         return actions;
                     }
-                    let _ = self.store.share_add(&hdr_dst, link, msg_len as i64);
-                    let _ = self.store.seen_add(*leg_hash, hdr_exp);
                     actions.push(Action::SendFrame {
                         pad_to: None,
                         link,
@@ -1079,12 +1118,18 @@ impl<S: Store> Node<S> {
                         lease_until: now + CUSTODY_TIMEOUT_SECS,
                         excluded: Vec::new(),
                     };
-                    if self.store.custody_put(entry).is_err() {
+                    let accept = CustodyAccept {
+                        entry,
+                        share_dest: rcpt,
+                        share_upstream: link,
+                        share_bytes: msg_len as i64,
+                        seen_hash: *leg_hash,
+                        seen_exp: msg.header.exp,
+                    };
+                    if self.store.custody_accept(accept).is_err() {
                         actions.push(self.busy(link, leg));
                         return actions;
                     }
-                    let _ = self.store.share_add(&rcpt, link, msg_len as i64);
-                    let _ = self.store.seen_add(*leg_hash, msg.header.exp);
                     actions.push(Action::SendFrame {
                         pad_to: None,
                         link,
@@ -1301,19 +1346,16 @@ impl<S: Store> Node<S> {
                 },
                 sent_at: now,
                 excluded,
-            },
-        );
-        self.note_frame_sent(
-            next_link,
-            Action::SendFrame {
-                pad_to: None,
                 link: next_link,
-                frame: Frame::Offer(OfferFrame {
-                    message: entry.message.clone(),
-                }),
             },
-            actions,
         );
+        actions.push(Action::SendFrame {
+            pad_to: None,
+            link: next_link,
+            frame: Frame::Offer(OfferFrame {
+                message: entry.message.clone(),
+            }),
+        });
     }
 }
 
@@ -1439,36 +1481,57 @@ impl<S: Store> Node<S> {
         let Some(reference) = envelope.reference else {
             return actions;
         };
+        let terminal_status = |s: u64| {
+            matches!(
+                s,
+                local::MSG_STATUS_DELIVERED | local::MSG_STATUS_FAILED | local::MSG_STATUS_EXPIRED
+            )
+        };
+        let already_terminal = self
+            .store
+            .status_get(&reference)
+            .ok()
+            .flatten()
+            .map(|(s, _)| terminal_status(s))
+            .unwrap_or(false);
         match envelope.kind {
-            KIND_RECEIPT => {
-                if let Ok(Some(mut msg)) = self.store.outbound_get(&reference) {
-                    if matches!(msg.state, OutboundState::Queued | OutboundState::InFlight) {
-                        msg.state = OutboundState::Delivered;
-                        let _ = self.store.outbound_put(&msg);
-                    }
+            KIND_RECEIPT | KIND_NEGATIVE_RECEIPT => {
+                let Ok(Some(mut msg)) = self.store.outbound_get(&reference) else {
+                    // Not one of ours (or already forgotten): nothing to update.
+                    return actions;
+                };
+                // A receipt is authoritative only from the message's recipient.
+                // The signature is verified by the caller; this binds the
+                // signer to the original message.
+                if msg.recipient != envelope.from {
+                    return actions;
                 }
-                let _ = self
-                    .store
-                    .status_set(&reference, local::MSG_STATUS_DELIVERED, None);
+                let was_active =
+                    matches!(msg.state, OutboundState::Queued | OutboundState::InFlight);
+                if was_active {
+                    msg.state = if envelope.kind == KIND_RECEIPT {
+                        OutboundState::Delivered
+                    } else {
+                        OutboundState::Failed
+                    };
+                    let _ = self.store.outbound_put(&msg);
+                }
+                // Terminal states are sticky: a late receipt must not flip
+                // Delivered/Failed/Expired.
+                if !was_active || already_terminal {
+                    return actions;
+                }
+                let (status, detail) = if envelope.kind == KIND_RECEIPT {
+                    (local::MSG_STATUS_DELIVERED, None)
+                } else {
+                    (local::MSG_STATUS_FAILED, envelope.reason)
+                };
+                let _ = self.store.status_set(&reference, status, detail);
                 self.outbound_exclusions.remove(&reference);
                 actions.push(Action::Status {
                     mid: reference,
-                    status: local::MSG_STATUS_DELIVERED,
-                    detail: None,
-                });
-            }
-            KIND_NEGATIVE_RECEIPT => {
-                if let Ok(Some(mut msg)) = self.store.outbound_get(&reference) {
-                    msg.state = OutboundState::Failed;
-                    let _ = self.store.outbound_put(&msg);
-                }
-                let _ =
-                    self.store
-                        .status_set(&reference, local::MSG_STATUS_FAILED, envelope.reason);
-                actions.push(Action::Status {
-                    mid: reference,
-                    status: local::MSG_STATUS_FAILED,
-                    detail: envelope.reason,
+                    status,
+                    detail,
                 });
             }
             _ => {}
@@ -1565,11 +1628,15 @@ impl<S: Store> Node<S> {
             self.next_reconcile_at = now + self.config.reconcile_interval_secs;
         }
 
-        if self.neighbors_dirty && now >= self.record_refresh_at {
+        if now >= self.record_refresh_at {
             self.own_seq += 1;
             let _ = self.publish_record(now);
             self.record_refresh_at = now + self.config.record_refresh_secs;
-            self.neighbors_dirty = false;
+        }
+
+        if now >= self.next_claim_sweep_at {
+            self.sweep_ck_claims(now);
+            self.next_claim_sweep_at = now + CLAIM_SWEEP_SECS;
         }
 
         // Expire originated messages.
@@ -1606,7 +1673,6 @@ impl<S: Store> Node<S> {
                 if now < deadline {
                     continue;
                 }
-                msg.attempts += 1;
                 if msg.attempts > self.config.fresh_waypoint_retries {
                     msg.state = OutboundState::Failed;
                     let _ = self.store.outbound_put(&msg);
@@ -1623,13 +1689,6 @@ impl<S: Store> Node<S> {
                 } else {
                     msg.state = OutboundState::Queued;
                     msg.next_attempt = now;
-                    let recipient_private = self.record_mode(&msg.recipient) == Some(Mode::Private);
-                    let timeout = if recipient_private {
-                        self.config.receipt_timeout_private
-                    } else {
-                        self.config.receipt_timeout_public
-                    };
-                    msg.receipt_deadline = Some(now + timeout);
                     let _ = self.store.outbound_put(&msg);
                 }
             }
@@ -1646,8 +1705,10 @@ impl<S: Store> Node<S> {
             if let Some(p) = self.pending.remove(&leg) {
                 match p.origin {
                     PendingOrigin::Outbound { mid } => {
+                        let excl = self.outbound_exclusions.entry(mid).or_default();
+                        add_exclusion(excl, p.link, now + self.config.retry_base_secs);
                         for (l, u) in p.excluded {
-                            add_exclusion(self.outbound_exclusions.entry(mid).or_default(), l, u);
+                            add_exclusion(excl, l, u);
                         }
                         if let Ok(Some(mut msg)) = self.store.outbound_get(&mid) {
                             if msg.state == OutboundState::InFlight {
@@ -1659,6 +1720,11 @@ impl<S: Store> Node<S> {
                     }
                     PendingOrigin::Relay { custody_leg } => {
                         if let Ok(Some(mut e)) = self.store.custody_get(&custody_leg) {
+                            add_exclusion(
+                                &mut e.excluded,
+                                p.link,
+                                now + self.config.retry_base_secs,
+                            );
                             for (l, u) in p.excluded {
                                 add_exclusion(&mut e.excluded, l, u);
                             }
@@ -1816,8 +1882,12 @@ impl<S: Store> Node<S> {
                 frame: Frame::Ping(PingFrame { nonce: p.nonce }),
             }],
             Frame::Dummy(d) => {
-                if d.echo {
-                    let jitter = (self.rng.next_u64() % 900) + 50;
+                if d.echo && self.inner_pending_echo.len() < MAX_PENDING_ECHOES {
+                    // The node's clock has 1s granularity; the spec's "short
+                    // random delay" (same distribution as a custody reply,
+                    // i.e. ~immediate) is expressed as 0-1 ticks. Sub-second
+                    // delay needs a millisecond time base.
+                    let jitter = self.rng.next_u64() % 2;
                     self.inner_pending_echo.push((at + jitter, link));
                 }
                 Vec::new()
@@ -1988,4 +2058,148 @@ fn scope_as_u8(s: Scope) -> u8 {
 
 fn scope_from_u8(v: u8) -> Scope {
     if v == 1 { Scope::Hive } else { Scope::Wan }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Identity;
+    use lattice_store::{MemStore, OutboundMessage, OutboundState};
+
+    fn test_node() -> Node<MemStore> {
+        let cfg = Config {
+            snow_per_min: 0.0,
+            ..Config::default()
+        };
+        Node::new(cfg, Identity::generate(), MemStore::new(), 1_000).expect("node construction")
+    }
+
+    fn outbound(mid: [u8; 16], recipient: [u8; 32], state: OutboundState) -> OutboundMessage {
+        OutboundMessage {
+            mid,
+            recipient,
+            envelope: lattice_proto::message::Envelope {
+                kind: KIND_MESSAGE,
+                mid,
+                from: [0xF1; 32],
+                fsvc: "svc".into(),
+                fmbx: b"out".to_vec(),
+                tsvc: "svc".into(),
+                tmbx: b"in".to_vec(),
+                created: 1,
+                body: Some(b"hi".to_vec()),
+                reference: None,
+                reason: None,
+                sig: [0; 64],
+            },
+            priority: 1,
+            exp: u64::MAX / 2,
+            state,
+            waypoints_tried: vec![],
+            receipt_deadline: Some(u64::MAX / 2),
+            attempts: 0,
+            next_attempt: 0,
+            route: 0,
+        }
+    }
+
+    fn receipt(kind: u64, reference: [u8; 16], from: [u8; 32]) -> Envelope {
+        Envelope {
+            kind,
+            mid: [0xEE; 16],
+            from,
+            fsvc: "svc".into(),
+            fmbx: b"in".to_vec(),
+            tsvc: "svc".into(),
+            tmbx: b"out".to_vec(),
+            created: 1,
+            body: None,
+            reference: Some(reference),
+            reason: None,
+            sig: [0; 64],
+        }
+    }
+
+    #[test]
+    fn receipt_from_recipient_marks_delivered() {
+        let mut node = test_node();
+        let recipient = [0xA1; 32];
+        let mid = [0x11; 16];
+        node.store
+            .outbound_push(&outbound(mid, recipient, OutboundState::InFlight))
+            .unwrap();
+        let actions = node.on_receipt(1_000, &receipt(KIND_RECEIPT, mid, recipient));
+        assert_eq!(actions.len(), 1);
+        let msg = node.store.outbound_get(&mid).unwrap().unwrap();
+        assert_eq!(msg.state, OutboundState::Delivered);
+        assert_eq!(
+            node.store.status_get(&mid).unwrap().unwrap().0,
+            local::MSG_STATUS_DELIVERED
+        );
+    }
+
+    #[test]
+    fn receipt_from_non_recipient_is_ignored() {
+        let mut node = test_node();
+        let recipient = [0xA1; 32];
+        let attacker = [0xB2; 32];
+        let mid = [0x22; 16];
+        node.store
+            .outbound_push(&outbound(mid, recipient, OutboundState::InFlight))
+            .unwrap();
+        let actions = node.on_receipt(1_000, &receipt(KIND_RECEIPT, mid, attacker));
+        assert!(actions.is_empty());
+        let msg = node.store.outbound_get(&mid).unwrap().unwrap();
+        assert_eq!(msg.state, OutboundState::InFlight);
+        assert_eq!(node.store.status_get(&mid).unwrap(), None);
+        // A negative receipt from a non-recipient is ignored too.
+        let actions = node.on_receipt(1_000, &receipt(KIND_NEGATIVE_RECEIPT, mid, attacker));
+        assert!(actions.is_empty());
+        let msg = node.store.outbound_get(&mid).unwrap().unwrap();
+        assert_eq!(msg.state, OutboundState::InFlight);
+    }
+
+    #[test]
+    fn late_receipt_does_not_flip_terminal_states() {
+        let mut node = test_node();
+        let recipient = [0xA1; 32];
+
+        // Expired message stays Expired when a receipt arrives late.
+        let mid1 = [0x33; 16];
+        node.store
+            .outbound_push(&outbound(mid1, recipient, OutboundState::Expired))
+            .unwrap();
+        node.store
+            .status_set(&mid1, local::MSG_STATUS_EXPIRED, Some(ERR_EXPIRED))
+            .unwrap();
+        let actions = node.on_receipt(1_000, &receipt(KIND_RECEIPT, mid1, recipient));
+        assert!(actions.is_empty());
+        assert_eq!(
+            node.store.status_get(&mid1).unwrap().unwrap().0,
+            local::MSG_STATUS_EXPIRED
+        );
+        assert_eq!(
+            node.store.outbound_get(&mid1).unwrap().unwrap().state,
+            OutboundState::Expired
+        );
+
+        // Delivered message stays Delivered when a negative receipt arrives late.
+        let mid2 = [0x44; 16];
+        node.store
+            .outbound_push(&outbound(mid2, recipient, OutboundState::Delivered))
+            .unwrap();
+        node.store
+            .status_set(&mid2, local::MSG_STATUS_DELIVERED, None)
+            .unwrap();
+        let actions = node.on_receipt(1_000, &receipt(KIND_NEGATIVE_RECEIPT, mid2, recipient));
+        assert!(actions.is_empty());
+        assert_eq!(
+            node.store.status_get(&mid2).unwrap().unwrap().0,
+            local::MSG_STATUS_DELIVERED
+        );
+        assert_eq!(
+            node.store.outbound_get(&mid2).unwrap().unwrap().state,
+            OutboundState::Delivered
+        );
+    }
 }

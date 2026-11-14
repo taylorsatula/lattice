@@ -15,3 +15,6 @@ lattice-core = { version = "0.0.0", path = "../lattice-core" }
 lattice-crypto = { version = "0.0.0", path = "../lattice-crypto" }
 lattice-proto = { version = "0.0.0", path = "../lattice-proto" }
 lattice-store = { version = "0.0.0", path = "../lattice-store" }
+
+[dev-dependencies]
+tempfile = "3"

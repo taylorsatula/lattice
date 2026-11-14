@@ -12,7 +12,7 @@ use std::collections::VecDeque;
 
 use lattice_core::{Action, AppSend, Config, Event, Node};
 use lattice_proto::frames::Frame;
-use lattice_store::MemStore;
+use lattice_store::{MemStore, Store};
 
 pub type NodeIndex = usize;
 
@@ -45,8 +45,8 @@ pub struct Delivery {
     pub body: Vec<u8>,
 }
 
-pub struct Sim {
-    pub nodes: Vec<Node<MemStore>>,
+pub struct Sim<S: Store = MemStore> {
+    pub nodes: Vec<Node<S>>,
     pub ids: Vec<[u8; 32]>,
     pub channel_keys: std::collections::HashMap<[u8; 32], [u8; 32]>,
     links: Vec<Link>,
@@ -59,10 +59,19 @@ pub struct Sim {
     pub frame_counts: std::collections::HashMap<&'static str, u64>,
     configs: Vec<Config>,
     prototype: Config,
+    store_factory: Box<dyn FnMut(usize) -> S>,
 }
 
-impl Sim {
+impl Sim<MemStore> {
     pub fn new(config: Config) -> Self {
+        Self::with_stores(config, |_| MemStore::new())
+    }
+}
+
+impl<S: Store> Sim<S> {
+    /// A simulator whose nodes are backed by stores from `factory`
+    /// (called once per added node, with the node index).
+    pub fn with_stores(config: Config, factory: impl FnMut(usize) -> S + 'static) -> Self {
         let prototype = config.clone();
         Sim {
             nodes: Vec::new(),
@@ -78,6 +87,7 @@ impl Sim {
             frame_counts: std::collections::HashMap::new(),
             configs: Vec::new(),
             prototype,
+            store_factory: Box::new(factory),
         }
     }
 
@@ -86,7 +96,7 @@ impl Sim {
             0x5EED_0000u64.wrapping_add((self.nodes.len() as u64).wrapping_mul(0x9E3779B97F4A7C15));
         let mut cfg = self.configs_prototype();
         cfg.rng_seed = seed;
-        let store = MemStore::new();
+        let store = (self.store_factory)(self.nodes.len());
         let identity = lattice_core::Identity::generate();
         let channel_key = lattice_crypto::x25519_public(&identity.channel_seed);
         let node = Node::new(cfg.clone(), identity, store, self.now).expect("node construction");
@@ -449,13 +459,13 @@ impl Sim {
         }
     }
 
-    fn placeholder_node(&self) -> Node<MemStore> {
+    fn placeholder_node(&mut self) -> Node<S> {
         let mut cfg = self.configs_prototype();
         cfg.rng_seed = u64::MAX;
         Node::new(
             cfg,
             lattice_core::Identity::generate(),
-            MemStore::new(),
+            (self.store_factory)(usize::MAX),
             self.now,
         )
         .expect("placeholder")

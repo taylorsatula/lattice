@@ -683,6 +683,7 @@ dependencies = [
  "lattice-crypto",
  "lattice-proto",
  "lattice-store",
+ "tempfile",
 ]
 
 [[package]]

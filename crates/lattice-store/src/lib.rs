@@ -96,6 +96,19 @@ pub struct ShareCounters {
     pub held_bytes: u64,
 }
 
+/// Everything that must commit atomically when a node accepts custody of a
+/// message: the custody row, the fair-share debit, and the dedup marker.
+/// Splitting these across transactions can strand a message (custody row
+/// without a dedup marker) or leak share accounting on crash.
+pub struct CustodyAccept {
+    pub entry: CustodyEntry,
+    pub share_dest: [u8; 32],
+    pub share_upstream: u64,
+    pub share_bytes: i64,
+    pub seen_hash: [u8; 32],
+    pub seen_exp: u64,
+}
+
 pub trait Store {
     // peer records (raw bytes + received time), keyed by (id, scope)
     fn record_get(&self, id: &[u8; 32], scope: Scope)
@@ -133,6 +146,7 @@ pub trait Store {
     fn outbound_all(&self) -> Result<Vec<OutboundMessage>, StoreError>;
 
     // custody
+    fn custody_accept(&mut self, accept: CustodyAccept) -> Result<(), StoreError>;
     fn custody_put(&mut self, entry: CustodyEntry) -> Result<(), StoreError>;
     fn custody_get(&self, leg: &[u8; 16]) -> Result<Option<CustodyEntry>, StoreError>;
     fn custody_remove(&mut self, leg: &[u8; 16]) -> Result<Option<CustodyEntry>, StoreError>;

@@ -234,6 +234,10 @@ fn fair_share_caps_a_flooded_upstream() {
 fn snow_emits_at_configured_rate_and_backs_off_when_busy() {
     let mut cfg = fast_config();
     cfg.snow_per_min = 120.0; // 2 per second
+    // Quiet network: any real frame suppresses a snow tick, so keep
+    // reconcile/gossip off the wire for this measurement.
+    cfg.reconcile_interval_secs = 3600;
+    cfg.record_refresh_secs = 3600;
     let mut sim = Sim::new(cfg);
     let a = sim.add_node();
     let b = sim.add_node();
@@ -556,5 +560,34 @@ fn contested_channel_key_claim_unbinds_link() {
         sim.deliveries.iter().filter(|d| d.mid == mid2).count(),
         0,
         "contested link must not be used for routing"
+    );
+}
+
+#[test]
+fn queued_message_survives_receipt_timeout_and_delivers() {
+    // Receipt timeout is 2s; the link stays down far longer, so the message
+    // sits Queued well past its original deadline. Once the link heals it
+    // must still deliver — the deadline is re-armed at send time, not at
+    // enqueue time.
+    let mut cfg = fast_config();
+    cfg.receipt_timeout_public = 2;
+    cfg.retry_base_secs = 1;
+    cfg.retry_max_secs = 2;
+    let mut sim = Sim::new(cfg);
+    for _ in 0..2 {
+        sim.add_node();
+    }
+    sim.connect(0, 1);
+    let link = sim.link_between(0, 1).unwrap();
+    sim.run_for(6); // let records converge before partitioning
+    sim.set_link(link, false);
+    sim.run_for(2);
+    let mid = sim.app_send(0, 1, b"late but alive");
+    sim.run_for(30);
+    sim.set_link(link, true);
+    sim.run_for(15);
+    assert!(
+        sim.deliveries.iter().any(|d| d.mid == mid),
+        "message queued past its original receipt deadline must still deliver"
     );
 }

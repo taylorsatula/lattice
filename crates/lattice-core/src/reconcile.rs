@@ -175,7 +175,9 @@ pub fn respond(
 ) -> (Vec<Range>, Vec<([u8; 32], u8)>) {
     let mut out = Vec::new();
     let mut wants = Vec::new();
-    for m in msgs {
+    // A peer may not make us do unbounded work: cap the ranges we process
+    // and the entries we echo per response.
+    for m in msgs.iter().take(MAX_RANGES_PER_MSG) {
         // Reject inverted ranges before doing any arithmetic on them.
         let (lo, hi) = range_parts(m);
         if let (Some(l), Some(h)) = (lo, hi) {
@@ -246,7 +248,11 @@ pub fn respond(
                         out.push(Range::Entries {
                             lower: *lower,
                             upper: *upper,
-                            entries: mine.into_iter().map(|i| (i.id, i.scope, i.seq)).collect(),
+                            entries: mine
+                                .into_iter()
+                                .take(LEAF_LIMIT)
+                                .map(|i| (i.id, i.scope, i.seq))
+                                .collect(),
                         });
                     }
                 }
@@ -255,7 +261,7 @@ pub fn respond(
                         Ok(idx) => items[idx].seq < *seq,
                         Err(_) => true,
                     };
-                    if want && !wants.contains(&(*id, *scope)) {
+                    if want && wants.len() < MAX_RANGES_PER_MSG && !wants.contains(&(*id, *scope)) {
                         wants.push((*id, *scope));
                     }
                 }
@@ -399,5 +405,80 @@ mod tests {
         let (a_wants, b_wants) = reconcile_pair(&a, &b);
         assert!(a_wants.contains(&([0xad; 32], 0)));
         assert!(b_wants.contains(&([0xde; 32], 0)));
+    }
+}
+
+#[cfg(test)]
+mod adversarial_tests {
+    use super::*;
+
+    fn item(n: u8) -> Item {
+        Item {
+            id: [n; 32],
+            scope: 0,
+            seq: n as u64,
+        }
+    }
+
+    #[test]
+    fn oversized_range_list_is_truncated() {
+        // A peer sending 500 ranges gets at most MAX_RANGES_PER_MSG processed.
+        let items = vec![item(1)];
+        let msgs: Vec<Range> = (0..500)
+            .map(|_| Range::Fingerprint {
+                lower: None,
+                upper: None,
+                count: 0,
+                sum: [0; 32],
+            })
+            .collect();
+        let mut session = ReconcileSession::new();
+        let (out, _wants) = respond(&items, &msgs, &mut session);
+        // 64 processed ranges, one output each (all mismatch), capped at 64.
+        assert!(out.len() <= MAX_RANGES_PER_MSG);
+    }
+
+    #[test]
+    fn entries_echo_is_capped_at_leaf_limit() {
+        // Peer sends an Entries range covering 100 of our items; we must
+        // echo at most LEAF_LIMIT of them.
+        let items: Vec<Item> = (0..100u8).map(item).collect();
+        let entries: Vec<([u8; 32], u8, u64)> =
+            items.iter().map(|i| (i.id, i.scope, i.seq)).collect();
+        let msgs = vec![Range::Entries {
+            lower: None,
+            upper: None,
+            entries,
+        }];
+        let mut session = ReconcileSession::new();
+        let (out, _wants) = respond(&items, &msgs, &mut session);
+        let echoed: usize = out
+            .iter()
+            .map(|r| match r {
+                Range::Entries { entries, .. } => entries.len(),
+                _ => 0,
+            })
+            .sum();
+        assert!(echoed <= LEAF_LIMIT, "echoed {echoed} entries");
+    }
+
+    #[test]
+    fn wants_are_capped() {
+        let items: Vec<Item> = vec![];
+        let entries: Vec<([u8; 32], u8, u64)> = (0..200u16)
+            .map(|i| {
+                let mut id = [0u8; 32];
+                id[..2].copy_from_slice(&i.to_be_bytes());
+                (id, 0u8, 1u64)
+            })
+            .collect();
+        let msgs = vec![Range::Entries {
+            lower: None,
+            upper: None,
+            entries,
+        }];
+        let mut session = ReconcileSession::new();
+        let (_out, wants) = respond(&items, &msgs, &mut session);
+        assert!(wants.len() <= MAX_RANGES_PER_MSG);
     }
 }
