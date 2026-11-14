@@ -130,8 +130,8 @@ yields a 32-byte shared secret and a 1120-byte KEM ciphertext.
   The nonce is zero, since each key is single-use.
 - **Associated data** is the encoded routing header. This binds the header
   to both layers: a hop that alters the header makes decryption fail at the
-  gateway or recipient. The design's "copy of the header inside the
-  envelope" isn't needed.
+  gateway or recipient, so no copy of the header is needed inside the
+  envelope.
 
 ## 5. Message (§6)
 

@@ -417,9 +417,9 @@ that limit, it minimizes what any node can learn or keep.
 - **The set of identities is public** within the mesh, though not their
   locations.
 - **Envelopes have no forward secrecy.** They are encrypted to the
-  recipient's published envelope keys, so whoever later steals those private
-  keys can decrypt recorded envelopes sent to them. Rotating envelope keys
-  regularly (a new record with a higher seq, deleting the old private keys)
+  recipient's published envelope key, so whoever later steals that private
+  key can decrypt recorded envelopes sent to it. Rotating the envelope key
+  regularly (a new record with a higher seq, deleting the old private key)
   limits how much a single theft exposes.
 - **Routing headers are protected only classically.** The hybrid KEM
   protects envelope content. The Noise channel uses X25519 alone, so a
