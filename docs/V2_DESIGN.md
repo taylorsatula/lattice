@@ -59,7 +59,7 @@ as little as possible to the nodes it passes through.
 |---|---|
 | Signatures (identity, records, envelopes, receipts) | Ed25519 |
 | Channel (Noise static key) | X25519 |
-| End-to-end encryption (envelope, gateway layer) | Hybrid X25519 + ML-KEM-768 (FIPS 203) |
+| End-to-end encryption (envelope, gateway layer) | X-Wing: hybrid X25519 + ML-KEM-768 (FIPS 203) |
 | Symmetric encryption | ChaCha20-Poly1305 |
 | Hashes, identifiers, commitments | BLAKE3, full 256 bits, never truncated |
 
@@ -102,20 +102,27 @@ as little as possible to the nodes it passes through.
   same across rotations and replaces v1's separate UUID.
 - **Key event log:** the inception event plus any rotations. It is short,
   append-only and self-verifying.
-- **Address format:** `user@<identifier>`, with the identifier written as
-  base32, about 52 characters. Addresses are exchanged by copy-paste or QR
-  code, never typed.
+- **Address format:** `<service>:<mailbox>@<identifier>`, for example
+  `mira:taylor@<identifier>`, with the identifier written as base32, 52
+  characters. Addresses are exchanged by copy-paste or QR code, never typed.
 - **No names on the network.** Lattice publishes no display names and keeps
   no name table. An application establishes a link using the full address
   and maps its own short name (`west`) to the identifier in its address
   book. Lattice's local API accepts identifiers only.
-- **Users are the instance's business.** Lattice authenticates instances;
-  each instance vouches for its own users, as in email.
+- **Lattice is general-purpose.** Any number of applications ("services")
+  can use one instance. Lattice routes on the identifier and delivers on the
+  service. The mailbox is opaque to Lattice and belongs to the service, so
+  users and their schemas are the application's business.
 
 ## 2. Peer record
 
 There is one record type. Each instance publishes and periodically
-refreshes its own. An instance is either **public** or **private**:
+refreshes its own: one record per scope, so an instance on a hive publishes
+a WAN record and a hive record. A signed record can't have its hive data
+removed before it crosses the WAN, so the two are separate and the hive
+record never leaves the hive. Exact layouts are in `V2_SPEC.md`.
+
+An instance is either **public** or **private**:
 
 - **Public instances** publish endpoints and links, and can be routed
   through.
@@ -125,9 +132,10 @@ refreshes its own. An instance is either **public** or **private**:
 |---|---|---|
 | identifier | All | Stable identity (§1) |
 | signing key + key event log | All | Verifies the signature and the rotation history |
-| seq | All | Monotonic; the highest seq for an identifier wins |
+| scope | All | WAN or hive |
+| seq | All | Monotonic; the highest seq for an (identifier, scope) wins |
 | channel key | All | X25519 static key for the Noise handshake |
-| envelope keys | All | X25519 and ML-KEM-768 public keys that messages to this instance are encrypted to |
+| envelope key | All | X-Wing public key that messages to this instance are encrypted to |
 | expiry | All | Signed coarse expiry, on the order of days |
 | signature | All | By the current signing key, over the exact encoded bytes |
 | endpoints | Public | Addresses, each tagged with a scope (hive or WAN) |
@@ -256,16 +264,20 @@ designated relays and no per-message flooding.
 | Part | Readable by | Contents |
 |---|---|---|
 | Routing header | Every hop | Message id, routing destination (the recipient, or a gateway of a private recipient), expiry |
-| Gateway layer | That gateway only (hybrid-encrypted to its envelope keys) | The private recipient's identifier. Present only for private recipients |
-| Envelope | Recipient only (hybrid-encrypted to its envelope keys) | Sender identifier and user, recipient user, content, metadata, created time, a copy of the header fields, and the sender's signature over all of it |
+| Gateway layer | That gateway only (sealed to its envelope key) | The private recipient's identifier. Present only for private recipients |
+| Envelope | Recipient only (sealed to its envelope key) | Sender identifier, sending and receiving service and mailbox, created time, an opaque application payload, and the sender's signature over the header and all of it |
 | Padding | Nobody | Fills the message to its size bucket (§7) |
 
 - **Immutable end to end.** The sender builds the whole message, and nothing
   changes in transit.
+- **The payload is opaque.** Lattice never interprets it, so applications
+  define and change their own schemas freely.
 - **Hops learn nothing about the sender.** The sender's signature sits inside
   the envelope, so only the recipient can see who sent the message and check
-  that it's genuine. The recipient also checks that the header matches the
-  copy inside the envelope, so tampering by any hop is detected at the end.
+  that it's genuine.
+- **The header is bound to both sealed layers.** It is the associated data
+  of their encryption, so a hop that alters it makes decryption fail at the
+  gateway or the recipient.
 - **Hops judge traffic by the link it arrived on.** A hop checks that a
   message is well formed, fits a size bucket and hasn't expired. Whether it
   takes custody is then decided by fair-share custody for the link the
@@ -318,11 +330,14 @@ designated relays and no per-message flooding.
 
 ### Receipts and recovery
 
-- **End-to-end receipt.** The recipient returns a small receipt for the
-  message id, signed inside its own envelope. It uses the same format and
-  padding as any other message, addressed to the sender, or to the sender's
-  gateway if the sender is private. Custody tells each hop its own job is
-  done; only the receipt tells the sender the message arrived.
+- **End-to-end receipt.** Once the recipient instance has durably stored the
+  message for the target service, it returns a small receipt for the message
+  id, signed inside its own envelope. It uses the same format and padding as
+  any other message, addressed to the sender, or to the sender's gateway if
+  the sender is private. Custody tells each hop its own job is done; only
+  the receipt tells the sender the message arrived. Whether the application
+  read or accepted it is application-level and goes in the application's own
+  messages.
 - **Retry on a disjoint path.** If no receipt arrives within the receipt
   timeout, the sender sends the message again over a path that avoids the
   intermediate nodes it expected earlier attempts to use. This routes
@@ -333,9 +348,10 @@ designated relays and no per-message flooding.
   multiple paths harmless and is also what prevents routing loops.
 - **Failure classes:**
   - **Transient** (unreachable, busy, no path): retry with backoff.
-  - **Permanent** (malformed, invalid signature at the recipient, unknown
-    user at the recipient): stop. A permanent failure at the recipient
-    comes back as a negative receipt.
+  - **Permanent** (malformed, failing verification at the recipient, no such
+    service at the recipient): stop. A permanent failure at the recipient
+    comes back as a negative receipt. Lattice has no concept of users, so it
+    never rejects on a mailbox.
 
 ### Transit
 
@@ -531,14 +547,16 @@ principle).
 - **A hardened systemd unit:** dedicated user, `ProtectSystem=strict`,
   minimal writable paths, resource limits, a single process owning all
   state.
-- **Local control plane.** The application talks to Lattice over a local
-  interface that is never exposed to the network. Admin access fails
-  closed.
+- **Local API.** Applications talk to Lattice over a Unix socket that is
+  never exposed to the network. Each service authenticates with its own
+  configured secret and can read only its own inbox. Admin operations use a
+  separate owner-only socket and the `latticectl` CLI. Details are in
+  `V2_SPEC.md`.
 - **Bounded inputs:** caps on frame and field sizes, and timeouts on every
   network operation.
 - **No per-message logging of senders or destinations by default** (§7).
-- **Lattice doesn't own users.** The application maps users, keeps the
-  address book, and receives messages.
+- **Lattice doesn't own users.** Applications own their users, their
+  mailboxes, their address books and their payload schemas.
 
 ## 11. Removed from v1
 
@@ -569,17 +587,9 @@ principle).
 
 ## 12. Open questions
 
-- **Encoding:** deterministic CBOR (RFC 8949 §4.2) or plain length-prefixed
-  binary fields. Either way the exact bytes are signed, and every object
-  carries a version field.
-- **Object schemas:** exact layouts for the key event log, the public and
-  private peer record, the message, the receipt and the gossip exchange.
-- **The application interface:** a local socket offering send, inbox fetch
-  and acknowledge, with the application pulling from Lattice's inbox. Also
-  whether to add an optional push notification. This determines when the
-  recipient learns a user is unknown and sends its negative receipt.
 - **Configuration surface:** roots, hive networks, public or private,
-  endpoints to advertise, gateways, limit overrides.
+  endpoints to advertise, gateways, services and their secrets, limit
+  overrides.
 - **Hive multicast discovery:** mDNS or a minimal custom announcement.
 - **Parameters:** record and message expiry, gossip cadence, the
   per-destination custody allowance, the transit storage cap, push caps,
@@ -619,6 +629,8 @@ principle).
 - Bortnikov et al., "Brahms: Byzantine Resilient Random Membership Sampling," PODC 2008.
 - Smith, "Key Event Receipt Infrastructure (KERI)," arXiv:1907.02143; Trust over IP KERI specification v1.1 (pre-rotation, quantum attack recovery).
 - NIST FIPS 203, "Module-Lattice-Based Key-Encapsulation Mechanism Standard" (ML-KEM), 2024.
+- Connolly, Schwabe & Westerbaan, "X-Wing: general-purpose hybrid post-quantum KEM," IETF CFRG draft.
+- Bormann & Hoffman, "Concise Binary Object Representation (CBOR)," RFC 8949, 2020 (§4.2 deterministic encoding).
 - Perrin, "The Noise Protocol Framework."
 - Tarr, Lavoie, Meyer & Tschudin, "Secure Scuttlebutt," ACM ICN 2019.
 - Fall, "A Delay-Tolerant Network Architecture for Challenged Internets," SIGCOMM 2003.
