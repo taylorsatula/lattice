@@ -10,16 +10,17 @@ Lattice connects peers over possibly shaky connections without a central
 orchestrator. Instances in the same hive (a LAN, a tailnet, any network
 where members reach each other directly) talk to each other, and instances
 talk across the WAN. A message must be able to cross the mesh resiliently
-to reach an instance the sender can't reach directly.
+to reach an instance the sender can't reach directly, and it should reveal
+as little as possible to the nodes it passes through.
 
 ## Principles
 
 1. **End-to-end.** Each hop guarantees only custody: the next hop durably
    stored the message. Only the recipient can confirm arrival, so arrival is
-   confirmed by a receipt from the recipient, and confidentiality is
-   end-to-end encryption to the recipient's key. Anything only the
-   application can know (read, understood, acted on) is an application
-   message. (Saltzer, Reed & Clark 1984)
+   confirmed by a receipt from the recipient. Confidentiality and sender
+   authentication are end to end as well. Anything only the application can
+   know (read, understood, acted on) is an application message.
+   (Saltzer, Reed & Clark 1984)
 2. **Integrity is cryptographic; discovery is best-effort.** Every record
    proves itself, so it doesn't matter who relayed it. Discovery is allowed
    to be messy.
@@ -43,10 +44,14 @@ to reach an instance the sender can't reach directly.
    self-proving, and nothing depends on a synchronous round trip, so a
    radio mesh such as Meshtastic remains possible later without designing
    for it now.
+8. **Reveal and retain as little as possible.** A node learns only what it
+   needs in order to do its job, and keeps it only as long as it needs it.
+   Lattice is not an anonymity network (§7), but nothing is published,
+   exposed to hops or stored without a reason.
 
 ## 1. Identity
 
-- **Keys:** Ed25519.
+- **Keys:** Ed25519 for signing, X25519 for encryption.
 - **Pre-rotation (from KERI).** Every key state includes a hash of the
   *next* key, committed to before it's needed. A rotation is signed by that
   pre-committed key, and it commits to the hash of the key after that.
@@ -64,9 +69,9 @@ to reach an instance the sender can't reach directly.
 
 ### Names
 
-- **Readable for display, key underneath** (a petname system). The display
-  name is a claim inside the instance's signed record. It is never
-  registered or checked network-wide.
+- **Readable for display, key underneath** (a petname system). An instance
+  may claim a display name in its signed record. The claim is optional and
+  is never registered or checked network-wide.
 - **A local name table on each instance** maps names to identifiers the
   first time it sees them, like SSH's `known_hosts`.
 - **Collisions are shown, never silently resolved.** The first identifier
@@ -74,7 +79,9 @@ to reach an instance the sender can't reach directly.
   short fingerprint suffix (`rocketcity#k7f3`). A name is never silently
   rebound to a different key.
 - **Address format:** `user@name`, or `user@name#suffix` when shared out of
-  band, so the recipient pins the correct identity on first contact.
+  band, so the recipient pins the correct identity on first contact. An
+  instance that publishes no display name is reachable only by an address
+  shared this way.
 - **Envelopes, replies and contact lists use identifiers.** Names are
   resolved only at the edges: when a user types an address and when the app
   displays one. Renames don't break contacts.
@@ -84,20 +91,25 @@ to reach an instance the sender can't reach directly.
 ## 2. Peer record
 
 There is one record type. Each instance publishes and periodically
-refreshes its own.
+refreshes its own. An instance is either **public** or **private**:
 
-| Field | Purpose |
-|---|---|
-| identifier | Stable identity (§1) |
-| current key + key event log | Verifies the signature and the rotation history |
-| seq | Monotonic; the highest seq for an identifier wins |
-| display name | Petname claim |
-| endpoints | Addresses, each tagged with a scope (hive or WAN) |
-| links | Identifiers this instance has recently proven direct reachability to (capped, about 32) |
-| encryption key | X25519 key that messages to this instance are encrypted to |
-| capabilities / protocol version | Feature flags and negotiation |
-| expiry | Signed coarse expiry, on the order of days |
-| signature | By the current key, over the exact encoded bytes |
+- **Public instances** publish endpoints and links, and can be routed
+  through.
+- **Private instances** publish neither. They name gateways instead (§7).
+
+| Field | Present for | Purpose |
+|---|---|---|
+| identifier | All | Stable identity (§1) |
+| current key + key event log | All | Verifies the signature and the rotation history |
+| seq | All | Monotonic; the highest seq for an identifier wins |
+| encryption key | All | X25519 key that messages to this instance are encrypted to |
+| expiry | All | Signed coarse expiry, on the order of days |
+| signature | All | By the current key, over the exact encoded bytes |
+| display name | Optional | Petname claim |
+| endpoints | Public | Addresses, each tagged with a scope (hive or WAN) |
+| links | Public | Identifiers this instance has recently proven direct reachability to (capped, about 32) |
+| gateways | Private | One to three identifiers that accept messages for this instance (§7) |
+| capabilities / protocol version | All | Feature flags and negotiation |
 
 - **Last-writer-wins by seq,** as in BitTorrent's BEP 44 mutable items.
   Partitions merge with no special logic.
@@ -110,9 +122,10 @@ refreshes its own.
   from the two records alone.
 - **Endpoint scope rule.** An address is only valid in the context it was
   learned in. The operator declares which networks make up their hive.
-  Private and overlay addresses (RFC 1918, 100.64.0.0/10 and similar) are
-  accepted only from hive sources and dropped from records that arrive over
-  the WAN. This replaces v1's fixed SSRF blocklist.
+  Hive-scoped endpoints and links are gossiped only within the hive and
+  never over the WAN. Private and overlay addresses (RFC 1918,
+  100.64.0.0/10 and similar) arriving over the WAN are dropped. This
+  replaces v1's fixed SSRF blocklist.
 - **Prove an endpoint before using it.** An endpoint counts as reachable
   only after a handshake at that address proves the far end holds the
   record's key. That stops anyone using the mesh to aim traffic at a victim.
@@ -126,18 +139,21 @@ refreshes its own.
 
 - **Channels authenticated by the two instances' keys,** in the style of
   Noise, WireGuard or SSB's Secret Handshake. There are no certificate
-  authorities and no dependence on DNS for trust.
+  authorities and no dependence on DNS for trust. Each node always knows
+  which neighbor handed it traffic.
 - **WireGuard-style cookies under load.** Normally the handshake proceeds as
   usual. Under load the server keeps no state and answers with a cookie
   derived from the sender's address and a rotating secret. The sender must
   echo it back before the server spends any resources. It costs honest
   peers one extra round trip, only during an attack. There is no
   proof-of-work.
-- **Every protocol object is signed and self-proving,** so objects stay
-  independent of the transport that carries them.
+- **Every protocol object is self-proving.** Peer records are signed
+  publicly. Messages are authenticated end to end inside their encryption
+  (§6). Either way, objects stay independent of the transport that carries
+  them.
 - **Two layers of encryption.** The channel is encrypted hop by hop. Each
   message's content is also encrypted end to end, to the recipient's
-  encryption key (§6), so intermediate nodes never see the content.
+  encryption key, so intermediate nodes never see it.
 
 ## 4. Bootstrap and discovery
 
@@ -170,6 +186,7 @@ merges them.
   - Initially, nodes exchange the full digest of those pairs.
   - When the set grows large, range-based set reconciliation (Meyer 2022,
     as used by Negentropy) replaces it.
+- **Hive-scoped data stays in the hive** (§2).
 - **Neighbor selection** (Heilman et al. 2015; Brahms 2008):
   - Random, from peers grouped by network range.
   - Which peers to keep is chosen by a hash salted with a local secret, so
@@ -189,8 +206,9 @@ designated relays and no per-message flooding.
 
 ### The graph
 
-- **Every node already holds every peer record** through gossip (§5). With
-  the `links` field (§2), that set is the whole reachability graph.
+- **The graph is the public backbone:** the public instances and their
+  links, plus hive links inside a hive. Private instances appear only as
+  "reachable via gateway G."
 - **A link counts only if both ends list each other.** A node that lies can
   invent links only to nodes that also claim it, so it can't make itself look
   adjacent to everyone to attract traffic.
@@ -199,40 +217,48 @@ designated relays and no per-message flooding.
 
 ### The message
 
-| Part | Visible to | Contents |
+| Part | Readable by | Contents |
 |---|---|---|
-| Routing header | Every hop | Message id, destination identifier, expiry |
-| Envelope | Recipient only (encrypted to the recipient's key) | Sender identifier and user, recipient user, content, metadata, created time |
-| Signature | Every hop | The sender instance's signature over the exact bytes of the header and the ciphertext |
+| Routing header | Every hop | Message id, routing destination (the recipient, or a gateway of a private recipient), expiry |
+| Gateway layer | That gateway only (encrypted to its key) | The private recipient's identifier. Present only for private recipients |
+| Envelope | Recipient only (encrypted to its key) | Sender identifier and user, recipient user, content, metadata, created time, a copy of the header fields, and the sender instance's signature over all of it |
+| Padding | Nobody | Fills the message to its size bucket (§7) |
 
-- **Immutable end to end.** Nothing in the message changes in transit, so
-  the sender's signature covers all of it and there is no mutable part to
-  tamper with.
-- **End-to-end encryption.** The envelope is sealed to the recipient's X25519
-  key from its peer record. An intermediate node sees only the destination
-  and ciphertext. It learns who handed it the message and who it hands it
-  to, never the route so far.
-- **Each hop verifies the sender's signature** before taking custody, so a
-  node can't inject traffic in someone else's name or alter it in transit.
-- **Size capped.**
+- **Immutable end to end.** The sender builds the whole message, and nothing
+  changes in transit.
+- **Hops learn nothing about the sender.** The sender's signature sits inside
+  the envelope, so only the recipient can see who sent the message and check
+  that it's genuine. The recipient also checks that the header matches the
+  copy inside the envelope, so tampering by any hop is detected at the end.
+- **Hops judge traffic by who handed it to them.** A hop checks that a
+  message is well formed, fits a size bucket and hasn't expired. It then
+  accepts it from the neighbor that handed it over, subject to that
+  neighbor's limits (§8).
 
 ### Forwarding
 
-1. **Sender:** signs and encrypts the message at enqueue time and writes it
-   to the durable outbound queue. The first attempt is made immediately.
+1. **Sender:** builds, encrypts and pads the message at enqueue time and
+   writes it to the durable outbound queue. The first attempt is made
+   immediately.
 2. **Each hop,** including the sender:
-   - If it is the destination, it stores the message, hands it to the
+   - If it is the routing destination and the final recipient, it opens the
+     envelope, verifies the sender's signature, hands the message to the
      application, and sends a receipt.
-   - Otherwise it computes the next hop toward the destination on its own
-     current view of the graph. The route isn't fixed by the sender, so each
-     hop uses the freshest information available.
+   - If it is a gateway, it opens the gateway layer, learns which private
+     instance the message is for, and forwards it over its direct link to
+     that instance.
+   - Otherwise it computes the next hop toward the routing destination on
+     its own current view of the graph. The route isn't fixed by the sender,
+     so each hop uses the freshest information available.
    - **Loops are prevented by dedup.** A node that already holds or has held
      the message id answers "already have it" and takes no further action.
      The forwarding hop then picks its next-best hop. This holds even while
      hops' views of the graph disagree.
+   - **Each hop may hold the message for a small random delay** before
+     forwarding (§7).
 3. **Custody transfer** (Fall 2003). The next hop accepts only after
    durably storing the message. Responsibility then passes to it, and the
-   previous hop is done.
+   previous hop deletes its copy.
 4. **No path right now:** the message waits at the furthest node that took
    custody, retrying with backoff, and moves on when the graph changes. It
    is dropped at expiry. This is delay-tolerant behavior: traversal
@@ -242,47 +268,110 @@ designated relays and no per-message flooding.
 
 ### Receipts and recovery
 
-- **End-to-end receipt.** The recipient returns a small signed receipt for
-  the message id, routed back through the graph like any other message.
-  Custody tells each hop its own job is done; only the receipt tells the
-  sender the message arrived.
+- **End-to-end receipt.** The recipient returns a small receipt for the
+  message id, signed inside its own envelope. It uses the same format and
+  padding as any other message, addressed to the sender, or to the sender's
+  gateway if the sender is private. Custody tells each hop its own job is
+  done; only the receipt tells the sender the message arrived.
 - **Retry on a disjoint path.** If no receipt arrives within the receipt
   timeout, the sender sends the message again over a path that avoids the
-  intermediate nodes of earlier attempts. This routes around a node that
-  accepts custody and then silently drops messages.
-- **Idempotent receive by message id.** Every hop and the recipient keep
-  the ids they have seen until the message expires, not merely until they
-  have forwarded it, at about 16 bytes per id. This one rule makes
-  retries and multiple paths harmless and is also what prevents routing
-  loops.
+  intermediate nodes it expected earlier attempts to use. This routes
+  around a node that accepts custody and then silently drops messages.
+- **Idempotent receive by message id.** Every hop and the recipient keep a
+  hash of each message id they have seen until the message expires, not
+  merely until they have forwarded it. This one rule makes retries and
+  multiple paths harmless and is also what prevents routing loops.
 - **Failure classes:**
   - **Transient** (unreachable, overloaded, no path): retry with backoff.
-  - **Permanent** (malformed, invalid signature, unknown user at the
-    recipient): stop. A permanent failure at the recipient comes back as a
-    signed negative receipt.
+  - **Permanent** (malformed, invalid signature at the recipient, unknown
+    user at the recipient): stop. A permanent failure at the recipient
+    comes back as a negative receipt.
 
 ### Transit
 
 - **Every node may carry traffic for others.** Accepting transit traffic is
-  each server's policy, bounded by per-peer rate limits and a transit
-  storage cap (§7).
-- **Topology is visible.** Every node can see who links to whom. That's the
-  cost of routing without designated relays.
+  each server's policy, bounded by per-neighbor rate limits and a transit
+  storage cap (§8).
+- **Only the public backbone is visible.** Anyone can see which public
+  instances link to which. Private instances and hive-internal links are
+  not visible outside their hive.
 
-## 7. Abuse resistance and the immune system
+## 7. Privacy
 
-**The protocol enforces only validity:** signatures verify, formats parse,
-size limits hold. Everything else is server-level policy.
+Lattice is not an anonymity network. It doesn't re-encrypt messages at each
+hop the way onion routing does, so the routing model stays simple. Within
+that limit, it minimizes what any node can learn or keep.
+
+### Measures
+
+1. **The sender is hidden from hops.** The sender's signature and identity
+   are inside the envelope (§6). Because every node carries transit
+   traffic, the first hop can't tell whether its neighbor wrote a message
+   or is forwarding one.
+2. **Private instances.** A private instance publishes no endpoints and no
+   links. Its record names one to three gateways it chooses, usually hive
+   peers. Senders route to a gateway, and only the gateway can open the
+   layer that names the real recipient. This is a one-layer form of
+   Lightning's blinded paths.
+3. **Only the public backbone is published.** Endpoints and links come only
+   from public instances. Hive-scoped data never leaves the hive (§2).
+4. **Size buckets.** Every message, receipts included, is padded to one of a
+   few fixed sizes (for example 1, 4 and 16 KB), so size doesn't
+   distinguish messages.
+5. **Random per-hop delay.** Each hop holds a message for a small random
+   time before forwarding, a few seconds by default and set per server.
+   Store-and-forward delivery makes this nearly free. It blunts simple
+   timing correlation. There is no cover traffic.
+6. **Receipts look like messages.** Same format, same padding, no separate
+   channel.
+7. **Minimal retention.** After handing off custody, a hop deletes the
+   message and keeps only a hash of its id for dedup. By default nothing
+   logs senders or destinations per message, so a seized or compromised
+   server reveals little.
+8. **Optional display names.** An instance shared only by
+   address-with-suffix doesn't need to announce a name to the whole mesh.
+
+### Who learns what
+
+| Party | Learns | Does not learn |
+|---|---|---|
+| Any node, from gossip | The public backbone, which identities exist, which gateways private instances use | Private instances' locations, hive-internal links |
+| A hop relaying a message | The neighbor it came from, the neighbor it goes to, the routing destination, its size bucket, a rough time | The sender, the content, the full path |
+| A gateway | The above, plus which of its private instances the message is for | The sender, the content |
+| The recipient | The sender instance and user, the content | The path |
+
+### What remains exposed
+
+- **Colluding hops on the same path can link it,** because the message is
+  identical at every hop. Re-encrypting at each hop is what onion routing
+  adds, and Lattice deliberately doesn't.
+- **An observer who sees the whole network** can still correlate timing.
+  Random delay makes that harder but doesn't prevent it.
+- **Gateways see their private instances' traffic.** That's why instances
+  choose their own gateways, usually within their hive.
+- **The set of identities is public** within the mesh, though not their
+  locations.
+
+## 8. Abuse resistance and the immune system
+
+**The protocol enforces only validity:** records' signatures verify, formats
+parse, size buckets and expiries hold. Everything else is server-level
+policy.
+
+**Accountability follows the link.** Hops can't see senders, so a hop holds
+the neighbor that handed it traffic responsible for that traffic. A neighbor
+is a proven link and costs something to establish; a sender key is free to
+make. The recipient, which can see the sender, applies its own limits on
+senders.
 
 **Baseline server limits** cost honest traffic nothing:
 
-- A rate limit per peer.
-- A rate limit per network range on first contact from unknown identifiers.
-  The limit follows the address range, so churning through fresh keys
-  doesn't help.
-- Per-peer push limits on unsolicited records.
-- Per-peer limits on transit messages accepted for forwarding, and a cap on
-  total transit storage.
+- A rate limit per neighbor, on messages and on records.
+- Per-neighbor limits on transit messages accepted for forwarding, and a cap
+  on total transit storage.
+- At the recipient: a rate limit per network range on first contact from
+  unknown sender identifiers. The limit follows the neighbor's address
+  range, so churning through fresh keys doesn't help.
 - A fixed cap on stored records, with eviction by the secret-salted hash.
 - Soft-state expiry.
 - Local bans, based on the server's own direct evidence.
@@ -298,8 +387,9 @@ trigger-happy (the smoke detector principle).
 - **Wary list.** Each server attaches a short, capped, expiring list of
   identifiers it's wary of, based on its own observations, to the gossip
   exchange that already happens. There is no new message type. Observations
-  include rate abuse, invalid data, user spam reports, and a node on whose
-  paths messages repeatedly fail to produce receipts.
+  include a neighbor abusing rate limits or sending invalid data, senders its
+  users report as spam, and a node on whose expected paths messages
+  repeatedly fail to produce receipts.
 - **Rule.** When peers from *k* distinct network ranges list the same
   identifier, the server applies a much tighter rate limit to it, stops
   relaying its records, and routes around it when other paths exist. When
@@ -310,7 +400,7 @@ trigger-happy (the smoke detector principle).
   the herd grows wary, because its records spread only through servers that
   haven't flagged it.
 
-## 8. Time
+## 9. Time
 
 - **Ordering uses seq numbers;** no clock is involved.
 - **Replay protection** uses seq numbers plus the record of seen message
@@ -318,7 +408,7 @@ trigger-happy (the smoke detector principle).
 - **The only timestamps are coarse signed expiries,** on peer records and
   messages, measured in days. Clocks only need to be right to within hours.
 
-## 9. Operations (carried forward from v1)
+## 10. Operations (carried forward from v1)
 
 - **The daemon runs its own timers.** No external scheduler calls admin
   endpoints.
@@ -336,10 +426,11 @@ trigger-happy (the smoke detector principle).
 - **Bounded inputs:** caps on request body and field sizes, and timeouts on
   every outbound call.
 - **A minimal public status endpoint** and a detailed admin health endpoint.
+- **No per-message logging of senders or destinations by default** (§7).
 - **Lattice doesn't own users.** The application maps users and receives
   messages.
 
-## 10. Removed from v1
+## 11. Removed from v1
 
 | v1 | v2 |
 |---|---|
@@ -349,7 +440,8 @@ trigger-happy (the smoke detector principle).
 | Network-wide name registration, confidence scores | Local petname table |
 | Domain queries, route cache, hop counts, confidence decay | Full-membership gossip; link-state routing over it |
 | Direct delivery to the recipient's endpoint only | Hop-by-hop forwarding with custody across the mesh |
-| Plaintext content, readable by the receiving daemon | Content encrypted end to end to the recipient's key |
+| Plaintext content; sender visible to the receiving daemon's path | Content and sender encrypted end to end; hops see neither |
+| Every server's endpoints published | Endpoints published only by public instances |
 | Admission only via pinned bootstrap | Any valid record from any peer; root as introducer |
 | Mandatory bootstrap pins | Optional fingerprint, trust on first use otherwise |
 | Peer exchange defined but unused | Anti-entropy is the core mechanism |
@@ -362,11 +454,11 @@ trigger-happy (the smoke detector principle).
 | Saturation metric | Removed |
 | External scheduler driving the daemon | Self-running daemon |
 
-## 11. Open questions
+## 12. Open questions
 
-- **Wire transport:** HTTP(S) carrying signed objects, or a Noise-style
-  channel over TCP or UDP. This determines how the handshake and cookie
-  mechanism are built.
+- **Wire transport:** HTTP(S) carrying the objects, or a Noise-style channel
+  over TCP or UDP. This determines how the handshake and cookie mechanism
+  are built.
 - **Encoding:** deterministic CBOR or another canonical binary encoding, or
   signing raw payload bytes inside a simple envelope.
 - **Handoff to the application:** whether the app pulls from Lattice's
@@ -390,8 +482,14 @@ trigger-happy (the smoke detector principle).
 - **End-to-end encryption scheme:** a sealed-box construction to X25519, or
   a ratcheting session between instances that talk often. The first is
   simpler and doesn't need a round trip.
-- **Topology visibility:** whether any link information should be hidden,
-  for example hive-internal links published only inside the hive.
+- **Privacy details:**
+  - The size buckets, and whether messages larger than the largest bucket
+    are split or refused.
+  - The default per-hop delay range.
+  - How a private instance chooses its gateways, how many it lists, and what
+    a private instance with no hive uses as a gateway.
+  - Whether recipients may accept messages from anonymous senders. For now
+    the recipient always learns the sender.
 - **Scale ceiling:** if nodes can no longer hold the whole graph (very large
   meshes, or tiny radio devices), the documented next step is greedy routing
   on a self-re-rooting spanning tree, as in Yggdrasil (Kleinberg 2007).
@@ -411,6 +509,9 @@ trigger-happy (the smoke detector principle).
 - Moy, "OSPF Version 2," RFC 2328, 1998.
 - Kleinberg, "Geographic Routing Using Hyperbolic Space," INFOCOM 2007.
 - Yggdrasil network whitepaper and Ironwood routing library (greedy tree routing).
+- Danezis & Goldberg, "Sphinx: A Compact and Provably Secure Mix Format," IEEE S&P 2009 (the onion format Lattice deliberately doesn't adopt).
+- Lightning Network BOLT 4, onion routing and route blinding (the full form of the gateway layer).
+- Piotrowska et al., "The Loopix Anonymity System," USENIX Security 2017 (per-hop random delay; cover traffic not adopted).
 - BitTorrent BEP 5 (DHT), BEP 9 (metadata exchange), BEP 11 (PEX), BEP 14 (LSD), BEP 44 (mutable items).
 - Donenfeld, "WireGuard: Next Generation Kernel Network Tunnel," NDSS 2017 (cookie mechanism).
 - Laurie & Clayton, "Proof-of-Work Proves Not to Work," WEIS 2004.
