@@ -111,7 +111,7 @@ pub struct Config {
     pub wary_list_max: usize,
     pub default_message_horizon: u64,
     pub rng_seed: u64,
-    /// Endpoints to publish in our record (public mode). `wss://host[:port]/` URLs.
+    /// Endpoints to publish in our record (public mode). `ws://host[:port]/` URLs.
     pub advertise: Vec<String>,
     /// Gateway node ids for a private node's record (1-3, private mode only).
     pub gateways: Vec<[u8; 32]>,

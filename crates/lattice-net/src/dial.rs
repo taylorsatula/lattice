@@ -20,16 +20,16 @@ use crate::peer::PeerIo;
 pub struct EndpointUrl {
     pub host: String,
     pub port: u16,
-    pub tls: bool,
 }
 
 pub fn parse_endpoint(url: &str) -> Result<EndpointUrl, NetError> {
     let (scheme, rest) = url.split_once("://").ok_or(NetError::Io)?;
-    let tls = match scheme {
-        "ws" => false,
-        "wss" => true,
+    match scheme {
+        // Lattice speaks plain WebSocket; confidentiality comes from Noise.
+        // wss is rejected rather than silently downgraded.
+        "ws" => {}
         _ => return Err(NetError::Io),
-    };
+    }
     let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
     if authority.is_empty() || authority.contains('@') {
         return Err(NetError::Io);
@@ -41,13 +41,7 @@ pub fn parse_endpoint(url: &str) -> Result<EndpointUrl, NetError> {
         let after = &rest[end + 1..];
         let port = match after.strip_prefix(':') {
             Some(p) => p.parse::<u16>().map_err(|_| NetError::Io)?,
-            None => {
-                if tls {
-                    443
-                } else {
-                    80
-                }
-            }
+            None => 80,
         };
         (h.to_string(), port)
     } else if let Some((h, p)) = authority.rsplit_once(':') {
@@ -57,12 +51,12 @@ pub fn parse_endpoint(url: &str) -> Result<EndpointUrl, NetError> {
         }
         (h.to_string(), port)
     } else {
-        (authority.to_string(), if tls { 443 } else { 80 })
+        (authority.to_string(), 80)
     };
     if host.is_empty() {
         return Err(NetError::Io);
     }
-    Ok(EndpointUrl { host, port, tls })
+    Ok(EndpointUrl { host, port })
 }
 
 /// Addresses worth dialing for an endpoint, after scope enforcement.
@@ -79,6 +73,12 @@ pub async fn scoped_addresses(
     } else if let Ok(ip) = endpoint.host.parse::<IpAddr>() {
         candidates.push(ip);
     } else {
+        // Resolution uses the system resolver. To move to DoH/DoT later,
+        // swap this lookup for a DoH client (e.g. hickory-resolver) behind
+        // the same signature; nothing else in the dial path cares how the
+        // addresses were obtained. The resolved addresses still pass through
+        // the scope filter below, so a hostile resolver cannot smuggle a
+        // private address into a WAN dial.
         let resolved = tokio::net::lookup_host((endpoint.host.as_str(), endpoint.port))
             .await
             .map_err(|_| NetError::Io)?;
@@ -141,7 +141,7 @@ mod tests {
 
     #[tokio::test]
     async fn wan_record_with_private_ips_is_never_dialed() {
-        let ep = parse_endpoint("wss://mesh.example.com:443/").unwrap();
+        let ep = parse_endpoint("ws://mesh.example.com:443/").unwrap();
         let private = vec![
             IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)),
             IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
@@ -186,22 +186,22 @@ mod tests {
 
     #[tokio::test]
     async fn wan_public_ip_is_dialable() {
-        let ep = parse_endpoint("wss://mesh.example.com/").unwrap();
+        let ep = parse_endpoint("ws://mesh.example.com/").unwrap();
         let out = scoped_addresses(&ep, &[IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))], Scope::Wan)
             .await
             .unwrap();
         assert_eq!(out[0].ip(), IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)));
-        assert_eq!(out[0].port(), 443);
+        assert_eq!(out[0].port(), 80);
     }
 
     #[test]
     fn parse_variants() {
-        let p = parse_endpoint("wss://mesh.example.com/path").unwrap();
-        assert_eq!(p.port, 443);
+        let p = parse_endpoint("ws://mesh.example.com/path").unwrap();
+        assert_eq!(p.port, 80);
         let p = parse_endpoint("ws://[fd00::1]:8443/").unwrap();
         assert_eq!(p.host, "fd00::1");
         assert_eq!(p.port, 8443);
         assert!(parse_endpoint("https://x/").is_err());
-        assert!(parse_endpoint("wss://user:pw@host/").is_err());
+        assert!(parse_endpoint("ws://user:pw@host/").is_err());
     }
 }

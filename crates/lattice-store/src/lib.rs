@@ -70,7 +70,6 @@ pub struct CustodyEntry {
     pub destination: [u8; 32],
     pub class: u8,
     pub exp: u64,
-    pub lease_until: u64,
     /// Neighbors that already answered busy/already-have for this leg.
     /// Neighbors that already replied busy/already-have for this leg,
     /// with the unix time after which they may be retried.

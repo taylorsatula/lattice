@@ -13,7 +13,7 @@ listen = ["0.0.0.0:8443"]
 
 # Endpoints advertised in this node's record (public mode). Required for
 # other nodes to dial you; otherwise use hive/roots-based setups.
-# advertise = ["wss://node.example.net:8443/"]
+# advertise = ["ws://node.example.net:8443/"]
 
 # Peers to dial at startup. Give each either a channel_key (IK handshake)
 # or a path (XX upgrade path). Optional id pins the expected peer.

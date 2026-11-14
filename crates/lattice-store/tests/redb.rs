@@ -47,7 +47,6 @@ fn custody(byte: u8) -> CustodyEntry {
         destination: [3; 32],
         class: 4,
         exp: 9_999_999_999,
-        lease_until: 100,
         excluded: vec![],
     }
 }
@@ -238,7 +237,6 @@ fn crash_child(db_path: &str, journal_path: &str) {
                 destination: [9; 32],
                 class: 1,
                 exp: u64::MAX / 2,
-                lease_until: u64::MAX / 2,
                 excluded: vec![],
             },
             share_dest: [9; 32],

@@ -11,7 +11,6 @@ fn entry(n: u8) -> CustodyEntry {
         destination: [9; 32],
         class: 1,
         exp: u64::MAX / 2,
-        lease_until: u64::MAX / 2,
         excluded: vec![],
     }
 }

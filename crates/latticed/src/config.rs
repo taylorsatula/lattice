@@ -35,7 +35,7 @@ pub struct Config {
     /// Path of the admin socket (mode 0600).
     #[serde(default = "default_admin_socket")]
     pub admin_socket: PathBuf,
-    /// Endpoints to advertise in our record (public mode). `wss://host[:port]/` URLs.
+    /// Endpoints to advertise in our record (public mode). `ws://host[:port]/` URLs.
     #[serde(default)]
     pub advertise: Vec<String>,
     /// Gateway node ids (hex, 32 bytes). Required in private mode; forbidden otherwise.
@@ -178,8 +178,8 @@ pub fn validate(cfg: &Config) -> Result<(), String> {
         _ => unreachable!("mode checked above"),
     }
     for (i, ep) in cfg.advertise.iter().enumerate() {
-        if !ep.starts_with("wss://") && !ep.starts_with("ws://") {
-            return Err(format!("advertise[{i}] must be a ws(s):// URL, got {ep:?}"));
+        if !ep.starts_with("ws://") {
+            return Err(format!("advertise[{i}] must be a ws:// URL, got {ep:?}"));
         }
         // Full validation (host syntax, port) happens by building the record at startup.
     }

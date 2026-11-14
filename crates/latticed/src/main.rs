@@ -172,23 +172,30 @@ async fn cmd_run(args: &[String]) -> std::process::ExitCode {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    // Restore the persisted drain flag (set via the admin socket or a
-    // signal); a restarted node stays drained until explicitly re-enabled.
+    // Restore the persisted drain flag. Drain is a maintenance state, not a
+    // transient one: an operator who drained a node for maintenance expects
+    // it to stay drained across a restart (e.g. after a crash or a package
+    // upgrade), not to silently resume accepting custody. Clearing it is an
+    // explicit operator action (`latticectl drain off`).
     let draining = Arc::new(std::sync::atomic::AtomicBool::new(
         store.drain_get().unwrap_or(false),
     ));
     let cfg = Arc::new(cfg);
 
     // Install signal handlers before binding any socket, so SIGTERM/SIGINT
-    // at any point after startup is caught and drains before exit.
+    // at any point after startup is caught and drains before exit. NB:
+    // tokio registers the OS handler eagerly in `signal()`, so these must be
+    // created here, not inside the future passed to run().
     #[cfg(unix)]
-    let shutdown = async {
+    let shutdown = {
         use tokio::signal::unix::{SignalKind, signal};
         let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
         let mut int = signal(SignalKind::interrupt()).expect("install SIGINT handler");
-        tokio::select! {
-            _ = term.recv() => {},
-            _ = int.recv() => {},
+        async move {
+            tokio::select! {
+                _ = term.recv() => {},
+                _ = int.recv() => {},
+            }
         }
     };
     #[cfg(not(unix))]

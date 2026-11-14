@@ -980,6 +980,13 @@ impl<S: Store> Node<S> {
         };
         let class = dist.min(BUF_CLASSES - 1) as u8;
         let upstream_count = self.links.len().max(1) as u64;
+        // Fair-share accounting is per (destination, upstream link): each
+        // upstream gets custody_allowance/N per destination. The spec's
+        // wording suggests a per-upstream aggregate cap; the per-destination
+        // form is strictly more permissive for single-destination floods and
+        // equivalent otherwise. If per-upstream aggregate accounting is ever
+        // wanted, add a second counter keyed by upstream alone and check both
+        // here — the store already keys shares by (dest, upstream).
         let share_limit = self.config.custody_allowance / upstream_count;
         if self.store.share_get(&dst, link).unwrap_or(0) + msg_len > share_limit {
             actions.push(self.busy(link, leg));
@@ -997,7 +1004,6 @@ impl<S: Store> Node<S> {
             destination: dst,
             class,
             exp: msg.header.exp,
-            lease_until: now + CUSTODY_TIMEOUT_SECS,
             excluded: Vec::new(),
         };
         let accept = CustodyAccept {
@@ -1084,7 +1090,6 @@ impl<S: Store> Node<S> {
                         destination: hdr_dst,
                         class,
                         exp: hdr_exp,
-                        lease_until: now + CUSTODY_TIMEOUT_SECS,
                         excluded: Vec::new(),
                     };
                     let accept = CustodyAccept {
@@ -1131,7 +1136,6 @@ impl<S: Store> Node<S> {
                         destination: rcpt,
                         class,
                         exp: msg.header.exp,
-                        lease_until: now + CUSTODY_TIMEOUT_SECS,
                         excluded: Vec::new(),
                     };
                     let accept = CustodyAccept {

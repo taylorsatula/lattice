@@ -439,14 +439,9 @@ pub fn compare_lww(a_bytes: &[u8], a_seq: u64, b_bytes: &[u8], b_seq: u64) -> st
 }
 
 fn validate_endpoint(ep: &Endpoint, scope: Scope) -> Result<(), ProtoError> {
-    let rest = ep
-        .url
-        .strip_prefix("wss://")
-        .or_else(|| ep.url.strip_prefix("ws://"))
-        .ok_or(ProtoError::Invalid("endpoint scheme must be ws or wss"))?;
-    if scope == Scope::Wan && !ep.url.starts_with("wss://") {
-        return Err(ProtoError::Invalid("WAN endpoints must use wss"));
-    }
+    let rest = ep.url.strip_prefix("ws://").ok_or(ProtoError::Invalid(
+        "endpoint scheme must be ws (Noise provides confidentiality; TLS is not used)",
+    ))?;
     let hostport = rest.split('/').next().unwrap_or("");
     if hostport.is_empty() || hostport.contains('@') {
         return Err(ProtoError::Invalid(

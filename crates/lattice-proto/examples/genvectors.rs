@@ -49,7 +49,7 @@ fn main() {
             mode: Mode::Public,
             scope: Scope::Wan,
             endpoints: vec![Endpoint {
-                url: "wss://mesh.example.com/".into(),
+                url: "ws://mesh.example.com/".into(),
                 ips: vec!["1.1.1.1".parse().unwrap()],
             }],
             links: vec![],

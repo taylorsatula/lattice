@@ -38,7 +38,7 @@ fn public_record(f: &Fixture) -> PeerRecord {
             mode: Mode::Public,
             scope: Scope::Wan,
             endpoints: vec![Endpoint {
-                url: "wss://mesh.example.com/".into(),
+                url: "ws://mesh.example.com/".into(),
                 ips: vec![],
             }],
             links: vec![],
@@ -96,7 +96,7 @@ fn private_record_with_private_endpoints_rejected() {
                 mode: Mode::Private,
                 scope: Scope::Wan,
                 endpoints: vec![Endpoint {
-                    url: "wss://x.example/".into(),
+                    url: "ws://x.example/".into(),
                     ips: vec![]
                 }],
                 links: vec![],
@@ -144,7 +144,7 @@ fn wan_record_rejects_private_endpoint_ip() {
             mode: Mode::Public,
             scope: Scope::Wan,
             endpoints: vec![Endpoint {
-                url: "wss://mesh.example.com/".into(),
+                url: "ws://mesh.example.com/".into(),
                 ips: vec!["192.168.1.10".parse().unwrap()],
             }],
             links: vec![],

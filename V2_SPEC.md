@@ -119,7 +119,7 @@ Each event is a signed map.
 | 7 | ck | x25519 | All | Noise static key |
 | 8 | ek | xwing_pk | All | Envelope key (§4) |
 | 9 | mode | uint | All | 0 = public, 1 = private |
-| 10 | ep | array of endpoint | Public | Endpoint = `{0: url, 1: [ip address, …] or absent}`. `url` is `wss://` or `ws://` (hive). Connecting nodes prefer the listed IPs, using the URL's host only for TLS and the `Host` header |
+| 10 | ep | array of endpoint | Public | Endpoint = `{0: url, 1: [ip address, …] or absent}`. `url` is `ws://`. Connecting nodes prefer the listed IPs, using the URL's host only for the `Host` header |
 | 11 | ln | array of id | Public | Current links, at most 32 |
 | 12 | gw | array of id | Private | One to three gateways |
 | 13 | cap | uint | All | Capability bitset |
@@ -251,6 +251,12 @@ it through gossip (§7 below) and holds the message until the record arrives
 or the message expires.
 
 ## 6. Channel (§3)
+
+Lattice uses plain WebSocket (`ws://`). Confidentiality and integrity come
+from the Noise session, not from TLS: the payload is encrypted end to end
+before the WebSocket ever sees it, so a second encryption layer would add
+certificate management for nameless nodes without adding protection. `wss://`
+is not used; implementations must reject it rather than silently downgrade.
 
 Each WebSocket binary frame carries one CBOR value.
 
@@ -523,7 +529,7 @@ redb tables, derived from the objects above:
 | `identity` | singleton | Own KEL, current secret keys, configuration hash |
 | `records` | (id, scope) | Peer record bytes, received time, plus range fingerprints maintained for reconciliation |
 | `outbound` | mid | Message bytes, priority, state, attempt, next attempt, receipt deadline, waypoints used |
-| `custody` | leg | Message bytes, upstream link, current destination, buffer class, lease |
+| `custody` | leg | Message bytes, upstream link, current destination, buffer class |
 | `shares` | (destination, upstream link) | Count held, for fair-share custody |
 | `seen` | BLAKE3(leg) | Expiry. Hop-level dedup |
 | `delivered` | BLAKE3(mid) | Expiry. Recipient-level dedup |

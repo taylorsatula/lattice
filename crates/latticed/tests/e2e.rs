@@ -480,7 +480,7 @@ async fn drain_persists_across_restart() {
         None,
         &[("test", "test-secret-with-plenty-of-entropy")],
     );
-    wait_for(|| b.app.exists(), Duration::from_secs(10), "b app socket").await;
+    wait_sockets(&b).await;
 
     let mut admin = Client::connect_admin(&b.admin)
         .await
