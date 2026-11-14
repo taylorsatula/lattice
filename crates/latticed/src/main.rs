@@ -16,6 +16,8 @@ mod keys;
 mod runtime;
 
 use std::path::PathBuf;
+
+use lattice_store::Store;
 use std::sync::Arc;
 
 #[tokio::main]
@@ -170,16 +172,21 @@ async fn cmd_run(args: &[String]) -> std::process::ExitCode {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
+    // Restore the persisted drain flag (set via the admin socket or a
+    // signal); a restarted node stays drained until explicitly re-enabled.
+    let draining = Arc::new(std::sync::atomic::AtomicBool::new(
+        store.drain_get().unwrap_or(false),
+    ));
     let cfg = Arc::new(cfg);
 
     // Inbound listener: accept connections, hand peers to the runtime.
     let (peer_tx, peer_rx) = tokio::sync::mpsc::unbounded_channel::<lattice_net::PeerIo>();
     for addr in &cfg.listen {
-        let under_load = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let listener_cfg = lattice_net::ListenerConfig {
             channel_seed: identity.channel_seed,
             status_enabled: cfg.status,
-            under_load,
+            draining: draining.clone(),
+            force_under_load: false,
             on_peer: peer_tx.clone(),
         };
         match lattice_net::serve(listener_cfg, vec![*addr]).await {
@@ -191,7 +198,7 @@ async fn cmd_run(args: &[String]) -> std::process::ExitCode {
         }
     }
 
-    let runtime = runtime::Runtime::new(&cfg, identity, store, now, peer_rx);
+    let runtime = runtime::Runtime::new(&cfg, identity, store, now, peer_rx, draining.clone());
 
     // Dial configured roots at startup.
     for root in &cfg.roots {
@@ -218,18 +225,33 @@ async fn cmd_run(args: &[String]) -> std::process::ExitCode {
         }
     }
 
+    // Bind both sockets before doing anything else; if either fails, exit
+    // nonzero rather than run without a local API.
+    let app_listener = match api::bind_app(&cfg) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("app socket {}: {e}", cfg.app_socket.display());
+            return std::process::ExitCode::from(1);
+        }
+    };
+    let admin_listener = match api::bind_admin(&cfg) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("admin socket {}: {e}", cfg.admin_socket.display());
+            return std::process::ExitCode::from(1);
+        }
+    };
     let api_tx = runtime.api_tx();
     let app_broadcast = runtime.app_broadcast.clone();
     let app_cfg = cfg.clone();
-    let admin_cfg = cfg.clone();
     tokio::spawn(async move {
-        if let Err(e) = api::serve_app(app_cfg, api_tx.clone(), app_broadcast).await {
+        if let Err(e) = api::serve_app(app_listener, app_cfg, api_tx.clone(), app_broadcast).await {
             eprintln!("application socket failed: {e}");
         }
     });
     let api_tx2 = runtime.api_tx();
     tokio::spawn(async move {
-        if let Err(e) = api::serve_admin(admin_cfg, api_tx2).await {
+        if let Err(e) = api::serve_admin(admin_listener, api_tx2).await {
             eprintln!("admin socket failed: {e}");
         }
     });

@@ -236,6 +236,9 @@ impl PeerRecord {
                 }
             }
         }
+        for ep in &endpoints {
+            validate_endpoint(ep, scope)?;
+        }
         let id = identifier(&kel)?;
         let mut rec = PeerRecord {
             id,

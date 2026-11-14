@@ -177,6 +177,18 @@ impl<S: Store> Node<S> {
                 .map(|(r, _)| r.seq)
                 .unwrap_or(1);
         }
+        // Crash recovery: anything InFlight at boot may or may not have
+        // reached the next hop. Requeue it now; the recipient dedups by mid,
+        // so at-least-once survives a restart.
+        if let Ok(all) = node.store.outbound_all() {
+            for mut msg in all {
+                if msg.state == OutboundState::InFlight {
+                    msg.state = OutboundState::Queued;
+                    msg.next_attempt = now;
+                    let _ = node.store.outbound_put(&msg);
+                }
+            }
+        }
         Ok(node)
     }
 
@@ -597,6 +609,7 @@ impl<S: Store> Node<S> {
                 mid,
                 status: local::MSG_STATUS_FAILED,
                 detail: Some(ERR_NO_RECORD),
+                service: send.service.clone(),
             }];
         }
 
@@ -644,12 +657,14 @@ impl<S: Store> Node<S> {
                 mid,
                 status: local::MSG_STATUS_FAILED,
                 detail: Some(ERR_INTERNAL),
+                service: send.service.clone(),
             }];
         }
         let mut actions = vec![Action::Status {
             mid,
             status: local::MSG_STATUS_QUEUED,
             detail: None,
+            service: send.service.clone(),
         }];
         actions.extend(self.pump_outbound(now));
         actions
@@ -825,6 +840,7 @@ impl<S: Store> Node<S> {
                             mid: msg.mid,
                             status: local::MSG_STATUS_FAILED,
                             detail: Some(ERR_NO_ROUTE),
+                            service: msg.envelope.fsvc.clone(),
                         });
                     } else {
                         msg.next_attempt = now + self.config.retry_base_secs;
@@ -1369,8 +1385,10 @@ impl<S: Store> Node<S> {
         match frame.result {
             CUSTODY_ACCEPTED => match pending.as_ref().map(|p| &p.origin) {
                 Some(PendingOrigin::Outbound { mid }) => {
+                    let mut service = String::new();
                     if let Ok(Some(mut msg)) = self.store.outbound_get(mid) {
                         msg.state = OutboundState::InFlight;
+                        service = msg.envelope.fsvc.clone();
                         let _ = self.store.outbound_put(&msg);
                     }
                     let _ = self
@@ -1380,6 +1398,7 @@ impl<S: Store> Node<S> {
                         mid: *mid,
                         status: local::MSG_STATUS_IN_TRANSIT,
                         detail: None,
+                        service,
                     });
                 }
                 Some(PendingOrigin::Relay { custody_leg }) => {
@@ -1443,9 +1462,11 @@ impl<S: Store> Node<S> {
                 if let Some(p) = pending {
                     match p.origin {
                         PendingOrigin::Outbound { mid } => {
+                            let mut service = String::new();
                             if let Ok(Some(mut msg)) = self.store.outbound_get(&mid) {
                                 msg.state = OutboundState::Failed;
                                 self.outbound_exclusions.remove(&msg.mid);
+                                service = msg.envelope.fsvc.clone();
                                 let _ = self.store.outbound_put(&msg);
                             }
                             let _ = self.store.status_set(
@@ -1457,6 +1478,7 @@ impl<S: Store> Node<S> {
                                 mid,
                                 status: local::MSG_STATUS_FAILED,
                                 detail: Some(ERR_REFUSED),
+                                service,
                             });
                         }
                         PendingOrigin::Relay { custody_leg } => {
@@ -1532,6 +1554,7 @@ impl<S: Store> Node<S> {
                     mid: reference,
                     status,
                     detail,
+                    service: msg.envelope.fsvc.clone(),
                 });
             }
             _ => {}
@@ -1656,6 +1679,7 @@ impl<S: Store> Node<S> {
                         mid: msg.mid,
                         status: local::MSG_STATUS_EXPIRED,
                         detail: Some(ERR_EXPIRED),
+                        service: msg.envelope.fsvc.clone(),
                     });
                 }
             }
@@ -1685,6 +1709,7 @@ impl<S: Store> Node<S> {
                         mid: msg.mid,
                         status: local::MSG_STATUS_FAILED,
                         detail: Some(ERR_NO_ROUTE),
+                        service: msg.envelope.fsvc.clone(),
                     });
                 } else {
                     msg.state = OutboundState::Queued;

@@ -75,10 +75,13 @@ pub enum Action {
         received: u64,
     },
     /// Status transition for a message this node originated (or accepted).
+    /// `service` is the originating service, so the daemon can route the
+    /// event to the right application connection.
     Status {
         mid: [u8; 16],
         status: u64,
         detail: Option<u64>,
+        service: String,
     },
     /// Number of unfetched deliveries for a service changed.
     Inbox { service: String, unread: u64 },

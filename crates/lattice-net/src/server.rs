@@ -27,20 +27,108 @@ use crate::peer::PeerIo;
 const MAX_HEAD: usize = 8192;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Connections above this many in flight (pre-auth) set the under-load
+/// flag; it clears only when the count drops below [`PREAUTH_LOW_WATER`].
+/// Hysteresis avoids flapping at the boundary.
+pub const PREAUTH_HIGH_WATER: u64 = 64;
+/// See [`PREAUTH_HIGH_WATER`].
+pub const PREAUTH_LOW_WATER: u64 = 32;
+/// Hard cap on concurrent connections (pre- and post-handshake). Excess
+/// connections are closed immediately, not queued.
+pub const MAX_CONNECTIONS: u64 = 1024;
+
 pub struct ListenerConfig {
     /// This node's static X25519 channel key seed (32 bytes).
     pub channel_seed: [u8; 32],
     /// Serve `GET /status` on the same listener.
     pub status_enabled: bool,
-    /// Under load, clients must present a cookie (see cookie.rs).
-    pub under_load: Arc<std::sync::atomic::AtomicBool>,
+    /// Drain flag shared with the daemon: when set, `/status` reports
+    /// `accepting = false`. The daemon sets this on drain and on signal.
+    pub draining: Arc<std::sync::atomic::AtomicBool>,
+    /// Force cookie-required mode regardless of load. Intended for tests;
+    /// production leaves this false and lets the pre-auth counter decide.
+    pub force_under_load: bool,
     /// Called once per established peer.
     pub on_peer: mpsc::UnboundedSender<PeerIo>,
 }
 
-/// Shared cookie state, exposed so the daemon can rotate keys hourly.
-pub fn new_cookie_state() -> Arc<Mutex<CookieState>> {
-    Arc::new(Mutex::new(CookieState::new(now_secs())))
+/// Shared load state for one listener. `under_load` is derived from the
+/// pre-auth in-flight counter with hysteresis; `force_under_load` (config)
+/// overrides it. Only the boolean is ever exposed (via /status), never the
+/// raw count.
+struct LoadState {
+    preauth_inflight: std::sync::atomic::AtomicU64,
+    total_connections: std::sync::atomic::AtomicU64,
+    under_load: std::sync::atomic::AtomicBool,
+    force_under_load: bool,
+}
+
+impl LoadState {
+    fn new(force_under_load: bool) -> Self {
+        Self {
+            preauth_inflight: std::sync::atomic::AtomicU64::new(0),
+            total_connections: std::sync::atomic::AtomicU64::new(0),
+            under_load: std::sync::atomic::AtomicBool::new(force_under_load),
+            force_under_load,
+        }
+    }
+    fn under_load(&self) -> bool {
+        self.force_under_load || self.under_load.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    fn preauth_enter(&self) -> u64 {
+        let n = self
+            .preauth_inflight
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        if n > PREAUTH_HIGH_WATER {
+            self.under_load
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        n
+    }
+    fn preauth_leave(&self) {
+        let n = self
+            .preauth_inflight
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed)
+            - 1;
+        if n < PREAUTH_LOW_WATER {
+            self.under_load
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    /// Try to admit a new connection. Returns false when at capacity.
+    fn admit(&self) -> bool {
+        let n = self
+            .total_connections
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        if n > MAX_CONNECTIONS {
+            self.total_connections
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            return false;
+        }
+        true
+    }
+    fn release(&self) {
+        self.total_connections
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Decrements the total connection count on drop.
+struct ConnGuard(Arc<LoadState>);
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
+/// Decrements the pre-auth in-flight count on drop.
+struct PreAuthGuard(Arc<LoadState>);
+impl Drop for PreAuthGuard {
+    fn drop(&mut self) {
+        self.0.preauth_leave();
+    }
 }
 
 fn now_secs() -> u64 {
@@ -147,19 +235,28 @@ pub async fn serve(
     let listener = TcpListener::bind(&bind[..]).await?;
     let local = listener.local_addr()?;
     let cookie_state = Arc::new(Mutex::new(CookieState::new(now_secs())));
+    let load = Arc::new(LoadState::new(cfg.force_under_load));
     let cfg = Arc::new(cfg);
     let handle = tokio::spawn(async move {
         loop {
             let Ok((stream, peer)) = listener.accept().await else {
                 continue;
             };
+            let _ = crate::set_tcp_keepalive(&stream);
+            if !load.admit() {
+                // At capacity: close immediately rather than queue.
+                drop(stream);
+                continue;
+            }
+            let _conn_guard = ConnGuard(load.clone());
             let cfg = cfg.clone();
             let cookie_state = cookie_state.clone();
-            let cfg2 = cfg.clone();
+            let load = load.clone();
             tokio::spawn(async move {
-                match handle_conn(stream, peer, cfg2.clone(), cookie_state).await {
+                let _conn_guard = _conn_guard;
+                match handle_conn(stream, peer, cfg.clone(), cookie_state, load).await {
                     Ok(peer_io) => {
-                        let _ = cfg2.on_peer.send(peer_io);
+                        let _ = cfg.on_peer.send(peer_io);
                     }
                     Err(_) => {
                         // Probes, wrong paths and aborted handshakes are routine.
@@ -177,14 +274,18 @@ async fn handle_conn(
     peer: SocketAddr,
     cfg: Arc<ListenerConfig>,
     cookie_state: Arc<Mutex<CookieState>>,
+    load: Arc<LoadState>,
 ) -> Result<PeerIo, NetError> {
+    load.preauth_enter();
+    let _preauth = PreAuthGuard(load.clone());
     cookie_state.lock().unwrap().tick();
     let head = read_head(&mut stream).await.ok_or(NetError::Io)?;
     let parsed = parse_head(&head).ok_or(NetError::Io)?;
     let derived = crate::upgrade_path(&lattice_crypto::x25519_public(&cfg.channel_seed));
 
     if parsed.path == "/status" && cfg.status_enabled && parsed.method == "GET" {
-        let accepting = !cfg.under_load.load(std::sync::atomic::Ordering::Relaxed);
+        let draining = cfg.draining.load(std::sync::atomic::Ordering::Relaxed);
+        let accepting = !draining && !load.under_load();
         let body = lattice_proto::local::encode_status(true, accepting, &[1]);
         let resp = format!(
             "HTTP/1.1 200 OK\r\ncontent-type: application/cbor\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
@@ -230,7 +331,7 @@ async fn handle_conn(
     .await
     .map_err(|_| NetError::Handshake)?;
 
-    handshake_server(ws, peer, &cfg, &cookie_state).await
+    handshake_server(ws, peer, &cfg, &cookie_state, &load).await
 }
 
 async fn next_binary(
@@ -261,9 +362,10 @@ async fn handshake_server(
     peer: SocketAddr,
     cfg: &ListenerConfig,
     cookie_state: &Arc<Mutex<CookieState>>,
+    load: &LoadState,
 ) -> Result<PeerIo, NetError> {
     let addr_bytes = peer.to_string().into_bytes();
-    let under_load = cfg.under_load.load(std::sync::atomic::Ordering::Relaxed);
+    let under_load = load.under_load();
 
     // First init, possibly preceded by a cookie exchange.
     let init_msg = next_binary(&mut ws).await?;

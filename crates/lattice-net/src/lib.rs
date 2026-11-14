@@ -27,3 +27,17 @@ pub use server::{ListenerConfig, serve};
 /// 16-byte Poly1305 tag. Handshake frames are padded to 2048 and capped
 /// separately (see handshake.rs).
 pub const MAX_WIRE_BYTES: usize = 32768 + 16;
+
+/// Enable TCP keepalive on a connected socket: probe after 60s idle, then
+/// every 10s, giving up after 3 unanswered probes (~90s to detect a dead
+/// peer). This is the half-open detector for the mesh; without it a silently
+/// dead peer holds its slot forever (there is no application-level ping —
+/// the core echoes Ping frames, so a transport keepalive must live below
+/// the protocol).
+pub fn set_tcp_keepalive(stream: &tokio::net::TcpStream) -> std::io::Result<()> {
+    let ka = socket2::TcpKeepalive::new()
+        .with_time(std::time::Duration::from_secs(60))
+        .with_interval(std::time::Duration::from_secs(10))
+        .with_retries(3);
+    socket2::SockRef::from(stream).set_tcp_keepalive(&ka)
+}

@@ -184,10 +184,42 @@ pub fn validate(cfg: &Config) -> Result<(), String> {
         // Full validation (host syntax, port) happens by building the record at startup.
     }
     for (i, root) in cfg.roots.iter().enumerate() {
+        root.addr.parse::<std::net::SocketAddr>().map_err(|e| {
+            format!(
+                "roots[{i}].addr {:?} is not a socket address: {e}",
+                root.addr
+            )
+        })?;
         if root.channel_key.is_none() && root.path.is_none() {
             return Err(format!(
                 "roots[{i}] needs either channel_key (IK) or path (XX)"
             ));
+        }
+        if let Some(k) = &root.channel_key {
+            decode_hex32(k).map_err(|e| format!("roots[{i}].channel_key: {e}"))?;
+        }
+        if let Some(id) = &root.id {
+            decode_hex32(id).map_err(|e| format!("roots[{i}].id: {e}"))?;
+        }
+    }
+    for (name, v) in [
+        ("snow_per_min", cfg.limits.snow_per_min),
+        ("sideways_prob", cfg.limits.sideways_prob),
+        ("waypoint_share", cfg.limits.waypoint_share),
+    ] {
+        if !v.is_finite() {
+            return Err(format!("limits.{name} must be finite, got {v}"));
+        }
+    }
+    if cfg.limits.snow_per_min < 0.0 {
+        return Err("limits.snow_per_min must be >= 0".into());
+    }
+    for (name, v) in [
+        ("sideways_prob", cfg.limits.sideways_prob),
+        ("waypoint_share", cfg.limits.waypoint_share),
+    ] {
+        if !(0.0..=1.0).contains(&v) {
+            return Err(format!("limits.{name} must be in [0, 1], got {v}"));
         }
     }
     Ok(())

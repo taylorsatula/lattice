@@ -23,17 +23,18 @@ async fn start_server(
     Arc<AtomicBool>,
 ) {
     let (tx, rx) = mpsc::unbounded_channel();
-    let flag = Arc::new(AtomicBool::new(under_load));
+    let draining = Arc::new(AtomicBool::new(false));
     let cfg = lattice_net::ListenerConfig {
         channel_seed: server_seed,
         status_enabled: status,
-        under_load: flag.clone(),
+        draining: draining.clone(),
+        force_under_load: under_load,
         on_peer: tx,
     };
     let (addr, _handle) = serve(cfg, vec!["127.0.0.1:0".parse().unwrap()])
         .await
         .unwrap();
-    (addr, rx, flag)
+    (addr, rx, draining)
 }
 
 #[tokio::test]

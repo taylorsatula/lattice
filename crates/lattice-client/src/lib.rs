@@ -139,6 +139,25 @@ impl Client {
         self.events.drain(..).collect()
     }
 
+    /// Wait for the next event from the daemon.
+    ///
+    /// Only call this when no request is in flight; a response frame
+    /// arriving here is a protocol violation. Previously stashed events
+    /// (received during earlier calls) are returned first.
+    pub async fn next_event(&mut self) -> Result<Event> {
+        if let Some(ev) = self.events.pop_front() {
+            return Ok(ev);
+        }
+        let payload = self.read_frame().await?;
+        let v = decode(&payload).map_err(|e| Error::Connection(format!("decode: {e}")))?;
+        match Event::from_value(&v) {
+            Ok(ev) => Ok(ev),
+            Err(_) => Err(Error::Connection(
+                "expected an event frame, got a response".into(),
+            )),
+        }
+    }
+
     /// Send a message; returns the message id.
     pub async fn send(&mut self, msg: &Send) -> Result<[u8; 16]> {
         let mut args = vec![
@@ -313,7 +332,15 @@ impl Client {
                 self.buf.drain(..used);
                 return Ok(out);
             }
-            let n = self.stream.read(&mut chunk).await?;
+            let n = match tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                self.stream.read(&mut chunk),
+            )
+            .await
+            {
+                Ok(r) => r?,
+                Err(_) => return Err(Error::Connection("read timed out after 30s".into())),
+            };
             if n == 0 {
                 return Err(Error::Connection("daemon closed the socket".into()));
             }

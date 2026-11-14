@@ -55,6 +55,25 @@ Applications talk to the node over the local API (length-prefixed CBOR over a
 Unix socket, see `V2_SPEC.md` §7) using `lattice-client` or their own
 implementation. Administration goes through `latticectl` on the admin socket.
 
+### Local sockets and access
+
+- The **admin socket** (`admin_socket`, default `/run/lattice/admin.sock`) is
+  mode `0600`, owner-only. It carries node control (drain, link, unlink,
+  node info) and is root-only in practice.
+- The **application socket** (`app_socket`, default `/run/lattice/app.sock`)
+  is mode `0660`. There is no dedicated `lattice` group yet; with the default
+  root ownership that is effectively root-only as well. Widening access
+  (group `lattice`, tmpfiles.d) is a deliberate decision still pending —
+  until then, run application clients as root or adjust the mode yourself.
+- Delivery to applications is **at least once**: a delivery stays in the
+  inbox until acknowledged, and is re-fetched after a crash. Applications
+  must dedup by message id (`mid`).
+- The listener sheds load before it sheds correctness: at most 1024
+  concurrent connections (excess are closed immediately), and when more
+  than 64 pre-auth handshakes are in flight the node requires the cookie
+  round-trip (clears below 32). TCP keepalive (60s idle, 10s interval,
+  3 probes) reaps dead peers.
+
 ## Documentation
 
 - `V2_SPEC.md` — normative protocol and local API

@@ -7,7 +7,7 @@
 //! Wire format: 4-byte big-endian length prefix, then one CBOR local-API
 //! object (see V2_SPEC §7 and lattice-proto::local).
 
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -67,6 +67,22 @@ fn args_map(v: &Value) -> Option<&[(Value, Value)]> {
     v.as_map()
 }
 
+/// Reject any key outside `allowed`; the request args must be a map.
+fn deny_unknown_args(v: &Value, allowed: &[u64]) -> Result<(), ()> {
+    match v.as_map() {
+        Some(map) => {
+            for (k, _) in map {
+                match k.as_uint() {
+                    Some(k) if allowed.contains(&k) => {}
+                    _ => return Err(()),
+                }
+            }
+            Ok(())
+        }
+        None => Err(()),
+    }
+}
+
 fn args_get(v: &Value, key: u64) -> Option<&Value> {
     args_map(v)?
         .iter()
@@ -87,7 +103,7 @@ async fn handle_app(
     mut stream: UnixStream,
     cfg: Arc<Config>,
     api: mpsc::UnboundedSender<ApiCmd>,
-    mut events: broadcast::Receiver<Vec<u8>>,
+    mut events: broadcast::Receiver<(String, Vec<u8>)>,
 ) {
     let mut buf = Vec::new();
 
@@ -137,10 +153,18 @@ async fn handle_app(
     }
     // Hello reply carries the node identifier so apps can pin it.
     let (tx, rx) = tokio::sync::oneshot::channel();
-    let node_id = if api.send(ApiCmd::NodeInfo { respond: tx }).is_ok() {
-        rx.await.map(|info| info.id).unwrap_or([0u8; 32])
-    } else {
-        [0u8; 32]
+    let node_id = match api.send(ApiCmd::NodeInfo { respond: tx }) {
+        Ok(()) => match rx.await {
+            Ok(info) => info.id,
+            Err(_) => {
+                let _ = write_frame(&mut stream, &resp_err(req.id, ERR_INTERNAL)).await;
+                return;
+            }
+        },
+        Err(_) => {
+            let _ = write_frame(&mut stream, &resp_err(req.id, ERR_INTERNAL)).await;
+            return;
+        }
     };
     let hello_ok = Value::map(vec![
         (Value::UInt(0), Value::Bytes(node_id.to_vec())),
@@ -151,10 +175,14 @@ async fn handle_app(
     loop {
         tokio::select! {
             ev = events.recv() => {
-                if let Ok(bytes) = ev {
-                    if let Ok(framed) = frame_local(&bytes) {
-                        if stream.write_all(&framed).await.is_err() {
-                            return;
+                // Events are tagged with the originating service; a
+                // connection only ever sees its own service's events.
+                if let Ok((tag, bytes)) = ev {
+                    if tag == service {
+                        if let Ok(framed) = frame_local(&bytes) {
+                            if stream.write_all(&framed).await.is_err() {
+                                return;
+                            }
                         }
                     }
                 }
@@ -210,6 +238,9 @@ async fn dispatch_app(
             }
         }
         OP_STATUS => {
+            if deny_unknown_args(&req.args, &[0]).is_err() {
+                return resp_err(req.id, ERR_BAD_ARGS);
+            }
             let Some(mid_bytes) = args_get(&req.args, 0).and_then(Value::as_bytes) else {
                 return resp_err(req.id, ERR_BAD_ARGS);
             };
@@ -233,6 +264,9 @@ async fn dispatch_app(
             }
         }
         OP_FETCH => {
+            if deny_unknown_args(&req.args, &[0]).is_err() {
+                return resp_err(req.id, ERR_BAD_ARGS);
+            }
             let max = args_get(&req.args, 0)
                 .and_then(Value::as_uint)
                 .unwrap_or(16)
@@ -274,11 +308,20 @@ async fn dispatch_app(
             }
         }
         OP_ACK => {
+            if deny_unknown_args(&req.args, &[0]).is_err() {
+                return resp_err(req.id, ERR_BAD_ARGS);
+            }
             let ids: Vec<[u8; 16]> = match args_get(&req.args, 0).and_then(Value::as_array) {
-                Some(arr) => arr
-                    .iter()
-                    .filter_map(|v| v.as_bytes().and_then(|b| <[u8; 16]>::try_from(b).ok()))
-                    .collect(),
+                Some(arr) => {
+                    let mut out = Vec::with_capacity(arr.len());
+                    for v in arr {
+                        match v.as_bytes().and_then(|b| <[u8; 16]>::try_from(b).ok()) {
+                            Some(id) => out.push(id),
+                            None => return resp_err(req.id, ERR_BAD_ARGS),
+                        }
+                    }
+                    out
+                }
                 None => return resp_err(req.id, ERR_BAD_ARGS),
             };
             let (tx, rx) = tokio::sync::oneshot::channel();
@@ -301,6 +344,9 @@ async fn dispatch_app(
             }
         }
         OP_LOOKUP => {
+            if deny_unknown_args(&req.args, &[0]).is_err() {
+                return resp_err(req.id, ERR_BAD_ARGS);
+            }
             let Some(id_bytes) = args_get(&req.args, 0).and_then(Value::as_bytes) else {
                 return resp_err(req.id, ERR_BAD_ARGS);
             };
@@ -353,6 +399,9 @@ async fn handle_admin(mut stream: UnixStream, api: mpsc::UnboundedSender<ApiCmd>
 async fn dispatch_admin(api: &mpsc::UnboundedSender<ApiCmd>, req: &Request) -> Vec<u8> {
     match req.op {
         OP_NODE => {
+            if deny_unknown_args(&req.args, &[]).is_err() {
+                return resp_err(req.id, ERR_BAD_ARGS);
+            }
             let (tx, rx) = tokio::sync::oneshot::channel();
             if api.send(ApiCmd::NodeInfo { respond: tx }).is_err() {
                 return resp_err(req.id, ERR_INTERNAL);
@@ -373,6 +422,9 @@ async fn dispatch_admin(api: &mpsc::UnboundedSender<ApiCmd>, req: &Request) -> V
             }
         }
         OP_DRAIN => {
+            if deny_unknown_args(&req.args, &[0]).is_err() {
+                return resp_err(req.id, ERR_BAD_ARGS);
+            }
             let setting = args_get(&req.args, 0).and_then(Value::as_bool);
             let (tx, rx) = tokio::sync::oneshot::channel();
             if api
@@ -396,6 +448,9 @@ async fn dispatch_admin(api: &mpsc::UnboundedSender<ApiCmd>, req: &Request) -> V
             }
         }
         OP_LINK => {
+            if deny_unknown_args(&req.args, &[0, 1, 2, 3]).is_err() {
+                return resp_err(req.id, ERR_BAD_ARGS);
+            }
             let Some(addr) = args_get(&req.args, 0)
                 .and_then(Value::as_text)
                 .map(String::from)
@@ -447,6 +502,9 @@ async fn dispatch_admin(api: &mpsc::UnboundedSender<ApiCmd>, req: &Request) -> V
             }
         }
         OP_UNLINK => {
+            if deny_unknown_args(&req.args, &[0]).is_err() {
+                return resp_err(req.id, ERR_BAD_ARGS);
+            }
             let Some(id) = args_get(&req.args, 0).and_then(Value::as_bytes) else {
                 return resp_err(req.id, ERR_BAD_ARGS);
             };
@@ -472,27 +530,63 @@ async fn dispatch_admin(api: &mpsc::UnboundedSender<ApiCmd>, req: &Request) -> V
     }
 }
 
-/// Bind a socket path with the given mode, replacing any stale socket file.
+/// Bind a socket path with the given mode.
+///
+/// Refuses to touch anything that is not a socket; refuses to start if a
+/// live socket answers (another latticed is running); removes a stale
+/// socket file otherwise. The mode is applied before the listener is
+/// returned, so no connection is ever accepted with wider permissions.
 fn bind_unix(path: &Path, mode: u32) -> std::io::Result<UnixListener> {
     if path.exists() {
+        let meta = std::fs::symlink_metadata(path)?;
+        if !meta.file_type().is_socket() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!(
+                    "{} exists and is not a socket; refusing to remove it",
+                    path.display()
+                ),
+            ));
+        }
+        if std::os::unix::net::UnixStream::connect(path).is_ok() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AddrInUse,
+                format!(
+                    "{} answers connections; is another latticed running?",
+                    path.display()
+                ),
+            ));
+        }
         std::fs::remove_file(path)?;
     }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let listener = UnixListener::bind(path)?;
+    // chmod before the listener is handed out: no accept happens before this.
     let mut perms = std::fs::metadata(path)?.permissions();
     perms.set_mode(mode);
     std::fs::set_permissions(path, perms)?;
     Ok(listener)
 }
 
+/// Pre-bind the application socket (mode 0660; see note in README about the
+/// group story — deliberately unchanged pending the D5 decision).
+pub fn bind_app(cfg: &Config) -> std::io::Result<UnixListener> {
+    bind_unix(&cfg.app_socket, 0o660)
+}
+
+/// Pre-bind the admin socket (mode 0600, owner-only).
+pub fn bind_admin(cfg: &Config) -> std::io::Result<UnixListener> {
+    bind_unix(&cfg.admin_socket, 0o600)
+}
+
 pub async fn serve_app(
+    listener: UnixListener,
     cfg: Arc<Config>,
     api: mpsc::UnboundedSender<ApiCmd>,
-    events: broadcast::Sender<Vec<u8>>,
+    events: broadcast::Sender<(String, Vec<u8>)>,
 ) -> std::io::Result<()> {
-    let listener = bind_unix(&cfg.app_socket, 0o660)?;
     loop {
         let (stream, _) = listener.accept().await?;
         let cfg = cfg.clone();
@@ -503,10 +597,9 @@ pub async fn serve_app(
 }
 
 pub async fn serve_admin(
-    cfg: Arc<Config>,
+    listener: UnixListener,
     api: mpsc::UnboundedSender<ApiCmd>,
 ) -> std::io::Result<()> {
-    let listener = bind_unix(&cfg.admin_socket, 0o600)?;
     loop {
         let (stream, _) = listener.accept().await?;
         let api = api.clone();

@@ -19,7 +19,23 @@ fn credentials_dir() -> Option<PathBuf> {
 fn read_seed(dir: &Path, name: &str) -> io::Result<[u8; 32]> {
     let cred_path = credentials_dir().map(|d| d.join(name));
     let binding = dir.join(name);
+    let from_credentials = cred_path.is_some();
     let path = cred_path.as_deref().unwrap_or(&binding);
+    #[cfg(unix)]
+    if !from_credentials {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(path)?.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "{}: seed file mode {mode:o} is too open; expected 0600 or 0400 (chmod 600 {})",
+                    path.display(),
+                    path.display()
+                ),
+            ));
+        }
+    }
     let bytes = fs::read(path)?;
     bytes.as_slice().try_into().map_err(|_| {
         io::Error::new(

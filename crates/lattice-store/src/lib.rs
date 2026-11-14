@@ -187,4 +187,8 @@ pub trait Store {
     // transmission counters used for snow sizing
     fn size_bucket_sample(&mut self, bucket: u8);
     fn size_bucket_counts(&self) -> [u64; 3];
+
+    // drain flag: persisted so a restart does not silently accept new work
+    fn drain_get(&self) -> Result<bool, StoreError>;
+    fn drain_set(&mut self, draining: bool) -> Result<(), StoreError>;
 }

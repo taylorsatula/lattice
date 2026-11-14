@@ -915,6 +915,30 @@ impl Store for RedbStore {
     fn size_bucket_counts(&self) -> [u64; 3] {
         self.bucket_counts().unwrap_or([0, 0, 0])
     }
+
+    fn drain_get(&self) -> Result<bool, StoreError> {
+        self.read(|txn| {
+            let meta = txn
+                .open_table(META)
+                .map_err(|e| StoreError::Backend(e.to_string()))?;
+            Ok(meta
+                .get("drain")
+                .map_err(|e| StoreError::Backend(e.to_string()))?
+                .map(|v| v.value() != 0)
+                .unwrap_or(false))
+        })
+    }
+
+    fn drain_set(&mut self, draining: bool) -> Result<(), StoreError> {
+        self.write(|txn| {
+            let mut meta = txn
+                .open_table(META)
+                .map_err(|e| StoreError::Backend(e.to_string()))?;
+            meta.insert("drain", if draining { 1 } else { 0 })
+                .map_err(|e| StoreError::Backend(e.to_string()))?;
+            Ok(())
+        })
+    }
 }
 
 impl RedbStore {

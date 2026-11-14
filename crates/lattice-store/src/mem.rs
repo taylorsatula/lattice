@@ -19,6 +19,7 @@ pub struct MemStore {
     wary: HashMap<[u8; 32], Vec<(u64, u64)>>, // id -> [(source_range, exp)]
     buckets: [u64; 3],
     custody_bytes: u64,
+    drain: bool,
 }
 
 impl MemStore {
@@ -277,5 +278,13 @@ impl Store for MemStore {
     }
     fn size_bucket_counts(&self) -> [u64; 3] {
         self.buckets
+    }
+
+    fn drain_get(&self) -> Result<bool, StoreError> {
+        Ok(self.drain)
+    }
+    fn drain_set(&mut self, draining: bool) -> Result<(), StoreError> {
+        self.drain = draining;
+        Ok(())
     }
 }

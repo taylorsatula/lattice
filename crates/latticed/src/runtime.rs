@@ -94,11 +94,13 @@ pub(crate) struct OutFrame {
 struct LinkHandle {
     peer: Option<[u8; 32]>,
     tx: mpsc::UnboundedSender<OutFrame>,
+    task: tokio::task::AbortHandle,
 }
 
 pub struct Runtime {
     pub node: Arc<std::sync::Mutex<Node<RedbStore>>>,
     pub draining: Arc<AtomicBool>,
+    mode: &'static str,
     channel_seed: [u8; 32],
     links: HashMap<u64, LinkHandle>,
     peer_rx: Option<mpsc::UnboundedReceiver<lattice_net::PeerIo>>,
@@ -108,7 +110,7 @@ pub struct Runtime {
     cmd_tx: mpsc::UnboundedSender<Cmd>,
     api_rx: Option<mpsc::UnboundedReceiver<ApiCmd>>,
     api_tx: mpsc::UnboundedSender<ApiCmd>,
-    pub app_broadcast: broadcast::Sender<Vec<u8>>,
+    pub app_broadcast: broadcast::Sender<(String, Vec<u8>)>,
     next_link: u64,
 }
 
@@ -159,6 +161,7 @@ impl Runtime {
         store: RedbStore,
         now: u64,
         peer_rx: mpsc::UnboundedReceiver<lattice_net::PeerIo>,
+        draining: Arc<AtomicBool>,
     ) -> Self {
         let channel_seed = identity.channel_seed;
         let mode = if cfg.mode == "private" {
@@ -184,14 +187,22 @@ impl Runtime {
             mode,
             ..lattice_core::Config::default()
         };
-        let node = Node::new(core_cfg, identity, store, now).expect("node init");
+        let mut node = Node::new(core_cfg, identity, store, now).expect("node init");
+        if draining.load(Ordering::Relaxed) {
+            node.set_draining(true);
+        }
         let (link_tx, link_rx) = mpsc::unbounded_channel();
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (api_tx, api_rx) = mpsc::unbounded_channel();
         let (app_broadcast, _) = broadcast::channel(256);
         Self {
             node: Arc::new(std::sync::Mutex::new(node)),
-            draining: Arc::new(AtomicBool::new(false)),
+            draining,
+            mode: if cfg.mode == "private" {
+                "private"
+            } else {
+                "public"
+            },
             channel_seed,
             links: HashMap::new(),
             link_rx: Some(link_rx),
@@ -220,13 +231,6 @@ impl Runtime {
         let id = self.next_link;
         self.next_link += 1;
         let (outbound_tx, outbound_rx) = mpsc::unbounded_channel();
-        self.links.insert(
-            id,
-            LinkHandle {
-                peer,
-                tx: outbound_tx,
-            },
-        );
         {
             let mut node = self.node.lock().unwrap();
             let _ = node.handle(Event::LinkUp {
@@ -238,7 +242,15 @@ impl Runtime {
             });
         }
         let inbound = self.link_tx.clone();
-        tokio::spawn(link_task(id, io, inbound, outbound_rx));
+        let task = tokio::spawn(link_task(id, io, inbound, outbound_rx));
+        self.links.insert(
+            id,
+            LinkHandle {
+                peer,
+                tx: outbound_tx,
+                task: task.abort_handle(),
+            },
+        );
         id
     }
 
@@ -261,14 +273,45 @@ impl Runtime {
         });
     }
 
+    /// Enter drain: refuse new custody, persist the flag, and report.
+    /// Called on SIGTERM/SIGINT before the process exits.
+    fn begin_drain(&mut self) {
+        self.draining.store(true, Ordering::Relaxed);
+        let mut node = self.node.lock().unwrap();
+        node.set_draining(true);
+        if let Err(e) = node.store_mut().drain_set(true) {
+            eprintln!("lattice: failed to persist drain flag: {e}");
+        }
+        eprintln!("lattice: draining (refusing new custody); exiting");
+    }
+
     pub async fn run(mut self) {
         let mut link_rx = self.link_rx.take().expect("run once");
         let mut api_rx = self.api_rx.take().expect("run once");
         let mut peer_rx = self.peer_rx.take().expect("run once");
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+        #[cfg(unix)]
+        let shutdown = async {
+            use tokio::signal::unix::{SignalKind, signal};
+            let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+            let mut int = signal(SignalKind::interrupt()).expect("install SIGINT handler");
+            tokio::select! {
+                _ = term.recv() => {},
+                _ = int.recv() => {},
+            }
+        };
+        #[cfg(not(unix))]
+        let shutdown = async {
+            let _ = tokio::signal::ctrl_c().await;
+        };
+        tokio::pin!(shutdown);
         loop {
             tokio::select! {
                 biased;
+                _ = &mut shutdown => {
+                    self.begin_drain();
+                    return;
+                }
                 Some(peer) = peer_rx.recv() => {
                     let ck = peer.remote_static;
                     self.attach_link(None, ck, peer);
@@ -283,8 +326,9 @@ impl Runtime {
                         self.apply(Event::Frame { at: now_secs(), link, from: peer.unwrap_or([0u8; 32]), frame });
                     }
                     LinkEvent::Down { link } => {
-                        self.links.remove(&link);
-                        self.apply(Event::LinkDown { at: now_secs(), link });
+                        if self.links.remove(&link).is_some() {
+                            self.apply(Event::LinkDown { at: now_secs(), link });
+                        }
                     }
                 },
                 _ = tick.tick() => {
@@ -314,15 +358,23 @@ impl Runtime {
                         let _ = h.tx.send(OutFrame { frame, pad_to });
                     }
                 }
-                Action::Deliver { service, .. } => {
-                    let _ = service;
-                    let _ = self.app_broadcast.send(encode_inbox_event());
+                // Deliver is followed by an Inbox action carrying the unread
+                // count; the Inbox event is the one apps consume.
+                Action::Deliver { .. } => {}
+                Action::Status {
+                    mid,
+                    status,
+                    service,
+                    ..
+                } => {
+                    let _ = self
+                        .app_broadcast
+                        .send((service, encode_status_event(mid, status)));
                 }
-                Action::Status { mid, status, .. } => {
-                    let _ = self.app_broadcast.send(encode_status_event(mid, status));
-                }
-                Action::Inbox { .. } => {
-                    let _ = self.app_broadcast.send(encode_inbox_event());
+                Action::Inbox { service, unread } => {
+                    let _ = self
+                        .app_broadcast
+                        .send((service, encode_inbox_event(unread)));
                 }
             }
         }
@@ -379,7 +431,7 @@ impl Runtime {
                 let node = self.node.lock().unwrap();
                 let info = NodeInfo {
                     id: node.own_id,
-                    mode: "public",
+                    mode: self.mode,
                     links: self.links.len(),
                     records: node.debug_record_count(),
                     custody_bytes: node.custody_bytes(),
@@ -392,6 +444,9 @@ impl Runtime {
                 if let Some(d) = draining {
                     node.set_draining(d);
                     self.draining.store(d, Ordering::Relaxed);
+                    if let Err(e) = node.store_mut().drain_set(d) {
+                        eprintln!("lattice: failed to persist drain flag: {e}");
+                    }
                 }
                 let _ = respond.send((node.is_draining(), node.custody_bytes() as usize));
             }
@@ -433,6 +488,13 @@ impl Runtime {
             Ok(a) => a,
             Err(_) => return,
         };
+        let pinned = pinned_peer(ik_key.is_some(), peer_id);
+        if peer_id.is_some() && pinned.is_none() {
+            eprintln!(
+                "lattice: ignoring configured peer id for {addr}: XX dials authenticate no one; \
+                 attribution will come from records"
+            );
+        }
         let contact = match (ik_key, path) {
             (Some(ck), _) => lattice_net::PeerContact::Ik {
                 addr,
@@ -445,8 +507,7 @@ impl Runtime {
         match lattice_net::connect(contact, &seed).await {
             Ok(io) => {
                 let remote_ck = io.remote_static;
-                // We know the dialed side's id only if the config named it.
-                self.attach_link(peer_id, remote_ck, io);
+                self.attach_link(pinned, remote_ck, io);
             }
             Err(e) => {
                 eprintln!("lattice: dial {addr} failed: {e}");
@@ -462,7 +523,9 @@ impl Runtime {
             .map(|(id, _)| *id)
             .collect();
         for id in dead {
-            self.links.remove(&id);
+            if let Some(h) = self.links.remove(&id) {
+                h.task.abort();
+            }
             self.apply(Event::LinkDown {
                 at: now_secs(),
                 link: id,
@@ -471,12 +534,12 @@ impl Runtime {
     }
 }
 
-fn encode_inbox_event() -> Vec<u8> {
+fn encode_inbox_event(unread: u64) -> Vec<u8> {
     encode_event(
         1,
         &lattice_proto::Value::map(vec![(
             lattice_proto::Value::UInt(1),
-            lattice_proto::Value::UInt(1),
+            lattice_proto::Value::UInt(unread),
         )]),
     )
 }
@@ -506,4 +569,30 @@ fn encode_status_event(mid: [u8; 16], status: u64) -> Vec<u8> {
             ),
         ]),
     )
+}
+
+/// Pin the configured peer id only for IK-authenticated dials. An XX dial
+/// proves nothing about who is on the other end; pinning then would bind the
+/// link to an unverified id. Record-based attribution binds it later.
+fn pinned_peer(ik: bool, peer_id: Option<[u8; 32]>) -> Option<[u8; 32]> {
+    if ik { peer_id } else { None }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pinned_peer;
+
+    #[test]
+    fn ik_dial_pins_configured_id() {
+        let id = [7u8; 32];
+        assert_eq!(pinned_peer(true, Some(id)), Some(id));
+        assert_eq!(pinned_peer(true, None), None);
+    }
+
+    #[test]
+    fn xx_dial_never_pins() {
+        let id = [7u8; 32];
+        assert_eq!(pinned_peer(false, Some(id)), None);
+        assert_eq!(pinned_peer(false, None), None);
+    }
 }

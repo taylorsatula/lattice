@@ -133,7 +133,8 @@ fn private_record_with_private_endpoints_rejected() {
 #[test]
 fn wan_record_rejects_private_endpoint_ip() {
     let f = fixture();
-    let rec = PeerRecord::build(
+    // build() now rejects this too (boot-time record self-test relies on it).
+    let built = PeerRecord::build(
         lattice_proto::record::RecordParams {
             kel: f.kel.clone(),
             seq: 1,
@@ -151,9 +152,8 @@ fn wan_record_rejects_private_endpoint_ip() {
             capabilities: 0,
         },
         &f.seed,
-    )
-    .unwrap();
-    assert!(PeerRecord::from_bytes(&rec.encode(), NOW, None).is_err());
+    );
+    assert!(built.is_err());
 }
 
 #[test]

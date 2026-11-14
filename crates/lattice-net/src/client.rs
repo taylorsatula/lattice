@@ -57,6 +57,7 @@ pub async fn connect(contact: PeerContact, channel_seed: &[u8; 32]) -> Result<Pe
     };
 
     let tcp = TcpStream::connect(addr).await.map_err(|_| NetError::Io)?;
+    let _ = crate::set_tcp_keepalive(&tcp);
     let boxed: crate::peer::BoxedStream = Box::pin(tcp);
     let request = Request::builder()
         .uri(format!("ws://{addr}{path}"))

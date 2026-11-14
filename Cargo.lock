@@ -659,6 +659,7 @@ dependencies = [
  "lattice-proto",
  "lattice-store",
  "snow",
+ "socket2",
  "subtle",
  "tokio",
  "tokio-tungstenite",
