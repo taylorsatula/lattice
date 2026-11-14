@@ -61,7 +61,7 @@ crate with `#![forbid(unsafe_code)]` and a workspace-level
 `unsafe_code = "forbid"` lint. Replace `.github/workflows/ci.yml` with the
 Rust pipeline (fmt, clippy `-D warnings`, tests, forbid-unsafe check, MSRV
 job, `cargo deny`, `cargo geiger` report) and delete the Python release
-workflow. MSRV pinned at 1.85 via `rust-version` plus an msrv CI job.
+workflow. MSRV pinned at 1.87 via `rust-version` plus an msrv CI job.
 *Gate:* every CI step passes locally (fmt, clippy, test, deny check); a
 deliberate `unsafe` block fails the build. The GitHub-side CI run is pending
 the first push, which the operator controls.

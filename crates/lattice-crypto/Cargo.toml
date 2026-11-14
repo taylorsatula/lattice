@@ -9,3 +9,19 @@ repository.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+blake3 = "1.8"
+getrandom = "0.4"
+chacha20poly1305 = "0.11"
+ed25519-dalek = "3"
+subtle = "2.6"
+x-wing = { version = "0.1", features = ["getrandom"] }
+x25519-dalek = "3"
+zeroize = "1.9"
+
+[dev-dependencies]
+x-wing = { version = "0.1", features = ["getrandom"] }
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

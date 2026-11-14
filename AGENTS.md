@@ -33,7 +33,7 @@ Lattice is a key-anchored mesh for cross-node messaging. There is no DNS depende
 
 ## Mandatory checks before changing code
 
-Until `lattice-core` has behavior, the workspace is scaffolding; the checks already apply: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, `cargo deny check`, and a `cargo geiger` report per crate (CI runs all of these). MSRV is 1.85 (`rust-version` and the msrv CI job). From Phase 2 on, the simulator invariant suite joins these.
+Until `lattice-core` has behavior, the workspace is scaffolding; the checks already apply: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, `cargo deny check`, and a `cargo geiger` report per crate (CI runs all of these). MSRV is 1.87 (`rust-version` and the msrv CI job). From Phase 2 on, the simulator invariant suite joins these.
 
 - If you change `V2_SPEC.md` objects, keep `V2_PLAN.md` phase exits and the test-vector plan consistent with it.
 - If you change `V2_DESIGN.md` decisions, check `V2_SPEC.md` for dependent spec text in the same edit.
