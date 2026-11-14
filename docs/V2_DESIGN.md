@@ -9,12 +9,15 @@
 Lattice connects peers over possibly shaky connections without a central
 orchestrator. Instances in the same hive (a LAN, a tailnet, any network
 where members reach each other directly) talk to each other, and instances
-talk across the WAN.
+talk across the WAN. A message must be able to cross the mesh resiliently
+to reach an instance the sender can't reach directly.
 
 ## Principles
 
-1. **End-to-end.** The transport guarantees custody (the next hop durably
-   stored the message), never end-to-end outcomes. Anything only the
+1. **End-to-end.** Each hop guarantees only custody: the next hop durably
+   stored the message. Only the recipient can confirm arrival, so arrival is
+   confirmed by a receipt from the recipient, and confidentiality is
+   end-to-end encryption to the recipient's key. Anything only the
    application can know (read, understood, acted on) is an application
    message. (Saltzer, Reed & Clark 1984)
 2. **Integrity is cryptographic; discovery is best-effort.** Every record
@@ -30,10 +33,12 @@ talk across the WAN.
 5. **The protocol defines validity; servers define policy.** Signatures,
    formats and size limits are protocol rules. Who to trust, throttle or
    ignore is each server's business.
-6. **Reachability is the operator's job.** WARP, Tailscale, Headscale,
-   WireGuard, a public IP or port forwarding all work. Lattice assumes any
-   address it holds for a peer is directly reachable and contains no code
-   for a particular network product.
+6. **Links are the operator's job; routing across them is Lattice's.**
+   WARP, Tailscale, Headscale, WireGuard, a public IP or port forwarding all
+   provide direct links between instances, and Lattice contains no code for
+   any particular network product. Lattice routes messages across whatever
+   graph of links exists, so instances with no direct path still reach each
+   other through intermediates.
 7. **Don't foreclose non-IP transports.** Objects stay small and
    self-proving, and nothing depends on a synchronous round trip, so a
    radio mesh such as Meshtastic remains possible later without designing
@@ -88,6 +93,8 @@ refreshes its own.
 | seq | Monotonic; the highest seq for an identifier wins |
 | display name | Petname claim |
 | endpoints | Addresses, each tagged with a scope (hive or WAN) |
+| links | Identifiers this instance has recently proven direct reachability to (capped, about 32) |
+| encryption key | X25519 key that messages to this instance are encrypted to |
 | capabilities / protocol version | Feature flags and negotiation |
 | expiry | Signed coarse expiry, on the order of days |
 | signature | By the current key, over the exact encoded bytes |
@@ -109,6 +116,11 @@ refreshes its own.
 - **Prove an endpoint before using it.** An endpoint counts as reachable
   only after a handshake at that address proves the far end holds the
   record's key. That stops anyone using the mesh to aim traffic at a victim.
+- **Links come from proven handshakes.** An instance lists another as a
+  link only after a recent successful handshake with it, and drops the link
+  when it goes stale.
+- **The encryption key** is part of the signed record, so it changes the
+  way everything else in the record does: a new record with a higher seq.
 
 ## 3. Transport
 
@@ -123,6 +135,9 @@ refreshes its own.
   proof-of-work.
 - **Every protocol object is signed and self-proving,** so objects stay
   independent of the transport that carries them.
+- **Two layers of encryption.** The channel is encrypted hop by hop. Each
+  message's content is also encrypted end to end, to the recipient's
+  encryption key (§6), so intermediate nodes never see the content.
 
 ## 4. Bootstrap and discovery
 
@@ -164,32 +179,90 @@ merges them.
 - **Relay only what you would accept.**
 - **Per-peer push limits** on unsolicited records.
 
-## 6. Delivery
+## 6. Routing and delivery
 
-- **Message object:** message id, sender identifier and user, recipient
-  identifier and user, content, metadata, created time, expiry, and the
-  sender instance's signature over the exact bytes. Size capped.
-- **Durable outbound queue.** The message is signed at enqueue time and
-  stored with its signature. The first attempt is made immediately; failures
-  retry with exponential backoff until expiry. A message stuck in "sending"
-  past its lease returns to pending, including after a crash.
-- **Custody transfer** (Fall 2003). A receiver accepts only after durably
-  storing the message. That acceptance is a transport-level result, not a
-  signed receipt object. Read or delivery receipts, if MIRA wants them, are
-  application messages.
-- **Idempotent receive by message id.** Seen ids are retained at least as
-  long as the message can still arrive (until its expiry). Retries are
-  always safe.
+Messages cross the mesh by **link-state routing over the existing gossip**.
+This is the routing model of OSPF and IS-IS, hardened in the manner of
+Perlman's Byzantine-robust link-state design (1988): signed link records,
+robust distribution, multipath around misbehaving nodes. There are no
+designated relays and no per-message flooding.
+
+### The graph
+
+- **Every node already holds every peer record** through gossip (§5). With
+  the `links` field (§2), that set is the whole reachability graph.
+- **A link counts only if both ends list each other.** A node that lies can
+  invent links only to nodes that also claim it, so it can't make itself look
+  adjacent to everyone to attract traffic.
+- **Paths are computed locally** with shortest-path over the current graph.
+  At thousands of nodes this takes milliseconds, even on low-power hardware.
+
+### The message
+
+| Part | Visible to | Contents |
+|---|---|---|
+| Routing header | Every hop | Message id, destination identifier, expiry, path list |
+| Envelope | Recipient only (encrypted to the recipient's key) | Sender identifier and user, recipient user, content, metadata, created time |
+| Signature | Every hop | The sender instance's signature over the exact bytes of the header (excluding the path list) and the ciphertext |
+
+- **End-to-end encryption.** The envelope is sealed to the recipient's X25519
+  key from its peer record. Intermediate nodes see only where the message is
+  going, which nodes it has passed through, and ciphertext.
+- **Each hop verifies the sender's signature** before taking custody, so a
+  node can't inject traffic in someone else's name or alter it in transit.
+- **The path list** is appended to at each hop. It is the only part that
+  changes on the way.
+- **Size capped.**
+
+### Forwarding
+
+1. **Sender:** signs and encrypts the message at enqueue time and writes it
+   to the durable outbound queue. The first attempt is made immediately.
+2. **Each hop,** including the sender:
+   - If it is the destination, it stores the message, hands it to the
+     application, and sends a receipt.
+   - Otherwise it computes the next hop toward the destination on its own
+     current view of the graph. The route isn't fixed by the sender, so each
+     hop uses the freshest information available.
+   - It never forwards to a node already on the path list. That prevents
+     loops while hops' views of the graph disagree, which is the same
+     loop-prevention trick BGP uses.
+3. **Custody transfer** (Fall 2003). The next hop accepts only after
+   durably storing the message. Responsibility then passes to it, and the
+   previous hop is done.
+4. **No path right now:** the message waits at the furthest node that took
+   custody, retrying with backoff, and moves on when the graph changes. It
+   is dropped at expiry. This is delay-tolerant behavior: traversal
+   continues as connectivity allows, rather than failing all at once.
+5. **Leases.** A message stuck in "sending" past its lease returns to
+   pending at whichever hop holds it, including after a crash.
+
+### Receipts and recovery
+
+- **End-to-end receipt.** The recipient returns a small signed receipt for
+  the message id, routed back through the graph like any other message.
+  Custody tells each hop its own job is done; only the receipt tells the
+  sender the message arrived.
+- **Retry on a disjoint path.** If no receipt arrives within the receipt
+  timeout, the sender sends the message again over a path that avoids the
+  intermediate nodes of earlier attempts. This routes around a node that
+  accepts custody and then silently drops messages.
+- **Idempotent receive by message id.** Every hop and the recipient keep
+  the ids they have seen until the message expires. Duplicates from retries
+  or multiple paths are harmless.
 - **Failure classes:**
-  - **Transient** (unreachable, overloaded): retry with backoff, tracked per
-    destination.
-  - **Permanent** (not addressed to this instance, malformed, unknown user
-    where the instance knows it): stop retrying.
-- **No open relay.** An instance accepts custody only for messages addressed
-  to itself.
-- **Delivery is direct** to the recipient's endpoints. Relaying through
-  intermediate nodes is not in the core; custody semantics leave room for it
-  later.
+  - **Transient** (unreachable, overloaded, no path): retry with backoff.
+  - **Permanent** (malformed, invalid signature, unknown user at the
+    recipient): stop. A permanent failure at the recipient comes back as a
+    signed negative receipt.
+
+### Transit
+
+- **Every node may carry traffic for others.** Accepting transit traffic is
+  each server's policy, bounded by per-peer rate limits and a transit
+  storage cap (§7).
+- **Topology is visible.** Every node can see who links to whom. That's the
+  cost of routing without designated relays.
 
 ## 7. Abuse resistance and the immune system
 
@@ -203,6 +276,8 @@ size limits hold. Everything else is server-level policy.
   The limit follows the address range, so churning through fresh keys
   doesn't help.
 - Per-peer push limits on unsolicited records.
+- Per-peer limits on transit messages accepted for forwarding, and a cap on
+  total transit storage.
 - A fixed cap on stored records, with eviction by the secret-salted hash.
 - Soft-state expiry.
 - Local bans, based on the server's own direct evidence.
@@ -217,11 +292,13 @@ trigger-happy (the smoke detector principle).
   evidence, or an equivocation proof, can exclude it.
 - **Wary list.** Each server attaches a short, capped, expiring list of
   identifiers it's wary of, based on its own observations, to the gossip
-  exchange that already happens. There is no new message type.
+  exchange that already happens. There is no new message type. Observations
+  include rate abuse, invalid data, user spam reports, and a node on whose
+  paths messages repeatedly fail to produce receipts.
 - **Rule.** When peers from *k* distinct network ranges list the same
-  identifier, the server applies a much tighter rate limit to it and stops
-  relaying its records. When those lists drop it, the limits lift on their
-  own.
+  identifier, the server applies a much tighter rate limit to it, stops
+  relaying its records, and routes around it when other paths exist. When
+  those lists drop it, the limits lift on their own.
 - **Why this needs no reputation tracking:** a forged alarm can only slow
   its victim down for a while, so there's nothing to defend against and no
   caller reliability to track. A bad actor's reach also shrinks as more of
@@ -265,12 +342,14 @@ trigger-happy (the smoke detector principle).
 | RSA-2048, fingerprint of PEM text | Ed25519, fingerprint of key bytes |
 | Signing re-serialized JSON | Signing the exact encoded bytes |
 | Network-wide name registration, confidence scores | Local petname table |
-| Domain queries, route cache, hop counts, confidence decay | Full-membership gossip |
+| Domain queries, route cache, hop counts, confidence decay | Full-membership gossip; link-state routing over it |
+| Direct delivery to the recipient's endpoint only | Hop-by-hop forwarding with custody across the mesh |
+| Plaintext content, readable by the receiving daemon | Content encrypted end to end to the recipient's key |
 | Admission only via pinned bootstrap | Any valid record from any peer; root as introducer |
 | Mandatory bootstrap pins | Optional fingerprint, trust on first use otherwise |
 | Peer exchange defined but unused | Anti-entropy is the core mechanism |
 | Trust levels (`trusted`/`untrusted`/…) | Local policy + immune system |
-| Signed delivery acks | Custody acceptance; receipts are application messages |
+| Signed delivery acks from the receiving server | Custody per hop + end-to-end receipt from the recipient |
 | Separate key rotation and cyanide pill | Pre-rotation; abandonment is a rotation |
 | Tiered peer aging, cleanup jobs | Soft-state expiry |
 | Short timestamp freshness windows | Seq numbers + seen ids + coarse expiry |
@@ -286,8 +365,8 @@ trigger-happy (the smoke detector principle).
 - **Encoding:** deterministic CBOR or another canonical binary encoding, or
   signing raw payload bytes inside a simple envelope.
 - **Handoff to the application:** whether the app pulls from Lattice's
-  inbox or Lattice pushes to a webhook. Also, whether "unknown user" is
-  checked at custody time (making it a permanent failure) or after.
+  inbox or Lattice pushes to a webhook. This determines when the recipient
+  learns a user is unknown and sends its negative receipt.
 - **Hive configuration:** how an operator declares hive networks, and which
   multicast discovery mechanism to use (mDNS or a minimal custom
   announcement).
@@ -297,8 +376,20 @@ trigger-happy (the smoke detector principle).
 - **Keeping the next key offline in practice:** where it lives and how a
   rotation is performed.
 - **Protocol versioning and capability negotiation.**
-- **Relaying through intermediates:** deferred; revisit only if direct
-  delivery proves insufficient.
+- **Routing details:**
+  - The path metric: hop count, or something weighted by link quality.
+  - How often links are re-proven and when a stale link is dropped.
+  - The receipt timeout and how many disjoint-path retries to make.
+  - Whether a sender may send over two disjoint paths at once for
+    high-priority messages.
+- **End-to-end encryption scheme:** a sealed-box construction to X25519, or
+  a ratcheting session between instances that talk often. The first is
+  simpler and doesn't need a round trip.
+- **Topology visibility:** whether any link information should be hidden,
+  for example hive-internal links published only inside the hive.
+- **Scale ceiling:** if nodes can no longer hold the whole graph (very large
+  meshes, or tiny radio devices), the documented next step is greedy routing
+  on a self-re-rooting spanning tree, as in Yggdrasil (Kleinberg 2007).
 
 ## References
 
@@ -311,6 +402,10 @@ trigger-happy (the smoke detector principle).
 - Smith, "Key Event Receipt Infrastructure (KERI)," arXiv:1907.02143.
 - Tarr, Lavoie, Meyer & Tschudin, "Secure Scuttlebutt," ACM ICN 2019.
 - Fall, "A Delay-Tolerant Network Architecture for Challenged Internets," SIGCOMM 2003.
+- Perlman, "Network Layer Protocols with Byzantine Robustness," MIT PhD thesis, 1988 (MIT-LCS-TR-429).
+- Moy, "OSPF Version 2," RFC 2328, 1998.
+- Kleinberg, "Geographic Routing Using Hyperbolic Space," INFOCOM 2007.
+- Yggdrasil network whitepaper and Ironwood routing library (greedy tree routing).
 - BitTorrent BEP 5 (DHT), BEP 9 (metadata exchange), BEP 11 (PEX), BEP 14 (LSD), BEP 44 (mutable items).
 - Donenfeld, "WireGuard: Next Generation Kernel Network Tunnel," NDSS 2017 (cookie mechanism).
 - Laurie & Clayton, "Proof-of-Work Proves Not to Work," WEIS 2004.
