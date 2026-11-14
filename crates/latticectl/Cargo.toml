@@ -1,0 +1,17 @@
+[package]
+name = "latticectl"
+version = "0.0.0"
+description = "Lattice admin CLI over the owner-only socket"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "latticectl"
+path = "src/main.rs"
+
+[dependencies]
+
+[lints]
+workspace = true

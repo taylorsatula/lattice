@@ -1,0 +1,11 @@
+[package]
+name = "lattice-net"
+version = "0.0.0"
+description = "Lattice transport: Noise inside WebSocket, cookies, listener, /status"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true

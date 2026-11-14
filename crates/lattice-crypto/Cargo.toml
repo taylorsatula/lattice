@@ -1,0 +1,11 @@
+[package]
+name = "lattice-crypto"
+version = "0.0.0"
+description = "Lattice cryptography: Ed25519, X25519, X-Wing, ChaCha20-Poly1305, BLAKE3, key events"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true

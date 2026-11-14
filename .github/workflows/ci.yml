@@ -6,47 +6,71 @@ on:
   pull_request:
     branches: [main]
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
-  lint:
+  fmt:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
-      - run: uv sync --all-extras
-      - run: uv run ruff check lattice tests
-      - run: uv run mypy --strict lattice tests
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --check
+
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - run: cargo clippy --workspace --all-targets -- -D warnings
 
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
-      - run: uv sync --all-extras
-      - run: uv run pytest tests/test_*.py -q
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --workspace --all-targets
 
-  vectors:
+  msrv:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
-      - run: uv sync --all-extras
-      - run: uv run pytest tests/test_vectors.py tests/test_canonical.py -q
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - run: cargo check --workspace
 
-  security:
+  no-unsafe:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
-      - run: uv sync --all-extras
-      - run: uvx bandit -r lattice -f json -o bandit.json || true
-      - run: cat bandit.json
-      - run: uvx pip-audit --desc
+      - name: every crate root forbids unsafe_code
+        run: |
+          missing=$(find crates -name 'lib.rs' -o -name 'main.rs' | xargs grep -L 'forbid(unsafe_code)')
+          if [ -n "$missing" ]; then echo "missing #![forbid(unsafe_code)]:"; echo "$missing"; exit 1; fi
 
-  build:
+  deny:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
-      - run: uv sync --all-extras
-      - run: uv build
-      - run: uv run pytest tests/test_wheel.py -q
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - run: cargo deny check
+
+  geiger:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-geiger
+      - name: geiger report (all crates)
+        run: |
+          for d in crates/*/; do
+            echo "== $d"
+            (cd "$d" && cargo geiger) || true
+          done

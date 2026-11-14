@@ -1,0 +1,17 @@
+[package]
+name = "latticed"
+version = "0.0.0"
+description = "Lattice daemon: config, wiring, local API sockets"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "latticed"
+path = "src/main.rs"
+
+[dependencies]
+
+[lints]
+workspace = true

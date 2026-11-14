@@ -1,0 +1,11 @@
+[package]
+name = "lattice-proto"
+version = "0.0.0"
+description = "Lattice wire objects: deterministic CBOR, spec objects, validation"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true

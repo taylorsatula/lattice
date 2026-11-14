@@ -18,28 +18,27 @@ partitions, crashes and lying nodes before networking code exists.
 
 ## Repository layout
 
-Following the original proposal: v1 moves to `old/` (and is also tagged
-`v1-final`), and v2 is built in `new/` as a Cargo workspace.
+v1 is in `old/` (tagged `v1-final`); v2 is built as a Cargo workspace rooted
+at the repository root, with member crates under `crates/`.
 
 ```
 old/                      v1, unchanged, for reference
-new/
-  Cargo.toml              workspace
-  crates/
-    lattice-crypto/       Ed25519, X-Wing seal/open, BLAKE3, key events
-    lattice-proto/        deterministic CBOR, every spec object, validation
-    lattice-core/         sans-IO state machine: gossip, routing, custody,
+Cargo.toml                workspace (virtual), at the repo root
+crates/
+  lattice-crypto/         Ed25519, X-Wing seal/open, BLAKE3, key events
+  lattice-proto/          deterministic CBOR, every spec object, validation
+  lattice-core/           sans-IO state machine: gossip, routing, custody,
                           receipts, fair shares, gateways, immune system
-    lattice-store/        Store trait; in-memory and redb implementations
-    lattice-net/          Noise inside WebSocket, cookies, listener, status,
+  lattice-store/          Store trait; in-memory and redb implementations
+  lattice-net/            Noise inside WebSocket, cookies, listener, status,
                           connect-time scope checks
-    lattice-sim/          deterministic simulator and invariant checks
-    lattice-client/       Rust client for the local API
-    latticed/             daemon binary: config, wiring, local API sockets
-    latticectl/           admin CLI
-  clients/python/         Python client for the local API (for MIRA)
-  vectors/                shared test vectors for every wire object
-  deploy/                 systemd unit, example configuration
+  lattice-sim/            deterministic simulator and invariant checks
+  lattice-client/         Rust client for the local API
+  latticed/               daemon binary: config, wiring, local API sockets
+  latticectl/             admin CLI
+clients/python/           Python client for the local API (for MIRA)
+vectors/                  shared test vectors for every wire object
+deploy/                   systemd unit, example configuration
 ```
 
 ## Ground rules for every phase
@@ -85,9 +84,10 @@ marks the choices with the most uncertainty.
 
 ## Phase 0: Repository and guardrails
 
-- Tag the current tree `v1-final`. Move v1 into `old/`.
-- Create the `new/` workspace with empty crates, each with
-  `#![forbid(unsafe_code)]`.
+- Tag the current tree `v1-final` (done, at `d652a8f`) and move v1 into `old/` (done).
+- Create the Cargo workspace (virtual manifest at the repo root, member crates
+  under `crates/`), each crate with `#![forbid(unsafe_code)]` and a workspace-level
+  `unsafe_code = "forbid"` lint.
 - Set up CI with the ground rules above, and pin the minimum supported Rust
   version.
 

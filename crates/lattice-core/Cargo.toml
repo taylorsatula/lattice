@@ -1,0 +1,11 @@
+[package]
+name = "lattice-core"
+version = "0.0.0"
+description = "Lattice sans-IO core: gossip, routing, custody, receipts, fair shares, gateways"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
