@@ -89,6 +89,13 @@ as little as possible to the nodes it passes through.
 - **Abandonment** (the cyanide pill) is a rotation with no next-key
   commitment. This one mechanism replaces both v1's key rotation and its
   separate revocation.
+- **Key history only moves forward.** A record whose key event log is a
+  prefix of a longer log already known for that identifier is invalid,
+  whatever its seq. Otherwise someone holding a superseded key could publish
+  a "newer" record with the old history. Every node keeps the latest key
+  event log head for each identifier (about 100 bytes) for a year after the
+  last record it saw, far longer than records live, so rotations and
+  abandonments stay final even after the records expire.
 - **The next private key is stored separately from the running daemon.**
   If the current and next keys are both stolen, recovery isn't possible.
 - **The channel and envelope keys** are listed in the peer record and signed
@@ -127,6 +134,7 @@ An instance is either **public** or **private**:
 - **Public instances** publish endpoints and links, and can be routed
   through.
 - **Private instances** publish neither. They name gateways instead (§7).
+  A gateway must be a public instance, so that WAN senders can reach it.
 
 | Field | Present for | Purpose |
 |---|---|---|
@@ -144,7 +152,10 @@ An instance is either **public** or **private**:
 | capabilities / protocol version | All | Feature flags and negotiation |
 
 - **Last-writer-wins by seq,** as in BitTorrent's BEP 44 mutable items.
-  Partitions merge with no special logic.
+  Partitions merge with no special logic. If two valid records have the
+  same seq, every node keeps the one with the lower BLAKE3 hash, so all
+  nodes converge on the same choice; the pair is still an equivocation
+  proof.
 - **Soft state.** The owner refreshes the record before it expires. A
   record that isn't refreshed fades out everywhere, so no cleanup jobs or
   liveness logic are needed.
@@ -172,9 +183,13 @@ An instance is either **public** or **private**:
   only after a handshake at that address proves the far end holds the
   record's channel key. That stops anyone using the mesh to aim traffic at a
   victim.
-- **A link is a live authenticated connection** (§3). An instance lists
-  another as a link while it holds a connection to it, and drops it when
-  the connection goes stale.
+- **A link is a live authenticated connection** (§3), with hysteresis. An
+  instance lists another as a link while it holds a connection to it, and
+  keeps listing it through drops shorter than a grace period (5 minutes by
+  default), so flaky connections don't churn the graph.
+- **Records are republished at most once per interval** (2 minutes by
+  default). Link changes within an interval are batched into one new
+  record, as OSPF limits link-state updates with a minimum interval.
 
 ## 3. Transport
 
@@ -196,9 +211,11 @@ An instance is either **public** or **private**:
   any resources. It costs honest peers one extra round trip, only during an
   attack. There is no proof-of-work.
 - **Connections are long-lived and bounded.** Each instance holds
-  authenticated connections to a bounded set of neighbors (about 8 to 32).
-  Those connections are its links, and they carry gossip, routing traffic
-  and custody alike.
+  authenticated connections to a bounded set of neighbors. Those connections
+  are its links, and they carry gossip, routing traffic and custody alike.
+  WAN links and hive links have separate caps (by default 16 WAN links, at
+  most 32, and up to 128 hive links), so a gateway can serve a large hive
+  and still hold its backbone links.
 - **Real frames go out immediately; snow fills the gaps.** Every frame after
   a handshake is padded to a size bucket. Real frames are sent as soon as
   they're ready. Dummy frames ("snow") fall at random in the quiet moments
@@ -224,7 +241,9 @@ An instance is either **public** or **private**:
 The layers, tried in order:
 
 1. **Saved peers** from previous runs. A node that has ever been connected
-   never needs its root again.
+   never needs its root again. Saved peer addresses are kept independently
+   of record expiry, so a node that was offline longer than records live
+   can still reconnect.
 2. **A configured root or roots.** Any instance can be any other instance's
    root. A root is given as an address with an optional identifier.
    - Without an identifier, the first contact is trusted on first use, using
@@ -247,12 +266,15 @@ merges them.
 
 - **Every node holds every peer record it accepts,** up to a local cap.
   There is no DHT; membership is small enough to replicate in full.
-- **Anti-entropy with random neighbors** (Demers et al. 1987). Two nodes
-  compare their sets of (identifier, seq) pairs and fetch only what's
-  missing.
-  - Initially, nodes exchange the full digest of those pairs.
-  - When the set grows large, range-based set reconciliation (Meyer 2022,
-    as used by Negentropy) replaces it.
+- **Anti-entropy with random neighbors** (Demers et al. 1987), by
+  range-based set reconciliation (Meyer 2022, as used by Negentropy) from
+  the start. Two nodes compare a single fingerprint of their whole set of
+  (identifier, scope, seq) entries. Only if the fingerprints differ do they
+  split the set into ranges and compare those, recursing into the ranges
+  that differ, then fetch what's missing. When nothing has changed, a round
+  costs one small frame each way, whatever the network's size. Exchanging
+  full digests would cost hundreds of megabytes a day per node at a
+  thousand nodes.
 - **Hive-scoped data stays in the hive** (§2).
 - **Neighbor selection** (Heilman et al. 2015; Brahms 2008):
   - Random, from peers grouped by network range.
@@ -294,11 +316,15 @@ levels.
 - **Progress:** a hop chooses uniformly at random among all neighbors closer
   to the destination than itself, not always the single shortest one.
 - **Sideways:** with a small probability (15% by default), it instead takes
-  a neighbor that is *no closer*.
-- **No loops:** dedup already answers "already have it" when a message
-  reaches a node that has seen it, so a wandering message can never revisit
-  a node. If every sideways choice has already seen it, the hop takes a
-  progress step, which is always available while a path exists.
+  a neighbor at exactly the *same* distance. Never one farther away.
+- **Sideways turns are opportunistic.** If the sideways neighbor answers busy
+  or "already have it," the hop immediately takes a progress step instead,
+  and never waits on a sideways neighbor.
+- **No loops and no dead ends:** dedup answers "already have it" when a
+  message reaches a node that has seen it, so a message never revisits a
+  node. Because no step moves away from the destination, every node a
+  message has visited is at least as far away as where it is now, so a
+  closer, unvisited neighbor always exists while views of the graph agree.
 - **Cost:** the message is unchanged, and on average the route grows by well
   under one hop. Hops dispatch immediately, so responsiveness holds.
 
@@ -312,8 +338,9 @@ public waypoint first, and from there on to the recipient.
 - **W opens its layer,** replaces the outer header with the real one, and
   forwards toward the recipient. Everything W sends on was built by the
   sender, so nothing becomes mutable or unverifiable.
-- **Each leg has its own message id.** A node can easily land on both legs,
-  and with a single id it would answer "already have it" to the second leg.
+- **Each leg of each attempt has its own leg id** (see the message below). A
+  node can easily land on both legs, and with a shared id it would answer
+  "already have it" to the second leg.
 - **Privacy:** first-leg hops never learn the destination. W learns the
   recipient but not the sender. Second-leg hops learn the recipient but not
   where the message came from.
@@ -326,13 +353,19 @@ public waypoint first, and from there on to the recipient.
 
 | Part | Readable by | Contents |
 |---|---|---|
-| Outer header | First-leg hops | Leg message id, the waypoint, expiry. Present only when a waypoint is used |
+| Outer header | First-leg hops | Leg id, the waypoint, expiry. Present only when a waypoint is used |
 | Waypoint layer | That waypoint only (sealed to its envelope key) | The routing header and the gateway layer. Present only when a waypoint is used |
-| Routing header | Every hop after the waypoint, or every hop if there is none | Message id, routing destination (the recipient, or a gateway of a private recipient), expiry |
+| Routing header | Every hop after the waypoint, or every hop if there is none | Leg id, routing destination (the recipient, or a gateway of a private recipient), expiry |
 | Gateway layer | That gateway only (sealed to its envelope key) | The private recipient's identifier. Present only for private recipients |
-| Envelope | Recipient only (sealed to its envelope key) | Sender identifier, sending and receiving service and mailbox, created time, an opaque application payload, and the sender's signature over the header and all of it |
+| Envelope | Recipient only (sealed to its envelope key) | Message id, sender identifier, sending and receiving service and mailbox, created time, an opaque application payload, and the sender's signature over the header and all of it |
 | Padding | Nobody | Fills the message to its size bucket (§7) |
 
+- **Two kinds of id.** The *message id* identifies the message itself. It
+  lives inside the envelope, where only the recipient sees it, and the
+  recipient dedups on it. A *leg id* is random and fresh for every leg of
+  every attempt. Hops dedup on it, which prevents loops. Because a retry
+  carries new leg ids, nodes that saw an earlier attempt never block it, and
+  insiders can't link attempts by id.
 - **Built entirely by the sender.** Nothing in the message is created or
   changed in transit. The one transformation, at a waypoint, uncovers a
   header the sender sealed in advance.
@@ -377,8 +410,8 @@ public waypoint first, and from there on to the recipient.
      isn't fixed by the sender, so each hop uses the freshest information
      available.
    - **Loops are prevented by dedup.** A node that already holds or has held
-     the message id answers "already have it" and takes no further action.
-     The forwarding hop then picks its next-best hop. This holds even while
+     the leg id answers "already have it" and takes no further action. The
+     forwarding hop then picks its next-best hop. This holds even while
      hops' views of the graph disagree.
    - **The forward goes out immediately.** An operator can optionally add a
      small random hold before forwarding (§7); the default is none.
@@ -393,9 +426,26 @@ public waypoint first, and from there on to the recipient.
    > later."
 
    Busy is a transient failure. The upstream hop keeps the message and
-   retries with backoff, while applying the same rule to its own upstream
-   links. Gateways and recipients apply the same rule as every other hop.
-   §8 explains how this contains floods.
+   retries with backoff, or tries another progress neighbor, while applying
+   the same rule to its own upstream links. Gateways and recipients apply
+   the same rule as every other hop. §8 explains how this contains floods.
+
+   **No store-and-forward deadlock.** If A's storage fills with messages that
+   need B while B's fills with messages that need A, each answers busy to the
+   other until the messages expire (Merlin & Schweitzer 1980). Two rules
+   prevent it:
+   - **Buffer classes by remaining distance.** Transit storage is divided
+     into classes by how far a message still has to go to its current
+     destination. A message that is *d* hops away is held in class *d*. A
+     hop only ever waits for room in a lower class at the next node, since
+     progress steps decrease distance and sideways steps are never waited on.
+     Waits therefore can't form a cycle, and class 0, at the destination,
+     always drains.
+   - **Waypoints and gateways re-originate.** When a message reaches its
+     waypoint, its second leg starts over with a new distance. The waypoint
+     accepts the first leg only if it has room to hold the second leg as its
+     own outbound traffic. A gateway does the same for the final hop to its
+     private instance.
 
    At the recipient, each service's inbox is also capped. When an
    application stops fetching and its inbox fills, the recipient answers
@@ -420,15 +470,21 @@ public waypoint first, and from there on to the recipient.
   messages.
 - **Retry through a fresh waypoint.** If no receipt arrives within the
   receipt timeout, the sender sends the message again through a different,
-  randomly chosen waypoint, whatever the waypoint share. A new waypoint
-  takes the message over a largely different route by construction, which
-  routes around a node that accepts custody and then silently drops
-  messages. The retry keeps the same real message id, so the recipient
-  dedups it if an earlier attempt did arrive.
-- **Idempotent receive by message id.** Every hop and the recipient keep a
-  hash of each message id they have seen until the message expires, not
-  merely until they have forwarded it. This one rule makes retries and
-  multiple paths harmless and is also what prevents routing loops.
+  randomly chosen waypoint, whatever the waypoint share, with fresh leg ids.
+  A new waypoint takes the message over a largely different route by
+  construction, which routes around a node that accepts custody and then
+  silently drops messages. The message id inside the envelope stays the
+  same, so the recipient dedups it if an earlier attempt did arrive.
+- **Longer timeouts for private recipients.** A private instance may be
+  offline while its gateway holds its messages, which is correct and
+  produces no receipt. The sender knows from the recipient's record that it
+  is private and uses a much longer receipt timeout (12 hours by default,
+  against 15 minutes for public recipients), so it doesn't retry spuriously.
+- **Two levels of dedup.** Every hop keeps a hash of each leg id it has seen
+  until the message expires, not merely until it has forwarded it; that
+  prevents routing loops. The recipient keeps a hash of each message id it
+  has received until the message expires; that makes retries and multiple
+  attempts harmless.
 - **Failure classes:**
   - **Transient** (unreachable, busy, no path): retry with backoff.
   - **Permanent** (malformed, failing verification at the recipient, no such
@@ -475,7 +531,7 @@ that limit, it minimizes what any node can learn or keep.
 7. **Receipts look like messages.** Same format, same padding, no separate
    channel.
 8. **Minimal retention.** After handing off custody, a hop deletes the
-   message and keeps only a hash of its id for dedup. By default nothing
+   message and keeps only a hash of its leg id for dedup. By default nothing
    logs senders or destinations per message, so a seized or compromised
    server reveals little.
 9. **No names on the network.** Records carry no display names (§1), so the
@@ -712,6 +768,11 @@ principle).
 - **Async runtime:** Tokio, with no blocking calls on async tasks.
 - **Storage:** redb, a pure-Rust ACID embedded database, in a single file.
   It keeps C code out of the stack.
+- **Group commit for custody.** Accepting custody requires a durable write,
+  and one disk sync per message would cap throughput at tens of messages a
+  second on an SD card. Messages arriving close together are written in one
+  commit, and every message's `accepted` is sent only after the commit that
+  holds it completes.
 - **A simulated mesh is built first.** A test harness runs many nodes in one
   process over in-memory links and injects partitions, dropped and slow
   links, crashes during custody, and lying or dropping nodes. Every protocol
@@ -860,6 +921,7 @@ principle).
 - Perrin, "The Noise Protocol Framework."
 - Tarr, Lavoie, Meyer & Tschudin, "Secure Scuttlebutt," ACM ICN 2019.
 - Fall, "A Delay-Tolerant Network Architecture for Challenged Internets," SIGCOMM 2003.
+- Merlin & Schweitzer, "Deadlock Avoidance in Store-and-Forward Networks," IEEE Transactions on Communications, 1980.
 - Perlman, "Network Layer Protocols with Byzantine Robustness," MIT PhD thesis, 1988 (MIT-LCS-TR-429).
 - Moy, "OSPF Version 2," RFC 2328, 1998.
 - Kleinberg, "Geographic Routing Using Hyperbolic Space," INFOCOM 2007.

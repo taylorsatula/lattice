@@ -60,7 +60,8 @@ that document; section references (§n) point back to it.
 | `x25519` | 32-byte bstr |
 | `xwing_pk` | 1216-byte bstr: X-Wing public key (ML-KEM-768 encapsulation key followed by X25519 key) |
 | `time` | uint: Unix seconds |
-| `mid` | 16-byte bstr: message id, random |
+| `mid` | 16-byte bstr: message id, random, carried inside the envelope |
+| `leg` | 16-byte bstr: leg id, random and fresh for every leg of every attempt, carried in headers |
 
 ### Signing rule
 
@@ -97,6 +98,10 @@ Each event is a signed map.
   rotation.
 - **Abandonment.** A rotation without `n` ends the identity permanently. No
   later record or event for that identifier is accepted.
+- **Monotonic history.** A node keeps the latest KEL head (sn and event hash)
+  for every identifier for one year after the last record it saw. A record
+  whose KEL is a prefix of, or diverges from, a longer valid KEL already
+  known is invalid, whatever its `seq`.
 - **Key event log (KEL):** the array of events from inception to the
   current one.
 
@@ -128,7 +133,8 @@ Each is last-writer-wins on its own (id, scope) pair. Hive-only instances
 publish only a hive record.
 
 **Validation:**
-- The KEL is valid (§2) and not abandoned.
+- The KEL is valid (§2), not abandoned, and not behind the KEL head already
+  known for this identifier (§2, monotonic history).
 - `sig` verifies under the current key in the KEL.
 - `id` matches the KEL's inception.
 - `exp` is in the future and within the record horizon (§1).
@@ -138,7 +144,14 @@ publish only a hive record.
 - The encoded record is within 3 KB.
 
 **Equivocation:** two records with the same (id, scope, seq) and different
-bytes, both validly signed.
+bytes, both validly signed. Every node keeps the one whose encoding has the
+lower BLAKE3 hash, so all nodes converge, and treats the pair as an
+equivocation proof.
+
+**Republishing:** an instance publishes a new record (seq + 1) at most once
+per *republish interval* (default 2 minutes), batching link changes. A link
+stays in `ln` through disconnections shorter than the *link grace* (default
+5 minutes).
 
 ## 4. Sealed layers (§1, §6)
 
@@ -185,13 +198,15 @@ Used for both the routing header and the outer header.
 |---|---|---|---|
 | 0 | v | uint | |
 | 1 | t | uint | 30 |
-| 2 | mid | mid | The message id; in an outer header, a separate random leg id |
+| 2 | leg | leg | Leg id. Hops dedup on it |
 | 3 | dst | id | Recipient, gateway or waypoint |
 | 4 | exp | time | Within the message horizon (§1). An outer header's expiry is no later than the real header's |
 
-**Each leg has its own id.** A node can be on both legs of a waypoint route.
-If the legs shared an id, that node would answer `already have` to the second
-leg.
+**Leg ids, not message ids, in headers.** Every leg of every attempt carries
+a fresh random leg id. A node can be on both legs of a waypoint route, or on
+the routes of two attempts, and with a shared id it would answer
+`already have` and block the later one. The message id lives in the envelope
+(below), where the recipient dedups on it.
 
 ### Hop layer plaintext
 
@@ -205,7 +220,9 @@ leg.
 **At a waypoint:** the waypoint replaces the outer header with `hdr`, and
 `hop_layer` with `inner` (or null). It re-pads to the **same bucket** the
 message arrived in, so the leg change isn't visible by size. Then it forwards
-toward `hdr.dst` as a new custody unit under `hdr.mid`.
+toward `hdr.dst` as a new custody unit under `hdr.leg`. It accepts the
+first leg only if it has room to hold the second leg as its own outbound
+traffic (§6 buffer classes).
 
 **At a gateway:** forward over the direct link to `rcpt`, unchanged.
 
@@ -214,6 +231,7 @@ toward `hdr.dst` as a new custody unit under `hdr.mid`.
 | Key | Name | Type | Notes |
 |---|---|---|---|
 | 0 | kind | uint | 0 = message, 1 = receipt, 2 = negative receipt |
+| 11 | mid | mid | Message id. The recipient dedups on it; retries keep it |
 | 1 | from | id | Sending instance |
 | 2 | fsvc | tstr | Sending service |
 | 3 | fmbx | bstr | Sending mailbox; opaque |
@@ -276,8 +294,8 @@ exactly a bucket size is refused. Frame types:
 | t | Frame | Contents |
 |---|---|---|
 | 50 | offer | `{2: message}` (the encoded message, §5) |
-| 51 | custody | `{2: mid, 3: result, 4: retry_after or absent}`. Result: 0 = accepted, 1 = already have, 2 = busy, 3 = refused |
-| 20 | digest | `{2: [[id, scope, seq], …]}` |
+| 51 | custody | `{2: leg, 3: result, 4: retry_after or absent}`. Result: 0 = accepted, 1 = already have, 2 = busy, 3 = refused |
+| 20 | reconcile | `{2: [range, …]}`. Range-based set reconciliation, below |
 | 21 | want | `{2: [[id, scope], …]}` |
 | 22 | records | `{2: [peer record, …]}` |
 | 23 | wary | `{2: [id, …], 3: exp}` (optional, §8) |
@@ -285,30 +303,67 @@ exactly a bucket size is refused. Frame types:
 | 61 | dummy | `{2: echo}` (bool). Discarded on receipt; if `echo` is true, answered with a dummy (§ Snow) |
 
 - **Large gossip** that doesn't fit one 32 KB frame is split across several
-  `digest` or `records` frames.
+  `reconcile` or `records` frames.
+
+### Reconciliation (design §5)
+
+Records are ordered by (id, scope). Each entry's item hash is
+BLAKE3(id ‖ scope ‖ seq). A range's fingerprint is the count of entries and
+the sum of their item hashes modulo 2²⁵⁶. Sums can be maintained
+incrementally as records change, and the order of addition doesn't matter.
+
+- **A range** is `{0: lower bound, 1: upper bound, 2: [count, sum]}` or
+  `{0: lower, 1: upper, 3: [[id, scope, seq], …]}` (an explicit list,
+  used for small ranges).
+- **A round** starts with one range covering everything. The receiver
+  compares fingerprints:
+  - **Equal:** done.
+  - **Different and large:** split the range into 16 subranges and reply
+    with their fingerprints.
+  - **Different and small** (32 entries or fewer): reply with the explicit
+    list.
+- **Fetching:** each side sends `want` for entries it lacks or holds at a
+  lower seq, and the other answers with `records`.
+- **Cost:** a round on an unchanged set is one small frame each way,
+  regardless of the number of records. (Meyer, "Range-Based Set
+  Reconciliation"; Negentropy.)
 
 - **Custody rule:** a receiver answers `accepted` only after durably storing
-  the message. `busy` is the fair-share answer (§6, §8), and also the answer
+  the message. Offers arriving close together are committed together (group
+  commit), and each is answered only after its commit completes. `busy` is the fair-share answer (§6, §8), and also the answer
   at the recipient when the target service's inbox is full. `refused` means
   the message is malformed, expired, beyond the message horizon, or the
   wrong size for its bucket.
 - **Check order for an offer,** cheapest first: frame and bucket size, then
-  expiry and horizon, then dedup (answer `already have`), then fair share
-  (answer `busy`), then durable storage (answer `accepted`).
+  expiry and horizon, then dedup on the leg id (answer `already have`), then
+  buffer class and fair share (answer `busy`), then durable storage (answer
+  `accepted`).
+- **Buffer classes.** Transit storage is divided into classes 0 to *D*
+  (default *D* = 16), each with an equal slice of the transit cap. An offer
+  for which this node would be *d* hops from the message's current
+  destination is stored in class min(*d*, *D*). Fair shares apply within each
+  class. A node waits only for room in a lower class at a progress neighbor,
+  never on a sideways neighbor, so waits can't form a cycle.
 - **Check order for a new connection:** frame size, then mac1, then mac2 when
   under load, then the Noise handshake.
 - **Next-hop choice** for a message held in custody, toward its current
   destination *d*, with *dist* the hop count to *d* over the current graph:
   - With probability *p_side* (default 15%), choose uniformly among links to
-    neighbors with *dist* equal to or greater than this node's own that
-    haven't answered `already have` for this id.
-  - Otherwise, or if there are none, choose uniformly among links to
-    neighbors with *dist* less than this node's own.
-  - On `already have`, exclude that link for this id and choose again.
+    neighbors with *dist* exactly equal to this node's own that haven't
+    answered `already have` for this leg. If that neighbor answers `busy` or
+    `already have`, fall through to a progress step at once; never wait on a
+    sideways neighbor.
+  - Otherwise, choose uniformly among links to neighbors with *dist* less
+    than this node's own. On `already have`, exclude that link for this leg
+    and choose again. On `busy`, try another progress neighbor, or wait with
+    backoff if all are busy.
+  - Never choose a neighbor with *dist* greater than this node's own.
 - **Waypoint choice** at the sender: uniformly among public instances with a
   valid record, excluding the sender's own links and the recipient (and its
   gateways). A share *w* of messages use one (default 0%). Retries always use
-  a waypoint not used by earlier attempts.
+  a waypoint not used by earlier attempts, and fresh leg ids for every leg.
+- **Receipt timeout:** 15 minutes for a public recipient, 12 hours for a
+  private one (known from its record), before a retry.
 - **Equivocation proofs** need no frame of their own. Conflicting records
   travel in an ordinary `records` frame, and the receiver detects the
   conflict.
@@ -448,11 +503,14 @@ redb tables, derived from the objects above:
 |---|---|---|
 | `meta` | singleton | Schema version |
 | `identity` | singleton | Own KEL, current secret keys, configuration hash |
-| `records` | (id, scope) | Peer record bytes, received time |
+| `records` | (id, scope) | Peer record bytes, received time, plus range fingerprints maintained for reconciliation |
 | `outbound` | mid | Message bytes, priority, state, attempt, next attempt, receipt deadline, waypoints used |
-| `custody` | mid (or leg id) | Message bytes, upstream link, current destination, lease |
+| `custody` | leg | Message bytes, upstream link, current destination, buffer class, lease |
 | `shares` | (destination, upstream link) | Count held, for fair-share custody |
-| `seen` | BLAKE3(mid) | Expiry |
+| `seen` | BLAKE3(leg) | Expiry. Hop-level dedup |
+| `delivered` | BLAKE3(mid) | Expiry. Recipient-level dedup |
+| `kel_heads` | id | Latest KEL sn and event hash, last-seen time (kept one year) |
+| `peers` | id | Saved endpoint addresses, kept independently of record expiry |
 | `inbox` | delivery id | Service, delivery fields, received |
 | `status` | mid | Latest status, for the API |
 | `wary` | id | Source ranges, expiry |

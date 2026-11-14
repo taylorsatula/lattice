@@ -105,13 +105,15 @@ fails the build.
    depth, entry counts, string lengths checked before allocation). It
    rejects non-canonical encodings, unknown keys and unsupported versions.
 3. **Key events:** inception, rotation and abandonment. Building them,
-   validating a KEL, and deriving the identifier.
+   validating a KEL, deriving the identifier, and comparing KELs so that a
+   record behind a known KEL head is rejected.
 4. **Peer records** (public and private, WAN and hive scope): building,
    signing, and the full validation list from the spec, including expiry
-   horizons.
+   horizons and the lower-hash tiebreak for equal seq.
 5. **Sealed layers:** X-Wing sealing with the routing header as associated
    data.
-6. **Messages:** building with optional waypoint and gateway layers,
+6. **Messages:** leg ids in headers and the message id in the envelope;
+   building with optional waypoint and gateway layers,
    padding to size buckets, refusing oversize messages, and opening at the
    waypoint (re-padding to the same bucket), the gateway and the recipient.
    Receipts and negative receipts.
@@ -157,7 +159,11 @@ invariants passing:
 1. **Records and gossip:**
    - validation and storage, with last-writer-wins per (id, scope)
    - soft-state expiry and expiry horizons
-   - anti-entropy by full digest
+   - anti-entropy by range-based reconciliation, with incrementally
+     maintained range fingerprints
+   - link grace and the republish interval
+   - KEL heads retained a year, and saved peer addresses kept beyond record
+     expiry
    - `want` for specific records
    - per-neighbor push limits
    - the hive/WAN scope rule
@@ -169,16 +175,23 @@ invariants passing:
 3. **The graph and routing:**
    - links counted only when both ends claim them
    - distances to each destination
-   - random choice among neighbors that make progress, with sideways turns
-   - waypoints, with a separate leg id per leg
+   - random choice among neighbors that make progress, with
+     equal-distance, opportunistic sideways turns
+   - waypoints, with a fresh leg id for every leg of every attempt
+   - separate caps for WAN and hive links
 4. **Custody:**
-   - accept only after a durable store, and keep a dedup set until expiry
+   - accept only after a durable store, with group commit
+   - buffer classes by remaining distance; waypoints and gateways
+     re-originate
+   - hop dedup by leg id and recipient dedup by message id, each kept until
+     expiry
    - "already have it"
    - leases, retry with backoff, and waiting for a path when there is none
 5. **Outbound queue and receipts:**
    - the queue, ordered by priority
    - receipts and negative receipts
-   - the receipt timeout, and retry through a fresh waypoint
+   - receipt timeouts (longer for private recipients), and retry through a
+     fresh waypoint
 6. **Fair-share custody:**
    - a per-destination allowance shared across upstream links, with busy
      answers
@@ -238,7 +251,20 @@ invariants passing:
   hop's state contains a message's sender; hive-scoped records never reach
   a node outside the hive.
 - **Key safety:** rotations signed by a stolen current key are rejected
-  everywhere, and abandonment is final everywhere.
+  everywhere, and abandonment is final everywhere, including after the
+  abandoned identity's records have expired and an attacker republishes with
+  a superseded key.
+- **Record convergence under equivocation:** when one key signs two records
+  with the same seq, every node ends up holding the same one.
+- **Retries aren't blocked:** a retry after a lost attempt is delivered even
+  when the nodes near the destination saw the first attempt.
+- **No deadlock:** under sustained saturation from many senders to many
+  destinations, with storage full everywhere, messages keep making progress;
+  no set of nodes ends up waiting on each other until expiry.
+- **Reconciliation cost:** with an unchanged record set, the bytes exchanged
+  per anti-entropy round don't grow with the number of records.
+- **Link churn:** flapping connections shorter than the grace period produce
+  no record churn.
 - **Bounded state:** every table on every node stays within its configured
   cap under adversarial load.
 
@@ -258,6 +284,9 @@ seed.
   random points during writes and check on restart that committed state is
   intact and nothing uncommitted was acknowledged.
 - A subset of the Phase 2 invariant suite re-run against redb.
+- **Group commit throughput:** custody acceptance rate measured on slow
+  storage (an SD card or a throttled disk), with group commit keeping it
+  well above one-sync-per-message rates.
 
 **Exit:** crash tests pass repeatedly, and the core passes its invariant
 subset on redb.
@@ -378,12 +407,16 @@ from the soak test.
 
 | Parameter | Default |
 |---|---|
-| Neighbors (links) | 16, hard cap 32 |
+| WAN links | 16, hard cap 32 |
+| Hive links | up to 128 |
+| Link grace / republish interval | 5 min / 2 min |
+| KEL head retention | 1 year |
+| Buffer classes | 0–16 |
 | Anti-entropy interval | 60 s |
 | Record refresh / record expiry | 1 day / 7 days (horizon 30 days) |
 | Message expiry | 3 days (horizon 14 days) |
 | Retry backoff | 30 s doubling, capped at 30 min |
-| Receipt timeout | 15 min |
+| Receipt timeout | 15 min public / 12 h private recipients |
 | Fresh-waypoint retries | 3 |
 | Custody allowance per destination | 4 MB |
 | Transit storage cap | 256 MB |
@@ -404,8 +437,6 @@ These are recorded in the design doc as open or deferred:
 - messages over 32 KB and attachments
 - post-quantum protection for the channel
 - loop messages and constant-rate cover
-- range-based set reconciliation, unless the simulator shows full-digest
-  anti-entropy is too costly at the target scale
 - Spray-and-Wait
 - greedy-tree routing for very large meshes
 - non-IP transports
