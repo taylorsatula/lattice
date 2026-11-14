@@ -490,6 +490,9 @@ pub fn is_globally_routable(ip: IpAddr) -> bool {
             if let Some(mapped) = v6.to_ipv4_mapped() {
                 return is_v4_global(mapped);
             }
+            if is_ipv4_embedding(&v6) {
+                return false;
+            }
             !(v6.is_loopback()
                 || v6.is_unspecified()
                 || v6.is_multicast()
@@ -498,6 +501,30 @@ pub fn is_globally_routable(ip: IpAddr) -> bool {
                 || (v6.segments()[0] == 0x2001 && v6.segments()[1] == 0x0db8)) // documentation 2001:db8::/32
         }
     }
+}
+
+/// IPv6 ranges that embed an IPv4 address. A WAN endpoint naming one of
+/// these is either a deprecated transition mechanism or a tunnel whose
+/// embedded destination we cannot vet, so fail closed.
+fn is_ipv4_embedding(v6: &std::net::Ipv6Addr) -> bool {
+    let s = v6.segments();
+    // ::/96 — deprecated IPv4-compatible addresses (::a.b.c.d)
+    if s[..6].iter().all(|&seg| seg == 0) {
+        return true;
+    }
+    // 64:ff9b::/96 — NAT64 well-known prefix
+    if s[0] == 0x0064 && s[1] == 0xff9b && s[2..6].iter().all(|&seg| seg == 0) {
+        return true;
+    }
+    // 2002::/16 — 6to4
+    if s[0] == 0x2002 {
+        return true;
+    }
+    // 2001::/32 — Teredo
+    if s[0] == 0x2001 && s[1] == 0x0000 {
+        return true;
+    }
+    false
 }
 
 fn is_v4_global(ip: Ipv4Addr) -> bool {

@@ -17,6 +17,8 @@ use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 
+use subtle::ConstantTimeEq;
+
 use crate::cookie::{CookieState, mac1};
 use crate::errors::NetError;
 use crate::handshake::{Pending, XX_MSG1_LEN, encode_handshake_frame};
@@ -268,10 +270,13 @@ async fn handshake_server(
     let mut init = parse_init(&init_msg)?;
     let is_xx = init.noise_msg.len() == XX_MSG1_LEN;
     if !is_xx {
-        let mac1_ok = mac1(
-            &lattice_crypto::x25519_public(&cfg.channel_seed),
-            &init.noise_msg,
-        ) == init.mac1;
+        let mac1_ok = bool::from(
+            mac1(
+                &lattice_crypto::x25519_public(&cfg.channel_seed),
+                &init.noise_msg,
+            )
+            .ct_eq(&init.mac1),
+        );
         if !mac1_ok {
             return Err(NetError::BadMac);
         }
@@ -298,10 +303,13 @@ async fn handshake_server(
             let retry = next_binary(&mut ws).await?;
             init = parse_init(&retry)?;
             if init.noise_msg.len() != 32
-                && mac1(
-                    &lattice_crypto::x25519_public(&cfg.channel_seed),
-                    &init.noise_msg,
-                ) != init.mac1
+                && !bool::from(
+                    mac1(
+                        &lattice_crypto::x25519_public(&cfg.channel_seed),
+                        &init.noise_msg,
+                    )
+                    .ct_eq(&init.mac1),
+                )
             {
                 return Err(NetError::BadMac);
             }

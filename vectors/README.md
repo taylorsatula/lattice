@@ -8,9 +8,13 @@ Intended for sharing across implementations; consumers may vendor this file as-i
   independent ground truth. Each entry carries the expected fields; sealed
   layers are covered by round-trip tests instead of byte-exact vectors
   because their KEM randomness is per-encapsulation.
-- `xwing-kat.json` — the X-Wing known-answer tests from the CFRG X-Wing
-  draft (as published with the RustCrypto `x-wing` crate). This is the
-  independent anchor for the KEM itself.
+- `xwing-kat.json` — a byte-copy of the known-answer tests published with
+  the RustCrypto `x-wing` crate (draft-06). It is the anchor for the KEM
+  itself, but it is not independent of the implementation: both come from
+  the same crate. Treat it as a regression anchor, not an external audit.
+- Regenerating `vectors.json` re-rolls KEM randomness, so sealed-layer
+  bytes change on every run; only the `vectors.json` entries whose inputs
+  are deterministic are stable across regenerations.
 
 Any change to encoding, signing preimages, or key handling that changes
 these files is a wire-format change: it requires a spec edit in the same

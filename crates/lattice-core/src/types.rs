@@ -54,9 +54,13 @@ pub enum Event {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Action {
     /// Send a frame on a link (padding applied by the transport).
+    /// `pad_to` requests a specific FRAME_BUCKETS index for the wire
+    /// padding (snow dummies must land in a sampled bucket); `None` lets the
+    /// transport pick the smallest fitting bucket.
     SendFrame {
         link: LinkId,
         frame: lattice_proto::frames::Frame,
+        pad_to: Option<usize>,
     },
     /// Hand a delivery to the application.
     Deliver {

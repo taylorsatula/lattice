@@ -48,6 +48,31 @@ pub fn encode_wire(frame_bytes: &[u8]) -> Result<Vec<u8>, FrameError> {
     Err(FrameError::TooLarge)
 }
 
+/// Encode a frame padded to exactly `FRAME_BUCKETS[bucket]`. Used for snow
+/// dummies, whose size is drawn from the mix of real frame buckets.
+/// Errors if the frame does not fit the chosen bucket.
+pub fn encode_wire_to_bucket(frame_bytes: &[u8], bucket: usize) -> Result<Vec<u8>, FrameError> {
+    let Some(&target) = FRAME_BUCKETS.get(bucket) else {
+        return Err(FrameError::TooLarge);
+    };
+    for head in [1usize, 2, 3, 5, 9] {
+        let pad = target as i64
+            - (1 + cbor_head_len(frame_bytes.len()) as i64
+                + frame_bytes.len() as i64
+                + head as i64);
+        if pad >= 0 && cbor_head_len(pad as usize) == head {
+            let arr = Value::Array(vec![
+                Value::Bytes(frame_bytes.to_vec()),
+                Value::Bytes(vec![0u8; pad as usize]),
+            ]);
+            let bytes = cbor::encode(&arr);
+            debug_assert_eq!(bytes.len(), target);
+            return Ok(bytes);
+        }
+    }
+    Err(FrameError::TooLarge)
+}
+
 /// Decode a wire payload back into the frame bytes. Exact bucket size and
 /// all-zero padding are mandatory.
 pub fn decode_wire(bytes: &[u8]) -> Result<Vec<u8>, FrameError> {

@@ -18,9 +18,12 @@ pub mod server;
 pub use client::{PeerContact, connect};
 pub use dial::{EndpointUrl, connect_scoped, parse_endpoint, scoped_addresses};
 pub use errors::NetError;
-pub use frame::{FRAME_BUCKETS, FrameError, decode_wire, encode_wire};
+pub use frame::{FRAME_BUCKETS, FrameError, decode_wire, encode_wire, encode_wire_to_bucket};
 pub use path::upgrade_path;
 pub use peer::PeerIo;
 pub use server::{ListenerConfig, serve};
 
-pub const MAX_WIRE_BYTES: usize = 40 * 1024;
+/// Largest post-handshake wire message: the 32768-byte bucket plus the
+/// 16-byte Poly1305 tag. Handshake frames are padded to 2048 and capped
+/// separately (see handshake.rs).
+pub const MAX_WIRE_BYTES: usize = 32768 + 16;

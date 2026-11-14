@@ -106,15 +106,21 @@ impl Response {
     pub fn from_value(v: &Value) -> Result<Self, ProtoError> {
         v.deny_unknown_keys(&[0, 1, 2])?;
         let id = v.req_uint(0)?;
-        match v.get_key(1)? {
-            Some(result) => Ok(Response::Ok {
+        match (v.get_key(1)?, v.get_key(2)?) {
+            (Some(_), Some(_)) => Err(ProtoError::Invalid(
+                "response carries both result and error",
+            )),
+            (Some(result), None) => Ok(Response::Ok {
                 id,
                 result: result.clone(),
             }),
-            None => {
+            (None, Some(_)) => {
                 let code = v.req_uint(2)?;
                 Ok(Response::Err { id, code })
             }
+            (None, None) => Err(ProtoError::Invalid(
+                "response carries neither result nor error",
+            )),
         }
     }
 }

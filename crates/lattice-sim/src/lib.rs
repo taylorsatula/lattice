@@ -343,7 +343,7 @@ impl Sim {
     fn apply_actions(&mut self, from: NodeIndex, actions: Vec<Action>) {
         for action in actions {
             match action {
-                Action::SendFrame { link, frame } => {
+                Action::SendFrame { link, frame, .. } => {
                     let tag = match &frame {
                         Frame::Offer(_) => "offer",
                         Frame::Custody(_) => "custody",

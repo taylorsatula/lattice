@@ -112,8 +112,6 @@ pub struct PingFrame {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DummyFrame {
     pub echo: bool,
-    /// Zero padding sized so the whole frame lands in a chosen bucket.
-    pub pad: Vec<u8>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -139,6 +137,7 @@ fn bound_value(b: &([u8; 32], u8)) -> Value {
 }
 
 fn parse_bound(v: &Value) -> Result<([u8; 32], u8), ProtoError> {
+    v.deny_unknown_keys(&[0, 1])?;
     let id: [u8; 32] = fixed_bytes(v, 0)?;
     let scope = v.req_uint(1)?;
     if scope > 1 {
@@ -377,16 +376,10 @@ impl Frame {
                 (Value::UInt(0), Value::UInt(T_PING)),
                 (Value::UInt(2), Value::UInt(f.nonce)),
             ]),
-            Frame::Dummy(f) => {
-                let mut pairs = vec![
-                    (Value::UInt(0), Value::UInt(T_DUMMY)),
-                    (Value::UInt(2), Value::Bool(f.echo)),
-                ];
-                if !f.pad.is_empty() {
-                    pairs.push((Value::UInt(3), Value::Bytes(f.pad.clone())));
-                }
-                Value::map(pairs)
-            }
+            Frame::Dummy(f) => Value::map(vec![
+                (Value::UInt(0), Value::UInt(T_DUMMY)),
+                (Value::UInt(2), Value::Bool(f.echo)),
+            ]),
         }
     }
 
@@ -513,17 +506,9 @@ impl Frame {
                 }))
             }
             T_DUMMY => {
-                v.deny_unknown_keys(&[0, 2, 3])?;
-                let pad = match v.get_key(3)? {
-                    Some(p) => p
-                        .as_bytes()
-                        .ok_or(ProtoError::WrongType(3, "bytes"))?
-                        .to_vec(),
-                    None => Vec::new(),
-                };
+                v.deny_unknown_keys(&[0, 2])?;
                 Ok(Frame::Dummy(DummyFrame {
                     echo: v.req_bool(2)?,
-                    pad,
                 }))
             }
             _ => Err(ProtoError::Invalid("unknown frame type")),

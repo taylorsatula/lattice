@@ -85,9 +85,15 @@ pub struct NodeInfo {
     pub draining: bool,
 }
 
+/// A frame plus the transport's padding hint (bucket index).
+pub(crate) struct OutFrame {
+    frame: Frame,
+    pad_to: Option<usize>,
+}
+
 struct LinkHandle {
     peer: Option<[u8; 32]>,
-    tx: mpsc::UnboundedSender<Frame>,
+    tx: mpsc::UnboundedSender<OutFrame>,
 }
 
 pub struct Runtime {
@@ -118,14 +124,14 @@ async fn link_task(
     id: u64,
     mut io: lattice_net::PeerIo,
     inbound: mpsc::UnboundedSender<LinkEvent>,
-    mut outbound: mpsc::UnboundedReceiver<Frame>,
+    mut outbound: mpsc::UnboundedReceiver<OutFrame>,
 ) {
     loop {
         tokio::select! {
             f = outbound.recv() => {
                 match f {
-                    Some(frame) => {
-                        if io.send_frame(&frame).await.is_err() {
+                    Some(out) => {
+                        if io.send_frame(&out.frame, out.pad_to).await.is_err() {
                             break;
                         }
                     }
@@ -299,9 +305,13 @@ impl Runtime {
     fn apply_actions(&mut self, actions: Vec<Action>) {
         for action in actions {
             match action {
-                Action::SendFrame { link, frame } => {
+                Action::SendFrame {
+                    link,
+                    frame,
+                    pad_to,
+                } => {
                     if let Some(h) = self.links.get(&link) {
-                        let _ = h.tx.send(frame);
+                        let _ = h.tx.send(OutFrame { frame, pad_to });
                     }
                 }
                 Action::Deliver { service, .. } => {

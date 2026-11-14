@@ -79,10 +79,7 @@ fn main() {
         "hex": hex_of(custody.encode()),
         "expect": { "type": "custody", "result": CUSTODY_ACCEPTED },
     }));
-    let dummy = Frame::Dummy(DummyFrame {
-        echo: true,
-        pad: vec![],
-    });
+    let dummy = Frame::Dummy(DummyFrame { echo: true });
     vectors.push(serde_json::json!({
         "name": "dummy_echo",
         "kind": "frame",

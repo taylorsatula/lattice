@@ -59,7 +59,7 @@ async fn ik_handshake_and_ping_pong() {
 
     // client -> server ping
     client_side
-        .send_frame(&Frame::Ping(PingFrame { nonce: 1234 }))
+        .send_frame(&Frame::Ping(PingFrame { nonce: 1234 }), None)
         .await
         .unwrap();
     let got = server_side.recv_frame().await.unwrap().unwrap();
@@ -69,7 +69,7 @@ async fn ik_handshake_and_ping_pong() {
     }
     // server -> client pong
     server_side
-        .send_frame(&Frame::Ping(PingFrame { nonce: 1234 }))
+        .send_frame(&Frame::Ping(PingFrame { nonce: 1234 }), None)
         .await
         .unwrap();
     let got = client_side.recv_frame().await.unwrap().unwrap();
@@ -99,7 +99,7 @@ async fn xx_handshake_works() {
     );
 
     client_side
-        .send_frame(&Frame::Ping(PingFrame { nonce: 77 }))
+        .send_frame(&Frame::Ping(PingFrame { nonce: 77 }), None)
         .await
         .unwrap();
     let got = server_side.recv_frame().await.unwrap().unwrap();
@@ -126,7 +126,7 @@ async fn cookie_flow_enforced_under_load() {
     let mut server_side = peers.recv().await.unwrap();
     let mut client_side = client.await.unwrap();
     client_side
-        .send_frame(&Frame::Ping(PingFrame { nonce: 55 }))
+        .send_frame(&Frame::Ping(PingFrame { nonce: 55 }), None)
         .await
         .unwrap();
     let got = server_side.recv_frame().await.unwrap().unwrap();

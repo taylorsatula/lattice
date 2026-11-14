@@ -155,6 +155,24 @@ mod tests {
         assert!(!is_globally_routable("100.64.0.1".parse().unwrap()));
         assert!(!is_globally_routable("169.254.1.1".parse().unwrap()));
         assert!(is_globally_routable("1.1.1.1".parse().unwrap()));
+        // IPv4-embedding transition ranges are not WAN-routable.
+        for embedded in [
+            "::1.2.3.4",        // deprecated compatible ::/96
+            "64:ff9b::1.2.3.4", // NAT64 well-known prefix
+            "2002:0102:0304::", // 6to4
+            "2001::1.2.3.4",    // Teredo
+        ] {
+            assert!(
+                !is_globally_routable(embedded.parse().unwrap()),
+                "{embedded} must not be WAN-routable"
+            );
+        }
+        // Mapped addresses defer to the embedded IPv4's routability.
+        assert!(is_globally_routable("::ffff:1.2.3.4".parse().unwrap()));
+        assert!(!is_globally_routable("::ffff:192.168.1.1".parse().unwrap()));
+        assert!(is_globally_routable(
+            "2001:4860:4860::8888".parse().unwrap()
+        ));
     }
 
     #[tokio::test]

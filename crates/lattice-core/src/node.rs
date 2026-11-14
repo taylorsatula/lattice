@@ -357,6 +357,7 @@ impl<S: Store> Node<S> {
         self.reconcile_sessions
             .insert(link, ReconcileSession::new());
         vec![Action::SendFrame {
+            pad_to: None,
             link,
             frame: Frame::Reconcile(ReconcileFrame {
                 ranges: reconcile::initiate(&items),
@@ -371,12 +372,14 @@ impl<S: Store> Node<S> {
         let mut actions = Vec::new();
         if !reply.is_empty() {
             actions.push(Action::SendFrame {
+                pad_to: None,
                 link,
                 frame: Frame::Reconcile(ReconcileFrame { ranges: reply }),
             });
         }
         if !wants.is_empty() {
             actions.push(Action::SendFrame {
+                pad_to: None,
                 link,
                 frame: Frame::Want(WantFrame { wants }),
             });
@@ -396,6 +399,7 @@ impl<S: Store> Node<S> {
             return Vec::new();
         }
         vec![Action::SendFrame {
+            pad_to: None,
             link,
             frame: Frame::Records(RecordsFrame { records }),
         }]
@@ -772,6 +776,7 @@ impl<S: Store> Node<S> {
     fn note_frame_sent(&mut self, link: LinkId, action: Action, actions: &mut Vec<Action>) {
         let bucket = match &action {
             Action::SendFrame {
+                pad_to: None,
                 frame: Frame::Offer(o),
                 ..
             } => {
@@ -784,6 +789,7 @@ impl<S: Store> Node<S> {
                 }
             }
             Action::SendFrame {
+                pad_to: None,
                 frame: Frame::Records(r),
                 ..
             } => {
@@ -876,6 +882,7 @@ impl<S: Store> Node<S> {
         self.note_frame_sent(
             link,
             Action::SendFrame {
+                pad_to: None,
                 link,
                 frame: Frame::Offer(OfferFrame {
                     message: wire.to_vec(),
@@ -904,6 +911,7 @@ impl<S: Store> Node<S> {
         let leg_hash = lattice_crypto::hash(&leg);
         if self.store.seen_contains(&leg_hash, now).unwrap_or(false) {
             actions.push(Action::SendFrame {
+                pad_to: None,
                 link,
                 frame: Frame::Custody(CustodyFrame {
                     leg,
@@ -956,6 +964,7 @@ impl<S: Store> Node<S> {
         let _ = self.store.share_add(&dst, link, msg_len as i64);
         let _ = self.store.seen_add(leg_hash, msg.header.exp);
         actions.push(Action::SendFrame {
+            pad_to: None,
             link,
             frame: Frame::Custody(CustodyFrame {
                 leg,
@@ -969,6 +978,7 @@ impl<S: Store> Node<S> {
 
     fn busy(&self, link: LinkId, leg: [u8; 16]) -> Action {
         Action::SendFrame {
+            pad_to: None,
             link,
             frame: Frame::Custody(CustodyFrame {
                 leg,
@@ -1035,6 +1045,7 @@ impl<S: Store> Node<S> {
                     let _ = self.store.share_add(&hdr_dst, link, msg_len as i64);
                     let _ = self.store.seen_add(*leg_hash, hdr_exp);
                     actions.push(Action::SendFrame {
+                        pad_to: None,
                         link,
                         frame: Frame::Custody(CustodyFrame {
                             leg,
@@ -1075,6 +1086,7 @@ impl<S: Store> Node<S> {
                     let _ = self.store.share_add(&rcpt, link, msg_len as i64);
                     let _ = self.store.seen_add(*leg_hash, msg.header.exp);
                     actions.push(Action::SendFrame {
+                        pad_to: None,
                         link,
                         frame: Frame::Custody(CustodyFrame {
                             leg,
@@ -1087,6 +1099,7 @@ impl<S: Store> Node<S> {
                 }
                 Err(_) => {
                     actions.push(Action::SendFrame {
+                        pad_to: None,
                         link,
                         frame: Frame::Custody(CustodyFrame {
                             leg,
@@ -1138,6 +1151,7 @@ impl<S: Store> Node<S> {
             let _ = self.store.seen_add(*leg_hash, msg.header.exp);
             actions.extend(self.on_receipt(now, &opened));
             actions.push(Action::SendFrame {
+                pad_to: None,
                 link,
                 frame: Frame::Custody(CustodyFrame {
                     leg,
@@ -1157,6 +1171,7 @@ impl<S: Store> Node<S> {
             let _ = self.store.seen_add(*leg_hash, msg.header.exp);
             actions.extend(self.send_receipt(now, &opened));
             actions.push(Action::SendFrame {
+                pad_to: None,
                 link,
                 frame: Frame::Custody(CustodyFrame {
                     leg,
@@ -1205,6 +1220,7 @@ impl<S: Store> Node<S> {
             unread,
         });
         actions.push(Action::SendFrame {
+            pad_to: None,
             link,
             frame: Frame::Custody(CustodyFrame {
                 leg,
@@ -1218,6 +1234,7 @@ impl<S: Store> Node<S> {
 
     fn refuse(&self, link: LinkId, leg: [u8; 16]) -> Action {
         Action::SendFrame {
+            pad_to: None,
             link,
             frame: Frame::Custody(CustodyFrame {
                 leg,
@@ -1289,6 +1306,7 @@ impl<S: Store> Node<S> {
         self.note_frame_sent(
             next_link,
             Action::SendFrame {
+                pad_to: None,
                 link: next_link,
                 frame: Frame::Offer(OfferFrame {
                     message: entry.message.clone(),
@@ -1687,16 +1705,10 @@ impl<S: Store> Node<S> {
 
     /// Build a dummy whose padded size lands in the given bucket class
     /// (0=2K, 1=8K, 2=32K). Sizes approximate frame overhead.
-    fn dummy_in_bucket(&self, bucket: usize, echo: bool) -> Frame {
-        let target = match bucket {
-            0 => 1900,
-            1 => 8100,
-            _ => 32600,
-        };
-        Frame::Dummy(DummyFrame {
-            echo,
-            pad: vec![0u8; target],
-        })
+    fn dummy_frame(echo: bool) -> Frame {
+        // Bucket selection happens at the transport: the frame is padded
+        // into the sampled bucket via `Action::SendFrame::pad_to`.
+        Frame::Dummy(DummyFrame { echo })
     }
 
     fn random_link(&mut self) -> Option<LinkId> {
@@ -1720,8 +1732,9 @@ impl<S: Store> Node<S> {
             if self.links.contains_key(&link) {
                 let bucket = self.sample_snow_bucket();
                 actions.push(Action::SendFrame {
+                    pad_to: Some(bucket),
                     link,
-                    frame: self.dummy_in_bucket(bucket, false),
+                    frame: Self::dummy_frame(false),
                 });
                 self.note_snow_send(bucket);
             }
@@ -1746,8 +1759,9 @@ impl<S: Store> Node<S> {
             let echo = self.rng.chance(self.config.echo_share);
             let b = self.sample_snow_bucket();
             actions.push(Action::SendFrame {
+                pad_to: Some(b),
                 link,
-                frame: self.dummy_in_bucket(b, echo),
+                frame: Self::dummy_frame(echo),
             });
             self.note_snow_send(b);
         }
@@ -1797,6 +1811,7 @@ impl<S: Store> Node<S> {
             Frame::Want(want) => self.on_want(link, &want),
             Frame::Records(recs) => self.on_records(at, recs.records),
             Frame::Ping(p) => vec![Action::SendFrame {
+                pad_to: None,
                 link,
                 frame: Frame::Ping(PingFrame { nonce: p.nonce }),
             }],

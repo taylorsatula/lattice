@@ -7,7 +7,7 @@ use snow::TransportState;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::frame::{decode_wire, encode_wire};
+use crate::frame::{decode_wire, encode_wire, encode_wire_to_bucket};
 use crate::{MAX_WIRE_BYTES, errors::NetError};
 
 /// Type-erased async stream so server-side (peeked) and client-side
@@ -35,9 +35,17 @@ impl PeerIo {
         }
     }
 
-    pub async fn send_frame(&mut self, frame: &Frame) -> Result<(), NetError> {
+    pub async fn send_frame(
+        &mut self,
+        frame: &Frame,
+        pad_to: Option<usize>,
+    ) -> Result<(), NetError> {
         let inner = lattice_proto::encode(&frame.to_value());
-        let plaintext = encode_wire(&inner).map_err(|_| NetError::FrameTooLarge)?;
+        let plaintext = match pad_to {
+            Some(bucket) => encode_wire_to_bucket(&inner, bucket),
+            None => encode_wire(&inner),
+        }
+        .map_err(|_| NetError::FrameTooLarge)?;
         let mut buf = vec![0u8; plaintext.len() + 16];
         let n = self
             .transport

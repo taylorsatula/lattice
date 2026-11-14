@@ -82,10 +82,7 @@ fn want_records_wary_ping_dummy_roundtrip() {
     assert_eq!(Frame::from_bytes(&f.encode()).unwrap(), f);
     let f = Frame::Ping(PingFrame { nonce: 42 });
     assert_eq!(Frame::from_bytes(&f.encode()).unwrap(), f);
-    let f = Frame::Dummy(DummyFrame {
-        echo: true,
-        pad: vec![],
-    });
+    let f = Frame::Dummy(DummyFrame { echo: true });
     assert_eq!(Frame::from_bytes(&f.encode()).unwrap(), f);
 }
 

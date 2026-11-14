@@ -2,8 +2,10 @@
 //!
 //! Public keys are the 1216-byte encapsulation keys defined by the X-Wing
 //! draft; secret keys are the 32-byte decapsulation seeds. Decapsulation
-//! rejects non-contributory X25519 shares, matching the draft's final
-//! behaviour.
+//! rejects non-contributory X25519 shares, matching the draft's behavior.
+//! Note: X-Wing is still an IETF draft (the `x-wing` crate implements
+//! draft-06), not a published RFC; the wire format may change if the draft
+//! is revised.
 
 use x_wing::{
     DecapsulationKeyRejectNonContrib, Decapsulator, Encapsulate, EncapsulationKey, Kem, KeyExport,
