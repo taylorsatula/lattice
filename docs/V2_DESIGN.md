@@ -230,10 +230,10 @@ designated relays and no per-message flooding.
   the envelope, so only the recipient can see who sent the message and check
   that it's genuine. The recipient also checks that the header matches the
   copy inside the envelope, so tampering by any hop is detected at the end.
-- **Hops judge traffic by who handed it to them.** A hop checks that a
-  message is well formed, fits a size bucket and hasn't expired. It then
-  accepts it from the neighbor that handed it over, subject to that
-  neighbor's limits (§8).
+- **Hops judge traffic by the link it arrived on.** A hop checks that a
+  message is well formed, fits a size bucket and hasn't expired. Whether it
+  takes custody is then decided by fair-share custody for the link the
+  message arrived on (step 3 below).
 
 ### Forwarding
 
@@ -256,9 +256,20 @@ designated relays and no per-message flooding.
      hops' views of the graph disagree.
    - **Each hop may hold the message for a small random delay** before
      forwarding (§7).
-3. **Custody transfer** (Fall 2003). The next hop accepts only after
-   durably storing the message. Responsibility then passes to it, and the
-   previous hop deletes its copy.
+3. **Custody transfer** (Fall 2003) **with fair shares.** The next hop
+   accepts only after durably storing the message. Responsibility then
+   passes to it, and the previous hop deletes its copy. Acceptance follows
+   one rule:
+
+   > For each destination, a hop holds a bounded amount of traffic, and its
+   > upstream links share that allowance equally. When a link's share for
+   > that destination is full, new messages from that link get "busy, retry
+   > later."
+
+   Busy is a transient failure. The upstream hop keeps the message and
+   retries with backoff, while applying the same rule to its own upstream
+   links. Gateways and recipients apply the same rule as every other hop.
+   §8 explains how this contains floods.
 4. **No path right now:** the message waits at the furthest node that took
    custody, retrying with backoff, and moves on when the graph changes. It
    is dropped at expiry. This is delay-tolerant behavior: traversal
@@ -282,16 +293,15 @@ designated relays and no per-message flooding.
   merely until they have forwarded it. This one rule makes retries and
   multiple paths harmless and is also what prevents routing loops.
 - **Failure classes:**
-  - **Transient** (unreachable, overloaded, no path): retry with backoff.
+  - **Transient** (unreachable, busy, no path): retry with backoff.
   - **Permanent** (malformed, invalid signature at the recipient, unknown
     user at the recipient): stop. A permanent failure at the recipient
     comes back as a negative receipt.
 
 ### Transit
 
-- **Every node may carry traffic for others.** Accepting transit traffic is
-  each server's policy, bounded by per-neighbor rate limits and a transit
-  storage cap (§8).
+- **Every node may carry traffic for others,** bounded by fair-share custody
+  and a total transit storage cap (§8).
 - **Only the public backbone is visible.** Anyone can see which public
   instances link to which. Private instances and hive-internal links are
   not visible outside their hive.
@@ -358,29 +368,65 @@ that limit, it minimizes what any node can learn or keep.
 parse, size buckets and expiries hold. Everything else is server-level
 policy.
 
-**Accountability follows the link.** Hops can't see senders, so a hop holds
-the neighbor that handed it traffic responsible for that traffic. A neighbor
-is a proven link and costs something to establish; a sender key is free to
-make. The recipient, which can see the sender, applies its own limits on
-senders.
+**Accountability follows the link.** Hops can't see senders, by design.
+Attribution exists in only two places without weakening privacy: the link a
+message arrived on, which every hop knows, and the recipient, which sees the
+sender. Abuse control uses only those two.
 
-**Baseline server limits** cost honest traffic nothing:
+### Fair-share custody
 
-- A rate limit per neighbor, on messages and on records.
-- Per-neighbor limits on transit messages accepted for forwarding, and a cap
-  on total transit storage.
-- At the recipient: a rate limit per network range on first contact from
-  unknown sender identifiers. The limit follows the neighbor's address
-  range, so churning through fresh keys doesn't help.
+The custody rule in §6 is the core of abuse control. Each hop gives each
+destination a bounded allowance, shared equally among its upstream links.
+This is fair queuing (Demers, Keshav & Shenker 1989) applied to custody
+rather than to packets.
+
+Consider an abuser A flooding recipient R along A → X → Y → G → R:
+
+- At G, traffic arriving from Y gets only Y's share of R's allowance.
+  Traffic reaching G through other neighbors is unaffected.
+- At Y, traffic arriving from X gets only X's share. At X, A gets only its
+  own share.
+- Each full share answers busy, so pressure accumulates hop by hop back
+  toward A.
+
+The only senders affected are those whose path to R shares A's branch,
+which is A's own neighborhood. Harm stays local to where the abuser is
+attached.
+
+**Buying more shares doesn't work.** An abuser can't open many links to one
+node to collect extra shares, because link slots are capped, grouped by
+network range, and chosen by a secret-salted hash (§5). The eclipse defenses
+cover this too.
+
+**There is no separate intake or first-contact mechanism.** Gateways and
+public recipients apply the same custody rule as every other hop. Whether a
+recipient welcomes strangers is its own policy, applied after it opens the
+envelope.
+
+**What remains:** an abuser can still use transit bandwidth within its own
+branch, and a recipient still decrypts whatever reaches it. Both are bounded
+by the shares. Both fall mostly on the abuser's own neighbors, which are the
+nodes best placed to fix it at the source by demoting or dropping that link.
+
+### Baseline limits
+
+All of these cost honest traffic nothing:
+
+- Fair-share custody per destination per upstream link (§6).
+- A cap on total transit storage.
+- A rate limit per neighbor on records and gossip.
 - A fixed cap on stored records, with eviction by the secret-salted hash.
 - Soft-state expiry.
-- Local bans, based on the server's own direct evidence.
+- Local bans and link demotion, based on the server's own direct evidence.
+- At the recipient, any sender policy it chooses, applied after opening the
+  envelope.
 
 ### Immune system
 
-The model is herd alarm signaling: an alarm triggers vigilance, never
-flight, and false alarms are cheap, so the herd can afford to be
-trigger-happy (the smoke detector principle).
+This is optional, layered on top of fair-share custody. The model is herd
+alarm signaling: an alarm triggers vigilance, never flight, and false alarms
+are cheap, so the herd can afford to be trigger-happy (the smoke detector
+principle).
 
 - **Invariant:** secondhand alarms can only slow a key down. Only direct
   evidence, or an equivocation proof, can exclude it.
@@ -467,9 +513,9 @@ trigger-happy (the smoke detector principle).
 - **Hive configuration:** how an operator declares hive networks, and which
   multicast discovery mechanism to use (mDNS or a minimal custom
   announcement).
-- **Parameters:** record and message expiry, gossip cadence, storage and
-  push caps, rate limits, the *k* threshold for the wary rule, wary list
-  size.
+- **Parameters:** record and message expiry, gossip cadence, the
+  per-destination custody allowance, the transit storage cap, push caps,
+  rate limits, the *k* threshold for the wary rule, wary list size.
 - **Keeping the next key offline in practice:** where it lives and how a
   rotation is performed.
 - **Protocol versioning and capability negotiation.**
@@ -505,6 +551,7 @@ trigger-happy (the smoke detector principle).
 - Smith, "Key Event Receipt Infrastructure (KERI)," arXiv:1907.02143.
 - Tarr, Lavoie, Meyer & Tschudin, "Secure Scuttlebutt," ACM ICN 2019.
 - Fall, "A Delay-Tolerant Network Architecture for Challenged Internets," SIGCOMM 2003.
+- Demers, Keshav & Shenker, "Analysis and Simulation of a Fair Queueing Algorithm," SIGCOMM 1989.
 - Perlman, "Network Layer Protocols with Byzantine Robustness," MIT PhD thesis, 1988 (MIT-LCS-TR-429).
 - Moy, "OSPF Version 2," RFC 2328, 1998.
 - Kleinberg, "Geographic Routing Using Hyperbolic Space," INFOCOM 2007.
