@@ -10,7 +10,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use lattice_core::Identity;
-use lattice_crypto::{generate_seed, hash, public_key, sign, verify, x25519_public};
+use lattice_crypto::{channel_public, generate_seed, hash, public_key, sign, verify};
 
 fn credentials_dir() -> Option<PathBuf> {
     std::env::var_os("CREDENTIALS_DIRECTORY").map(PathBuf::from)
@@ -82,7 +82,7 @@ pub fn init_identity(dir: &Path) -> io::Result<()> {
     // The next signing key: store the seed (operator should move it offline).
     let next_seed = generate_seed();
     write_seed(dir, "next_signing_seed", &next_seed)?;
-    fs::write(dir.join("channel_key.pub"), x25519_public(&channel_seed))?;
+    fs::write(dir.join("channel_key.pub"), channel_public(&channel_seed))?;
     fs::write(dir.join("signing_seed.pub"), public_key(&signing_seed))?;
     // Persist the key event log itself: the node's identity is the hash of
     // this, and it must survive restarts even if next_signing_seed is later

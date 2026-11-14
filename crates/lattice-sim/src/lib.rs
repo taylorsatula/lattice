@@ -98,7 +98,7 @@ impl<S: Store> Sim<S> {
         cfg.rng_seed = seed;
         let store = (self.store_factory)(self.nodes.len());
         let identity = lattice_core::Identity::generate();
-        let channel_key = lattice_crypto::x25519_public(&identity.channel_seed);
+        let channel_key = lattice_crypto::channel_x25519_public(&identity.channel_seed);
         let node = Node::new(cfg.clone(), identity, store, self.now).expect("node construction");
         let id = node.own_id;
         self.channel_keys.insert(id, channel_key);
@@ -473,6 +473,21 @@ impl<S: Store> Sim<S> {
 
     fn configs_prototype(&self) -> Config {
         self.prototype.clone()
+    }
+
+    /// The Ed25519 channel key in a node's own record (what a forger would
+    /// claim). Read from the node's store.
+    pub fn channel_key_of(&self, node: NodeIndex) -> [u8; 32] {
+        let id = self.ids[node];
+        let (bytes, _) = self.nodes[node]
+            .store_ref()
+            .record_get(&id, lattice_proto::record::Scope::Wan)
+            .expect("record read")
+            .expect("own record present");
+        lattice_proto::record::PeerRecord::from_bytes(&bytes, self.now, None)
+            .expect("own record parses")
+            .0
+            .channel_key
     }
 
     /// Number of undelivered envelopes queued inside a node (debug).

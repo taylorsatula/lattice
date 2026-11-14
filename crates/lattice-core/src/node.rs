@@ -238,10 +238,9 @@ impl<S: Store> Node<S> {
         if let Ok(records) = node.store.record_all() {
             for (_, _, bytes, _) in records {
                 if let Ok((rec, _)) = PeerRecord::from_bytes(&bytes, now, None) {
-                    node.ck_claims
-                        .entry(rec.channel_key)
-                        .or_default()
-                        .insert(rec.id);
+                    if let Some(k) = Self::claim_key(&rec) {
+                        node.ck_claims.entry(k).or_default().insert(rec.id);
+                    }
                 }
             }
         }
@@ -375,7 +374,8 @@ impl<S: Store> Node<S> {
                 kel: self.identity.kel.clone(),
                 seq,
                 exp,
-                channel_key: lattice_crypto::x25519_public(&self.identity.channel_seed),
+                channel_key: lattice_crypto::channel_public(&self.identity.channel_seed),
+            channel_seed: self.identity.channel_seed,
                 envelope_key: self.identity.xwing_public,
                 mode: self.config.mode,
                 scope: self.scope,
@@ -552,7 +552,9 @@ impl<S: Store> Node<S> {
         if let Ok(records) = self.store.record_all() {
             for (_, _, bytes, _) in records {
                 if let Ok((rec, _)) = PeerRecord::from_bytes(&bytes, now, None) {
-                    fresh.entry(rec.channel_key).or_default().insert(rec.id);
+                    if let Some(k) = Self::claim_key(&rec) {
+                        fresh.entry(k).or_default().insert(rec.id);
+                    }
                 }
             }
         }
@@ -600,12 +602,17 @@ impl<S: Store> Node<S> {
         self.identity.sweep_retired_envelope_keys(now);
     }
 
+    /// The claim key for a record's channel key: the X25519 form, matching
+    /// what the Noise handshake reports as the peer's static key.
+    fn claim_key(rec: &PeerRecord) -> Option<[u8; 32]> {
+        lattice_crypto::channel_x25519_public_from_ed25519(&rec.channel_key)
+    }
+
     /// Fold a record's (channel_key, id) claim into the claim set.
     fn note_ck_claim(&mut self, rec: &PeerRecord) {
-        self.ck_claims
-            .entry(rec.channel_key)
-            .or_default()
-            .insert(rec.id);
+        if let Some(k) = Self::claim_key(rec) {
+            self.ck_claims.entry(k).or_default().insert(rec.id);
+        }
     }
 
     /// Recompute link attribution from the current claim sets.

@@ -178,14 +178,16 @@ fn redb_contested_channel_key_claim_unbinds_link() {
         "message should route over the uncontested link"
     );
 
-    let b_ck = sim.channel_keys[&sim.ids[b]];
+    let b_ck = sim.channel_key_of(b);
     let attacker = lattice_core::Identity::generate();
+    let attacker_channel_seed = lattice_crypto::generate_seed();
     let forged = PeerRecord::build(
         RecordParams {
             kel: attacker.kel.clone(),
             seq: 1,
             exp: 1_000_000,
             channel_key: b_ck,
+            channel_seed: attacker_channel_seed,
             envelope_key: [9u8; 1216],
             mode: Mode::Public,
             scope: Scope::Wan,
@@ -209,15 +211,18 @@ fn redb_contested_channel_key_claim_unbinds_link() {
     );
     sim.run_for(2);
 
-    assert!(
-        sim.nodes[a].debug_contested() >= 1,
-        "contested claim must be counted"
+    // The forged record cannot carry a valid channel signature, so it is
+    // rejected at admission: no contested claim, link stays bound to b.
+    assert_eq!(
+        sim.nodes[a].debug_contested(),
+        0,
+        "forged record must not create a contested claim"
     );
-    let mid2 = sim.app_send(a, b, b"after contest");
+    let mid2 = sim.app_send(a, b, b"after forgery attempt");
     sim.run_for(15);
     assert_eq!(
         sim.deliveries.iter().filter(|d| d.mid == mid2).count(),
-        0,
-        "contested link must not be used for routing"
+        1,
+        "link must stay bound to b after a rejected forgery"
     );
 }

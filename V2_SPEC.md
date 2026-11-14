@@ -116,7 +116,7 @@ Each event is a signed map.
 | 4 | seq | uint | All | Last-writer-wins per (id, scope) |
 | 5 | exp | time | All | Coarse expiry, days out |
 | 6 | kel | array of key events | All | Full KEL |
-| 7 | ck | x25519 | All | Noise static key |
+| 7 | ck | ed25519 | All | Channel key: Ed25519 public key; the Noise static key is the derived X25519 key (below) |
 | 8 | ek | xwing_pk | All | Envelope key (§4) |
 | 9 | mode | uint | All | 0 = public, 1 = private |
 | 10 | ep | array of endpoint | Public | Endpoint = `{0: url, 1: [ip address, …] or absent}`. `url` is `ws://`. Connecting nodes prefer the listed IPs, using the URL's host only for the `Host` header |
@@ -124,6 +124,19 @@ Each event is a signed map.
 | 12 | gw | array of id | Private | One to three gateways |
 | 13 | cap | uint | All | Capability bitset |
 | 14 | sig | sig | All | By the current signing key in `kel` |
+| 15 | csig | sig | All | By the channel key over the same preimage as `sig` |
+
+**Channel key and Noise key.** The channel key is an Ed25519 public key.
+The Noise handshake runs on the matching X25519 key, derived from the same
+seed: the private half is the first 32 bytes of SHA-512(seed) (clamped by
+X25519), and the public half is the Montgomery u-coordinate of the Ed25519
+public point. Anyone can derive the X25519 public key from the record's
+channel key, so no second key is published. The record carries two
+signatures over the same preimage (everything except keys 14 and 15): `sig`
+by the current KEL signing key, and `csig` by the channel key. A record
+claiming someone else's channel key cannot be produced without that key, so
+a forged record is rejected at validation — the channel-key claim cannot be
+poisoned by a third party.
 
 **One record per scope.** A signed record can't have hive data stripped out
 of it before it goes over the WAN; removing fields would break the

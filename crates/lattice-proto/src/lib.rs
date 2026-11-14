@@ -32,7 +32,7 @@ pub use record::{
 /// Largest message on the wire (bucket 3) and the derived message buckets.
 pub const MESSAGE_BUCKETS: [usize; 3] = [2048 - 64, 8192 - 64, 32768 - 64];
 pub const FRAME_BUCKETS: [usize; 3] = [2048, 8192, 32768];
-pub const RECORD_MAX: usize = 3072;
+pub const RECORD_MAX: usize = 3200;
 /// Longest a message may live, from minting.
 pub const MAX_MESSAGE_HORIZON: u64 = 14 * 24 * 3600;
 /// Longest a record may live, from issue.

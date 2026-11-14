@@ -124,6 +124,10 @@ pub struct PeerRecord {
     pub gateways: Vec<[u8; 32]>,
     pub capabilities: u64,
     pub sig: [u8; 64],
+    /// Signature by the channel key over the same preimage as `sig`.
+    /// Proves the channel-key holder endorsed this record; a record claiming
+    /// someone else's channel key cannot be produced without that key.
+    pub channel_sig: [u8; 64],
 }
 
 /// Parameters for [`PeerRecord::build`].
@@ -132,6 +136,8 @@ pub struct RecordParams {
     pub seq: u64,
     pub exp: u64,
     pub channel_key: [u8; 32],
+    /// The channel private key, used to sign the record (cross-signature).
+    pub channel_seed: [u8; 32],
     pub envelope_key: [u8; 1216],
     pub mode: Mode,
     pub scope: Scope,
@@ -141,7 +147,7 @@ pub struct RecordParams {
     pub capabilities: u64,
 }
 
-const RECORD_KEYS: [u64; 15] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14];
+const RECORD_KEYS: [u64; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
 
 impl PeerRecord {
     /// The unsigned portion, as a CBOR map.
@@ -196,6 +202,7 @@ impl PeerRecord {
             _ => unreachable!(),
         };
         pairs.push((Value::UInt(14), Value::Bytes(self.sig.to_vec())));
+        pairs.push((Value::UInt(15), Value::Bytes(self.channel_sig.to_vec())));
         Value::map(pairs)
     }
 
@@ -210,6 +217,7 @@ impl PeerRecord {
             seq,
             exp,
             channel_key,
+            channel_seed,
             envelope_key,
             mode,
             scope,
@@ -254,8 +262,11 @@ impl PeerRecord {
             gateways,
             capabilities,
             sig: [0; 64],
+            channel_sig: [0; 64],
         };
-        rec.sig = sign(signing_seed, &encode(&rec.unsigned_value()));
+        let preimage = encode(&rec.unsigned_value());
+        rec.sig = sign(signing_seed, &preimage);
+        rec.channel_sig = sign(&channel_seed, &preimage);
         Ok(rec)
     }
 }
@@ -294,6 +305,7 @@ impl PeerRecord {
         let mode = Mode::from_u64(value.req_uint(9)?)?;
         let capabilities = value.req_uint(13)?;
         let sig = fixed_bytes::<64>(&value, 14)?;
+        let channel_sig = fixed_bytes::<64>(&value, 15)?;
 
         let endpoints = match value.get_key(10)? {
             None => Vec::new(),
@@ -402,9 +414,15 @@ impl PeerRecord {
             gateways,
             capabilities,
             sig,
+            channel_sig,
         };
         let preimage = encode(&record.unsigned_value());
         if !verify(&head.current_key, &preimage, &record.sig) {
+            return Err(ProtoError::BadSignature);
+        }
+        // The channel key must endorse the record too: without this, anyone
+        // could publish a record claiming someone else's channel key.
+        if !verify(&channel_key, &preimage, &record.channel_sig) {
             return Err(ProtoError::BadSignature);
         }
         Ok((record, head))

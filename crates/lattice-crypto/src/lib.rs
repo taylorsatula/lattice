@@ -14,7 +14,10 @@ mod xwing;
 pub use random::{os_bytes, os_fill};
 pub use seal::{ENVELOPE_CONTEXT, HOP_CONTEXT, Sealed, open, seal};
 pub use sign::generate_seed;
-pub use sign::{public_key, sign, verify, x25519_public};
+pub use sign::{
+    channel_public, channel_x25519_public, channel_x25519_public_from_ed25519,
+    channel_x25519_seed, public_key, sign, verify,
+};
 pub use xwing::generate_keypair;
 pub use xwing::{
     KEM_CIPHERTEXT_LEN, XWING_PUBLIC_KEY_LEN, XWING_SECRET_KEY_LEN, XWingKeypair, XWingSecretKey,

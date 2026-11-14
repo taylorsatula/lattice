@@ -40,7 +40,7 @@ async fn start_server(
 #[tokio::test]
 async fn ik_handshake_and_ping_pong() {
     let (server_seed, client_seed) = test_seeds();
-    let server_ck = lattice_crypto::x25519_public(&server_seed);
+    let server_ck = lattice_crypto::channel_public(&server_seed);
     let (addr, mut peers, _flag) = start_server(server_seed, false, false).await;
 
     let client = tokio::spawn(async move {
@@ -80,7 +80,7 @@ async fn ik_handshake_and_ping_pong() {
 #[tokio::test]
 async fn xx_handshake_works() {
     let (server_seed, client_seed) = test_seeds();
-    let path = lattice_net::upgrade_path(&lattice_crypto::x25519_public(&server_seed));
+    let path = lattice_net::upgrade_path(&lattice_crypto::channel_public(&server_seed));
     let (addr, mut peers, _flag) = start_server(server_seed, false, false).await;
 
     let client = tokio::spawn(async move {
@@ -92,11 +92,11 @@ async fn xx_handshake_works() {
     let mut client_side = client.await.unwrap();
 
     // Both sides must see each other's channel static key.
-    let client_sk_pub = lattice_crypto::x25519_public(&client_seed);
+    let client_sk_pub = lattice_crypto::channel_x25519_public(&client_seed);
     assert_eq!(server_side.remote_static, client_sk_pub);
     assert_eq!(
         client_side.remote_static,
-        lattice_crypto::x25519_public(&server_seed)
+        lattice_crypto::channel_x25519_public(&server_seed)
     );
 
     client_side
@@ -110,7 +110,7 @@ async fn xx_handshake_works() {
 #[tokio::test]
 async fn cookie_flow_enforced_under_load() {
     let (server_seed, client_seed) = test_seeds();
-    let server_ck = lattice_crypto::x25519_public(&server_seed);
+    let server_ck = lattice_crypto::channel_public(&server_seed);
     let (addr, mut peers, _flag) = start_server(server_seed, true, false).await;
 
     let client = tokio::spawn(async move {

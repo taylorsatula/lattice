@@ -10,6 +10,7 @@ struct Fixture {
     kel: Vec<KeyEvent>,
     envelope: [u8; 1216],
     channel: [u8; 32],
+    channel_seed: [u8; 32],
 }
 
 fn fixture() -> Fixture {
@@ -19,11 +20,14 @@ fn fixture() -> Fixture {
         &seed,
         lattice_crypto::hash(&lattice_crypto::public_key(&next_seed)),
     )];
+    let channel_seed = generate_seed();
+    let channel = lattice_crypto::public_key(&channel_seed);
     Fixture {
         seed,
         kel,
         envelope: [7u8; 1216],
-        channel: [9u8; 32],
+        channel,
+        channel_seed,
     }
 }
 
@@ -34,6 +38,7 @@ fn public_record(f: &Fixture) -> PeerRecord {
             seq: 1,
             exp: NOW + 86_400,
             channel_key: f.channel,
+            channel_seed: f.channel_seed,
             envelope_key: f.envelope,
             mode: Mode::Public,
             scope: Scope::Wan,
@@ -92,6 +97,7 @@ fn private_record_with_private_endpoints_rejected() {
                 seq: 1,
                 exp: NOW + 86_400,
                 channel_key: f.channel,
+            channel_seed: f.channel_seed,
                 envelope_key: f.envelope,
                 mode: Mode::Private,
                 scope: Scope::Wan,
@@ -116,6 +122,7 @@ fn private_record_with_private_endpoints_rejected() {
             seq: 1,
             exp: NOW + 86_400,
             channel_key: f.channel,
+            channel_seed: f.channel_seed,
             envelope_key: f.envelope,
             mode: Mode::Private,
             scope: Scope::Wan,
@@ -140,6 +147,7 @@ fn wan_record_rejects_private_endpoint_ip() {
             seq: 1,
             exp: NOW + 86_400,
             channel_key: f.channel,
+            channel_seed: f.channel_seed,
             envelope_key: f.envelope,
             mode: Mode::Public,
             scope: Scope::Wan,
@@ -165,6 +173,7 @@ fn hive_record_allows_private_endpoint_ip() {
             seq: 1,
             exp: NOW + 86_400,
             channel_key: f.channel,
+            channel_seed: f.channel_seed,
             envelope_key: f.envelope,
             mode: Mode::Public,
             scope: Scope::Hive,
@@ -205,6 +214,7 @@ fn equivocation_detection() {
             seq: b.seq,
             exp: b.exp,
             channel_key: b.channel_key,
+            channel_seed: f.channel_seed,
             envelope_key: b.envelope_key,
             mode: b.mode,
             scope: b.scope,

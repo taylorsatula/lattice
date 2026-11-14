@@ -15,6 +15,7 @@ blake3 = "1.8"
 getrandom = "0.4"
 chacha20poly1305 = "0.11"
 ed25519-dalek = "3"
+sha2 = "0.10"
 subtle = "2.6"
 x-wing = { version = "0.1", features = ["getrandom", "zeroize"] }
 x25519-dalek = "3"

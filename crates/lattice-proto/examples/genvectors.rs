@@ -36,7 +36,8 @@ fn main() {
 
     // --- peer record (public, WAN) ---
     let envelope_ek = [7u8; 1216];
-    let channel = [9u8; 32];
+    let channel_seed = [9u8; 32];
+    let channel = lattice_crypto::public_key(&channel_seed);
     let kel = vec![inception.clone()];
     let id = lattice_proto::kel::identifier(&kel).unwrap();
     let rec = PeerRecord::build(
@@ -45,6 +46,7 @@ fn main() {
             seq: 7,
             exp: NOW + 86_400,
             channel_key: channel,
+            channel_seed,
             envelope_key: envelope_ek,
             mode: Mode::Public,
             scope: Scope::Wan,

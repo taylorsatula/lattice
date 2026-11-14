@@ -26,9 +26,12 @@ pub struct Pending {
 
 impl Pending {
     pub fn initiator_ik(seed: &[u8; 32], responder_static: &[u8; 32]) -> Result<Self, snow::Error> {
+        let x_seed = lattice_crypto::channel_x25519_seed(seed);
+        let x_pub = lattice_crypto::channel_x25519_public_from_ed25519(responder_static)
+            .ok_or(snow::Error::Input)?;
         let state = Builder::new(PARAMS_IK.parse()?)
-            .local_private_key(seed)?
-            .remote_public_key(responder_static)?
+            .local_private_key(&x_seed)?
+            .remote_public_key(&x_pub)?
             .build_initiator()?;
         Ok(Self {
             state,
@@ -38,8 +41,9 @@ impl Pending {
     }
 
     pub fn initiator_xx(seed: &[u8; 32]) -> Result<Self, snow::Error> {
+        let x_seed = lattice_crypto::channel_x25519_seed(seed);
         let state = Builder::new(PARAMS_XX.parse()?)
-            .local_private_key(seed)?
+            .local_private_key(&x_seed)?
             .build_initiator()?;
         Ok(Self {
             state,
@@ -49,8 +53,9 @@ impl Pending {
     }
 
     pub fn responder_ik(seed: &[u8; 32]) -> Result<Self, snow::Error> {
+        let x_seed = lattice_crypto::channel_x25519_seed(seed);
         let state = Builder::new(PARAMS_IK.parse()?)
-            .local_private_key(seed)?
+            .local_private_key(&x_seed)?
             .build_responder()?;
         Ok(Self {
             state,
@@ -60,8 +65,9 @@ impl Pending {
     }
 
     pub fn responder_xx(seed: &[u8; 32]) -> Result<Self, snow::Error> {
+        let x_seed = lattice_crypto::channel_x25519_seed(seed);
         let state = Builder::new(PARAMS_XX.parse()?)
-            .local_private_key(seed)?
+            .local_private_key(&x_seed)?
             .build_responder()?;
         Ok(Self {
             state,

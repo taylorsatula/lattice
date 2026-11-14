@@ -281,7 +281,7 @@ async fn handle_conn(
     cookie_state.lock().unwrap().tick();
     let head = read_head(&mut stream).await.ok_or(NetError::Io)?;
     let parsed = parse_head(&head).ok_or(NetError::Io)?;
-    let derived = crate::upgrade_path(&lattice_crypto::x25519_public(&cfg.channel_seed));
+    let derived = crate::upgrade_path(&lattice_crypto::channel_public(&cfg.channel_seed));
 
     if parsed.path == "/status" && cfg.status_enabled && parsed.method == "GET" {
         let draining = cfg.draining.load(std::sync::atomic::Ordering::Relaxed);
@@ -374,7 +374,7 @@ async fn handshake_server(
     if !is_xx {
         let mac1_ok = bool::from(
             mac1(
-                &lattice_crypto::x25519_public(&cfg.channel_seed),
+                &lattice_crypto::channel_public(&cfg.channel_seed),
                 &init.noise_msg,
             )
             .ct_eq(&init.mac1),
@@ -407,7 +407,7 @@ async fn handshake_server(
             if init.noise_msg.len() != 32
                 && !bool::from(
                     mac1(
-                        &lattice_crypto::x25519_public(&cfg.channel_seed),
+                        &lattice_crypto::channel_public(&cfg.channel_seed),
                         &init.noise_msg,
                     )
                     .ct_eq(&init.mac1),

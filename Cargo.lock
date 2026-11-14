@@ -639,6 +639,7 @@ dependencies = [
  "hex",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "subtle",
  "x-wing",
  "x25519-dalek",

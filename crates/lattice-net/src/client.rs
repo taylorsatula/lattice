@@ -130,9 +130,12 @@ pub async fn connect(contact: PeerContact, channel_seed: &[u8; 32]) -> Result<Pe
         .try_into()
         .map_err(|_| NetError::Handshake)?;
 
-    // IK mode pins the responder static to the record's channel key.
+    // IK mode pins the responder static to the record's channel key
+    // (Ed25519; the handshake runs on the derived X25519 key).
     if let PeerContact::Ik { channel_key, .. } = &contact {
-        if &remote_static != channel_key {
+        let expected = lattice_crypto::channel_x25519_public_from_ed25519(channel_key)
+            .ok_or(NetError::Handshake)?;
+        if remote_static != expected {
             return Err(NetError::Handshake);
         }
     }

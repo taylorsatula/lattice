@@ -300,13 +300,16 @@ fn equivocating_records_converge_to_lower_hash() {
     let attacker = lattice_core::Identity::generate();
     let kel = attacker.kel.clone();
     let id = lattice_proto::kel::identifier(&kel).unwrap();
+    let attacker_channel_seed = lattice_crypto::generate_seed();
+    let attacker_channel = lattice_crypto::public_key(&attacker_channel_seed);
     let mk = |caps: u64| {
         PeerRecord::build(
             RecordParams {
                 kel: kel.clone(),
                 seq: 7,
                 exp: 1_000_000,
-                channel_key: [1u8; 32],
+                channel_key: attacker_channel,
+                channel_seed: attacker_channel_seed,
                 envelope_key: [2u8; 1216],
                 mode: Mode::Public,
                 scope: Scope::Wan,
@@ -513,20 +516,22 @@ fn contested_channel_key_claim_unbinds_link() {
         "message should route over the uncontested link"
     );
 
-    // The attacker signs a record binding the *victim's* (b's) channel key to
-    // the attacker's own id — a perfectly valid signature, a bogus claim.
+    // The attacker tries to bind the *victim's* (b's) channel key to the
+    // attacker's own id. With cross-signed records this record cannot be
+    // produced: the attacker cannot sign with b's channel key. It must be
+    // rejected at admission, the link must stay bound to b, and traffic
+    // must flow.
     let att_id = sim.ids[att];
-    let b_ck = sim.channel_keys[&sim.ids[b]];
-    // Rebuild a signing identity for the attacker is not available here; the
-    // attacker node signs with its own KEL, so craft the record by hand with
-    // a fresh attacker identity instead of the sim's.
+    let b_ck = sim.channel_key_of(b);
     let attacker = lattice_core::Identity::generate();
+    let attacker_channel_seed = lattice_crypto::generate_seed();
     let forged = PeerRecord::build(
         RecordParams {
             kel: attacker.kel.clone(),
             seq: 1,
             exp: 1_000_000,
             channel_key: b_ck, // the theft: b's channel key under a foreign id
+            channel_seed: attacker_channel_seed, // ...but not b's channel key
             envelope_key: [9u8; 1216],
             mode: Mode::Public,
             scope: Scope::Wan,
@@ -536,33 +541,35 @@ fn contested_channel_key_claim_unbinds_link() {
             capabilities: 0,
         },
         &attacker.signing_seed,
-    )
-    .unwrap()
-    .encode();
-    let _ = att_id;
+    );
+    // build() does not cross-check channel_key against channel_seed (the
+    // admission check is the enforcement point), so this produces a record
+    // whose channel signature cannot verify under b's key.
+    let forged_bytes = forged.expect("build does not cross-check channel_key").encode();
 
     let att_link = sim.link_between(a, att).unwrap();
     sim.inject_frame(
         a,
         att_link,
         lattice_proto::frames::Frame::Records(lattice_proto::frames::RecordsFrame {
-            records: vec![forged],
+            records: vec![forged_bytes],
         }),
     );
     sim.run_for(2);
 
-    // The claim set for b's channel key is now {b, attacker}; a must refuse to
-    // attribute the link and must not route to b either way.
-    assert!(
-        sim.nodes[a].debug_contested() >= 1,
-        "contested claim must be counted"
+    // The forged record must have been rejected: no contested claim, link
+    // still bound to b, traffic flows.
+    assert_eq!(
+        sim.nodes[a].debug_contested(),
+        0,
+        "forged record must not create a contested claim"
     );
-    let mid2 = sim.app_send(a, b, b"after contest");
+    let mid2 = sim.app_send(a, b, b"after forgery attempt");
     sim.run_for(15);
     assert_eq!(
         sim.deliveries.iter().filter(|d| d.mid == mid2).count(),
-        0,
-        "contested link must not be used for routing"
+        1,
+        "link must stay bound to b after a rejected forgery"
     );
 }
 
