@@ -201,17 +201,19 @@ designated relays and no per-message flooding.
 
 | Part | Visible to | Contents |
 |---|---|---|
-| Routing header | Every hop | Message id, destination identifier, expiry, path list |
+| Routing header | Every hop | Message id, destination identifier, expiry |
 | Envelope | Recipient only (encrypted to the recipient's key) | Sender identifier and user, recipient user, content, metadata, created time |
-| Signature | Every hop | The sender instance's signature over the exact bytes of the header (excluding the path list) and the ciphertext |
+| Signature | Every hop | The sender instance's signature over the exact bytes of the header and the ciphertext |
 
+- **Immutable end to end.** Nothing in the message changes in transit, so
+  the sender's signature covers all of it and there is no mutable part to
+  tamper with.
 - **End-to-end encryption.** The envelope is sealed to the recipient's X25519
-  key from its peer record. Intermediate nodes see only where the message is
-  going, which nodes it has passed through, and ciphertext.
+  key from its peer record. An intermediate node sees only the destination
+  and ciphertext. It learns who handed it the message and who it hands it
+  to, never the route so far.
 - **Each hop verifies the sender's signature** before taking custody, so a
   node can't inject traffic in someone else's name or alter it in transit.
-- **The path list** is appended to at each hop. It is the only part that
-  changes on the way.
 - **Size capped.**
 
 ### Forwarding
@@ -224,9 +226,10 @@ designated relays and no per-message flooding.
    - Otherwise it computes the next hop toward the destination on its own
      current view of the graph. The route isn't fixed by the sender, so each
      hop uses the freshest information available.
-   - It never forwards to a node already on the path list. That prevents
-     loops while hops' views of the graph disagree, which is the same
-     loop-prevention trick BGP uses.
+   - **Loops are prevented by dedup.** A node that already holds or has held
+     the message id answers "already have it" and takes no further action.
+     The forwarding hop then picks its next-best hop. This holds even while
+     hops' views of the graph disagree.
 3. **Custody transfer** (Fall 2003). The next hop accepts only after
    durably storing the message. Responsibility then passes to it, and the
    previous hop is done.
@@ -248,8 +251,10 @@ designated relays and no per-message flooding.
   intermediate nodes of earlier attempts. This routes around a node that
   accepts custody and then silently drops messages.
 - **Idempotent receive by message id.** Every hop and the recipient keep
-  the ids they have seen until the message expires. Duplicates from retries
-  or multiple paths are harmless.
+  the ids they have seen until the message expires, not merely until they
+  have forwarded it, at about 16 bytes per id. This one rule makes
+  retries and multiple paths harmless and is also what prevents routing
+  loops.
 - **Failure classes:**
   - **Transient** (unreachable, overloaded, no path): retry with backoff.
   - **Permanent** (malformed, invalid signature, unknown user at the
