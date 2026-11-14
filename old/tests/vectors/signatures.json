@@ -1,0 +1,129 @@
+{
+  "description": "Lattice v1 signature vectors using Ed25519 and RFC 8785 JCS.",
+  "media_type": "application/vnd.lattice+json; version=1",
+  "signature_prefix": "lattice-signature-v1",
+  "node_id_prefix": "lattice-node-id-v1\u0000",
+  "keys": {
+    "root": {
+      "seed": "bGF0dGljZS10ZXN0LXJvb3Qtc2VlZC0wMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA",
+      "public_key": "z2UenZ2S_4IELtrxEt6huNhxuHtJFDqenSOsL0CGN8k",
+      "node_id": "lat_vks7c5auxbacgfy6kodmu7nfob7oth2mjbftix2rx44xftcsgasq"
+    },
+    "old_operational": {
+      "seed": "bGF0dGljZS10ZXN0LW9sZC1vcC1zZWVkLTAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAw",
+      "public_key": "EEdBTbvUTdXM0VTekevLf1WWX64kGbSchdHI0JZni3s"
+    },
+    "new_operational": {
+      "seed": "bGF0dGljZS10ZXN0LW5ldy1vcC1zZWVkLTAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAw",
+      "public_key": "rFJcyPScXrUi64gH4C0xoHh34HTKhSGCvsb-WQ-kTbQ"
+    },
+    "recipient_root": {
+      "seed": "bGF0dGljZS10ZXN0LXJlY2lwaWVudC1zZWVkLTAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMA",
+      "public_key": "iBdFXiCiA7lzdcl3U0aHy43uys60FXNDCIknJX3rB80",
+      "node_id": "lat_3efl3qtegnkxbo74ukp6e7amrckcncobu7hkibvjkqpamvjgdk7q"
+    }
+  },
+  "objects": {
+    "operational_certificate": {
+      "kind": "operational_certificate",
+      "node_id": "lat_vks7c5auxbacgfy6kodmu7nfob7oth2mjbftix2rx44xftcsgasq",
+      "operational_public_key": "EEdBTbvUTdXM0VTekevLf1WWX64kGbSchdHI0JZni3s",
+      "valid_from": "2024-01-01T00:00:00Z",
+      "valid_until": "2024-04-01T00:00:00Z",
+      "sequence": 1,
+      "signature": "nl7MW7QQC59MIJX9eVydY7M4TjHdSKzPQpCJxWTYgrCClyydPa9EYahpxALR9gwnls-lWAM5LLvLd6AC9cmRAw"
+    },
+    "well_known": {
+      "kind": "well_known",
+      "node_id": "lat_vks7c5auxbacgfy6kodmu7nfob7oth2mjbftix2rx44xftcsgasq",
+      "domain": "example.com",
+      "root_public_key": "z2UenZ2S_4IELtrxEt6huNhxuHtJFDqenSOsL0CGN8k",
+      "operational_certificate": {
+        "kind": "operational_certificate",
+        "node_id": "lat_vks7c5auxbacgfy6kodmu7nfob7oth2mjbftix2rx44xftcsgasq",
+        "operational_public_key": "EEdBTbvUTdXM0VTekevLf1WWX64kGbSchdHI0JZni3s",
+        "valid_from": "2024-01-01T00:00:00Z",
+        "valid_until": "2024-04-01T00:00:00Z",
+        "sequence": 1,
+        "signature": "nl7MW7QQC59MIJX9eVydY7M4TjHdSKzPQpCJxWTYgrCClyydPa9EYahpxALR9gwnls-lWAM5LLvLd6AC9cmRAw"
+      },
+      "endpoints": {
+        "gossip": "https://example.com/lattice/v1/gossip",
+        "messages": "https://example.com/lattice/v1/messages"
+      },
+      "issued_at": "2024-01-15T10:30:00Z",
+      "signature": "TaSWB24EVd2lZAOWyhY2mSKe3-DLL_XaGAZ8ME1ZbW0stcLqlwlpfSLzqFOblhb7kQUUuhzI2ukYCJCEJ8vrAg"
+    },
+    "peer_card": {
+      "kind": "peer_card",
+      "node_id": "lat_vks7c5auxbacgfy6kodmu7nfob7oth2mjbftix2rx44xftcsgasq",
+      "domain": "example.com",
+      "root_public_key": "z2UenZ2S_4IELtrxEt6huNhxuHtJFDqenSOsL0CGN8k",
+      "operational_certificate": {
+        "kind": "operational_certificate",
+        "node_id": "lat_vks7c5auxbacgfy6kodmu7nfob7oth2mjbftix2rx44xftcsgasq",
+        "operational_public_key": "EEdBTbvUTdXM0VTekevLf1WWX64kGbSchdHI0JZni3s",
+        "valid_from": "2024-01-01T00:00:00Z",
+        "valid_until": "2024-04-01T00:00:00Z",
+        "sequence": 1,
+        "signature": "nl7MW7QQC59MIJX9eVydY7M4TjHdSKzPQpCJxWTYgrCClyydPa9EYahpxALR9gwnls-lWAM5LLvLd6AC9cmRAw"
+      },
+      "endpoints": {
+        "gossip": "https://example.com/lattice/v1/gossip",
+        "messages": "https://example.com/lattice/v1/messages"
+      },
+      "sequence": 1,
+      "issued_at": "2024-01-15T10:30:00Z",
+      "expires_at": "2024-01-22T10:30:00Z",
+      "signature": "v-P0fZ9LtrOAHRHKbq3tf07Nd27XU-unQQFce4IDMNN6ctc2Ul0JpYxQCjn6uoi8ArDkVofvCW-Raw54EN0aAw"
+    },
+    "message": {
+      "kind": "message",
+      "message_id": "msg_2jmj7l5rSw0yVb_vlWAYkK_YBwk",
+      "from_address": "alice@lat_vks7c5auxbacgfy6kodmu7nfob7oth2mjbftix2rx44xftcsgasq",
+      "to_address": "bob@lat_3efl3qtegnkxbo74ukp6e7amrckcncobu7hkibvjkqpamvjgdk7q",
+      "content": "Hello, Lattice!",
+      "priority": "normal",
+      "ttl_seconds": 86400,
+      "timestamp": "2024-01-15T10:30:00Z",
+      "signature": "UR6hl8xV3ndMW54CjLH74Od-cjWBd0dPrwHeIZKzlQ9BUJ3cHmJImnCT2ASJ4v0thyvsPgi-pfMVQB_VgIPeAw"
+    },
+    "receipt": {
+      "kind": "receipt",
+      "message_id": "msg_2jmj7l5rSw0yVb_vlWAYkK_YBwk",
+      "node_id": "lat_3efl3qtegnkxbo74ukp6e7amrckcncobu7hkibvjkqpamvjgdk7q",
+      "status": "accepted",
+      "received_at": "2024-01-15T10:30:00Z",
+      "signature": "jQGyt7DnGNqBkqrPrjjqZFlF6SlFH3_jItmyzEBbVqskPXtfGv6fWC6xJpqr22ty7hfoZRzq8Gtgf3dWjtFrCg"
+    },
+    "block": {
+      "kind": "block",
+      "node_id": "lat_vks7c5auxbacgfy6kodmu7nfob7oth2mjbftix2rx44xftcsgasq",
+      "blocked_node_id": "lat_3efl3qtegnkxbo74ukp6e7amrckcncobu7hkibvjkqpamvjgdk7q",
+      "reason": "spam",
+      "issued_at": "2024-01-15T10:30:00Z",
+      "signature": "MEJmYQgVuH1bWv6bnIaslP1b_I312Wii6lGj4LNRIcSHrWXhBg0E3_wbWceiOAJEMJfkOCnhInqdWmpP7LVDBQ"
+    },
+    "transfer": {
+      "kind": "transfer",
+      "domain": "example.com",
+      "old_node_id": "lat_vks7c5auxbacgfy6kodmu7nfob7oth2mjbftix2rx44xftcsgasq",
+      "new_node_id": "lat_3efl3qtegnkxbo74ukp6e7amrckcncobu7hkibvjkqpamvjgdk7q",
+      "issued_at": "2024-01-15T10:30:00Z",
+      "signature": "fWXFuVyJ8X3IiC3NTYgyJlzlwY7DBdcgU3aM4HAL3QuqitMLp138j43n9iDxMNE9YFxW8YsYjcRHRMSMdAPfBw",
+      "new_signature": "mwflarzXGGOVAW9kwIYBFI9oGyZb2hnpBoYRTF5og3tZbH7xnWuPBjOvbVJbZ11takW1iMUYZ-4bIN0lwfhPAw"
+    },
+    "rotation": {
+      "kind": "rotation",
+      "node_id": "lat_vks7c5auxbacgfy6kodmu7nfob7oth2mjbftix2rx44xftcsgasq",
+      "old_operational_public_key": "EEdBTbvUTdXM0VTekevLf1WWX64kGbSchdHI0JZni3s",
+      "new_operational_public_key": "rFJcyPScXrUi64gH4C0xoHh34HTKhSGCvsb-WQ-kTbQ",
+      "old_certificate_sequence": 1,
+      "new_certificate_sequence": 2,
+      "issued_at": "2024-01-15T10:30:00Z",
+      "signature": "_Y-qsWLJEpTAfb8uP_JVdfY2FrePXlmKXXb3r3cf1Mmz_ypnsOtgk6g0p-T97LAMlRJuEzKjdJJmFA2tV-UsAg",
+      "old_signature": "3Xf5VhXDtftgTf6VJXbo51WdJ5eaaB_osNgXgI5Tu2XR7mL5ua0xCQmYSHo9-kmXABu14kf65c5KyKkAXTNzDw",
+      "new_signature": "F4p89EEHOVbw66zrSjQ9AcYDvM6x3NZf3fQDro6YeIYMjhvwRd3usbbWXy_oknbZXsc_w-qpsbPfxFX0PCWoBQ"
+    }
+  }
+}

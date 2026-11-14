@@ -1,198 +1,162 @@
-# Lattice Discovery Daemon systemd Service
+# Lattice v1 deployment guide
 
-This document describes how to set up the Lattice discovery daemon as a systemd service for production deployment.
+This document describes how to deploy a Lattice v1 node on Linux with systemd 250+ and Nginx.
 
-## Quick Start
+## Prerequisites
 
-The easiest way to deploy is using the deploy script:
+- Linux host with systemd 250 or newer.
+- Python 3.11+.
+- Nginx for the public TLS edge.
+- A DNS name pointing at the host.
+- A TLS certificate and private key for the DNS name.
+
+## Install the package
+
+Create a dedicated user and a virtual environment:
 
 ```bash
-./runme.sh
+sudo useradd --system --home-dir /var/lib/lattice --create-home lattice
+sudo mkdir -p /opt/lattice /etc/lattice /var/lib/lattice /var/cache/lattice
+sudo python3 -m venv /opt/lattice/venv
+sudo /opt/lattice/venv/bin/pip install lattice-mesh
 ```
 
-This handles secrets setup, identity generation, and systemd configuration automatically.
+## Initialize the node
 
-## Manual Setup
+Run `lattice init` as root to create the identity, configuration, and staged credentials:
 
-### Service File
+```bash
+sudo /opt/lattice/venv/bin/lattice init \
+  --config /etc/lattice/config.toml \
+  --domain example.com \
+  --public-base-url https://example.com
+```
 
-The service file is at `deploy/lattice.service`. For manual installation:
+This writes:
+
+- `/etc/lattice/config.toml`
+- `/etc/lattice/identity.json`
+- `/etc/lattice/well-known.json` (root-signed)
+- `/etc/lattice/root_key.pem` (password-encrypted)
+- `/etc/lattice/operational_key.pem` (staging)
+- `/etc/lattice/webhook_bearer` (staging)
+- `/etc/lattice/admin_bearer` (staging)
+
+Set restrictive permissions on `/etc/lattice`:
+
+```bash
+sudo chmod 755 /etc/lattice
+sudo chmod 640 /etc/lattice/config.toml
+sudo chmod 600 /etc/lattice/root_key.pem
+sudo chmod 600 /etc/lattice/operational_key.pem
+sudo chmod 600 /etc/lattice/webhook_bearer
+sudo chmod 600 /etc/lattice/admin_bearer
+sudo chown -R root:lattice /etc/lattice
+```
+
+## Encrypt credentials with systemd-creds
+
+```bash
+sudo systemd-creds encrypt --name=operational_key \
+  /etc/lattice/operational_key.pem /etc/lattice/operational_key.cred
+sudo systemd-creds encrypt --name=webhook_bearer \
+  /etc/lattice/webhook_bearer /etc/lattice/webhook_bearer.cred
+sudo systemd-creds encrypt --name=admin_bearer \
+  /etc/lattice/admin_bearer /etc/lattice/admin_bearer.cred
+
+# Remove plaintext staging files.
+sudo rm -f /etc/lattice/operational_key.pem \
+  /etc/lattice/webhook_bearer /etc/lattice/admin_bearer
+```
+
+## Run database migrations
+
+```bash
+sudo /opt/lattice/venv/bin/lattice upgrade --config /etc/lattice/config.toml
+```
+
+This creates or migrates the durable database in `/var/lib/lattice` and the cache database in `/var/cache/lattice`.
+
+## Install the systemd unit
 
 ```bash
 sudo cp deploy/lattice.service /etc/systemd/system/lattice.service
 sudo systemctl daemon-reload
-```
-
-### Secrets Configuration
-
-Lattice uses file-based secrets at `/etc/lattice/`:
-
-```bash
-# Create secrets directory
-sudo mkdir -p /etc/lattice
-sudo chmod 700 /etc/lattice
-
-# Create config file
-sudo tee /etc/lattice/config.env > /dev/null <<EOF
-APP_URL=https://your-server.com
-LATTICE_ADMIN_TOKEN=$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')
-# Optional bootstrap requires an out-of-band fingerprint pin:
-# LATTICE_BOOTSTRAP_SERVERS=https://bootstrap.example.com
-# LATTICE_BOOTSTRAP_PINS=bootstrap.example.com=ABCD1234...
-EOF
-sudo chmod 600 /etc/lattice/config.env
-```
-
-The private key is auto-generated on first run at `/etc/lattice/private_key.pem`.
-
-### systemd Credentials (systemd 250+)
-
-On modern systems, the deploy script automatically encrypts credentials:
-
-```bash
-# Manual encryption (optional)
-sudo systemd-creds encrypt --name=private_key /etc/lattice/private_key.pem /etc/lattice/private_key.cred
-sudo systemd-creds encrypt --name=config /etc/lattice/config.env /etc/lattice/config.cred
-```
-
-The provided service file uses `LoadCredential=` for `private_key` and `config`. To use encrypted credentials, change those directives to `LoadCredentialEncrypted=` and point them at encrypted `.cred` files.
-
-## Service Management
-
-### Enable and Start
-
-```bash
 sudo systemctl enable lattice
-sudo systemctl start lattice
 ```
 
-### View Logs
+Verify the unit file syntax:
 
 ```bash
-# Follow logs in real-time
-sudo journalctl -u lattice -f
-
-# View last 100 lines
-sudo journalctl -u lattice -n 100
+sudo systemd-analyze verify /etc/systemd/system/lattice.service
 ```
 
-### Control Service
+## Install the Nginx configuration
+
+Copy the example configuration, update the server name and certificate paths, then install it:
+
+```bash
+sudo cp deploy/lattice.nginx.conf /etc/nginx/sites-available/lattice
+sudo sed -i 's/example.com/your-domain.example/g' /etc/nginx/sites-available/lattice
+# Edit certificate paths as needed.
+sudo ln -s /etc/nginx/sites-available/lattice /etc/nginx/sites-enabled/lattice
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+The Nginx configuration:
+
+- exposes only `GET /.well-known/lattice`, `POST /lattice/v1/gossip`, and `POST /lattice/v1/messages`;
+- enforces method allowlists and body-size limits;
+- proxies `X-Forwarded-For` and `X-Forwarded-Proto`;
+- allows `/lattice/v1/admin/` and `/lattice/v1/health/` only from the loopback interface.
+
+## Start the daemon
 
 ```bash
 sudo systemctl start lattice
-sudo systemctl stop lattice
+sudo systemctl status lattice
+```
+
+## Operational commands
+
+### Show status
+
+```bash
+sudo /opt/lattice/venv/bin/lattice status --config /etc/lattice/config.toml
+```
+
+### Rotate the operational key
+
+```bash
+sudo /opt/lattice/venv/bin/lattice keys rotate-operational --config /etc/lattice/config.toml
+# Re-encrypt the new operational key and restart the service.
+sudo systemd-creds encrypt --name=operational_key \
+  /etc/lattice/operational_key.pem /etc/lattice/operational_key.cred
+sudo rm -f /etc/lattice/operational_key.pem
 sudo systemctl restart lattice
-sudo systemctl status lattice
 ```
 
-## Troubleshooting
-
-### Service won't start
+### View logs
 
 ```bash
-# Check service status for errors
-sudo systemctl status lattice
-
-# Check recent logs
-sudo journalctl -u lattice -n 50
-
-# Test manually
-python -m uvicorn lattice.discovery_daemon:app --port 1113
+sudo journalctl -u lattice -f
 ```
 
-### Port 1113 already in use
+### Health checks
+
+Liveness and readiness are available on the loopback interface:
 
 ```bash
-sudo lsof -i :1113
+curl http://127.0.0.1:1113/lattice/v1/health/live
+curl http://127.0.0.1:1113/lattice/v1/health/ready
 ```
 
-### Credentials not loading
+The readiness endpoint returns `503` if the node is not ready to accept traffic.
 
-Verify files exist and have correct permissions:
+## Security notes
 
-```bash
-ls -la /etc/lattice/
-# Should show:
-# -rw------- private_key.pem
-# -rw------- config.env
-```
-
-## Integration with Main Application
-
-The main application schedules periodic HTTP calls to the discovery daemon:
-
-- **Gossip rounds**: `POST http://localhost:1113/api/v1/announce` (every 10 minutes)
-- **Neighbor updates**: `POST http://localhost:1113/api/v1/maintenance/update_neighbors` (every 6 hours)
-- **Cleanup**: `POST http://localhost:1113/api/v1/maintenance/cleanup` (daily)
-
-These are registered automatically when the application starts (see `lattice/init_lattice.py`) and include the `X-Lattice-Admin-Token` header.
-
-## Monitoring
-
-### Health Check
-
-```bash
-curl http://localhost:1113/status
-curl -H "X-Lattice-Admin-Token: $LATTICE_ADMIN_TOKEN" http://localhost:1113/health
-```
-
-### Service Metrics
-
-```bash
-systemctl status lattice
-systemctl show lattice --property=MemoryCurrent,CPUUsage
-```
-
-## Security Best Practices
-
-1. **Run as non-root user**: Service runs as dedicated `lattice` user
-2. **Protect credentials**: Secret files have 600 permissions
-3. **Use encrypted credentials**: On systemd 250+, credentials are encrypted at rest
-4. **Filesystem restrictions**: Service has limited write access via `ProtectSystem=strict`
-5. **Resource limits**: Memory and CPU limits prevent resource exhaustion
-
-## Reverse Proxy Configuration (Nginx)
-
-For external federation access:
-
-```nginx
-proxy_http_version 1.1;
-proxy_set_header Host $host;
-proxy_set_header X-Real-IP $remote_addr;
-proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-proxy_set_header X-Forwarded-Proto $scheme;
-
-location /discovery/ {
-    return 404;
-}
-
-location = /status {
-    proxy_pass http://localhost:1113/status;
-}
-
-location = /api/v1/announcement {
-    proxy_pass http://localhost:1113/api/v1/announcement;
-}
-
-location = /api/v1/gossip/receive {
-    proxy_pass http://localhost:1113/api/v1/gossip/receive;
-}
-
-location = /api/v1/domain/query {
-    proxy_pass http://localhost:1113/api/v1/domain/query;
-}
-
-location = /api/v1/federation/messages/receive {
-    proxy_pass http://localhost:1113/api/v1/federation/messages/receive;
-}
-
-location ~ ^/(health|api/v1/(identity|peers|announce|route|domain/(verify|register)|messages/send|maintenance/)) {
-    return 404;
-}
-
-location / {
-    return 404;
-}
-```
-
-Do not proxy the daemon root to the public internet. Only the public federation endpoints above should be externally reachable.
+- The daemon binds only to the loopback interface by default. Nginx owns the public TLS edge.
+- The service unit uses `ProtectSystem=strict`, private `/tmp`, and encrypted credentials.
+- The daemon never loads the root private key; it serves the pre-signed `well-known.json` generated by `lattice init`.
+- `/var/lib/lattice` and `/var/cache/lattice` are created by systemd with `StateDirectory=` and `CacheDirectory=`.

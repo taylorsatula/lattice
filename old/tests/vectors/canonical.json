@@ -1,0 +1,54 @@
+{
+  "description": "RFC 8785 JCS canonicalization vectors for Lattice v1.",
+  "media_type": "application/vnd.lattice+json; version=1",
+  "vectors": [
+    {
+      "name": "simple_object",
+      "input": {
+        "b": 2,
+        "a": 1
+      },
+      "canonical": "{\"a\":1,\"b\":2}"
+    },
+    {
+      "name": "unicode_keys_and_strings",
+      "input": {
+        "é": "café",
+        "a": "hello"
+      },
+      "canonical": "{\"a\":\"hello\",\"é\":\"café\"}"
+    },
+    {
+      "name": "floating_point",
+      "input": {
+        "pi": 3.14159,
+        "zero": 0.0,
+        "neg_zero": -0.0
+      },
+      "canonical": "{\"neg_zero\":0,\"pi\":3.14159,\"zero\":0}"
+    },
+    {
+      "name": "nested_and_array",
+      "input": {
+        "z": [
+          true,
+          false,
+          null
+        ],
+        "a": {
+          "c": 3,
+          "b": 2
+        }
+      },
+      "canonical": "{\"a\":{\"b\":2,\"c\":3},\"z\":[true,false,null]}"
+    },
+    {
+      "name": "large_integer",
+      "input": {
+        "max_safe": 9007199254740991,
+        "min_safe": -9007199254740991
+      },
+      "canonical": "{\"max_safe\":9007199254740991,\"min_safe\":-9007199254740991}"
+    }
+  ]
+}

@@ -15,8 +15,13 @@ lattice.db
 .security-cache/
 .venv/
 venv/
+dist/
+build/
+*.egg-info/
+**/_version.py
 
 # Local secrets/configuration
 .env
 *.pem
 *.key
+.kata.local.toml

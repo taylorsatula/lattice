@@ -1,0 +1,55 @@
+[Unit]
+Description=Lattice v1 federation daemon
+Documentation=https://github.com/taylorsatula/lattice
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=lattice
+Group=lattice
+WorkingDirectory=/var/lib/lattice
+StateDirectory=lattice
+CacheDirectory=lattice
+RuntimeDirectory=lattice
+UMask=0077
+
+Environment="PYTHONUNBUFFERED=1"
+Environment="PYTHONDONTWRITEBYTECODE=1"
+
+# Encrypted credentials are decrypted by systemd and made available under
+# /run/credentials/lattice.service/.
+LoadCredentialEncrypted=operational_key:/etc/lattice/operational_key.cred
+LoadCredentialEncrypted=webhook_bearer:/etc/lattice/webhook_bearer.cred
+LoadCredentialEncrypted=admin_bearer:/etc/lattice/admin_bearer.cred
+
+ExecStart=/opt/lattice/venv/bin/lattice serve --config /etc/lattice/config.toml
+ExecReload=/bin/kill -HUP $MAINPID
+
+Restart=on-failure
+RestartSec=10
+StartLimitInterval=60
+StartLimitBurst=3
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+# Resource limits
+LimitNOFILE=65536
+MemoryMax=2G
+TasksMax=256
+
+[Install]
+WantedBy=multi-user.target

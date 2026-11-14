@@ -1,0 +1,112 @@
+[build-system]
+requires = ["setuptools>=68.0", "setuptools-scm>=8.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lattice-mesh"
+dynamic = ["version"]
+description = "DNS-bootstrapped, key-anchored flat mesh for cross-server messaging"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+authors = [
+    { name = "Taylor Satula", email = "taylor@satula.org" },
+]
+keywords = ["federation", "messaging", "mesh", "p2p", "ed25519"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Communications",
+    "Topic :: Internet :: WWW/HTTP :: HTTP Servers",
+    "Topic :: System :: Networking",
+    "Typing :: Typed",
+]
+
+dependencies = [
+    "cryptography>=42.0.0",
+    "fastapi>=0.109.0",
+    "httpx>=0.26.0",
+    "pydantic>=2.6.0",
+    "urllib3>=2.0.0",
+    "rfc8785>=0.1.4",
+    "uvicorn[standard]>=0.27.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "mypy>=1.8.0",
+    "pytest>=8.0.0",
+    "ruff>=0.2.0",
+]
+
+[project.scripts]
+lattice = "lattice.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/taylorsatula/lattice"
+Documentation = "https://github.com/taylorsatula/lattice/tree/main/docs"
+Issues = "https://github.com/taylorsatula/lattice/issues"
+
+[tool.setuptools]
+packages = ["lattice", "lattice.protocol", "lattice.storage", "lattice.migrations", "lattice.migrations.durable"]
+include-package-data = true
+
+[tool.setuptools.package-data]
+lattice = ["py.typed", "migrations/durable/*.sql", "migrations/cache_schema.sql"]
+
+[tool.setuptools_scm]
+write_to = "lattice/_version.py"
+fallback_version = "0.1.0.dev0"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "F",   # Pyflakes
+    "I",   # isort
+    "N",   # pep8-naming
+    "W",   # pycodestyle warnings
+    "B",   # flake8-bugbear
+    "C4",  # flake8-comprehensions
+    "UP",  # pyupgrade
+    "SIM", # flake8-simplify
+    "T20", # flake8-print
+]
+ignore = []
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+"lattice/cli.py" = ["T20"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_return_any = true
+warn_unused_ignores = true
+warn_unreachable = true
+show_error_codes = true
+namespace_packages = true
+explicit_package_bases = true
+
+[[tool.mypy.overrides]]
+module = "tests.*"
+disallow_untyped_defs = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --strict-markers"
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "integration: marks tests requiring network or external services",
+]

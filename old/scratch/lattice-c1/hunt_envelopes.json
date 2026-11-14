@@ -1,0 +1,696 @@
+[
+  {
+    "clean_areas": "require_admin bearer auth (compare_digest, case-insensitive prefix); require_content_length 411/413/400 mapping matching nginx body limits; health/admin loopback gating per deploy/lattice.nginx.conf; blocked-sender 202+rejected receipt per PROTOCOL \u00a78; CustodyError 202+rejected receipt with sender-side status check; accept() 400 path; admin submit priority/TTL validation via outbound Message.model_validate; gossip body parsing and batch-size caps; introduced_by not trusted; no message relay; no root-key exposure in the app; problem+json handlers for RequestValidationError/HTTPException; require_ready gating on public routes.",
+    "disputes": "E4 site 339 (CustodyError \u2192 202 when custody was NOT established) literally matches the preamble's \"202 without durable custody IS reportable\" clause, but docs/PROTOCOL.md \u00a78 explicitly blesses \"A 202 Accepted with a rejected receipt is final\" and the sender-side validation requires status==\"accepted\", so I dispositioned it examined-clean; flagged for arbitration. Also note finding 1 is partially mitigated by design (identity-keyed limits are also key-rotation-bypassable; docstring says \"best-effort\") \u2014 the XFF first-element parse is still a trust-boundary fault the nginx config (X-Real-IP set, ignored) shows was unintended.",
+    "enumeration": "All 7 E4 sites dispositioned (table in report): 189 examined-clean; 293 examined-clean (PROTOCOL \u00a78); 301 = finding 6; 339 examined-clean (PROTOCOL \u00a78, see disputes); 346 examined-clean; 393 = finding 5; 407 examined-clean. Class closed via rg over raise/except sites cross-checked against exception bases: AddressError(ValueError), ResolutionError(ValueError), CustodyError(ValueError), BlockedSenderError(RuntimeError); only CustodyError and BlockedSenderError are caught in api.py, the other two escape.",
+    "findings": [
+      {
+        "id": "hunt-a1#1",
+        "tier": "M",
+        "title": "XFF first element trusted for rate limiting"
+      },
+      {
+        "id": "hunt-a1#2",
+        "tier": "M",
+        "title": "Canonical to_address bypasses recipient-ownership check"
+      },
+      {
+        "id": "hunt-a1#3",
+        "tier": "H",
+        "title": "Cold-sender path: unbounded domain queue, eternal retries"
+      },
+      {
+        "id": "hunt-a1#4",
+        "tier": "L",
+        "title": "Malformed to_address crashes route with 500"
+      },
+      {
+        "id": "hunt-a1#5",
+        "tier": "L",
+        "title": "admin_submit ResolutionError uncaught, returns 500"
+      },
+      {
+        "id": "hunt-a1#6",
+        "tier": "L",
+        "title": "Structural message errors misreported as 401"
+      }
+    ],
+    "findings_h": 1,
+    "findings_l": 3,
+    "findings_m": 2,
+    "findings_s_minus": 0,
+    "pass_id": "hunt-a1",
+    "report_path": "scratch/lattice-c1/reports/hunt-a1.md"
+  },
+  {
+    "clean_areas": "Root-key confinement to offline commands (invariant 2 held on every serve path); transfer preimage parity between cli and identity.verify_transfer; accept-transfer fail-closed chain (resolver schema/derivation/signature checks + dual-sig verify); trust reset-domain case handling (repo lowercases, no false-success); contacts import signature verification; E3 clock sites (all UTC-aware) and CREDENTIALS_DIRECTORY resolution semantics; exit-code plumbing in main; upgrade/status/contacts-list state-path consistency; init secret staging modes and public-only manifest/well-known.",
+    "disputes": "None. One candidate refuted during the pass (contacts export username charset producing unimportable cards \u2014 parse_address accepts any non-empty username, so cards round-trip).",
+    "enumeration": "E3 sites 109/304/381/472/628/764 dispositioned via `sed -n '109p;304p;381p;472p;628p;764p' lattice/cli.py`: all six examined-clean for their own command (clock sites UTC-aware; _credential_path systemd name/fallback semantics correct); site 628's loaded-key non-check is covered by finding hunt-a2#1, site 764's surrounding write ordering is finding hunt-a2#2. Full table in report.",
+    "findings": [
+      {
+        "id": "hunt-a2#1",
+        "tier": "M",
+        "title": "Serve runs with key not matching certificate"
+      },
+      {
+        "id": "hunt-a2#2",
+        "tier": "L",
+        "title": "Rotate writes keys before config validation"
+      },
+      {
+        "id": "hunt-a2#3",
+        "tier": "L",
+        "title": "Init accepts config-invalid domain or URL"
+      }
+    ],
+    "findings_h": 0,
+    "findings_l": 2,
+    "findings_m": 1,
+    "findings_s_minus": 0,
+    "pass_id": "hunt-a2",
+    "report_path": "scratch/lattice-c1/reports/hunt-a2.md"
+  },
+  {
+    "clean_areas": "E6 SQL string-building all clean (fixed literal whitelists / error-message text only); E5's 34 with-self._conn blocks individually correct apart from finding 1; lease CAS predicates, retry/attempt accounting, expiry+erasure paths; fixed-width UTC timestamp comparisons; FK graph in 001_initial.sql (callers satisfy RESTRICT); migration runner ordering/version/preflight checks; cache_schema.sql and cache re-init sidecar handling.",
+    "disputes": "Finding 1 severity: failure mode is H-grade (accepted-then-lost custody after 202, invariant 5), but the trigger is a coincidence race whose production rate is unmeasured \u2014 mechanism was empirically reproduced, frequency is analytic. Findings 2 and 3 are latent/environment-armed and capped at L per the latent cap; both mechanisms were empirically reproduced. Side discovery (placeholder root keys) is caller-side, out of assigned files, left as S- candidate.",
+    "enumeration": "34 `with self._conn:` sites enumerated and dispositioned; 3 E6 f-string SQL sites dispositioned clean; 2 SQL files (durable/001_initial.sql, cache_schema.sql) examined. Full table in report.",
+    "findings": [
+      {
+        "id": "hunt-c1#1",
+        "tier": "H",
+        "title": "Shared-connection rollback voids accepted custody"
+      },
+      {
+        "id": "hunt-c1#2",
+        "tier": "L",
+        "title": "Migrations run without transaction atomicity"
+      },
+      {
+        "id": "hunt-c1#3",
+        "tier": "L",
+        "title": "Migration backup omits WAL sidecar"
+      }
+    ],
+    "findings_h": 1,
+    "findings_l": 2,
+    "findings_m": 0,
+    "findings_s_minus": 0,
+    "pass_id": "hunt-c1",
+    "report_path": "scratch/lattice-c1/reports/hunt-c1.md"
+  },
+  {
+    "clean_areas": "connection.py: all five lock overrides (execute/executemany/executescript/commit/rollback) hold the RLock, and the unoverridden mutating surface (cursor(), backup, iterdump, create_function, load_extension, setconfig, etc.) has zero call sites in tree \u2014 enumeration closed with rg (exit=1). configure_connection pragmas/JSON registration and open_connection wiring correct. cache.py happy paths clean: matching-hash return, 0-byte file handled via OperationalError \u2192 recreate, WAL sidecar cleanup correct for suffixed paths, partial execute_script failure self-heals on restart, timestamp-string expiry comparisons order-consistent. E5 KNOWN site verified unchanged via instrumented subclass spy (with-exit calls neither override) \u2014 bare mechanism not re-reported.",
+    "disputes": "Finding 1 may be disputed as an extension of the orchestrator-known E5 mechanism rather than a distinct defect. Position taken: E5 as handed down is the __exit__ lock-bypass; finding 1 holds even if every statement (including the implicit commit) were lock-covered, because transactions span multiple lock acquisitions \u2014 demonstrated with fully-lock-protected writes. Tier H rests on the 202-without-custody/data-loss variant and duplicate delivery, both demonstrated end-to-end with real repository SQL; the race window is sub-millisecond per block, and severity was assigned independent of frequency per the pinned scale. Findings 2 and 3 are the two latent findings (at the cap); both mechanisms were demonstrated empirically, only frequency is ungrounded.",
+    "enumeration": "E5 (cache.py:60, connection.py:102): KNOWN \u2014 verified unchanged (spy subclass: with-exit calls neither overridden commit nor rollback); bare mechanism not re-reported; its wider-reaching instance reported as finding 1 (interleaving inside with-conn blocks defeats the per-statement lock entirely, demonstrated with real threads and real claim_pending SQL). Unoverridden-mutating-method class: closed \u2014 `rg -n \"\\.cursor\\(|\\.backup\\(|iterdump|create_function|load_extension|setconfig|set_trace_callback|set_progress_handler|create_collation\" lattice/` returns zero matches. 36 `with conn:` transaction blocks (repositories.py:34, cache.py:1, connection.py:1): all dispositioned under finding 1.",
+    "findings": [
+      {
+        "id": "hunt-c2#1",
+        "tier": "H",
+        "title": "Shared transactions cross-commit and cross-rollback across threads"
+      },
+      {
+        "id": "hunt-c2#2",
+        "tier": "L",
+        "title": "Corrupt cache file crashes startup, no recreate"
+      },
+      {
+        "id": "hunt-c2#3",
+        "tier": "L",
+        "title": "Extensionless cache path breaks mismatch recreation"
+      }
+    ],
+    "findings_h": 1,
+    "findings_l": 2,
+    "findings_m": 0,
+    "findings_s_minus": 0,
+    "pass_id": "hunt-c2",
+    "report_path": "scratch/lattice-c1/reports/hunt-c2.md"
+  },
+  {
+    "clean_areas": "network_policy.py read in full: _is_internal public-mode coverage (0/8, 198.18/15, ULA, mapped-v6 all verified in venv), cross-version CIDR containment fails closed, hostname_allowed ignored-return benign; transport.py read in full: TOCTOU/rebinding-resistant connect-to-validated-IP design sound, IPv4-mapped-IPv6 unwrapping correct, scheme enforcement, well-known URL construction from peer domains (addressing blocks :/@ smuggling), private CA load, webhook pool dispositioned out-of-scope (operator config).",
+    "disputes": "None. Note for dedupe: finding 1 (redirect SSRF) was also filed by hunt-b1b as its finding 4 \u2014 merge; finding 3 (IPv6 unbracketed URL) was noted inside hunt-b1b finding 1's evidence as a second failure mode \u2014 distinct mechanism, survives that repair. Latent findings capped at 2 (findings 2 and 4, both operator-configuration-dependent).",
+    "enumeration": "Composed rg enumeration of every policy-check call site (validate_ip, hostname_allowed, _is_internal, NetworkPolicy constructions) and every outbound URL/pool construction (https:// literals, parse_url, PoolManager, urlopen, getaddrinfo) across lattice/; 14 instances dispositioned in the report table: findings 1-5, examined-clean, or out-of-scope-with-reason (webhook.py operator-config URL).",
+    "findings": [
+      {
+        "id": "hunt-d1#1",
+        "tier": "H",
+        "title": "3xx redirects bypass network policy entirely"
+      },
+      {
+        "id": "hunt-d1#2",
+        "tier": "M",
+        "title": "Unanchored private_suffixes match admits lookalike domains"
+      },
+      {
+        "id": "hunt-d1#3",
+        "tier": "M",
+        "title": "IPv6 targets build unparseable unbracketed URL"
+      },
+      {
+        "id": "hunt-d1#4",
+        "tier": "L",
+        "title": "Daemon policy construction skips suffix normalization"
+      },
+      {
+        "id": "hunt-d1#5",
+        "tier": "S-",
+        "title": "Public mode permits CGNAT 100.64.0.0/10"
+      }
+    ],
+    "findings_h": 1,
+    "findings_l": 1,
+    "findings_m": 2,
+    "findings_s_minus": 1,
+    "pass_id": "hunt-d1",
+    "report_path": "scratch/lattice-c1/reports/hunt-d1.md"
+  },
+  {
+    "clean_areas": "Root-key invariant holds in the daemon: cmd_serve loads only the operational key, webhook/admin bearers, and the root public key; load_root_key/save_root_key are confined to offline CLI commands. _credential_path resolution (CREDENTIALS_DIRECTORY precedence, fail-closed on missing, suffix-limited fallback that cannot reach root_key.pem) examined clean. Bearer comparison uses secrets.compare_digest; no export/log/write path for daemon secrets. config.py fail-closed defaults (domain, https URLs, webhook.url, private-mode requirements, TTL/rate bounds) verified. Webhook delivery target is config-only, no peer influence. E3 class closed: no serving-process site reads root private material.",
+    "disputes": "None. All three findings are L-tier error-path misreporting / schema-loader divergence; the surface is otherwise clean. Both latent findings (1, 2) kept at L per the latent cap; finding 3's frequency is demonstrated (operator config typo), not latent.",
+    "enumeration": "Composed command: rg -n \"os\\\\.environ|open\\\\(|read_bytes\\\\(|read_text\\\\(|load_credential|\\\\.pem|root_key\" lattice/*.py \u2014 all instances dispositioned in the report's instance table (finding / examined-clean / out-of-scope-intended, including urlopen sites at transport.py:132 and webhook.py:91 as non-file network calls and runtime.py *_circuit_is_open hits as name collisions). Serving-process key-material inventory closed: operational_key, webhook_bearer, admin_bearer, root public key only.",
+    "findings": [
+      {
+        "id": "hunt-d2#1",
+        "tier": "L",
+        "title": "bearer_credential_name config field ignored by daemon"
+      },
+      {
+        "id": "hunt-d2#2",
+        "tier": "L",
+        "title": "Malformed credentials escape CredentialError, raw traceback"
+      },
+      {
+        "id": "hunt-d2#3",
+        "tier": "L",
+        "title": "Invalid TOML escapes ConfigError handlers"
+      }
+    ],
+    "findings_h": 0,
+    "findings_l": 3,
+    "findings_m": 0,
+    "findings_s_minus": 0,
+    "pass_id": "hunt-d2",
+    "report_path": "scratch/lattice-c1/reports/hunt-d2.md"
+  },
+  {
+    "clean_areas": "derive_node_id domain separation and re-derivation at all consumers; OperationalCertificate.verify node-id binding; transfer dual-signature CLI path (fails closed); create_operational_certificate bounds; sign/verify preimage consistency; crypto.py primitives; root-key confinement to offline CLI (invariant 2); gossip sender-card self-consistent verification incl. is_valid_at; root-history insert-once semantics",
+    "disputes": "Finding 3 (sequence monotonicity, PROTOCOL.md \u00a73.3 MUST unenforced) is the borderline call: the no-adversary trigger (operator backup-restore of an old well-known) is plausible but rare, and the adversary trigger needs coincident domain-serving control plus a leaked old operational key. Reported as M on the strength of the explicit protocol MUST; a reviewer holding 'no adversary in production means drop' could argue it down to L. Finding 4 is the weakest (L, fail-open startup self-check); kept because the non-atomic rotation write ordering gives it a concrete crash trigger.",
+    "enumeration": "Composed rg over lattice/ for all verify/sign call sites (22 sites) and all validity-window/sequence checks, dispositioned in a per-site table in the report. Headline: is_valid_at has exactly one caller in the entire tree (runtime.py:564, gossip sender card) out of ~7 certificate-consuming paths; sequence monotonicity is compared against stored state at zero adoption sites; LATTICE_EXPIRED_CERTIFICATE (PROTOCOL.md:272) appears nowhere in code. verify_rotation has zero callers.",
+    "findings": [
+      {
+        "id": "hunt-e1#1",
+        "tier": "M",
+        "title": "Expired operational certificates accepted into message custody"
+      },
+      {
+        "id": "hunt-e1#2",
+        "tier": "M",
+        "title": "Rotation unhandled by receivers; rotated peers permanently rejected"
+      },
+      {
+        "id": "hunt-e1#3",
+        "tier": "M",
+        "title": "Certificate sequence monotonicity never enforced"
+      },
+      {
+        "id": "hunt-e1#4",
+        "tier": "L",
+        "title": "Daemon serves expired or mismatched certificate undetected"
+      }
+    ],
+    "findings_h": 0,
+    "findings_l": 1,
+    "findings_m": 3,
+    "findings_s_minus": 0,
+    "pass_id": "hunt-e1",
+    "report_path": "scratch/lattice-c1/reports/hunt-e1.md"
+  },
+  {
+    "clean_areas": "signature_preimage byte layout (matches doc \u00a74.3/\u00a712.2 exactly); signature-field exclusion incl. transfer/rotation multi-sig stripping; rfc8785 canonicalization semantics (UTF-16 key order, safe-int domain, surrogate rejection, all sites catch the resulting ValueError); strict_json_loads itself (dup keys/NaN/non-UTF-8 all rejected \u2014 verified live); derive_node_id/b32lower_encode vs doc \u00a73.2; pydantic models (extra=forbid, Literal kinds, tz-aware timestamps, node-id cross-checked against derivation at every verification boundary); resolution.py well-known fetch path (strict parse + raw-dict verify); receipt building and idempotent duplicate returns; webhook envelope signing self-consistency; JCS/signature cross-impl vectors present and wrong-kind tested.",
+    "disputes": "None between findings. Borderline calls documented in the report: (a) findings 1 and 2 are wire-contract MUST violations with bounded outcomes (no signature/validation split found \u2014 same last-wins parsed dict is both validated and signed), kept at L rather than M deliberately; (b) finding 3's malleability direction is hostile-peer-reachable today, but the two-paths-disagree direction requires a non-conforming RFC-3339-offset emitter, and no value-level signature bypass exists \u2014 kept at L for those reasons; (c) the stuck-candidate ValueError escape (side discovery 1) is a traced, attacker-reachable defect but lives in topology.py/resolution.py/identity.py outside the assigned files, so it is not promoted into primary findings.",
+    "enumeration": "Kind set enumerated via grep over Literal[\"...\"] in protocol/models.py, kind strings at all sign/verify sites, and doc \u00a74.4 table. 10 kinds in code vs 9 in doc: well_known, operational_certificate (finding 3), peer_card (finding 3), message, receipt, block (sign helper uncalled by daemon; no defect), transfer, rotation all examined-clean/mapped; contact_card in doc+CLI but has NO protocol model (side discovery: unvalidated fields on CLI import); webhook_envelope in code but absent from doc \u00a74.4 table. Kind strings at every sign/verify site agree with model literals and doc \u2014 no mismatched kind at any call site. Parsers/normalizers all dispositioned: strict_json_loads (correct, unwired to routes \u2014 finding 1), canonicalize (clean), signature_preimage (clean), b64url_encode/b32lower_encode (clean), b64url_decode (lenient, validate=False \u2014 contributes to finding 3, no standalone defect), _parse_ts/_format_ts (finding 3), 12 pydantic model validators (clean).",
+    "findings": [
+      {
+        "id": "hunt-e2#1",
+        "tier": "L",
+        "title": "Public routes bypass strict JSON rules"
+      },
+      {
+        "id": "hunt-e2#2",
+        "tier": "L",
+        "title": "Media-type version never enforced"
+      },
+      {
+        "id": "hunt-e2#3",
+        "tier": "L",
+        "title": "Signatures verify re-serialized, not wire bytes"
+      }
+    ],
+    "findings_h": 0,
+    "findings_l": 3,
+    "findings_m": 0,
+    "findings_s_minus": 0,
+    "pass_id": "hunt-e2",
+    "report_path": "scratch/lattice-c1/reports/hunt-e2.md"
+  },
+  {
+    "clean_areas": "E4 per-card failure isolation at gossip.py:92,130,246 (rejected-with-reason + continue inbound; bounded silent skip outbound \u2014 no abort, no tally corruption); batch bound (32-card slice + api.py 400 + 256KiB body check before any storage); self-card refusal (two layers); intake authenticity deferred to well-known verification by design; 7-day card lifetime cap; candidate caps 256/8-per-introducer/4-per-prefix with upsert on duplicates; invariant 6 (gossip carries only peer cards, no message relay); build_own_card (root public key only, invariant 2 respected); rate-limit consumption order in api.py",
+    "disputes": "Finding 1 implements exactly what docs/PROTOCOL.md \u00a75.2 prescribes (\"verify it ... and rate limit gossip by its node ID\"); the implementation is faithful, but the spec's trust assumption (identity minting is costly) does not hold, so repair requires a protocol decision as much as a code change. Finding 2's harm is bounded because nothing currently consumes attributed_to. Side discovery 1 (dead candidate_ttl_seconds) is in topology.py, outside this pass's assigned file, and awaits confirmation by a topology-focused pass.",
+    "enumeration": "Exception-handling class in gossip.py closed via `rg -n \"except \" lattice/gossip.py` (exactly 3 sites: 92, 130, 246 \u2014 all dispositioned examined-clean per E4). Call graph closed via `rg -n \"receive_batch\\(|add_transient_card\\(|list_transient_cards\\(|select_batch_to_send\\(|build_own_card\\(\" lattice/ tests/`: receive_batch \u2190 api.py:267 only; add_transient_card \u2190 gossip.py:145 + topology.py:276 (neither records introduced_by); list_transient_cards \u2190 gossip.py:240 only; select_batch_to_send \u2190 runtime.py:1102 only; build_own_card \u2190 runtime.py:1083 only.",
+    "findings": [
+      {
+        "id": "hunt-f1#1",
+        "tier": "M",
+        "title": "Self-attested first card defeats gossip rate limiting"
+      },
+      {
+        "id": "hunt-f1#2",
+        "tier": "L",
+        "title": "Gossip batch attribution is always None"
+      }
+    ],
+    "findings_h": 0,
+    "findings_l": 1,
+    "findings_m": 1,
+    "findings_s_minus": 0,
+    "pass_id": "hunt-f1",
+    "report_path": "scratch/lattice-c1/reports/hunt-f1.md"
+  },
+  {
+    "clean_areas": "Prefix derivation (both /24-/48 IP and hostname variants); maturity arithmetic in _maybe_promote/record_observation; guard slot allocation and demotion in _fill_guards; discovery round-robin selection and config wiring (guard_slots/discovery_slots match TopologyConfig); can_accept_candidate cap comparisons; blocked-state write atomicity in add_block; all 5 E4 broad-except sites in topology.py (convert to TopologyError with appropriate candidate removal); Peer row mapping and create/transition guards; candidate failure lifecycle (remove on verify failure, retain on resolution failure by design).",
+    "disputes": "Two judgment calls: (1) the expired-certificate finding overlaps hunt-e1's certificate-sequence-monotonicity finding in location but is a distinct unchecked MUST (valid_until window, plus card expiry-vs-now) \u2014 reported separately, flagging the adjacency. (2) The block/discovery-set finding is real-mechanism but its trigger (TopologyService.block) currently has no production caller (no CLI command, no admin route) \u2014 kept at M per test-only-reachability rule with the gate named.",
+    "enumeration": "11 state-transition sites dispositioned (2 clean families, 3 findings, 1 documented-contract, 1 dead method, 1 traced out-of-scope bootstrap path); 7 quota/prefix arithmetic sites dispositioned (6 examined-clean, 1 finding); 5 E4 broad-except sites in topology.py dispositioned all clean; composed rg commands and tables included in the report.",
+    "findings": [
+      {
+        "id": "hunt-f2#1",
+        "tier": "M",
+        "title": "Verification accepts expired certificates and cards"
+      },
+      {
+        "id": "hunt-f2#2",
+        "tier": "L",
+        "title": "Stale candidate demotes bootstrap-established peer"
+      },
+      {
+        "id": "hunt-f2#3",
+        "tier": "M",
+        "title": "Block leaves discovery set; gossip continues"
+      }
+    ],
+    "findings_h": 0,
+    "findings_l": 1,
+    "findings_m": 2,
+    "findings_s_minus": 0,
+    "pass_id": "hunt-f2",
+    "report_path": "scratch/lattice-c1/reports/hunt-f2.md"
+  },
+  {
+    "clean_areas": "resolution.py:51 transport/network-policy except; E4 broad excepts at lines 63/72/83/89/100 (fail-closed conversions, verified); resolve_with_ip full fail-closed ordering incl. strict JSON, schema, domain match, node-id derivation, root signature \u2014 happy path verified end-to-end with real keys; TOFU pin/get_pin/reset_domain semantics with lowercase-normalized pin keys on both repo sides; endpoints stored only from validated https-only model; no root-key load in resolution.py. addressing.py: parse_address regex identical to model's, domain length/charset bounds, URL-injection prevention with transport-level revalidation, consistent system-wide case folding; to_canonical/to_human; node_id_from_address swallow is intended contract. resolved_ip sourced from our own transport, not remote content.",
+    "disputes": "None. Severity of finding 1 set at H on the pinned scale's cross-peer-reach clause (one hostile POST permanently starves cold-sender resolution for later-sorted domains, causing sender-side message erasure); the same root defect also yields 500s on public/admin routes and CLI tracebacks, listed as secondary outcomes within that finding.",
+    "enumeration": "E4 closed with `rg -n \"except\" lattice/resolution.py lattice/addressing.py`: resolution.py:63,72,83,89,100 examined-clean (fail-cored broad conversions); resolution.py:108 too-narrow except -> Finding 1; addressing.py:78 examined-clean (intended None-on-non-canonical contract; no callers in tree).",
+    "findings": [
+      {
+        "id": "hunt-g1#1",
+        "tier": "H",
+        "title": "Certificate failures escape as non-ResolutionError exceptions"
+      },
+      {
+        "id": "hunt-g1#2",
+        "tier": "M",
+        "title": "Pin path skips operational certificate validity window"
+      }
+    ],
+    "findings_h": 1,
+    "findings_l": 0,
+    "findings_m": 1,
+    "findings_s_minus": 0,
+    "pass_id": "hunt-g1",
+    "report_path": "scratch/lattice-c1/reports/hunt-g1.md"
+  },
+  {
+    "clean_areas": "Message semantic validation (both submit and accept): extra=forbid, 64 KiB content, 16 KiB extension, priority/ttl bounds, body pre-bounded; expiry arithmetic (disjoint claim/expire predicates, chronological string timestamps); retry/backoff arithmetic; erasure completeness across all 6 service sites and 3 repository implementations (content+extension+message_json erased on every terminal path; receipt retention protocol-mandated; no content-bearing column survives); dedup key consistency incl. cross-sender UNIQUE divergence (protocol-accurate rejected receipt); receipt construction and signing preimage; lease/claim CAS semantics incl. same-owner re-select unreachability; E3 clock site messages.py:36; submit UNIQUE string-match; FK hygiene via ensure_root_history.",
+    "disputes": "Finding 1 is L but GATED behind hunt-b1b finding 1 (transport TypeError currently prevents all live outbound delivery), flagged per the reachability-kind rule. hunt-b1b examined claim/lease/expiry semantics clean but did not disposition the expire-vs-inflight-lease audit/DB divergence; receipt-signature non-verification and rejected-receipt retry divergence are known (b1b) and excluded. Design risks: SQLite remanence vs erasure intent; erase-on-exhausted-webhook-retry destroying undelivered custody content (~2-3 h of backoff). Side discoveries: stale inbound_service.stage() comment at runtime.py:646; outbound expiry produces no audit event.",
+    "enumeration": "Field validators: `rg -n \"@field_validator\" -A 1 lattice/protocol/models.py | rg \"field_validator|def \"` \u2014 31 declarations, all dispositioned (Message validators clean; Endpoints URL weakness out-of-scope to peer-card hunts). Erasure sites: `rg -n \"erase_content|erase_value|mark_terminal|expire_messages\" lattice --glob '!*.md'` \u2014 6 service sites + 3 repo implementations, all examined-clean except the expire_messages leased-row interaction (Finding 1). E3 clock site messages.py:36 examined-clean (default clock only; runtime injects shared clock; issuer-correct for all produced timestamps).",
+    "findings": [
+      {
+        "id": "hunt-h1#1",
+        "tier": "L",
+        "title": "Expire sweep erases in-flight leased delivery"
+      }
+    ],
+    "findings_h": 0,
+    "findings_l": 1,
+    "findings_m": 0,
+    "findings_s_minus": 0,
+    "pass_id": "hunt-h1",
+    "report_path": "scratch/lattice-c1/reports/hunt-h1.md"
+  },
+  {
+    "clean_areas": "webhook.py deliver: exception surface (all URL/connection failures empirically raise HTTPError subclasses -> caught, retryable), 2xx/429/5xx classification, response handling, pool close ordering. Idempotency key derivation/persistence consistency. Inbound webhook claim/lease state machine (reclaim conditions, owner+status guards, attempt cap 10 with 30s-1h backoff, no same-second double-claim). Same-sender duplicate-receipt byte-identical idempotency incl. post-terminal. Envelope construction and re-validation. At-least-once delivery with receiver dedupe consistent with custody invariant 5; no 202 without committed custody. Outbound 202 receipt field validation matches documented decision. Single-connection SQLite serialization.",
+    "disputes": "None. Design risks are documented LOOSE_ENDS decisions (transient custody-insert failures -> final rejected receipt; outbound receipt field-only validation), listed separately rather than as findings per assignment rules.",
+    "enumeration": "rg over retryable=/Idempotency-Key/idempotency_key/should_retry/429/>=500/record_failure/record_webhook_failure/mark_terminal/release_webhook_lease in lattice/ (42 matches): 19 retry-classification branches (17 examined-clean, 1 production-dead classify_status -> side discovery, 1 covered by design risk 2) and 6 idempotency-key uses (5 examined-clean, WebhookStateRepository.get has no production caller -> side discovery). Full table in report.",
+    "findings": [
+      {
+        "id": "hunt-h2#1",
+        "tier": "H",
+        "title": "Poison from-domain permanently wedges cold-sender resolution"
+      },
+      {
+        "id": "hunt-h2#2",
+        "tier": "H",
+        "title": "Failed domains never leave resolution queue, unbounded retries"
+      },
+      {
+        "id": "hunt-h2#3",
+        "tier": "L",
+        "title": "Cross-sender message_id collision yields final rejection"
+      }
+    ],
+    "findings_h": 2,
+    "findings_l": 1,
+    "findings_m": 0,
+    "findings_s_minus": 0,
+    "pass_id": "hunt-h2",
+    "report_path": "scratch/lattice-c1/reports/hunt-h2.md"
+  },
+  {
+    "clean_areas": "Fresh-built wheel file set matches source exactly (33/33 files incl. py.typed + both SQL migrations, verified via /tmp build + comm -3 diff); entry point lattice.cli:main correct; declared packages cover every module; all third-party imports declared. Nginx config matches code contract: three public routes = protocol/constants.py routes, body limits 256k/128k = MAX_GOSSIP/MESSAGE_BODY_BYTES, method allowlists correct, admin/health prefixes cover exactly the four local api.py routes loopback-only, catch-all 404, no proxy_pass URI mangling. Systemd unit wiring matches code: LoadCredentialEncrypted names match _credential_path lookups via $CREDENTIALS_DIRECTORY, StateDirectory/CacheDirectory match DEFAULT_STATE_DIR/DEFAULT_CACHE_DIR, daemon binds 127.0.0.1:1113, no root key loaded on serve path. docs/MIGRATIONS.md runner description matches storage/migrations.py behavior. lattice init outputs match the seven documented files. Tests' assertions consistent with artifacts (but string-only \u2014 why both findings escaped them).",
+    "disputes": "Tier call on hunt-k1#1: deterministic total availability failure (deployed service can never start; every documented CLI invocation fails). Pinned H list is security-flavored (data loss/secret exposure/auth bypass/remote crash); by strict letter this is top-of-M, by impact it is release-blocking H. Flagged in the report for the merge agent to re-tier if the ledger reads the scale strictly. hunt-k1#2's restart-suppression component rests on documented systemd Restart=on-failure semantics (SIGHUP excluded from restart triggers), not reproducible on this macOS host; the kill mechanism itself was demonstrated live. Side discovery 1 (X-Forwarded-For rate-limit bypass) is read-traced only and belongs to the api/rate-limit pass's file set.",
+    "enumeration": "A) Packaged/module set vs source: built wheel from a byte-identical /tmp copy (no in-tree writes); comm -3 of source files vs wheel contents = empty diff; all 33 payload files dispositioned examined-clean. Stale dist/ wheels contain 14 deleted legacy modules \u2014 out-of-scope (gitignored build artifacts of pre-rewrite tree, invariant 8). B) Documented routes/config vs code constants: 10-item table dispositioned \u2014 8 examined-clean (routes, health/admin paths, body limits, credential names, state/cache dirs, ports), 2 findings (docs CLI arg order; ExecReload SIGHUP). Full table in report.",
+    "findings": [
+      {
+        "id": "hunt-k1#1",
+        "tier": "H",
+        "title": "systemd ExecStart arg order breaks serve"
+      },
+      {
+        "id": "hunt-k1#2",
+        "tier": "M",
+        "title": "ExecReload SIGHUP kills daemon unrestarted"
+      }
+    ],
+    "findings_h": 1,
+    "findings_l": 0,
+    "findings_m": 1,
+    "findings_s_minus": 0,
+    "pass_id": "hunt-k1",
+    "report_path": "scratch/lattice-c1/reports/hunt-k1.md"
+  },
+  {
+    "clean_areas": "receive_gossip\u2194verify_gossip_sender_card (never raises, str|None as assumed); receive_gossip\u2194gossip_service.receive_batch (ReceivedCard shape matches, per-card exceptions converted); receive_message\u2194inbound accept/build_receipt (CustodyError contract closed, BlockedSenderError ordering correct); admin_submit\u2194allow_submission/sign_local_message/outbound.submit (RuntimeError+ValueError coverage correct for those calls); signature-verification chain (all signature failures surface as ValueError\u2192401); require_ready/require_admin/require_content_length and both FastAPI exception handlers; admin_status shape checks.",
+    "disputes": "Two judgment calls where another reviewer might tier differently: canonical-address guard bypass (M vs H \u2014 misdelivered third-node mail to local webhook, but sender-directed, not exfiltration of our data) and cold-path rate-limit bypass (L vs M \u2014 wrong quota decision by the M definition, but per-request work is bounded). Side discovery, not a finding: runtime._send_outbound_message treats a final \u00a78 rejected receipt as retryable and never verifies receipt signatures despite its comment \u2014 belongs to the outbound pass. Stale docstring: verify_inbound_message references a nonexistent inbound_service.stage().",
+    "enumeration": "14-row route\u2192method table: 9 examined-clean, 5 findings (Finding 4 covers rows 3+8; Finding 1 covers row 8's canonical-form gap). Exception surfaces closed by reading class definitions: ResolutionError/AddressError/CustodyError/SignatureError/IdentityError all subclass ValueError; BlockedSenderError subclasses RuntimeError. Package not executable in this environment (missing rfc8785) \u2014 hierarchies verified by source reading, not execution.",
+    "findings": [
+      {
+        "id": "hunt-s1#1",
+        "tier": "M",
+        "title": "Canonical to_address bypasses custody ownership guard"
+      },
+      {
+        "id": "hunt-s1#2",
+        "tier": "M",
+        "title": "Failed resolution domains never evicted, set grows"
+      },
+      {
+        "id": "hunt-s1#3",
+        "tier": "L",
+        "title": "Admin resolution failure returns 500 not 400"
+      },
+      {
+        "id": "hunt-s1#4",
+        "tier": "L",
+        "title": "Malformed address gives 500 on public route"
+      },
+      {
+        "id": "hunt-s1#5",
+        "tier": "L",
+        "title": "Cold senders bypass message rate limiting"
+      }
+    ],
+    "findings_h": 0,
+    "findings_l": 3,
+    "findings_m": 2,
+    "findings_s_minus": 0,
+    "pass_id": "seam-s1",
+    "report_path": "scratch/lattice-c1/reports/seam-s1.md"
+  },
+  {
+    "clean_areas": "IPv4-mapped normalization agreement between transport and prefix_from_ip; None propagation through resolve_with_ip \u2192 verify_candidate \u2192 peers storage (COALESCE/conditional update preserves prior observed_prefix, never erases); _fill_discovery prefix fallback chain; hostname-grouped candidate intake (documented intent); runtime POST callers' handling of FederationResponse; normal IPv4 path where resolved_ip is genuinely the validated, actually-connected IP (pool keyed by literal IP).",
+    "disputes": "Finding 1 frequency requires a hostile/compromised peer rather than honest operation; reported as an enforcement-gap finding per the preamble's SSRF-in-scope rule. Finding 2's cadence depends on deployment IPv6 enablement and platform getaddrinfo ordering (RFC 6724) \u2014 mechanism and trigger proven, exact rate ungroundable.",
+    "enumeration": "Producer\u2192consumer table for resolved_ip dispositioned across 5 rows: OutboundTransport IPv4 no-redirect path (examined-clean), IPv6 target path (Finding 2 \u2014 never returns), 3xx redirect path (Finding 1 \u2014 misattributed IP), tests/conftest FakeTransport (test-only, consistent), runtime.py POST senders (examined-clean). Verified via rg over resolved_ip/observed_prefix plus urllib3 2.3.0 source read and local parse_url/urljoin probes.",
+    "findings": [
+      {
+        "id": "seam-s2#1",
+        "tier": "H",
+        "title": "Redirect following bypasses NetworkPolicy, misreports resolved_ip"
+      },
+      {
+        "id": "seam-s2#2",
+        "tier": "M",
+        "title": "Unbracketed IPv6 URL: IPv6 peers never fetchable"
+      }
+    ],
+    "findings_h": 1,
+    "findings_l": 0,
+    "findings_m": 1,
+    "findings_s_minus": 0,
+    "pass_id": "seam-s2",
+    "report_path": "scratch/lattice-c1/reports/seam-s2.md"
+  },
+  {
+    "clean_areas": "Repository return shapes vs runtime callers (pins return parsed cert/endpoints dicts; peers parsed via PeerStore; message_json TEXT re-parsed with terminal fallback; root-history \"\" placeholders truthiness-guarded); claim/release/mark_terminal owner+status guard predicates; inbound 202-only-after-commit custody write with duplicate-receipt short-circuit and FK ordering; rate-bucket save/load epoch round-trip and restore clamping; priority/created_at lexicographic ordering; expiry filter at claim; exception-guarded rate-limit persist/restore; topology/gossip cache calls (caps counts, transient-card round-trip, record_observation rowcount).",
+    "disputes": "None within scope. Two borderline items deliberately placed outside primary findings per assignment scope: (a) cold-sender unbounded _unresolved_domains + rate-limit bypass on the public messages route (runtime/api seam, likely another pass's assignment; side discovery); (b) api.py converting CustodyError \u2014 including transient sqlite3.OperationalError \u2014 into a final signed rejected receipt under 202 (protocol/durability seam, side discovery). Finding 1's practical harm is bounded by the cache DB being disposable by design; reported at L on the transaction-contract violation, not on user-visible damage.",
+    "enumeration": "Composed command: rg -n \"self\\.(_outbound|_inbound|_cache_repo|_peer_repo|_pin_repo|_peer_store|_block_store|_webhook_repo|_audit_repo|_rate_limiter|_topology|_gossip|_resolver)\\.[a-z_]+\\(\" lattice/runtime.py \u2014 40 call sites dispositioned in the report table: 3 findings, 1 S- mechanism, remainder examined-clean; storage-reaching calls inside TopologyService/GossipService traced by reading those files.",
+    "findings": [
+      {
+        "id": "hunt-s3#1",
+        "tier": "L",
+        "title": "Circuit-breaker cache writes never committed"
+      },
+      {
+        "id": "hunt-s3#2",
+        "tier": "L",
+        "title": "Expiry task expires in-flight leased delivery"
+      },
+      {
+        "id": "hunt-s3#3",
+        "tier": "L",
+        "title": "Claim re-select over-returns same-expiry rows"
+      },
+      {
+        "id": "hunt-s3#4",
+        "tier": "S-",
+        "title": "Shared-connection rollback loses concurrent claim"
+      }
+    ],
+    "findings_h": 0,
+    "findings_l": 3,
+    "findings_m": 0,
+    "findings_s_minus": 1,
+    "pass_id": "seam-s3",
+    "report_path": "scratch/lattice-c1/reports/seam-s3.md"
+  },
+  {
+    "clean_areas": "Single-implementation preimage (canonical.signature_preimage) used by every signer and verifier \u2014 no hand-rolled headers. well_known, operational_certificate, peer_card (both raw-dict and model_dump verifiers), message, transfer, rotation, contact_card, and webhook_envelope all agree on kind string, MEDIA_TYPE, canonicalization (JCS), signature-field strip sets, and the exact object signed; in-tree signer formats round-trip pydantic byte-identically (probed empirically). Cross-kind signature confusion impossible (kind inside preimage + disjoint field sets; pinned by test_vectors). Nested signature fields correctly not stripped. Crypto/encoding primitives clean. Root-key boundary respected (daemon never signs with a root key).",
+    "disputes": "Findings 1 and 2 independently reproduce hunt-b1b #2 and #5 (same mechanisms, traced from the seam side); they are reported for ledger completeness with explicit dedupe cross-references, not as new mechanisms. The certificate validity-window gap on the message path (hunt-g1 #2) was confirmed but not re-reported \u2014 not a preimage disagreement. Note: wave reports disagree on installed urllib3 (seam-s2 says 2.3.0, hunt-b1b says 2.7.0 per uv.lock); I observed both (system 2.3.0, lock 2.7.0) \u2014 both exhibit the kwargs TypeError, so the gating claim holds either way. No other disputes.",
+    "enumeration": "Ten signed kinds dispositioned via composed rg over all sign_*/verify_*/sign_object/verify_object/signature_preimage call sites: well_known (signer cli init/rotate, verifiers resolution.py/topology.py \u2014 clean), operational_certificate (create/verify via identity.py \u2014 clean; validity-window gap belongs to hunt-g1 #2), peer_card (gossip signer; runtime raw-dict verifier + topology model_dump verifier \u2014 agree for in-tree formats), message (runtime signer/verifier over raw wire dict \u2014 clean), receipt (signer messages.build_receipt; NO production verifier \u2014 Findings 1 and 2), block (no production signer or verifier \u2014 out-of-scope), transfer (cli preimage vs identity.verify_transfer \u2014 clean), rotation (cli 3-signature vs identity.verify_rotation \u2014 clean, no production verifier caller), contact_card (cli export/import \u2014 clean), webhook_envelope (runtime signer; verifier provided for external consumers per LOOSE_ENDS Phase 7 \u2014 clean). All test sites use the same production helpers; no divergent test-local preimage construction.",
+    "findings": [
+      {
+        "id": "seam-s4#1",
+        "tier": "M",
+        "title": "Final rejected receipt retried as retryable"
+      },
+      {
+        "id": "seam-s4#2",
+        "tier": "L",
+        "title": "Receipt signature never verified by sender"
+      }
+    ],
+    "findings_h": 0,
+    "findings_l": 1,
+    "findings_m": 1,
+    "findings_s_minus": 0,
+    "pass_id": "seam-s4",
+    "report_path": "scratch/lattice-c1/reports/seam-s4.md"
+  },
+  {
+    "clean_areas": "resolution.py (7 sites, all re-raise with cause); topology.py verification chain; identity/canonical/crypto/models/config error narrowing; gossip.py per-card reason reporting in 200 response; webhook.py retry classification; transport.py; all 21 cli.py sites (stderr + exit 1); storage migrations/cache; runtime.py recurring-task/bootstrap/rate-persist/gossip-sender-card/circuit-write failure paths; messages.py duplicate-receipt idempotency for same (message_id, from_node_id)",
+    "disputes": "None. Noted judgment calls: Finding 3's trigger requires a destination storage fault (environment-armed) \u2014 frequency ungroundable, mechanism and reachability traced; Finding 2's in-tree rejected-receipt producer via blocked-sender is TESTS ONLY today (no production block route), reachable in production via hostile peers or Finding 3's CustodyError path \u2014 marked as such, severity retained.",
+    "enumeration": "rg -n '\\bexcept\\b' lattice/ -g '*.py' --no-heading | wc -l \u2192 98 clauses (plain 'except' pattern yields 109 raw matches; 11 are exception_handler/logger.exception substrings). All 98 dispositioned in the report's instance table: 6 findings, 4 sites folded into findings, remainder clean. Pattern zero-checked against known sites (api.py:301 matches; api.py:137 decorator does not).",
+    "findings": [
+      {
+        "id": "hunt-q-error#1",
+        "tier": "H",
+        "title": "Unbounded cold-sender resolution queue, forever-retried at DEBUG"
+      },
+      {
+        "id": "hunt-q-error#2",
+        "tier": "M",
+        "title": "Sender retries final rejected receipt, mislabels it invalid"
+      },
+      {
+        "id": "hunt-q-error#3",
+        "tier": "M",
+        "title": "Transient storage failure becomes final rejected receipt"
+      },
+      {
+        "id": "hunt-q-error#4",
+        "tier": "M",
+        "title": "Unknown-sender errors as 401; canonical form terminal"
+      },
+      {
+        "id": "hunt-q-error#5",
+        "tier": "L",
+        "title": "Malformed to_address crashes handler with HTTP 500"
+      },
+      {
+        "id": "hunt-q-error#6",
+        "tier": "L",
+        "title": "Circuit-open failures erase messages without audit"
+      }
+    ],
+    "findings_h": 1,
+    "findings_l": 2,
+    "findings_m": 3,
+    "findings_s_minus": 0,
+    "pass_id": "q-error",
+    "report_path": "scratch/lattice-c1/reports/q-error.md"
+  },
+  {
+    "clean_areas": "Public routes match doc+nginx exactly (three routes, verbs, body sizes, loopback-only admin/health per invariant 3); \u00a710 limits all match constants.py; signature preimage/JCS/node-ID derivation match \u00a74/\u00a73.2; object schemas (well-known, cert, message, receipt, block, transfer) match doc tables; gossip request/response contract and identity-keyed rate limiting match \u00a75.2; all documented CLI commands/flags exist; file modes and credential names match KEY_MANAGEMENT.md and lattice.service; MIGRATIONS.md claims all verified in migrations.py (integrity/fk checks, backup, user_version refusal, cumulative order) and cache recreate-on-mismatch; ADDRESSING.md parse_address examples, fingerprints, trust-reset and transfer flows match code.",
+    "disputes": "hunt-e2's clean claim \"Problem-details constants match doc \u00a79\" is wrong for the example-code table (only LATTICE_RATE_LIMITED overlaps \u2014 my finding 3). Overlaps verified-not-re-reported: cert/card expiry non-enforcement (hunt-e1#1, hunt-f2#1), sequence monotonicity absent (hunt-e1#3), \u00a711 media-type gap (hunt-e2#2, empirically re-confirmed here), malformed-address 500 (seam-s1#4, re-confirmed), 401-for-structural (hunt-a1#6), transport faults (hunt-b1b/seam-s2). Finding 1 is GATED behind hunt-b1b#1 (transport TypeError re-verified in venv) \u2014 daemon exits before the pin-overwrite upsert today; repairing the transport without a pin-mismatch check ships it.",
+    "enumeration": "Five composed two-sided comparisons published in the report: ENUM 1 signed-object kinds (doc \u00a74.4 vs code literals; only delta webhook_envelope, code-only, cross-ref hunt-e2 side 3); ENUM 2 error codes (doc \u00a79 table vs constants.py; 6 doc-only, 8 code-only, 1 overlap \u2192 finding 3); ENUM 3 routes (api.py+nginx vs doc \u00a75; admin/health intended per invariant 3); ENUM 4 limits (\u00a710 vs constants.py; all match); ENUM 5 CLI commands (3 docs vs parser; all exist, only init --force has semantic drift \u2192 finding 2).",
+    "findings": [
+      {
+        "id": "q-contract#1",
+        "tier": "H",
+        "title": "Bootstrap restart silently rewrites pinned domain binding"
+      },
+      {
+        "id": "q-contract#2",
+        "tier": "M",
+        "title": "Documented init --force recovery destroys root key"
+      },
+      {
+        "id": "q-contract#3",
+        "tier": "L",
+        "title": "Six of seven documented error codes nonexistent"
+      },
+      {
+        "id": "q-contract#4",
+        "tier": "L",
+        "title": "30-day audit retention never implemented"
+      },
+      {
+        "id": "q-contract#5",
+        "tier": "L",
+        "title": "Cold-sender 503 absent from normative spec"
+      }
+    ],
+    "findings_h": 1,
+    "findings_l": 3,
+    "findings_m": 1,
+    "findings_s_minus": 0,
+    "pass_id": "q-contract",
+    "report_path": "scratch/lattice-c1/reports/q-contract.md"
+  },
+  {
+    "pass_id": "hunt-b1a",
+    "report_path": "scratch/lattice-c1/reports/hunt-b1a.md",
+    "clean_areas": "see report",
+    "enumeration": "see report",
+    "disputes": "see report",
+    "findings_h": 1,
+    "findings_m": 0,
+    "findings_l": 1,
+    "findings_s_minus": 0,
+    "findings": [
+      {
+        "id": "hunt-b1a#1",
+        "tier": "H",
+        "title": "Shared durable connection: one thread's failed repository block rolls back other"
+      },
+      {
+        "id": "hunt-b1a#2",
+        "tier": "L",
+        "title": "`_RecurringTask` first-run arithmetic delays all maintenance on freshly booted h"
+      }
+    ]
+  },
+  {
+    "pass_id": "hunt-b1b",
+    "report_path": "scratch/lattice-c1/reports/hunt-b1b.md",
+    "clean_areas": "see report",
+    "enumeration": "see report",
+    "disputes": "see report",
+    "findings_h": 1,
+    "findings_m": 2,
+    "findings_l": 2,
+    "findings_s_minus": 0,
+    "findings": [
+      {
+        "id": "hunt-b1b#1",
+        "tier": "H",
+        "title": "`OutboundTransport.request()` raises `TypeError` on every call: all outbound fed"
+      },
+      {
+        "id": "hunt-b1b#2",
+        "tier": "M",
+        "title": "A final `rejected` receipt (HTTP 202) is retried as a retryable failure, contrad"
+      },
+      {
+        "id": "hunt-b1b#3",
+        "tier": "M",
+        "title": "`_resolve_pending_senders` never drops failed domains; the unresolved set grows "
+      },
+      {
+        "id": "hunt-b1b#4",
+        "tier": "L",
+        "title": "(latent, gated behind finding 1) Redirect following bypasses `NetworkPolicy` (SS"
+      },
+      {
+        "id": "hunt-b1b#5",
+        "tier": "L",
+        "title": "(latent) The custody receipt's signature is never verified; the sender trusts a "
+      }
+    ]
+  },
+  {
+    "pass_id": "hunt-b1c",
+    "report_path": "scratch/lattice-c1/reports/hunt-b1c.md",
+    "clean_areas": "see report",
+    "enumeration": "see report",
+    "disputes": "see report",
+    "findings_h": 1,
+    "findings_m": 1,
+    "findings_l": 3,
+    "findings_s_minus": 0,
+    "findings": [
+      {
+        "id": "hunt-b1c#1",
+        "tier": "H",
+        "title": "Cold-sender domain queue never drains failed domains: unbounded growth and etern"
+      },
+      {
+        "id": "hunt-b1c#2",
+        "tier": "M",
+        "title": "Recipient-ownership guard ignores canonical node-ID addressing: custody accepted"
+      },
+      {
+        "id": "hunt-b1c#3",
+        "tier": "L",
+        "title": "Malformed `from_address`/`to_address` raises unhandled `AddressError`: HTTP 500 "
+      },
+      {
+        "id": "hunt-b1c#4",
+        "tier": "L",
+        "title": "Transient custody-write failure is converted into a final signed \"rejected\" rece"
+      },
+      {
+        "id": "hunt-b1c#5",
+        "tier": "L",
+        "title": "Per-minute rate below 1.0 permanently locks out all inbound traffic (LATENT)"
+      }
+    ]
+  }
+]
