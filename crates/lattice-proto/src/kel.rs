@@ -267,6 +267,11 @@ pub enum KelRelation {
 
 /// Compare a validated candidate chain against a known head.
 ///
+/// Only the boundary commitment is held, so a candidate that ends before the
+/// known seq cannot be distinguished from a prefix of what we held; such
+/// candidates are reported as `Behind` (rejected either way). Full-chain
+/// fork detection requires retaining the chain or its commitments.
+///
 /// `commitments` is the per-event commitment list of the candidate chain.
 pub fn classify(
     known_seq: u64,
@@ -274,9 +279,11 @@ pub fn classify(
     candidate: &[KeyEvent],
 ) -> KelRelation {
     let commitments: Vec<[u8; 32]> = candidate.iter().map(|e| e.commitment()).collect();
-    let known_idx = known_seq as usize;
-    if known_idx < commitments.len() {
-        if commitments[known_idx] == *known_commitment {
+    // We only hold the head commitment, not the full known chain: only the
+    // boundary position can be compared directly. A candidate that at least
+    // reaches our known seq must commit to the same event there.
+    if (known_seq as usize) < commitments.len() {
+        return if commitments[known_seq as usize] == *known_commitment {
             if commitments.len() as u64 == known_seq + 1 {
                 KelRelation::Same
             } else {
@@ -284,15 +291,10 @@ pub fn classify(
             }
         } else {
             KelRelation::Divergent
-        }
-    } else if commitments.len() as u64 == known_seq + 1 {
-        KelRelation::Same
-    } else {
-        // Candidate is shorter than the known head: only valid if it is a
-        // prefix of what we know, which the caller can only confirm if it
-        // retains the full known chain; treat as behind.
-        KelRelation::Behind
+        };
     }
+    // Candidate ends at or before our known seq.
+    KelRelation::Behind
 }
 
 /// The identifier a KEL belongs to: hash of the inception event's unsigned encoding.
@@ -302,4 +304,39 @@ pub fn identifier(events: &[KeyEvent]) -> Result<[u8; 32], ProtoError> {
         return Err(ProtoError::BadKeyLog("first event is not an inception"));
     }
     Ok(hash(&encode(&first.unsigned_value())))
+}
+
+/// Encode a KEL as the concatenated event encodings preceded by a u32 count.
+/// This is a private serialization for on-disk storage, not a wire format.
+pub fn encode_kel(events: &[KeyEvent]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&(events.len() as u32).to_le_bytes());
+    for e in events {
+        let bytes = e.encode();
+        out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        out.extend_from_slice(&bytes);
+    }
+    out
+}
+
+/// Decode a KEL written by [`encode_kel`].
+pub fn decode_kel(bytes: &[u8]) -> Result<Vec<KeyEvent>, ProtoError> {
+    fn take<'a>(buf: &'a [u8], at: &mut usize, n: usize) -> Result<&'a [u8], ProtoError> {
+        if *at + n > buf.len() {
+            return Err(ProtoError::BadKeyLog("truncated KEL file"));
+        }
+        let out = &buf[*at..*at + n];
+        *at += n;
+        Ok(out)
+    }
+    let mut at = 0usize;
+    let count = u32::from_le_bytes(take(bytes, &mut at, 4)?.try_into().unwrap()) as usize;
+    let mut events = Vec::with_capacity(count.min(1024));
+    for _ in 0..count {
+        let len = u32::from_le_bytes(take(bytes, &mut at, 4)?.try_into().unwrap()) as usize;
+        let raw = take(bytes, &mut at, len)?;
+        events.push(KeyEvent::from_bytes(raw)?);
+    }
+    KeyEvent::validate_chain(&events)?;
+    Ok(events)
 }

@@ -494,23 +494,20 @@ impl Message {
 
     /// After a waypoint replaces the header with the inner routing header,
     /// the gateway layer it carried (if any) becomes the hop layer; the
-    /// message is re-padded to the same bucket.
+    /// message is re-padded to the SAME bucket it arrived in, so the leg
+    /// change is invisible on the wire.
     pub fn into_after_waypoint(self, inner: HopLayerPlain) -> Result<Vec<u8>, ProtoError> {
-        let new_header = match inner {
-            HopLayerPlain::Waypoint { hdr, inner } => (hdr, inner.map(|b| *b)), // unbox: SealedLayer moves into assemble()
+        let (hdr, gw_layer) = match inner {
+            HopLayerPlain::Waypoint { hdr, inner } => (hdr, inner.map(|b| *b)),
             HopLayerPlain::Gateway { .. } => {
                 return Err(ProtoError::Invalid(
                     "gateway layer cannot be unwrapped as a waypoint",
                 ));
             }
         };
-        let (hdr, gw_layer) = new_header;
-        for bucket in MESSAGE_BUCKETS {
-            if let Some(bytes) = assemble(&hdr, &gw_layer, &self.envelope, bucket) {
-                return Ok(bytes);
-            }
-        }
-        Err(ProtoError::TooBig(usize::MAX))
+        // Preserve the arrival bucket exactly; refuse rather than shrink.
+        assemble(&hdr, &gw_layer, &self.envelope, self.total_len)
+            .ok_or(ProtoError::TooBig(self.total_len))
     }
 
     /// Decrypt the envelope with the recipient's key. The AAD is the routing

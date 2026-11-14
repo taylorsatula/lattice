@@ -112,6 +112,8 @@ pub struct PingFrame {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DummyFrame {
     pub echo: bool,
+    /// Zero padding sized so the whole frame lands in a chosen bucket.
+    pub pad: Vec<u8>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -207,7 +209,18 @@ impl Range {
     }
 
     fn from_value(v: &Value) -> Result<Self, ProtoError> {
+        v.deny_unknown_keys(&[0, 1, 2, 3])?;
         let (lower, upper) = Self::parse_bounds(v)?;
+        if v.get_key(2)?.is_some() && v.get_key(3)?.is_some() {
+            return Err(ProtoError::Invalid(
+                "range must carry fingerprint (key 2) or entries (key 3), not both",
+            ));
+        }
+        if let (Some((lo_id, lo_scope)), Some((hi_id, hi_scope))) = (&lower, &upper) {
+            if (lo_id, lo_scope) > (hi_id, hi_scope) {
+                return Err(ProtoError::Invalid("range lower bound exceeds upper bound"));
+            }
+        }
         if let Some(fp) = v.get_key(2)? {
             let arr = fp.as_array().ok_or(ProtoError::WrongType(2, "array"))?;
             if arr.len() != 2 {
@@ -364,10 +377,16 @@ impl Frame {
                 (Value::UInt(0), Value::UInt(T_PING)),
                 (Value::UInt(2), Value::UInt(f.nonce)),
             ]),
-            Frame::Dummy(f) => Value::map(vec![
-                (Value::UInt(0), Value::UInt(T_DUMMY)),
-                (Value::UInt(2), Value::Bool(f.echo)),
-            ]),
+            Frame::Dummy(f) => {
+                let mut pairs = vec![
+                    (Value::UInt(0), Value::UInt(T_DUMMY)),
+                    (Value::UInt(2), Value::Bool(f.echo)),
+                ];
+                if !f.pad.is_empty() {
+                    pairs.push((Value::UInt(3), Value::Bytes(f.pad.clone())));
+                }
+                Value::map(pairs)
+            }
         }
     }
 
@@ -494,9 +513,17 @@ impl Frame {
                 }))
             }
             T_DUMMY => {
-                v.deny_unknown_keys(&[0, 2])?;
+                v.deny_unknown_keys(&[0, 2, 3])?;
+                let pad = match v.get_key(3)? {
+                    Some(p) => p
+                        .as_bytes()
+                        .ok_or(ProtoError::WrongType(3, "bytes"))?
+                        .to_vec(),
+                    None => Vec::new(),
+                };
                 Ok(Frame::Dummy(DummyFrame {
                     echo: v.req_bool(2)?,
+                    pad,
                 }))
             }
             _ => Err(ProtoError::Invalid("unknown frame type")),

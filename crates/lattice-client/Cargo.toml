@@ -9,3 +9,11 @@ repository.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+lattice-proto = { version = "0.0.0", path = "../lattice-proto" }
+tokio = { version = "1", features = ["io-util", "net", "io-std", "rt", "sync", "time", "macros"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["full"] }

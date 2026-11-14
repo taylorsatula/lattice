@@ -12,6 +12,8 @@ name = "latticectl"
 path = "src/main.rs"
 
 [dependencies]
+lattice-client = { version = "0.0.0", path = "../lattice-client" }
+tokio = { version = "1", features = ["rt"] }
 
 [lints]
 workspace = true

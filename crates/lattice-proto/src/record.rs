@@ -408,6 +408,13 @@ impl PeerRecord {
     }
 }
 
+impl PeerRecord {
+    /// The current signing key (last validated KEL event).
+    pub fn current_signing_key(&self) -> [u8; 32] {
+        self.kel.last().expect("validated KEL is non-empty").key
+    }
+}
+
 pub fn record_hash(bytes: &[u8]) -> [u8; 32] {
     hash(bytes)
 }

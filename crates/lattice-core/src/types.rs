@@ -1,5 +1,7 @@
 //! Public types for the core: events, actions, config, identity.
 
+use lattice_proto::record::Mode;
+
 /// Link identifier assigned by the transport (simulator or sockets layer).
 pub type LinkId = u64;
 
@@ -24,7 +26,8 @@ pub enum Event {
     LinkUp {
         at: u64,
         link: LinkId,
-        peer: [u8; 32],
+        peer: Option<[u8; 32]>,
+        remote_ck: [u8; 32],
         wan: bool,
     },
     LinkDown {
@@ -81,7 +84,6 @@ pub enum Action {
 pub struct Config {
     pub snow_per_min: f64,
     pub echo_share: f64,
-    pub hold_ms: u64,
     pub sideways_prob: f64,
     pub waypoint_share: f64,
     pub receipt_timeout_public: u64,
@@ -102,6 +104,12 @@ pub struct Config {
     pub wary_list_max: usize,
     pub default_message_horizon: u64,
     pub rng_seed: u64,
+    /// Endpoints to publish in our record (public mode). `wss://host[:port]/` URLs.
+    pub advertise: Vec<String>,
+    /// Gateway node ids for a private node's record (1-3, private mode only).
+    pub gateways: Vec<[u8; 32]>,
+    /// Public or private record mode.
+    pub mode: Mode,
 }
 
 impl Default for Config {
@@ -109,7 +117,6 @@ impl Default for Config {
         Config {
             snow_per_min: 2.0,
             echo_share: 0.25,
-            hold_ms: 0,
             sideways_prob: 0.15,
             waypoint_share: 0.0,
             receipt_timeout_public: 15 * 60,
@@ -127,6 +134,9 @@ impl Default for Config {
             wary_list_max: 32,
             default_message_horizon: 3 * 24 * 3600,
             rng_seed: 0x5eed_u64,
+            advertise: Vec::new(),
+            gateways: Vec::new(),
+            mode: Mode::Public,
         }
     }
 }

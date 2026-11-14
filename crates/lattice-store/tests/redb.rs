@@ -35,6 +35,7 @@ fn outbound(mid_byte: u8) -> OutboundMessage {
         receipt_deadline: Some(9_999_999_000),
         attempts: 0,
         next_attempt: 0,
+        route: 0,
     }
 }
 

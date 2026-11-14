@@ -318,3 +318,47 @@ fn receipt_roundtrip() {
     assert_eq!(opened.kind, KIND_RECEIPT);
     assert_eq!(opened.reference, Some([0x55; 16]));
 }
+
+#[test]
+fn waypoint_repack_preserves_bucket() {
+    let from_seed = generate_seed();
+    let from_pk = lattice_crypto::public_key(&from_seed);
+    let recipient_kp = generate_keypair();
+    let wp_kp = generate_keypair();
+    let recipient_id = lattice_crypto::hash(b"recipient");
+    let waypoint_id = lattice_crypto::hash(b"waypoint");
+
+    let body = vec![0u8; 4000]; // seals into the 8192 bucket
+    let env = Envelope {
+        body: Some(body.clone()),
+        ..envelope_for(&from_seed, b"sink")
+    };
+    let built = Message::build(BuildParams {
+        envelope: env,
+        sender_seed: &from_seed,
+        recipient_ek: &recipient_kp.public,
+        real_dst: recipient_id,
+        leg: [0x11; 16],
+        exp: EXP,
+        gateway: None,
+        waypoint: Some(WaypointSeal {
+            waypoint_id,
+            waypoint_ek: wp_kp.public,
+            leg: [0x22; 16],
+            exp: EXP,
+        }),
+    })
+    .unwrap();
+    let bucket = built.len();
+    assert_eq!(bucket, lattice_proto::MESSAGE_BUCKETS[1]);
+
+    let msg = Message::parse(&built, NOW).unwrap();
+    let inner = msg.open_hop_layer(&wp_kp.secret).unwrap();
+    let out = msg.into_after_waypoint(inner).unwrap();
+    assert_eq!(out.len(), bucket, "bucket must survive the waypoint re-pad");
+
+    let msg2 = Message::parse(&out, NOW).unwrap();
+    let opened = msg2.open_envelope(&recipient_kp.secret).unwrap();
+    assert_eq!(opened.body.as_deref(), Some(body.as_slice()));
+    assert!(opened.verify_signature(&from_pk, msg2.routing_header_bytes()));
+}

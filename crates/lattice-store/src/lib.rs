@@ -48,6 +48,9 @@ pub struct OutboundMessage {
     pub attempts: u32,
     /// Next allowed attempt time (backoff).
     pub next_attempt: u64,
+    /// 0 = default routing (waypoint share decides), 1 = force waypoint, 2 = force direct.
+    #[serde(default)]
+    pub route: u8,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -69,7 +72,9 @@ pub struct CustodyEntry {
     pub exp: u64,
     pub lease_until: u64,
     /// Neighbors that already answered busy/already-have for this leg.
-    pub excluded: Vec<u64>,
+    /// Neighbors that already replied busy/already-have for this leg,
+    /// with the unix time after which they may be retried.
+    pub excluded: Vec<(u64, u64)>,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]

@@ -381,3 +381,180 @@ fn everyone_flooding_still_delivers() {
     let expected_at_least = 5;
     assert!(sim.deliveries.len() >= expected_at_least);
 }
+
+#[test]
+fn forged_envelope_is_not_delivered() {
+    use lattice_proto::message::{BuildParams, Envelope, KIND_MESSAGE, Message};
+    use lattice_proto::record::{PeerRecord, Scope};
+    use lattice_store::Store;
+
+    let mut sim = Sim::new(fast_config());
+    for _ in 0..3 {
+        sim.add_node();
+    }
+    full_mesh(&mut sim, 3);
+    sim.run_for(5); // converge: everyone holds everyone's records
+
+    // Attacker crafts a message claiming to be from node 0 to node 1,
+    // signed with the attacker's key (not node 0's key).
+    let attacker_seed = lattice_crypto::generate_seed();
+    let victim_id = sim.ids[0];
+    let target_id = sim.ids[1];
+    let target_rec = sim.nodes[1]
+        .store_ref()
+        .record_get(&target_id, Scope::Wan)
+        .unwrap()
+        .unwrap()
+        .0;
+    let (target_rec, _) = PeerRecord::from_bytes(&target_rec, 0, None).unwrap();
+
+    let envelope = Envelope {
+        kind: KIND_MESSAGE,
+        mid: [0xEE; 16],
+        from: victim_id,
+        fsvc: "test".into(),
+        fmbx: b"outbox".to_vec(),
+        tsvc: "test".into(),
+        tmbx: b"inbox".to_vec(),
+        created: 1_800_000_000,
+        body: Some(b"forged".to_vec()),
+        reference: None,
+        reason: None,
+        sig: [0; 64],
+    };
+    let msg = Message::build(BuildParams {
+        envelope,
+        sender_seed: &attacker_seed,
+        recipient_ek: &target_rec.envelope_key,
+        real_dst: target_id,
+        leg: [0x42; 16],
+        exp: 1_900_000_000,
+        gateway: None,
+        waypoint: None,
+    })
+    .unwrap();
+
+    let link_01 = sim.link_between(0, 1).unwrap();
+    sim.inject_offer(1, link_01, msg);
+    sim.run_for(10);
+    assert!(
+        sim.deliveries.iter().all(|d| d.mid != [0xEE; 16]),
+        "forged envelope must not be delivered"
+    );
+    assert_eq!(
+        sim.custody_count(1),
+        0,
+        "forged offer must not be accepted into custody"
+    );
+}
+
+#[test]
+fn custody_drains_after_delivery() {
+    let mut cfg = fast_config();
+    cfg.waypoint_share = 1.0;
+    let mut sim = Sim::new(cfg);
+    for _ in 0..4 {
+        sim.add_node();
+    }
+    full_mesh(&mut sim, 4);
+    sim.run_for(5);
+    let to = sim.ids[3];
+    let send = lattice_core::AppSend {
+        service: "test".into(),
+        mid_hint: Some([0x77; 16]),
+        to,
+        tsvc: "test".into(),
+        tmbx: b"inbox".to_vec(),
+        fmbx: b"outbox".to_vec(),
+        body: b"track me".to_vec(),
+        exp: None,
+        priority: 1,
+        route: 1,
+    };
+    sim.force_app_send(0, send);
+    sim.run_for(20);
+    assert!(sim.deliveries.iter().any(|d| d.body == b"track me"));
+    for (i, node) in sim.nodes.iter().enumerate() {
+        assert_eq!(
+            node.debug_custody_count(),
+            0,
+            "node {i} still holds custody after delivery"
+        );
+    }
+}
+
+#[test]
+fn contested_channel_key_claim_unbinds_link() {
+    use lattice_proto::record::{Mode, PeerRecord, RecordParams, Scope};
+
+    // a--b unpinned both ways; a--attacker unpinned as well.
+    let mut sim = Sim::new(fast_config());
+    let a = sim.add_node();
+    let b = sim.add_node();
+    let att = sim.add_node();
+    sim.connect_unpinned(a, b);
+    sim.connect_unpinned(a, att);
+    sim.run_for(5);
+
+    // With only honest records in flight, `a` binds both links by channel key
+    // and can route to `b`.
+    let mid = sim.app_send(a, b, b"before contest");
+    sim.run_for(10);
+    assert_eq!(
+        sim.deliveries.iter().filter(|d| d.mid == mid).count(),
+        1,
+        "message should route over the uncontested link"
+    );
+
+    // The attacker signs a record binding the *victim's* (b's) channel key to
+    // the attacker's own id — a perfectly valid signature, a bogus claim.
+    let att_id = sim.ids[att];
+    let b_ck = sim.channel_keys[&sim.ids[b]];
+    // Rebuild a signing identity for the attacker is not available here; the
+    // attacker node signs with its own KEL, so craft the record by hand with
+    // a fresh attacker identity instead of the sim's.
+    let attacker = lattice_core::Identity::generate();
+    let forged = PeerRecord::build(
+        RecordParams {
+            kel: attacker.kel.clone(),
+            seq: 1,
+            exp: 1_000_000,
+            channel_key: b_ck, // the theft: b's channel key under a foreign id
+            envelope_key: [9u8; 1216],
+            mode: Mode::Public,
+            scope: Scope::Wan,
+            endpoints: vec![],
+            links: vec![],
+            gateways: vec![],
+            capabilities: 0,
+        },
+        &attacker.signing_seed,
+    )
+    .unwrap()
+    .encode();
+    let _ = att_id;
+
+    let att_link = sim.link_between(a, att).unwrap();
+    sim.inject_frame(
+        a,
+        att_link,
+        lattice_proto::frames::Frame::Records(lattice_proto::frames::RecordsFrame {
+            records: vec![forged],
+        }),
+    );
+    sim.run_for(2);
+
+    // The claim set for b's channel key is now {b, attacker}; a must refuse to
+    // attribute the link and must not route to b either way.
+    assert!(
+        sim.nodes[a].debug_contested() >= 1,
+        "contested claim must be counted"
+    );
+    let mid2 = sim.app_send(a, b, b"after contest");
+    sim.run_for(15);
+    assert_eq!(
+        sim.deliveries.iter().filter(|d| d.mid == mid2).count(),
+        0,
+        "contested link must not be used for routing"
+    );
+}

@@ -113,6 +113,15 @@ impl Value {
     }
 }
 
+/// Look up a uint-keyed field in a CBOR map. Returns `None` if `v` is not a
+/// map or the key is absent.
+pub fn map_get(v: &Value, key: u64) -> Option<&Value> {
+    v.as_map()?
+        .iter()
+        .find(|(k, _)| k.as_uint() == Some(key))
+        .map(|(_, v)| v)
+}
+
 // ---------- encoding ----------
 
 pub fn encode(value: &Value) -> Vec<u8> {

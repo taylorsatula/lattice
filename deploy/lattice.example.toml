@@ -1,0 +1,51 @@
+# latticed configuration. Everything except identity_dir, listen and services
+# has a default; unknown keys are rejected.
+
+# Where the node's secret keys and identity live. Created by `latticed init`.
+identity_dir = "/var/lib/lattice"
+
+# "public" (accepts connections, publishes endpoints) or "private"
+# (no endpoints/links in the record; reached via gateways).
+mode = "public"
+
+# WebSocket listeners. Loopback-only nodes can use ["127.0.0.1:8443"].
+listen = ["0.0.0.0:8443"]
+
+# Endpoints advertised in this node's record (public mode). Required for
+# other nodes to dial you; otherwise use hive/roots-based setups.
+# advertise = ["wss://node.example.net:8443/"]
+
+# Peers to dial at startup. Give each either a channel_key (IK handshake)
+# or a path (XX upgrade path). Optional id pins the expected peer.
+# [[roots]]
+# addr = "203.0.113.10:8443"
+# channel_key = "<64 hex>"
+# id = "<64 hex, optional>"
+
+# Private mode only: 1-3 gateway node ids this node is reachable through.
+# gateways = ["<64 hex>"]
+
+# CIDRs making up the hive. Multicast discovery is not implemented yet;
+# this is parsed and reserved.
+# hive = ["10.0.0.0/8"]
+
+# Application socket (0660) and admin socket (0600). systemd provides
+# /run/lattice when using RuntimeDirectory=lattice.
+app_socket = "/run/lattice/app.sock"
+admin_socket = "/run/lattice/admin.sock"
+
+# Optional /status endpoint on the listener. 404s everything when false.
+status = true
+
+# Services that may use the application socket. Each secret must be at
+# least 16 bytes; generate with: openssl rand -hex 32
+[services]
+mira = { secret = "change-me-0123456789abcdef" }
+
+[limits]
+# custody_allowance = 4194304      # bytes of custody per upstream link
+# transit_cap = 268435456         # total bytes held in transit
+# inbox_max = 1024                # deliveries per service inbox
+# snow_per_min = 2.0
+# sideways_prob = 0.15
+# waypoint_share = 0.0

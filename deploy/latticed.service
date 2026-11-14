@@ -1,0 +1,56 @@
+# latticed — lattice node daemon.
+# Install: cp latticed /usr/local/bin/ (or /usr/bin), cp lattice.example.toml /etc/lattice/lattice.toml,
+# systemctl daemon-reload && systemctl enable --now latticed
+[Unit]
+Description=Lattice node daemon
+Documentation=https://github.com/taylorsatula/lattice
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Runs as root because there is no package yet to create a system user.
+# systemd still creates and owns the state/runtime dirs; the sandbox below
+# (ProtectSystem, ProtectHome, no new privileges, restricted address families)
+# limits what root can protect the host. Once the package creates an
+# dedicated 'latticed' user, add: User=latticed
+# Group=latticed, and chown /var/lib/lattice and /run/lattice accordingly.
+StateDirectory=lattice
+StateDirectoryMode=0700
+ConfigurationDirectory=lattice
+ConfigurationDirectoryMode=0750
+RuntimeDirectory=lattice
+RuntimeDirectoryMode=0750
+
+# Option A (default): encrypted/seeded identity in /var/lib/lattice (0700).
+# Option B: systemd credentials instead of files — uncomment and remove the files:
+# LoadCredential=signing_seed:/etc/lattice/keys/signing_seed
+# LoadCredential=channel_seed:/etc/lattice/keys/channel_seed
+# LoadCredential=envelope_seed:/etc/lattice/keys/envelope_seed
+# LoadCredential=next_signing_seed:/etc/lattice/keys/next_signing_seed
+
+ExecStart=/usr/bin/latticed run --config /etc/lattice/lattice.toml
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=15
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+RestrictRealtime=true
+UMask=0077
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

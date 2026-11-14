@@ -48,6 +48,7 @@ pub struct Delivery {
 pub struct Sim {
     pub nodes: Vec<Node<MemStore>>,
     pub ids: Vec<[u8; 32]>,
+    pub channel_keys: std::collections::HashMap<[u8; 32], [u8; 32]>,
     links: Vec<Link>,
     next_link: u64,
     now: u64,
@@ -73,6 +74,7 @@ impl Sim {
             seq: 0,
             deliveries: Vec::new(),
             statuses: Vec::new(),
+            channel_keys: std::collections::HashMap::new(),
             frame_counts: std::collections::HashMap::new(),
             configs: Vec::new(),
             prototype,
@@ -85,14 +87,11 @@ impl Sim {
         let mut cfg = self.configs_prototype();
         cfg.rng_seed = seed;
         let store = MemStore::new();
-        let node = Node::new(
-            cfg.clone(),
-            lattice_core::Identity::generate(),
-            store,
-            self.now,
-        )
-        .expect("node construction");
+        let identity = lattice_core::Identity::generate();
+        let channel_key = lattice_crypto::x25519_public(&identity.channel_seed);
+        let node = Node::new(cfg.clone(), identity, store, self.now).expect("node construction");
         let id = node.own_id;
+        self.channel_keys.insert(id, channel_key);
         self.nodes.push(node);
         self.ids.push(id);
         let idx = self.nodes.len() - 1;
@@ -126,15 +125,41 @@ impl Sim {
         self.nodes[a].handle(Event::LinkUp {
             at: self.now,
             link: id,
-            peer: self.ids[b],
+            peer: Some(self.ids[b]),
+            remote_ck: self.channel_keys[&self.ids[b]],
             wan: true,
         });
         self.nodes[b].handle(Event::LinkUp {
             at: self.now,
             link: id,
-            peer: self.ids[a],
+            peer: Some(self.ids[a]),
+            remote_ck: self.channel_keys[&self.ids[a]],
             wan: true,
         });
+        id
+    }
+
+    /// Connect two nodes without pinning either side's peer id (as an
+    /// inbound/unsolicited link behaves); attribution must come from records.
+    pub fn connect_unpinned(&mut self, a: NodeIndex, b: NodeIndex) -> u64 {
+        let id = self.next_link;
+        self.next_link += 1;
+        self.links.push(Link {
+            id,
+            a,
+            b,
+            up: true,
+            latency_ticks: 0,
+        });
+        for (from, to) in [(a, b), (b, a)] {
+            self.nodes[from].handle(Event::LinkUp {
+                at: self.now,
+                link: id,
+                peer: None,
+                remote_ck: self.channel_keys[&self.ids[to]],
+                wan: true,
+            });
+        }
         id
     }
 
@@ -153,13 +178,15 @@ impl Sim {
             self.nodes[a].handle(Event::LinkUp {
                 at: self.now,
                 link: link_id,
-                peer: self.ids[b],
+                peer: Some(self.ids[b]),
+                remote_ck: self.channel_keys[&self.ids[b]],
                 wan: true,
             });
             self.nodes[b].handle(Event::LinkUp {
                 at: self.now,
                 link: link_id,
-                peer: self.ids[a],
+                peer: Some(self.ids[a]),
+                remote_ck: self.channel_keys[&self.ids[a]],
                 wan: true,
             });
         } else {
@@ -210,6 +237,15 @@ impl Sim {
                 from: self.ids[from],
                 frame,
             },
+        );
+    }
+
+    /// Wrap a message in an Offer frame and inject it at `target`.
+    pub fn inject_offer(&mut self, target: NodeIndex, link: u64, message: Vec<u8>) {
+        self.inject_frame(
+            target,
+            link,
+            lattice_proto::frames::Frame::Offer(lattice_proto::frames::OfferFrame { message }),
         );
     }
 
@@ -383,26 +419,30 @@ impl Sim {
                 self.nodes[a].handle(Event::LinkUp {
                     at: self.now,
                     link: lid,
-                    peer: self.ids[b],
+                    peer: Some(self.ids[b]),
+                    remote_ck: self.channel_keys[&self.ids[b]],
                     wan: true,
                 });
                 self.nodes[b].handle(Event::LinkUp {
                     at: self.now,
                     link: lid,
-                    peer: self.ids[a],
+                    peer: Some(self.ids[a]),
+                    remote_ck: self.channel_keys[&self.ids[a]],
                     wan: true,
                 });
             } else if b == idx {
                 self.nodes[b].handle(Event::LinkUp {
                     at: self.now,
                     link: lid,
-                    peer: self.ids[a],
+                    peer: Some(self.ids[a]),
+                    remote_ck: self.channel_keys[&self.ids[a]],
                     wan: true,
                 });
                 self.nodes[a].handle(Event::LinkUp {
                     at: self.now,
                     link: lid,
-                    peer: self.ids[b],
+                    peer: Some(self.ids[b]),
+                    remote_ck: self.channel_keys[&self.ids[b]],
                     wan: true,
                 });
             }

@@ -176,6 +176,13 @@ pub fn respond(
     let mut out = Vec::new();
     let mut wants = Vec::new();
     for m in msgs {
+        // Reject inverted ranges before doing any arithmetic on them.
+        let (lo, hi) = range_parts(m);
+        if let (Some(l), Some(h)) = (lo, hi) {
+            if l > h {
+                continue;
+            }
+        }
         match m {
             Range::Fingerprint {
                 lower,
@@ -244,9 +251,12 @@ pub fn respond(
                     }
                 }
                 for (id, scope, seq) in entries {
-                    match items.binary_search_by(|i| i.key().cmp(&(*id, *scope))) {
-                        Ok(idx) if items[idx].seq >= *seq => {}
-                        _ => wants.push((*id, *scope)),
+                    let want = match items.binary_search_by(|i| i.key().cmp(&(*id, *scope))) {
+                        Ok(idx) => items[idx].seq < *seq,
+                        Err(_) => true,
+                    };
+                    if want && !wants.contains(&(*id, *scope)) {
+                        wants.push((*id, *scope));
                     }
                 }
             }
