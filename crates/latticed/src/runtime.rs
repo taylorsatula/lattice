@@ -189,6 +189,7 @@ impl Runtime {
             snow_per_min: cfg.limits.snow_per_min,
             sideways_prob: cfg.limits.sideways_prob,
             waypoint_share: cfg.limits.waypoint_share,
+            reconcile_interval_secs: cfg.limits.reconcile_interval_secs,
             custody_allowance: cfg.limits.custody_allowance,
             transit_cap: cfg.limits.transit_cap,
             inbox_max_deliveries: cfg.limits.inbox_max,

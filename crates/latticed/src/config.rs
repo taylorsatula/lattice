@@ -98,6 +98,9 @@ pub struct Limits {
     pub sideways_prob: f64,
     #[serde(default)]
     pub waypoint_share: f64,
+    /// Anti-entropy (record gossip) interval, seconds.
+    #[serde(default = "default_reconcile_interval_secs")]
+    pub reconcile_interval_secs: u64,
 }
 
 impl Default for Limits {
@@ -109,6 +112,7 @@ impl Default for Limits {
             snow_per_min: default_snow_per_min(),
             sideways_prob: default_sideways_prob(),
             waypoint_share: 0.0,
+            reconcile_interval_secs: default_reconcile_interval_secs(),
         }
     }
 }
@@ -127,6 +131,9 @@ fn default_snow_per_min() -> f64 {
 }
 fn default_sideways_prob() -> f64 {
     0.15
+}
+fn default_reconcile_interval_secs() -> u64 {
+    60
 }
 
 pub fn load(path: &Path) -> Result<Config, String> {
