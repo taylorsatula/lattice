@@ -288,10 +288,7 @@ impl<S: Store> Node<S> {
 
     fn on_reconcile(&mut self, _at: u64, link: LinkId, frame: &ReconcileFrame) -> Vec<Action> {
         let items = self.record_items();
-        let session = self
-            .reconcile_sessions
-            .entry(link)
-            .or_default();
+        let session = self.reconcile_sessions.entry(link).or_default();
         let (reply, wants) = reconcile::respond(&items, &frame.ranges, session);
         let mut actions = Vec::new();
         if !reply.is_empty() {
@@ -1138,7 +1135,11 @@ impl<S: Store> Node<S> {
                                 msg.state = OutboundState::Failed;
                                 let _ = self.store.outbound_put(&msg);
                             }
-                            let _ = self.store.status_set(&mid, local::MSG_STATUS_FAILED, Some(ERR_REFUSED));
+                            let _ = self.store.status_set(
+                                &mid,
+                                local::MSG_STATUS_FAILED,
+                                Some(ERR_REFUSED),
+                            );
                             actions.push(Action::Status {
                                 mid,
                                 status: local::MSG_STATUS_FAILED,
@@ -1147,7 +1148,11 @@ impl<S: Store> Node<S> {
                         }
                         PendingOrigin::Relay { leg: deleg } => {
                             if let Ok(Some(e)) = self.store.custody_remove(&deleg) {
-                                let _ = self.store.share_add(&e.destination, e.upstream, -(e.message.len() as i64));
+                                let _ = self.store.share_add(
+                                    &e.destination,
+                                    e.upstream,
+                                    -(e.message.len() as i64),
+                                );
                             }
                         }
                     }

@@ -8,8 +8,10 @@
 #![forbid(unsafe_code)]
 
 mod mem;
+mod redb_store;
 
 pub use mem::MemStore;
+pub use redb_store::RedbStore;
 
 use lattice_proto::record::Scope;
 
@@ -26,7 +28,7 @@ pub enum StoreError {
 /// Stored record as returned by `record_all`: (id, scope, bytes, received_at).
 pub type StoredRecord = ([u8; 32], Scope, Vec<u8>, u64);
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct OutboundMessage {
     pub mid: [u8; 16],
     /// Final recipient (never the gateway).
@@ -48,7 +50,7 @@ pub struct OutboundMessage {
     pub next_attempt: u64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum OutboundState {
     Queued,
     InFlight,
@@ -57,7 +59,7 @@ pub enum OutboundState {
     Expired,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct CustodyEntry {
     pub leg: [u8; 16],
     pub message: Vec<u8>,
@@ -70,7 +72,7 @@ pub struct CustodyEntry {
     pub excluded: Vec<u64>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct InboxEntry {
     pub delivery_id: [u8; 16],
     pub mid: [u8; 16],

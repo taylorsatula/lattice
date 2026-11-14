@@ -13,6 +13,7 @@ workspace = true
 [dependencies]
 lattice-crypto = { version = "0.0.0", path = "../lattice-crypto" }
 thiserror = "2"
+serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
 hex = "0.4"

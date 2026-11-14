@@ -157,9 +157,7 @@ impl Range {
         }
     }
 
-    fn parse_bounds(
-        v: &Value,
-    ) -> Result<(Option<RangeBound>, Option<RangeBound>), ProtoError> {
+    fn parse_bounds(v: &Value) -> Result<(Option<RangeBound>, Option<RangeBound>), ProtoError> {
         let lower = match v.get_key(0)? {
             None => None,
             Some(b) => Some(parse_bound(b)?),

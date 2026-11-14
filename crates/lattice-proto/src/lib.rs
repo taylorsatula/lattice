@@ -39,3 +39,18 @@ pub const MAX_MESSAGE_HORIZON: u64 = 14 * 24 * 3600;
 pub const MAX_RECORD_HORIZON: u64 = 30 * 24 * 3600;
 /// Clock skew tolerance applied on top of horizons.
 pub const CLOCK_SKEW: u64 = 6 * 3600;
+
+/// Serde helpers for fixed-size byte arrays larger than serde's built-in 32.
+pub mod serde_arrays {
+    pub mod sig64 {
+        use serde::{Deserialize, Deserializer, Serializer};
+        pub fn serialize<S: Serializer>(v: &[u8; 64], s: S) -> Result<S::Ok, S::Error> {
+            s.serialize_bytes(v)
+        }
+        pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 64], D::Error> {
+            let v = Vec::<u8>::deserialize(d)?;
+            v.try_into()
+                .map_err(|_| serde::de::Error::custom("expected 64 bytes"))
+        }
+    }
+}

@@ -1,0 +1,55 @@
+//! Rough throughput comparison: one transaction per custody accept vs one
+//! group-committed transaction. Run with `cargo run --release --example group_commit`.
+use lattice_store::{CustodyEntry, RedbStore, Store};
+use std::time::Instant;
+
+fn entry(n: u8) -> CustodyEntry {
+    CustodyEntry {
+        leg: [n; 16],
+        message: vec![n; 2048],
+        upstream: 1,
+        destination: [9; 32],
+        class: 1,
+        exp: u64::MAX / 2,
+        lease_until: u64::MAX / 2,
+        excluded: vec![],
+    }
+}
+
+fn main() {
+    let dir = std::env::temp_dir().join("lattice-group-commit-demo");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("bench.redb");
+
+    let iterations = 200usize;
+    // Individual commits.
+    let mut store = RedbStore::open(&path).unwrap();
+    let t0 = Instant::now();
+    for i in 0..iterations {
+        store.custody_put(entry(i as u8)).unwrap();
+    }
+    let individual = t0.elapsed();
+    drop(store);
+
+    // Group commit of the same writes (fresh db).
+    let path2 = dir.join("bench2.redb");
+    let store = RedbStore::open(&path2).unwrap();
+    let batch: Vec<CustodyEntry> = (0..iterations).map(|i| entry(i as u8)).collect();
+    let t0 = Instant::now();
+    store.custody_put_batch(&batch).unwrap();
+    let batched = t0.elapsed();
+
+    println!(
+        "individual commits: {} accepts in {:?} ({:.1} accepts/s)",
+        iterations,
+        individual,
+        iterations as f64 / individual.as_secs_f64()
+    );
+    println!(
+        "group commit:       {} accepts in {:?} ({:.1} accepts/s)",
+        iterations,
+        batched,
+        iterations as f64 / batched.as_secs_f64()
+    );
+}

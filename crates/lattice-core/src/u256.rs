@@ -74,8 +74,16 @@ impl U256 {
         let mut out = [0u64; 4];
         for (i, limb) in out.iter_mut().enumerate() {
             let lo = self.0.get(i + word).copied().unwrap_or(0);
-            let hi = if rem == 0 { 0 } else { self.0.get(i + word + 1).copied().unwrap_or(0) };
-            *limb = if rem == 0 { lo } else { (lo >> rem) | (hi << (64 - rem)) };
+            let hi = if rem == 0 {
+                0
+            } else {
+                self.0.get(i + word + 1).copied().unwrap_or(0)
+            };
+            *limb = if rem == 0 {
+                lo
+            } else {
+                (lo >> rem) | (hi << (64 - rem))
+            };
         }
         U256(out)
     }

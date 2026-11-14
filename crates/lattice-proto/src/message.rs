@@ -161,7 +161,7 @@ impl HopLayerPlain {
 }
 
 /// Envelope plaintext. `sig` covers `header_bytes || encode(unsigned envelope)`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Envelope {
     pub kind: u64,
     pub mid: [u8; 16],
@@ -174,6 +174,7 @@ pub struct Envelope {
     pub body: Option<Vec<u8>>,
     pub reference: Option<[u8; 16]>,
     pub reason: Option<u64>,
+    #[serde(with = "crate::serde_arrays::sig64")]
     pub sig: [u8; 64],
 }
 
