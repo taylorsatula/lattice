@@ -1,7 +1,7 @@
 [package]
 name = "lattice-sim"
 version = "0.0.0"
-description = "Lattice simulator: deterministic mesh with faults, for protocol verification"
+description = "Lattice simulator: deterministic in-process mesh for protocol verification"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -9,3 +9,9 @@ repository.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+lattice-core = { version = "0.0.0", path = "../lattice-core" }
+lattice-crypto = { version = "0.0.0", path = "../lattice-crypto" }
+lattice-proto = { version = "0.0.0", path = "../lattice-proto" }
+lattice-store = { version = "0.0.0", path = "../lattice-store" }

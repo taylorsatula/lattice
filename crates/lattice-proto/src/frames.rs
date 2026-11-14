@@ -60,17 +60,23 @@ pub struct CustodyFrame {
     pub retry_after: Option<u64>,
 }
 
+/// A reconciliation range. `lower`/`upper` are (id, scope) bounds, half-open
+/// [lower, upper); `None` is unbounded on that side. Bounds have scope 0 at
+/// split points so both scopes of an id interval stay inside one range.
+/// A bound of a reconciliation range: `(id, scope)`.
+pub type RangeBound = ([u8; 32], u8);
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Range {
     Fingerprint {
-        lower: ([u8; 32], u8),
-        upper: ([u8; 32], u8),
+        lower: Option<([u8; 32], u8)>,
+        upper: Option<([u8; 32], u8)>,
         count: u64,
         sum: [u8; 32],
     },
     Entries {
-        lower: ([u8; 32], u8),
-        upper: ([u8; 32], u8),
+        lower: Option<([u8; 32], u8)>,
+        upper: Option<([u8; 32], u8)>,
         entries: Vec<([u8; 32], u8, u64)>,
     },
 }
@@ -140,29 +146,49 @@ fn parse_bound(v: &Value) -> Result<([u8; 32], u8), ProtoError> {
 }
 
 impl Range {
-    fn to_value(&self) -> Value {
+    fn bound_value(b: &Option<([u8; 32], u8)>) -> Option<Value> {
+        b.map(|(id, scope)| bound_value(&(id, scope)))
+    }
+
+    fn bounds(&self) -> (Option<RangeBound>, Option<RangeBound>) {
         match self {
-            Range::Fingerprint {
-                lower,
-                upper,
-                count,
-                sum,
-            } => Value::map(vec![
-                (Value::UInt(0), bound_value(lower)),
-                (Value::UInt(1), bound_value(upper)),
-                (
+            Range::Fingerprint { lower, upper, .. } => (*lower, *upper),
+            Range::Entries { lower, upper, .. } => (*lower, *upper),
+        }
+    }
+
+    fn parse_bounds(
+        v: &Value,
+    ) -> Result<(Option<RangeBound>, Option<RangeBound>), ProtoError> {
+        let lower = match v.get_key(0)? {
+            None => None,
+            Some(b) => Some(parse_bound(b)?),
+        };
+        let upper = match v.get_key(1)? {
+            None => None,
+            Some(b) => Some(parse_bound(b)?),
+        };
+        Ok((lower, upper))
+    }
+
+    fn to_value(&self) -> Value {
+        let (lower, upper) = self.bounds();
+        let mut pairs = Vec::with_capacity(4);
+        if let Some(b) = Self::bound_value(&lower) {
+            pairs.push((Value::UInt(0), b));
+        }
+        if let Some(b) = Self::bound_value(&upper) {
+            pairs.push((Value::UInt(1), b));
+        }
+        match self {
+            Range::Fingerprint { count, sum, .. } => {
+                pairs.push((
                     Value::UInt(2),
                     Value::Array(vec![Value::UInt(*count), Value::Bytes(sum.to_vec())]),
-                ),
-            ]),
-            Range::Entries {
-                lower,
-                upper,
-                entries,
-            } => Value::map(vec![
-                (Value::UInt(0), bound_value(lower)),
-                (Value::UInt(1), bound_value(upper)),
-                (
+                ));
+            }
+            Range::Entries { entries, .. } => {
+                pairs.push((
                     Value::UInt(3),
                     Value::Array(
                         entries
@@ -176,26 +202,15 @@ impl Range {
                             })
                             .collect(),
                     ),
-                ),
-            ]),
+                ));
+            }
         }
+        Value::map(pairs)
     }
 
     fn from_value(v: &Value) -> Result<Self, ProtoError> {
-        let map = v.expect_map()?;
-        let lower = parse_bound(
-            map.iter()
-                .find(|(k, _)| k.as_uint() == Some(0))
-                .map(|(_, v)| v)
-                .ok_or(ProtoError::MissingKey(0))?,
-        )?;
-        let upper = parse_bound(
-            map.iter()
-                .find(|(k, _)| k.as_uint() == Some(1))
-                .map(|(_, v)| v)
-                .ok_or(ProtoError::MissingKey(1))?,
-        )?;
-        if let Some((_, fp)) = map.iter().find(|(k, _)| k.as_uint() == Some(2)) {
+        let (lower, upper) = Self::parse_bounds(v)?;
+        if let Some(fp) = v.get_key(2)? {
             let arr = fp.as_array().ok_or(ProtoError::WrongType(2, "array"))?;
             if arr.len() != 2 {
                 return Err(ProtoError::Invalid("fingerprint must be [count, sum]"));
@@ -214,7 +229,7 @@ impl Range {
                 sum,
             });
         }
-        if let Some((_, list)) = map.iter().find(|(k, _)| k.as_uint() == Some(3)) {
+        if let Some(list) = v.get_key(3)? {
             let entries = list
                 .as_array()
                 .ok_or(ProtoError::WrongType(3, "array"))?

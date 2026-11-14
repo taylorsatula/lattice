@@ -278,6 +278,11 @@ version = "0.0.0"
 [[package]]
 name = "lattice-core"
 version = "0.0.0"
+dependencies = [
+ "lattice-crypto",
+ "lattice-proto",
+ "lattice-store",
+]
 
 [[package]]
 name = "lattice-crypto"
@@ -314,10 +319,20 @@ dependencies = [
 [[package]]
 name = "lattice-sim"
 version = "0.0.0"
+dependencies = [
+ "lattice-core",
+ "lattice-crypto",
+ "lattice-proto",
+ "lattice-store",
+]
 
 [[package]]
 name = "lattice-store"
 version = "0.0.0"
+dependencies = [
+ "lattice-proto",
+ "thiserror",
+]
 
 [[package]]
 name = "latticectl"

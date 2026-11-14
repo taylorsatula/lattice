@@ -1,11 +1,19 @@
 //! Lattice protocol core, sans I/O.
 //!
-//! A state machine fed by events (frame arrived, timer fired, application sent)
-//! returning actions (send frame, store, deliver). Time, randomness and storage
-//! are injected, so the same core runs under the simulator and the daemon.
-//! Implements gossip, routing, custody, receipts, fair-share custody, snow,
-//! gateways, key lifecycle and the immune system. Never touches a socket, the
-//! clock, or the heap through any path that bypasses the injected seams.
-//!
+//! A state machine: events in (frame arrived, timer fired, application sent
+//! something), actions out (send a frame, deliver to the app, update status).
+//! Time, randomness, sockets and disk are injected by the caller — the
+//! simulator or the daemon.
 
 #![forbid(unsafe_code)]
+
+pub mod graph;
+pub mod node;
+pub mod reconcile;
+pub mod rng;
+pub mod types;
+mod u256;
+
+pub use node::{Identity, Node};
+pub use rng::Rng;
+pub use types::{Action, AppSend, Config, Event, LinkId};

@@ -141,14 +141,14 @@ fn main() {
     let reconcile = Frame::Reconcile(ReconcileFrame {
         ranges: vec![
             Range::Fingerprint {
-                lower: ([0x01; 32], 0),
-                upper: ([0x7f; 32], 0),
+                lower: Some(([0x01; 32], 0)),
+                upper: Some(([0x7f; 32], 0)),
                 count: 42,
                 sum: [0x55; 32],
             },
             Range::Entries {
-                lower: ([0x80; 32], 1),
-                upper: ([0xfe; 32], 1),
+                lower: Some(([0x80; 32], 1)),
+                upper: Some(([0xfe; 32], 1)),
                 entries: vec![([0x90; 32], 0, 7)],
             },
         ],

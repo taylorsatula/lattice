@@ -1,7 +1,7 @@
 [package]
 name = "lattice-core"
 version = "0.0.0"
-description = "Lattice sans-IO core: gossip, routing, custody, receipts, fair shares, gateways"
+description = "Lattice sans-IO protocol core: gossip, routing, custody, receipts, fair shares, snow, immune system"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -9,3 +9,11 @@ repository.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+lattice-proto = { version = "0.0.0", path = "../lattice-proto" }
+lattice-store = { version = "0.0.0", path = "../lattice-store" }
+lattice-crypto = { version = "0.0.0", path = "../lattice-crypto" }
+
+[dev-dependencies]
+lattice-store = { version = "0.0.0", path = "../lattice-store", features = [] }

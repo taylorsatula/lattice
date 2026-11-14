@@ -261,13 +261,13 @@ impl PeerRecord {
     /// Parse and fully validate a record from the wire.
     ///
     /// `now` is injected so the same code runs in the simulator and the
-    /// daemon. `known_head`, when supplied, is the head this node already
-    /// holds for the record's identifier; a record whose KEL is behind or
-    /// divergent is rejected.
+    /// daemon. `known_head`, when supplied, is the (seq, commitment) this
+    /// node already holds for the record's identifier; a record whose KEL is
+    /// behind or divergent is rejected.
     pub fn from_bytes(
         bytes: &[u8],
         now: u64,
-        known_head: Option<&KelHead>,
+        known_head: Option<(u64, [u8; 32])>,
     ) -> Result<(PeerRecord, KelHead), ProtoError> {
         let value = decode_limited(bytes, RECORD_MAX)?;
         value.deny_unknown_keys(&RECORD_KEYS)?;
@@ -373,8 +373,8 @@ impl PeerRecord {
                 "identifier does not match inception event",
             ));
         }
-        if let Some(known) = known_head {
-            match classify(known, &kel) {
+        if let Some((known_seq, known_commitment)) = known_head {
+            match classify(known_seq, &known_commitment, &kel) {
                 KelRelation::Extends | KelRelation::Same => {}
                 KelRelation::Behind => {
                     return Err(ProtoError::BadKeyLog("KEL is behind the known head"));

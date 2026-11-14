@@ -83,10 +83,19 @@ fn tampered_signature_fails() {
 fn classify_against_known_head() {
     let events = chain(3);
     let head_two = KeyEvent::validate_chain(&events[..2]).unwrap();
-    assert_eq!(classify(&head_two, &events), KelRelation::Extends);
+    assert_eq!(
+        classify(head_two.seq, &head_two.commitment, &events),
+        KelRelation::Extends
+    );
     let head_full = KeyEvent::validate_chain(&events).unwrap();
-    assert_eq!(classify(&head_full, &events), KelRelation::Same);
-    assert_eq!(classify(&head_full, &events[..1]), KelRelation::Behind);
+    assert_eq!(
+        classify(head_full.seq, &head_full.commitment, &events),
+        KelRelation::Same
+    );
+    assert_eq!(
+        classify(head_full.seq, &head_full.commitment, &events[..1]),
+        KelRelation::Behind
+    );
 }
 
 #[test]

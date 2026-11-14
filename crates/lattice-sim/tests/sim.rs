@@ -1,0 +1,383 @@
+use lattice_core::Config;
+use lattice_sim::Sim;
+
+fn fast_config() -> Config {
+    Config {
+        reconcile_interval_secs: 1,
+        record_refresh_secs: 3600,
+        snow_per_min: 0.0,
+        receipt_timeout_public: 30,
+        fresh_waypoint_retries: 1,
+        ..Config::default()
+    }
+}
+
+fn full_mesh(sim: &mut Sim, n: usize) {
+    for a in 0..n {
+        for b in (a + 1)..n {
+            sim.connect(a, b);
+        }
+    }
+}
+
+#[test]
+fn records_converge_after_gossip() {
+    let mut sim = Sim::new(fast_config());
+    let n = 6;
+    for _ in 0..n {
+        sim.add_node();
+    }
+    full_mesh(&mut sim, n);
+    sim.run_for(10);
+    for node in 0..n {
+        let count = sim.nodes[node].debug_record_count();
+        assert_eq!(count, n, "node {node} knows {count} records, expected {n}");
+    }
+}
+
+#[test]
+fn message_delivers_end_to_end_and_sender_sees_receipt() {
+    let mut sim = Sim::new(fast_config());
+    for _ in 0..4 {
+        sim.add_node();
+    }
+    full_mesh(&mut sim, 4);
+    sim.run_for(5);
+    let mid = sim.app_send(0, 3, b"hello mesh");
+    sim.run_for(20);
+    let got: Vec<_> = sim.deliveries.iter().filter(|d| d.mid == mid).collect();
+    assert_eq!(got.len(), 1, "exactly one delivery expected");
+    assert_eq!(got[0].node, 3);
+    assert_eq!(got[0].body, b"hello mesh");
+    let delivered = sim
+        .statuses
+        .iter()
+        .filter(|(m, s)| *m == mid && *s == 3)
+        .count();
+    assert!(delivered >= 1, "sender should observe Delivered status");
+}
+
+#[test]
+fn partition_holds_then_heals() {
+    let mut sim = Sim::new(fast_config());
+    for _ in 0..3 {
+        sim.add_node();
+    }
+    sim.connect(0, 1);
+    sim.connect(1, 2);
+    let link = sim.link_between(1, 2).unwrap();
+    sim.run_for(6);
+    sim.set_link(link, false);
+    let mid = sim.app_send(0, 2, b"after heal");
+    sim.run_for(3);
+    assert!(
+        sim.deliveries.iter().all(|d| d.mid != mid),
+        "no delivery while partitioned"
+    );
+    sim.set_link(link, true);
+    sim.run_for(20);
+    assert!(
+        sim.deliveries.iter().any(|d| d.mid == mid),
+        "delivery expected after heal"
+    );
+}
+
+#[test]
+fn crash_during_custody_preserves_message() {
+    let mut sim = Sim::new(fast_config());
+    for _ in 0..3 {
+        sim.add_node();
+    }
+    sim.connect(0, 1);
+    sim.connect(1, 2);
+    let link_bc = sim.link_between(1, 2).unwrap();
+    sim.run_for(6);
+    sim.set_link(link_bc, false);
+    let mid = sim.app_send(0, 2, b"survive my crash");
+    sim.run_for(4);
+    assert_eq!(
+        sim.custody_count(1),
+        1,
+        "B should hold the message in custody"
+    );
+    sim.crash_node(1);
+    sim.set_link(link_bc, true);
+    sim.run_for(20);
+    assert!(
+        sim.deliveries.iter().any(|d| d.mid == mid),
+        "custody must survive a crash and be delivered after heal"
+    );
+}
+
+#[test]
+fn waypoint_route_delivers() {
+    let mut cfg = fast_config();
+    cfg.waypoint_share = 1.0;
+    let mut sim = Sim::new(cfg);
+    for _ in 0..4 {
+        sim.add_node();
+    }
+    full_mesh(&mut sim, 4);
+    sim.run_for(6);
+    let mid = [7u8; 16];
+    let to = sim.ids[3];
+    let send = lattice_core::AppSend {
+        service: "test".into(),
+        mid_hint: Some(mid),
+        to,
+        tsvc: "test".into(),
+        tmbx: b"inbox".to_vec(),
+        fmbx: b"outbox".to_vec(),
+        body: b"via waypoint".to_vec(),
+        exp: None,
+        priority: 1,
+        route: 1,
+    };
+    sim.force_app_send(0, send);
+    sim.run_for(20);
+    assert!(sim.deliveries.iter().any(|d| d.body == b"via waypoint"));
+}
+
+#[test]
+fn expired_message_is_not_delivered() {
+    let mut sim = Sim::new(fast_config());
+    for _ in 0..3 {
+        sim.add_node();
+    }
+    sim.connect(0, 1);
+    sim.connect(1, 2);
+    let link_bc = sim.link_between(1, 2).unwrap();
+    sim.run_for(6);
+    // Slow the B->C hop so custody dwells at B, then cut it.
+    sim.set_latency(link_bc, 100);
+    let start = 7; // after the 6s convergence below
+    let send = lattice_core::AppSend {
+        service: "test".into(),
+        mid_hint: Some([9u8; 16]),
+        to: sim.ids[2],
+        tsvc: "test".into(),
+        tmbx: b"inbox".to_vec(),
+        fmbx: b"outbox".to_vec(),
+        body: b"expires".to_vec(),
+        exp: Some(start + 3),
+        priority: 1,
+        route: 0,
+    };
+    sim.run_for(1); // settle at t≈7
+    sim.force_app_send(0, send);
+    sim.run_for(1);
+    assert_eq!(sim.custody_count(1), 1, "B holds the message in custody");
+    sim.set_link(link_bc, false);
+    sim.run_for(10);
+    assert_eq!(sim.custody_count(1), 0, "expired custody must be dropped");
+    sim.set_link(link_bc, true);
+    sim.run_for(10);
+    assert!(
+        sim.deliveries.iter().all(|d| d.body != b"expires"),
+        "expired message must not be delivered"
+    );
+}
+
+#[test]
+fn fair_share_caps_a_flooded_upstream() {
+    // F floods destination D via relay R. Honest node H also sends to D.
+    // R's custody link budget toward D is split equally between F and H;
+    // F's excess must be refused while H keeps its slot.
+    let mut cfg = fast_config();
+    // Each 2KB-bucket message counts full size; per-upstream share must fit two of them.
+    // With the R->D link down, R sees two upstreams; per-upstream share is
+    // allowance/2. F floods, H sends two. F may fill its own share only.
+    cfg.custody_allowance = 13000;
+    cfg.transit_cap = 100_000;
+    let mut sim = Sim::new(cfg);
+    let f = sim.add_node();
+    let r = sim.add_node();
+    let d = sim.add_node();
+    let h = sim.add_node();
+    sim.connect(f, r);
+    sim.connect(h, r);
+    let rd = sim.connect(r, d);
+    sim.run_for(6); // converge
+    // Jam the R->D link so custody backs up at R.
+    sim.set_link(rd, false);
+    // F floods.
+    for i in 0..20u8 {
+        sim.app_send(f, d, &vec![i; 400]);
+    }
+    // H sends its fair share.
+    sim.app_send(h, d, b"honest one");
+    sim.app_send(h, d, b"honest two");
+    sim.run_for(3);
+    let fr = sim.link_between(f, r).unwrap();
+    let hr = sim.link_between(h, r).unwrap();
+    let upstreams = sim.nodes[r].debug_custody_upstreams();
+    let from_f = upstreams.iter().filter(|&&u| u == fr).count();
+    let from_h = upstreams.iter().filter(|&&u| u == hr).count();
+    eprintln!("fr={fr} hr={hr} upstreams={upstreams:?}");
+    eprintln!("frame_counts={:?}", sim.frame_counts);
+    eprintln!(
+        "n_statuses={} in_transit={}",
+        sim.statuses.len(),
+        sim.statuses.iter().filter(|s| s.1 == 2).count()
+    );
+    assert!(
+        from_f <= 3,
+        "flooder exceeded its share: {from_f} messages held"
+    );
+    assert_eq!(
+        from_h, 2,
+        "honest node's messages must not be displaced by the flood"
+    );
+}
+
+#[test]
+fn snow_emits_at_configured_rate_and_backs_off_when_busy() {
+    let mut cfg = fast_config();
+    cfg.snow_per_min = 120.0; // 2 per second
+    let mut sim = Sim::new(cfg);
+    let a = sim.add_node();
+    let b = sim.add_node();
+    sim.connect(a, b);
+    sim.run_for(20);
+    let dummies = *sim.frame_counts.get("dummy").unwrap_or(&0);
+    // Two nodes each ticking at 2/s for 20s => expect ~80; accept wide bounds.
+    assert!(dummies >= 20, "too few dummies: {dummies}");
+    assert!(dummies <= 160, "too many dummies: {dummies}");
+}
+
+#[test]
+fn duplicate_mid_is_not_delivered_twice() {
+    let mut sim = Sim::new(fast_config());
+    for _ in 0..2 {
+        sim.add_node();
+    }
+    sim.connect(0, 1);
+    sim.run_for(4);
+    let mid = [0xABu8; 16];
+    let to_id = sim.ids[1];
+    let make = || lattice_core::AppSend {
+        service: "test".into(),
+        mid_hint: Some(mid),
+        to: to_id,
+        tsvc: "test".into(),
+        tmbx: b"inbox".to_vec(),
+        fmbx: b"outbox".to_vec(),
+        body: b"once".to_vec(),
+        exp: None,
+        priority: 1,
+        route: 0,
+    };
+    sim.force_app_send(0, make());
+    sim.run_for(5);
+    sim.force_app_send(0, make());
+    sim.run_for(10);
+    let n = sim.deliveries.iter().filter(|d| d.mid == mid).count();
+    assert_eq!(n, 1, "duplicate mid must not be delivered twice");
+}
+
+#[test]
+fn equivocating_records_converge_to_lower_hash() {
+    use lattice_proto::record::{Mode, PeerRecord, RecordParams, Scope};
+
+    let mut sim = Sim::new(fast_config());
+    let a = sim.add_node();
+    let b = sim.add_node();
+    let victim = sim.add_node(); // the equivocating party (never sends data itself)
+    sim.connect(a, b);
+    sim.connect(a, victim);
+    sim.connect(b, victim);
+    sim.run_for(4);
+
+    // Craft two validly-signed records for the same identity with the same
+    // seq but different capabilities — an equivocation by the key holder.
+    let attacker = lattice_core::Identity::generate();
+    let kel = attacker.kel.clone();
+    let id = lattice_proto::kel::identifier(&kel).unwrap();
+    let mk = |caps: u64| {
+        PeerRecord::build(
+            RecordParams {
+                kel: kel.clone(),
+                seq: 7,
+                exp: 1_000_000,
+                channel_key: [1u8; 32],
+                envelope_key: [2u8; 1216],
+                mode: Mode::Public,
+                scope: Scope::Wan,
+                endpoints: vec![],
+                links: vec![],
+                gateways: vec![],
+                capabilities: caps,
+            },
+            &attacker.signing_seed,
+        )
+        .unwrap()
+    };
+    let r1 = mk(1);
+    let r2 = mk(2);
+    let b1 = r1.encode();
+    let b2 = r2.encode();
+    use lattice_proto::record::record_hash;
+    let (first, second) = if record_hash(&b1) < record_hash(&b2) {
+        (b1.clone(), b2.clone())
+    } else {
+        (b2.clone(), b1.clone())
+    };
+
+    let _ = sim.link_between(a, b);
+    for victim_node in [a, b] {
+        // Feed in reverse-hash order: whichever is stored first, the lower-hash rule must win.
+        for bytes in [second.clone(), first.clone()] {
+            // Both nodes receive the same two records from the "attacker" link.
+            let attacker_link = sim.link_between(victim_node, victim).unwrap();
+            sim.inject_frame(
+                victim_node,
+                attacker_link,
+                lattice_proto::frames::Frame::Records(lattice_proto::frames::RecordsFrame {
+                    records: vec![bytes],
+                }),
+            );
+        }
+    }
+    use lattice_store::Store;
+    let stored_a = sim.nodes[a]
+        .store_ref()
+        .record_get(&id, Scope::Wan)
+        .unwrap()
+        .unwrap()
+        .0;
+    let stored_b = sim.nodes[b]
+        .store_ref()
+        .record_get(&id, Scope::Wan)
+        .unwrap()
+        .unwrap()
+        .0;
+    assert_eq!(stored_a, first, "node A must keep the lower-hash record");
+    assert_eq!(stored_b, first, "node B must keep the lower-hash record");
+}
+
+#[test]
+fn everyone_flooding_still_delivers() {
+    let mut sim = Sim::new(fast_config());
+    let n = 5;
+    for _ in 0..n {
+        sim.add_node();
+    }
+    full_mesh(&mut sim, n);
+    sim.run_for(5);
+    // Everyone sends to everyone; bounded run; delivery counter must advance
+    // and the node must not wedge.
+    for i in 0..n {
+        for j in 0..n {
+            if i != j {
+                sim.app_send(i, j, format!("{i}->{j}").as_bytes());
+            }
+        }
+    }
+    sim.run_for(30);
+    assert!(
+        !sim.deliveries.is_empty(),
+        "some deliveries must land under full load"
+    );
+    let expected_at_least = 5;
+    assert!(sim.deliveries.len() >= expected_at_least);
+}

@@ -1,5 +1,5 @@
 use lattice_crypto::generate_seed;
-use lattice_proto::kel::{KelHead, KeyEvent};
+use lattice_proto::kel::KeyEvent;
 use lattice_proto::record::*;
 use lattice_proto::{CLOCK_SKEW, MAX_RECORD_HORIZON};
 
@@ -239,20 +239,9 @@ fn known_head_divergence_rejected() {
     let f = fixture();
     let rec = public_record(&f);
     let bytes = rec.encode();
-    let forged_head = KelHead {
-        seq: 0,
-        commitment: [0xAA; 32],
-        abandoned: false,
-        current_key: [0; 32],
-    };
-    assert!(PeerRecord::from_bytes(&bytes, NOW, Some(&forged_head)).is_err());
-    let real_head = KelHead {
-        seq: 0,
-        commitment: lattice_proto::kel::KeyEvent::validate_chain(&f.kel)
-            .unwrap()
-            .commitment,
-        abandoned: false,
-        current_key: [0; 32],
-    };
-    assert!(PeerRecord::from_bytes(&bytes, NOW, Some(&real_head)).is_ok());
+    assert!(PeerRecord::from_bytes(&bytes, NOW, Some((0, [0xAA; 32]))).is_err());
+    let real_commitment = lattice_proto::kel::KeyEvent::validate_chain(&f.kel)
+        .unwrap()
+        .commitment;
+    assert!(PeerRecord::from_bytes(&bytes, NOW, Some((0, real_commitment))).is_ok());
 }

@@ -50,14 +50,14 @@ fn reconcile_roundtrip_both_range_kinds() {
     let f = Frame::Reconcile(ReconcileFrame {
         ranges: vec![
             Range::Fingerprint {
-                lower: ([1; 32], 0),
-                upper: ([9; 32], 1),
+                lower: Some(([1; 32], 0)),
+                upper: Some(([9; 32], 1)),
                 count: 1234,
                 sum: [7; 32],
             },
             Range::Entries {
-                lower: ([1; 32], 0),
-                upper: ([2; 32], 0),
+                lower: Some(([1; 32], 0)),
+                upper: Some(([2; 32], 0)),
                 entries: vec![([8; 32], 1, 42), ([9; 32], 0, 7)],
             },
         ],

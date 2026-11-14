@@ -9,3 +9,7 @@ repository.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+lattice-proto = { version = "0.0.0", path = "../lattice-proto" }
+thiserror = "2"

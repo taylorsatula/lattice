@@ -268,12 +268,16 @@ pub enum KelRelation {
 /// Compare a validated candidate chain against a known head.
 ///
 /// `commitments` is the per-event commitment list of the candidate chain.
-pub fn classify(known: &KelHead, candidate: &[KeyEvent]) -> KelRelation {
+pub fn classify(
+    known_seq: u64,
+    known_commitment: &[u8; 32],
+    candidate: &[KeyEvent],
+) -> KelRelation {
     let commitments: Vec<[u8; 32]> = candidate.iter().map(|e| e.commitment()).collect();
-    let known_idx = known.seq as usize;
+    let known_idx = known_seq as usize;
     if known_idx < commitments.len() {
-        if commitments[known_idx] == known.commitment {
-            if commitments.len() == known.seq as usize + 1 {
+        if commitments[known_idx] == *known_commitment {
+            if commitments.len() as u64 == known_seq + 1 {
                 KelRelation::Same
             } else {
                 KelRelation::Extends
@@ -281,7 +285,7 @@ pub fn classify(known: &KelHead, candidate: &[KeyEvent]) -> KelRelation {
         } else {
             KelRelation::Divergent
         }
-    } else if commitments.len() as u64 == known.seq + 1 {
+    } else if commitments.len() as u64 == known_seq + 1 {
         KelRelation::Same
     } else {
         // Candidate is shorter than the known head: only valid if it is a
