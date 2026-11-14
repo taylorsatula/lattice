@@ -603,6 +603,13 @@ principle).
 - **Safe default listen address.** The WebSocket listener binds only to
   configured hive interfaces by default, and to public interfaces only when
   the instance is in public mode.
+- **Optional public status endpoint.** A plain HTTP `GET /status` on the
+  WebSocket listener reports only that the node is up, whether it is
+  accepting custody (not draining), and which protocol versions it speaks.
+  It is enabled by default and disabled by a single configuration flag.
+  When disabled, any request that isn't a WebSocket upgrade gets the same
+  generic 404 as an unknown path, so a quiet node reveals nothing beyond an
+  open WebSocket endpoint. See `V2_SPEC.md`.
 - **Draining.** An admin drain operation stops accepting new custody
   (answering busy), keeps handing off what's held, and reports when empty,
   so planned shutdowns lose nothing and strand nothing.

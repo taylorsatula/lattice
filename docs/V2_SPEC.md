@@ -255,6 +255,31 @@ All frames are Noise transport messages wrapping CBOR:
   travel in an ordinary `records` frame, and the receiver detects the
   conflict.
 
+### Public status (optional)
+
+Served on the same listener as the WebSocket, as plain HTTP:
+
+- **`GET /status`** returns `200` with a deterministic CBOR map:
+
+  | Key | Name | Type | Notes |
+  |---|---|---|---|
+  | 0 | v | uint | Status format version |
+  | 1 | up | bool | Always true when answering |
+  | 2 | accepting | bool | False while draining |
+  | 3 | versions | array of uint | Protocol versions supported |
+
+- **What it deliberately leaves out:** the identifier, mode, peer counts,
+  link counts, queue depths, uptime and anything else that profiles the
+  node. Peers learn everything they need from records and links. The
+  status endpoint exists only to answer "is something Lattice-shaped alive
+  here?"
+- **It is cheap and can't fail.** The response is built from in-memory state
+  with no storage access, and it is subject to the same per-address
+  connection limits as the listener.
+- **Configuration:** `status = true` by default. With `status = false`,
+  `GET /status` gets the same generic `404` as any other non-WebSocket
+  request, so the node can't be distinguished by that path.
+
 ## 7. Local API (§10)
 
 The local API is how any application, MIRA or otherwise, uses Lattice.
