@@ -181,13 +181,19 @@ invariants passing:
    - the transit storage cap
    - per-service inbox caps
    - drain
-7. **Private instances and gateways.**
-8. **Key lifecycle across the mesh:**
+7. **Send schedule and cover:**
+   - one Poisson schedule per node, with the rate set from the floor and
+     the long-window average plus headroom
+   - real frames replacing dummies
+   - dummy sizes drawn from the recent real mix
+   - a separate hive floor
+8. **Private instances and gateways.**
+9. **Key lifecycle across the mesh:**
    - spreading rotations and abandonments
    - detecting equivocation
    - rotating envelope keys
-9. **Immune system (optional):** the wary list and the *k*-distinct-ranges
-   rule.
+10. **Immune system (optional):** the wary list and the *k*-distinct-ranges
+    rule.
 
 **Invariants the simulator checks on every run:**
 - **Convergence:** after any partition heals, every node holds the same
@@ -198,6 +204,13 @@ invariants passing:
 - **No silent loss:** a message is either delivered or reported failed or
   expired to its sender. If a path exists for long enough before expiry, it
   is delivered.
+- **Cover hides timing:** within one averaging window, the stream of frame
+  times and sizes an outside observer sees on a node's uplink is
+  statistically indistinguishable (by a two-sample test) between runs where
+  the node sends real messages and runs where it doesn't.
+- **Cover cost:** an idle node's sent bytes stay within its floor budget,
+  and a node whose real traffic exceeds the floor sends only headroom-level
+  dummies.
 - **Custody is durable:** no node answers `accepted` for a message it would
   lose in a crash.
 - **Flood containment:** under a flood from one attached node, delivery rate
@@ -253,7 +266,11 @@ subset on redb.
    is public.
 8. **Status endpoint** on the same listener, with its flag, and the generic
    404 for anything else.
-9. Plumb all of this into the core's events and actions.
+9. **Frame padding and the send schedule on real sockets:**
+   - every post-handshake frame padded to a frame bucket
+   - no WebSocket control frames
+   - socket writes driven only by the core's send schedule
+10. Plumb all of this into the core's events and actions.
 
 **Exit:**
 - Three daemons on loopback, and in separate network namespaces, exchange
@@ -281,7 +298,7 @@ subset on redb.
   | `gateways` | For private mode |
   | `services` | Name and secret for each application |
   | `status` | Public status endpoint on or off (default on) |
-  | `delay` | Per-hop random delay range |
+  | `cover` | Floor, averaging window, headroom, hive floor |
   | `limits` | Overrides for the defaults below |
 
 - **Startup:** load secrets (systemd credentials first, then files with mode
@@ -317,7 +334,8 @@ MIRA can be hooked in without changes to Lattice.
 ## Phase 7: Remaining features and release
 
 - Hive multicast discovery.
-- Per-hop random delay enabled with its default.
+- Cover defaults confirmed from the soak test: idle cost per node, busy-node
+  dummy fraction, and added latency per hop.
 - The immune system, if it wasn't finished in Phase 2.
 - **Soak test:** the real mesh runs for days with churn and injected faults,
   watching memory, storage growth and delivery rates.
@@ -343,7 +361,8 @@ from the soak test.
 | Custody allowance per destination | 4 MB |
 | Transit storage cap | 256 MB |
 | Inbox cap per service | 64 MB |
-| Per-hop delay | 0–2 s |
+| Cover floor / hive floor | One frame per 15 s / one per 2 s |
+| Cover averaging window / headroom | 6 hours / 25% |
 | Wary rule *k* / wary list size | 3 / 32 |
 | Size buckets | 2, 8, 32 KB |
 
@@ -354,7 +373,7 @@ These are recorded in the design doc as open or deferred:
 - anonymous senders
 - messages over 32 KB and attachments
 - post-quantum protection for the channel
-- cover traffic
+- loop messages and constant-rate cover
 - range-based set reconciliation, unless the simulator shows full-digest
   anti-entropy is too costly at the target scale
 - Spray-and-Wait

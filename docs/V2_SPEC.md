@@ -21,8 +21,9 @@ that document; section references (§n) point back to it.
   | Object | Limit |
   |---|---|
   | Peer record | 3 KB |
-  | Message | Exactly one size bucket: 2, 8 or 32 KB |
-  | Channel frame | 40 KB, enforced by the WebSocket layer before the frame is assembled |
+  | Frame after the handshake | Exactly one frame bucket: 2, 8 or 32 KB of plaintext (§6) |
+  | Message | Exactly one message bucket: its frame bucket minus 64 bytes, so an `offer` frame fits exactly |
+  | Channel frame on the wire | 40 KB, enforced by the WebSocket layer before the frame is assembled |
   | Local API frame | 64 KB |
 
 - **Decoding limits.** Every decoder of untrusted bytes enforces, before
@@ -229,7 +230,10 @@ Each WebSocket binary frame carries one CBOR value.
 
 ### After the handshake
 
-All frames are Noise transport messages wrapping CBOR:
+Every frame is a Noise transport message whose plaintext is the CBOR array
+`[frame, padding]`. The padding is a byte string that brings the plaintext to
+exactly one frame bucket (2, 8 or 32 KB). A frame whose plaintext isn't
+exactly a bucket size is refused. Frame types:
 
 | t | Frame | Contents |
 |---|---|---|
@@ -239,7 +243,11 @@ All frames are Noise transport messages wrapping CBOR:
 | 21 | want | `{2: [[id, scope], …]}` |
 | 22 | records | `{2: [peer record, …]}` |
 | 23 | wary | `{2: [id, …], 3: exp}` (optional, §8) |
-| 60 | ping | `{2: nonce}`, answered with the same frame |
+| 60 | ping | `{2: nonce}`, answered with the same frame. Replaces WebSocket ping/pong, which is not used |
+| 61 | dummy | `{}`. Discarded on receipt |
+
+- **Large gossip** that doesn't fit one 32 KB frame is split across several
+  `digest` or `records` frames.
 
 - **Custody rule:** a receiver answers `accepted` only after durably storing
   the message. `busy` is the fair-share answer (§6, §8), and also the answer
@@ -254,6 +262,39 @@ All frames are Noise transport messages wrapping CBOR:
 - **Equivocation proofs** need no frame of their own. Conflicting records
   travel in an ordinary `records` frame, and the receiver detects the
   conflict.
+
+### Send schedule (design §7)
+
+Every post-handshake frame a node sends, on any link, goes out through one
+per-node schedule:
+
+- **Slot times** follow a Poisson process at rate *r* (exponentially
+  distributed gaps drawn from OS randomness).
+- **Rate:** *r* = max(*floor*, *recent* × (1 + *headroom*)).
+  - *recent* is the node's own rate of real frames sent, transit included,
+    averaged over the window *W*.
+  - *r* is recomputed at most once per *W*/12, never in response to an
+    individual frame.
+- **At each slot:**
+  - If any link has a real frame queued, send the oldest one by priority,
+    choosing the link at random among links with frames queued.
+  - Otherwise send a `dummy` on a uniformly random current link, at a bucket
+    drawn from the distribution of real frame buckets sent over *W*. Use 2 KB
+    when there is no history.
+- **Handshake frames** (40–42) are not scheduled, since they occur only when
+  a link opens.
+- **Hive links** may use a separate, higher *floor_hive*, scheduled on its
+  own Poisson process, so cheap LAN cover doesn't raise WAN cost.
+- **Defaults:**
+
+  | Parameter | Default |
+  |---|---|
+  | *floor* | one frame per 15 s |
+  | *W* | 6 hours |
+  | *headroom* | 25% |
+  | *floor_hive* | one frame per 2 s |
+
+  A *floor* of zero turns synthetic cover off; slot timing stays random.
 
 ### Public status (optional)
 

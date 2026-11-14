@@ -195,6 +195,12 @@ An instance is either **public** or **private**:
   authenticated connections to a bounded set of neighbors (about 8 to 32).
   Those connections are its links, and they carry gossip, routing traffic
   and custody alike.
+- **One send schedule per node.** Every frame a node sends after a handshake,
+  on any link, goes out through a single random send schedule, with real
+  frames replacing dummies and every frame padded to a size bucket. To an
+  outside observer, a node's links carry a steady hum that doesn't reveal
+  when it is talking (§7). No unencrypted WebSocket control frames are used;
+  keepalives are encrypted frames on the same schedule.
 - **Every protocol object is self-proving.** Peer records are signed
   publicly. Messages are authenticated end to end inside their encryption
   (§6). Either way, objects stay independent of the transport that carries
@@ -314,8 +320,8 @@ designated relays and no per-message flooding.
      the message id answers "already have it" and takes no further action.
      The forwarding hop then picks its next-best hop. This holds even while
      hops' views of the graph disagree.
-   - **Each hop may hold the message for a small random delay** before
-     forwarding (§7).
+   - **The forward waits for the hop's next send slot** (§7). That wait is
+     random, so it also serves as a per-hop delay.
 3. **Custody transfer** (Fall 2003) **with fair shares.** The next hop
    accepts only after durably storing the message. Responsibility then
    passes to it, and the previous hop deletes its copy. Acceptance follows
@@ -394,13 +400,13 @@ that limit, it minimizes what any node can learn or keep.
    Lightning's blinded paths.
 3. **Only the public backbone is published.** Endpoints and links come only
    from public instances. Hive-scoped data never leaves the hive (§2).
-4. **Size buckets.** Every message, receipts included, is padded to one of a
-   few fixed sizes (for example 2, 8 and 32 KB), so size doesn't
-   distinguish messages.
-5. **Random per-hop delay.** Each hop holds a message for a small random
-   time before forwarding, a few seconds by default and set per server.
-   Store-and-forward delivery makes this nearly free. It blunts simple
-   timing correlation. There is no cover traffic.
+4. **Size buckets for every frame.** Every frame on a link (messages,
+   receipts, custody replies, gossip, keepalives and dummies) is padded to
+   one of a few fixed sizes (2, 8 and 32 KB). Size distinguishes nothing,
+   and the gossip that flows constantly becomes indistinguishable from
+   messages.
+5. **Cover traffic: one send schedule per node, sized by the crowd.** See
+   below.
 6. **Receipts look like messages.** Same format, same padding, no separate
    channel.
 7. **Minimal retention.** After handing off custody, a hop deletes the
@@ -409,6 +415,60 @@ that limit, it minimizes what any node can learn or keep.
    server reveals little.
 8. **No names on the network.** Records carry no display names (§1), so the
    mesh learns nothing about what an instance calls itself.
+
+### Cover traffic
+
+An outside observer sees only encrypted frames on each link. Each link has
+its own Noise keys, so the same message is different ciphertext on every
+link, and the observer has nothing to go on but sizes and timing. Size
+buckets remove size. The send schedule removes timing.
+
+**The rule.** Each node sends on one random schedule, a Poisson process.
+Its rate is the larger of a low floor and the node's own recent traffic,
+transit included, averaged over a long window (hours), plus some headroom.
+At each slot:
+
+- **A real frame is waiting:** send it, on the link it belongs to.
+- **Nothing is waiting:** send a dummy on a random link, padded to a bucket
+  size drawn from the node's recent real mix.
+
+Real frames replace dummies; they never add to them. That's what makes the
+observable stream independent of when the node talks. If real traffic were
+added on top of cover, volume would rise whenever the node is active, which
+is exactly the signal being hidden. Every post-handshake frame goes through
+this schedule, including gossip, custody replies and keepalives, so even a
+request and its reply don't appear as a timing pair.
+
+**The crowd is the cover.** Every node relays other nodes' traffic, so
+transit already hides a node's own messages. Cover traffic is needed only to
+keep the background from falling too low:
+
+> dummies ≈ desired background − real traffic already present
+
+In a quiet network the floor does the work at a small fixed cost. In a busy
+network, transit fills the slots, and dummies shrink to the headroom. The
+bigger and busier the mesh, the less synthetic noise it needs.
+
+**The floor is per node, not per link.** An outside observer watches a
+node's uplink and sees all its links at once, so a separate floor on each
+link would multiply the cost with no added protection. Each node's cost is
+therefore constant, however large the network grows. Precedent: Crowds
+(Reiter & Rubin 1998) hides a node's traffic in traffic it relays for
+others; Tarzan (Freedman & Morris 2002) confines cover to a node's fixed
+neighbor set.
+
+**What it costs.** With a floor of one frame every 15 seconds and an average
+frame of about 3 KB, an idle node sends about 17 MB a day and receives about
+the same. On a busy node the cost rounds to nothing, because the hum is
+mostly real traffic. Setting the floor to zero turns synthetic cover off; the
+schedule still randomizes timing.
+
+**The slot wait is the per-hop delay.** A real frame waits for its next
+slot, and that wait is random. No separate per-hop delay exists.
+
+**Hives.** Links across a hive LAN can run at a higher floor at little cost,
+and a gateway's WAN uplink then carries the aggregated traffic of its whole
+hive.
 
 ### Who learns what
 
@@ -421,11 +481,24 @@ that limit, it minimizes what any node can learn or keep.
 
 ### What remains exposed
 
-- **Colluding hops on the same path can link it,** because the message is
-  identical at every hop. Re-encrypting at each hop is what onion routing
-  adds, and Lattice deliberately doesn't.
-- **An observer who sees the whole network** can still correlate timing.
-  Random delay makes that harder but doesn't prevent it.
+- **Colluding hops on the same path can link it,** because inside the Noise
+  channel the message is identical at every hop. Re-encrypting at each hop is
+  what onion routing adds, and Lattice deliberately doesn't. This applies to
+  insiders only; outside observers see different ciphertext on every link.
+- **Neighbors know which frames are dummies.** Cover traffic hides activity
+  from outside observers, not from the node at the other end of the link.
+- **Average volume over hours is visible.** The send rate follows a node's
+  real traffic, transit included, over a long window. An observer can
+  roughly estimate how much a node handles on average, but not when it sent
+  anything or which traffic is its own. A burst that exceeds the headroom
+  waits in the queue or nudges the rate up gradually rather than appearing as
+  a spike.
+- **That a node runs Lattice is visible.** A steady random hum on a WebSocket
+  is a fingerprint of its own. So are handshakes when links open and links
+  opening and closing.
+- **An observer who sees the whole network** can still attempt timing
+  correlation. Independent random send schedules at every hop make it much
+  harder, but not impossible.
 - **Gateways see their private instances' traffic.** That's why instances
   choose their own gateways, usually within their hive.
 - **The set of identities is public** within the mesh, though not their
@@ -678,7 +751,11 @@ principle).
 - **Privacy details:**
   - The exact size buckets. Messages larger than the largest bucket are
     refused in v2.0; attachments come later.
-  - The default per-hop delay range.
+  - Cover parameters: the floor, the averaging window, the headroom, and
+    the hive floor.
+  - Loop messages: cover messages a node routes through the mesh back to
+    itself. They would look real even to hops, and their failure to return
+    would be evidence for the immune system. Deferred.
   - How a private instance chooses its gateways, how many it lists, and what
     a private instance with no hive uses as a gateway.
   - Whether recipients may accept messages from anonymous senders. For now
@@ -709,7 +786,10 @@ principle).
 - Yggdrasil network whitepaper and Ironwood routing library (greedy tree routing).
 - Danezis & Goldberg, "Sphinx: A Compact and Provably Secure Mix Format," IEEE S&P 2009 (the onion format Lattice deliberately doesn't adopt).
 - Lightning Network BOLT 4, onion routing and route blinding (the full form of the gateway layer).
-- Piotrowska et al., "The Loopix Anonymity System," USENIX Security 2017 (per-hop random delay; cover traffic not adopted).
+- Piotrowska et al., "The Loopix Anonymity System," USENIX Security 2017 (Poisson send schedules, real traffic replacing cover).
+- Reiter & Rubin, "Crowds: Anonymity for Web Transactions," ACM TISSEC 1998.
+- Freedman & Morris, "Tarzan: A Peer-to-Peer Anonymizing Network Layer," ACM CCS 2002.
+- Das et al., "Anonymity Trilemma: Strong Anonymity, Low Bandwidth Overhead, Low Latency — Choose Two," IEEE S&P 2018.
 - BitTorrent BEP 5 (DHT), BEP 9 (metadata exchange), BEP 11 (PEX), BEP 14 (LSD), BEP 44 (mutable items).
 - Donenfeld, "WireGuard: Next Generation Kernel Network Tunnel," NDSS 2017 (cookie mechanism).
 - Laurie & Clayton, "Proof-of-Work Proves Not to Work," WEIS 2004.
