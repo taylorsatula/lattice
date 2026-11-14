@@ -13,15 +13,40 @@ that document; section references (§n) point back to it.
 - **Every top-level object** carries `0: v` (protocol version, currently 1)
   and `1: t` (object type).
 - **Unknown keys are rejected,** not ignored. Within a version the format is
-  closed; extensions come with a new version number.
+  closed; extensions come with a new version number. A node refuses objects
+  whose version it doesn't support, and advertises the versions it supports
+  in its record's capabilities. There is no compatibility with v1.
 - **Sizes:**
 
   | Object | Limit |
   |---|---|
   | Peer record | 3 KB |
   | Message | Exactly one size bucket: 2, 8 or 32 KB |
-  | Channel frame | 40 KB |
+  | Channel frame | 40 KB, enforced by the WebSocket layer before the frame is assembled |
   | Local API frame | 64 KB |
+
+- **Decoding limits.** Every decoder of untrusted bytes enforces, before
+  allocating:
+
+  | Limit | Value |
+  |---|---|
+  | Nesting depth | 8 |
+  | Array or map length | 512 entries |
+  | Byte or text string | The enclosing object's size limit |
+
+  Anything beyond a limit is rejected outright, with nothing partially
+  decoded kept.
+
+- **Expiry horizons.** Expiries are chosen by their creators, so receivers
+  bound them:
+
+  | Object | Maximum expiry from now |
+  |---|---|
+  | Message (and receipt) | 14 days |
+  | Peer record | 30 days |
+
+  An object whose expiry is in the past, or beyond its horizon plus a few
+  hours of clock skew, is refused.
 
 ### Primitive types
 
@@ -105,7 +130,7 @@ publish only a hive record.
 - The KEL is valid (§2) and not abandoned.
 - `sig` verifies under the current key in the KEL.
 - `id` matches the KEL's inception.
-- `exp` is in the future, within skew of hours.
+- `exp` is in the future and within the record horizon (§1).
 - Fields match the mode: no `ep` or `ln` on a private record, no `gw` on a
   public one.
 - Every `ep` URL is consistent with the record's scope (§2 scope rule).
@@ -146,7 +171,7 @@ The wire form is a CBOR array:
 | 1 | t | uint | 30 |
 | 2 | mid | mid | |
 | 3 | dst | id | The recipient, or a gateway of a private recipient |
-| 4 | exp | time | |
+| 4 | exp | time | Within the message horizon (§1) |
 
 ### Gateway layer plaintext
 
@@ -217,8 +242,15 @@ All frames are Noise transport messages wrapping CBOR:
 | 60 | ping | `{2: nonce}`, answered with the same frame |
 
 - **Custody rule:** a receiver answers `accepted` only after durably storing
-  the message. `busy` is the fair-share answer (§6, §8). `refused` means the
-  message is malformed, expired, or the wrong size for its bucket.
+  the message. `busy` is the fair-share answer (§6, §8), and also the answer
+  at the recipient when the target service's inbox is full. `refused` means
+  the message is malformed, expired, beyond the message horizon, or the
+  wrong size for its bucket.
+- **Check order for an offer,** cheapest first: frame and bucket size, then
+  expiry and horizon, then dedup (answer `already have`), then fair share
+  (answer `busy`), then durable storage (answer `accepted`).
+- **Check order for a new connection:** frame size, then mac1, then mac2 when
+  under load, then the Noise handshake.
 - **Equivocation proofs** need no frame of their own. Conflicting records
   travel in an ordinary `records` frame, and the receiver detects the
   conflict.
@@ -238,7 +270,10 @@ The local API is how any application, MIRA or otherwise, uses Lattice.
 - **Services authenticate** on the application socket. Each service
   (`mira`, `backup`, …) is named in the configuration with a secret. A
   connection presents the service name and secret once, and can then send as
-  that service and read only that service's inbox.
+  that service and read only that service's inbox. The secret is compared in
+  constant time.
+- **Client libraries** for Rust and Python implement this framing and the
+  operations below, so applications don't hand-roll CBOR.
 - **Request:** `{0: request id, 1: op, 2: args}`
 - **Response:** `{0: request id, 1: ok}` or `{0: request id, 2: error code}`
 - **Event,** pushed without a request: `{3: event, 2: data}`
@@ -248,7 +283,7 @@ The local API is how any application, MIRA or otherwise, uses Lattice.
 | Op | Args | Result |
 |---|---|---|
 | `hello` | service, secret | Own identifier and service; the session is bound to that service |
-| `send` | to (id), tsvc, tmbx, fmbx, body, exp (optional) | mid. The message is accepted into the durable outbound queue |
+| `send` | to (id), tsvc, tmbx, fmbx, body, exp (optional, within the horizon), priority (optional, 0–3) | mid. The message is accepted into the durable outbound queue. Priority orders only this instance's outbound queue and never goes on the wire |
 | `status` | mid | `queued`, `in_transit`, `delivered`, `failed` (with reason) or `expired` |
 | `fetch` | max | Deliveries: delivery id, mid, from, fsvc, fmbx, tmbx, body, received |
 | `ack` | delivery ids | Removes them from the inbox |
@@ -271,6 +306,9 @@ The local API is how any application, MIRA or otherwise, uses Lattice.
   such service on this instance (reason 1), or a message that fails
   verification (reason 2). Lattice has no concept of users; mailboxes are
   the service's business.
+- **Each service's inbox is capped.** When it is full, the recipient answers
+  `busy` to offers for that service (§6), so an application that stops
+  fetching creates backpressure instead of unbounded growth.
 
 ### Admin operations
 
@@ -282,6 +320,7 @@ The local API is how any application, MIRA or otherwise, uses Lattice.
 | `rotate_envelope` | Publish new envelope keys and delete the old private keys |
 | `link` | Connect to an address, with an optional identifier (adds a root) |
 | `unlink` | Drop and demote a link |
+| `drain` | Stop accepting new custody (answer `busy`), keep handing off what's held, and report when empty |
 
 Admin operations are reached through a CLI (`latticectl`). Nothing
 administrative is available on the application socket.
@@ -292,9 +331,10 @@ redb tables, derived from the objects above:
 
 | Table | Key | Value |
 |---|---|---|
+| `meta` | singleton | Schema version |
 | `identity` | singleton | Own KEL, current secret keys, configuration hash |
 | `records` | (id, scope) | Peer record bytes, received time |
-| `outbound` | mid | Message bytes, state, attempt, next attempt, receipt deadline, expected path |
+| `outbound` | mid | Message bytes, priority, state, attempt, next attempt, receipt deadline, expected path |
 | `custody` | mid | Message bytes, upstream link, destination, lease |
 | `shares` | (destination, upstream link) | Count held, for fair-share custody |
 | `seen` | BLAKE3(mid) | Expiry |
@@ -304,3 +344,9 @@ redb tables, derived from the objects above:
 
 The next signing key's secret is not stored here. It lives in a separate
 file, or offline (§1).
+
+**Schema versioning.** The store starts at schema version 1. At startup the
+daemon reads `meta`. If the version is older than the daemon's, it runs the
+explicit migrations for each step in order before serving. If it is newer,
+the daemon refuses to start. There is no migration from v1's SQLite
+database.

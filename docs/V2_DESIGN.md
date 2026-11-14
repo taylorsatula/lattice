@@ -159,6 +159,11 @@ An instance is either **public** or **private**:
   never over the WAN. Private and overlay addresses (RFC 1918,
   100.64.0.0/10 and similar) arriving over the WAN are dropped. This
   replaces v1's fixed SSRF blocklist.
+- **The scope rule is applied to resolved addresses at connect time.** A
+  hostname in a WAN record can later resolve to a private address (DNS
+  rebinding), so every connection attempt resolves the name, checks every
+  resulting address against the record's scope, and connects only to an
+  address that passes. Checking record contents alone isn't enough.
 - **Prove an endpoint before using it.** An endpoint counts as reachable
   only after a handshake at that address proves the far end holds the
   record's channel key. That stops anyone using the mesh to aim traffic at a
@@ -279,9 +284,10 @@ designated relays and no per-message flooding.
   of their encryption, so a hop that alters it makes decryption fail at the
   gateway or the recipient.
 - **Hops judge traffic by the link it arrived on.** A hop checks that a
-  message is well formed, fits a size bucket and hasn't expired. Whether it
-  takes custody is then decided by fair-share custody for the link the
-  message arrived on (step 3 below).
+  message is well formed, fits a size bucket, hasn't expired, and doesn't
+  carry an expiry beyond the maximum horizon (§9). Whether it takes custody
+  is then decided by fair-share custody for the link the message arrived on
+  (step 3 below).
 - **Overhead.** Each hybrid-encrypted layer carries about 1.1 KB of KEM
   ciphertext, so the smallest size bucket is at least 2 KB (more for
   messages to private instances, which carry two encrypted layers).
@@ -290,7 +296,10 @@ designated relays and no per-message flooding.
 
 1. **Sender:** builds, encrypts and pads the message at enqueue time and
    writes it to the durable outbound queue. The first attempt is made
-   immediately.
+   immediately. The application may give a message a priority, which orders
+   the sender's own outbound queue (higher first, oldest first within a
+   priority). Priority is never put on the wire, so it reveals nothing to
+   hops.
 2. **Each hop,** including the sender:
    - If it is the routing destination and the final recipient, it opens the
      envelope, verifies the sender's signature, hands the message to the
@@ -321,6 +330,11 @@ designated relays and no per-message flooding.
    retries with backoff, while applying the same rule to its own upstream
    links. Gateways and recipients apply the same rule as every other hop.
    §8 explains how this contains floods.
+
+   At the recipient, each service's inbox is also capped. When an
+   application stops fetching and its inbox fills, the recipient answers
+   busy for that service, so a stalled application pushes back across the
+   mesh through the same mechanism.
 4. **No path right now:** the message waits at the furthest node that took
    custody, retrying with backoff, and moves on when the graph changes. It
    is dropped at expiry. This is delay-tolerant behavior: traversal
@@ -421,6 +435,13 @@ that limit, it minimizes what any node can learn or keep.
   key can decrypt recorded envelopes sent to it. Rotating the envelope key
   regularly (a new record with a higher seq, deleting the old private key)
   limits how much a single theft exposes.
+- **Deleting a key file doesn't guarantee the key is gone.** The mitigation
+  above depends on old envelope private keys really being destroyed. On SSDs
+  and journaling filesystems, deleting or even overwriting a file doesn't
+  guarantee the bytes are unrecoverable. Real assurance needs full-disk
+  encryption on the host, or keeping private keys only in memory-backed
+  storage such as systemd credentials. Lattice deletes old keys, but
+  promises no more than deletion can deliver.
 - **Routing headers are protected only classically.** The hybrid KEM
   protects envelope content. The Noise channel uses X25519 alone, so a
   future quantum adversary that recorded traffic could recover routing
@@ -478,6 +499,9 @@ All of these cost honest traffic nothing:
 
 - Fair-share custody per destination per upstream link (§6).
 - A cap on total transit storage.
+- A cap on each service's inbox at the recipient, enforced through busy.
+- A maximum expiry horizon on messages and records (§9), which bounds how
+  long anything can occupy custody, dedup or record storage.
 - A rate limit per neighbor on records and gossip.
 - A fixed cap on stored records, with eviction by the secret-salted hash.
 - Soft-state expiry.
@@ -517,6 +541,12 @@ principle).
   ids.
 - **The only timestamps are coarse signed expiries,** on peer records and
   messages, measured in days. Clocks only need to be right to within hours.
+- **Expiries have a maximum horizon.** Senders choose expiries, so hops
+  refuse messages whose expiry is further out than a fixed maximum (on the
+  order of 14 days), and gossip refuses records whose expiry is further out
+  than the record maximum. Without this, one sender could make a message or
+  record occupy every node's storage for a year. The horizon also puts a
+  hard bound on the size of the seen-id table.
 
 ## 10. Implementation and operations
 
@@ -536,6 +566,28 @@ principle).
   process over in-memory links and injects partitions, dropped and slow
   links, crashes during custody, and lying or dropping nodes. Every protocol
   rule is verified there before the real daemon depends on it.
+- **Bounded decoding of untrusted input.** The CBOR decoder enforces a
+  maximum nesting depth and maximum array, map and byte-string lengths, and
+  checks declared lengths before allocating. The WebSocket layer enforces the
+  frame size cap before assembling a frame in memory.
+- **Cheapest check first.** Untrusted input is rejected by the cheapest test
+  that can reject it, before any expensive work:
+  - **A new connection:** frame size, then the handshake checksum, then the
+    cookie when under load, then the Noise handshake.
+  - **A message offered for custody:** size bucket, then expiry and
+    horizon, then dedup, then fair share, then storage.
+  - **At the recipient:** decryption, which fails fast, then signature
+    verification.
+- **Secrets and randomness.** Secrets (such as service secrets on the local
+  API) are compared in constant time. Keys, message ids, salts and delays
+  come from the operating system's random number generator.
+- **Versioning.** Every wire object carries a protocol version (`V2_SPEC.md`
+  §1), and the store carries a schema version, with explicit migrations run
+  at startup when the schema changes in a future release. There is no
+  compatibility with v1, on the wire or in storage; v2 starts clean.
+- **Client libraries.** Lattice ships small client libraries for the local
+  API, starting with Rust and Python (for MIRA), so applications don't
+  implement the framing themselves.
 
 ### Operations (carried forward from v1)
 
@@ -544,6 +596,16 @@ principle).
 - **Secrets** come from systemd credentials (encrypted when available), then
   from files with mode 0600/0700. Never from environment variables.
 - **Private key files are created with mode 0600** from the start.
+- **Keys are checked at startup.** The daemon loads all key material and
+  performs a test signature and a test decapsulation before serving, so a
+  corrupt or mismatched key stops it immediately instead of failing at the
+  first message.
+- **Safe default listen address.** The WebSocket listener binds only to
+  configured hive interfaces by default, and to public interfaces only when
+  the instance is in public mode.
+- **Draining.** An admin drain operation stops accepting new custody
+  (answering busy), keeps handing off what's held, and reports when empty,
+  so planned shutdowns lose nothing and strand nothing.
 - **A hardened systemd unit:** dedicated user, `ProtectSystem=strict`,
   minimal writable paths, resource limits, a single process owning all
   state.
