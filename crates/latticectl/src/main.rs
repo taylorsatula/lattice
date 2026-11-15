@@ -70,173 +70,13 @@ async fn run(socket: &Path, args: &[String]) -> ExitCode {
         }
     };
     match args.first().map(String::as_str) {
-        Some("node") => match client.node().await {
-            Ok(n) => {
-                println!("id:            {}", hex(n.id.as_ref()));
-                println!("mode:          {}", n.mode);
-                println!("links:         {}", n.links);
-                println!("records:       {}", n.records);
-                println!("custody_bytes: {}", n.custody_bytes);
-                println!("draining:      {}", n.draining);
-                ExitCode::SUCCESS
-            }
-            Err(e) => fail(&e),
-        },
-        Some("drain") => {
-            let request = match args.get(1).map(String::as_str) {
-                None | Some("status") => lattice_client::DrainRequest::Query,
-                Some("on") => {
-                    lattice_client::DrainRequest::Set(lattice_client::DrainState::Draining)
-                }
-                Some("off") => {
-                    lattice_client::DrainRequest::Set(lattice_client::DrainState::Serving)
-                }
-                Some(other) => {
-                    eprintln!("drain: expected on|off|status, got {other:?}");
-                    return ExitCode::from(2);
-                }
-            };
-            match client.drain(request).await {
-                Ok(state) => {
-                    println!("draining:      {}", state.draining);
-                    println!("custody_bytes: {}", state.custody_bytes);
-                    ExitCode::SUCCESS
-                }
-                Err(e) => fail(&e),
-            }
-        }
-        Some("link") => {
-            let mut addr: Option<String> = None;
-            let mut key: Option<lattice_types::ChannelPublicKey> = None;
-            let mut path: Option<String> = None;
-            let mut id: Option<lattice_types::Identifier> = None;
-            let mut i = 1;
-            while i < args.len() {
-                match args[i].as_str() {
-                    "--key" => {
-                        let Some(v) = args.get(i + 1) else {
-                            eprintln!("--key needs a value");
-                            return ExitCode::from(2);
-                        };
-                        match decode_hex32(v) {
-                            Ok(k) => key = Some(lattice_types::ChannelPublicKey::from_bytes(k)),
-                            Err(e) => {
-                                eprintln!("--key: {e}");
-                                return ExitCode::from(2);
-                            }
-                        }
-                        i += 2;
-                    }
-                    "--path" => {
-                        let Some(v) = args.get(i + 1) else {
-                            eprintln!("--path needs a value");
-                            return ExitCode::from(2);
-                        };
-                        path = Some(v.clone());
-                        i += 2;
-                    }
-                    "--id" => {
-                        let Some(v) = args.get(i + 1) else {
-                            eprintln!("--id needs a value");
-                            return ExitCode::from(2);
-                        };
-                        match decode_hex32(v) {
-                            Ok(k) => id = Some(lattice_types::Identifier::from_bytes(k)),
-                            Err(e) => {
-                                eprintln!("--id: {e}");
-                                return ExitCode::from(2);
-                            }
-                        }
-                        i += 2;
-                    }
-                    other => {
-                        if addr.replace(other.to_string()).is_some() {
-                            eprintln!("unexpected extra argument {other:?}");
-                            return ExitCode::from(2);
-                        }
-                        i += 1;
-                    }
-                }
-            }
-            let Some(addr) = addr else {
-                eprintln!("usage: latticectl link <addr> [--key HEX | --path STR] [--id HEX]");
-                return ExitCode::from(2);
-            };
-            if key.is_none() && path.is_none() {
-                eprintln!("link needs --key (IK) or --path (XX upgrade path)");
-                return ExitCode::from(2);
-            }
-            match client.link(&addr, key, path, id).await {
-                Ok(()) => {
-                    println!("dial queued");
-                    ExitCode::SUCCESS
-                }
-                Err(e) => fail(&e),
-            }
-        }
-        Some("unlink") => {
-            let Some(hex) = args.get(1) else {
-                eprintln!("usage: latticectl unlink <id-hex>");
-                return ExitCode::from(2);
-            };
-            match decode_hex32(hex).map(lattice_types::Identifier::from_bytes) {
-                Ok(id) => match client.unlink(&id).await {
-                    Ok(lattice_client::UnlinkOutcome::Removed) => {
-                        println!("unlinked");
-                        ExitCode::SUCCESS
-                    }
-                    Ok(lattice_client::UnlinkOutcome::NotFound) => {
-                        println!("no such link");
-                        ExitCode::SUCCESS
-                    }
-                    Err(e) => fail(&e),
-                },
-                Err(e) => {
-                    eprintln!("bad peer id: {e}");
-                    ExitCode::from(2)
-                }
-            }
-        }
-        Some("rotate" | "abandon") => {
-            let abandon = args[0] == "abandon";
-            let mut next_key_file = None;
-            let mut i = 1;
-            while i < args.len() {
-                match args[i].as_str() {
-                    "--next-key-file" => {
-                        let Some(p) = args.get(i + 1) else {
-                            eprintln!("--next-key-file needs a path");
-                            return ExitCode::from(2);
-                        };
-                        next_key_file = Some(p.clone());
-                        i += 2;
-                    }
-                    other => {
-                        eprintln!("unknown flag {other:?}");
-                        return ExitCode::from(2);
-                    }
-                }
-            }
-            let result = if abandon {
-                client.abandon(next_key_file.as_deref()).await
-            } else {
-                client.rotate(next_key_file.as_deref()).await
-            };
-            match result {
-                Ok(msg) => {
-                    println!("{msg}");
-                    ExitCode::SUCCESS
-                }
-                Err(e) => fail(&e),
-            }
-        }
-        Some("rotate-envelope") => match client.rotate_envelope().await {
-            Ok(msg) => {
-                println!("{msg}");
-                ExitCode::SUCCESS
-            }
-            Err(e) => fail(&e),
-        },
+        Some("node") => cmd_node(&mut client).await,
+        Some("drain") => cmd_drain(&mut client, args).await,
+        Some("link") => cmd_link(&mut client, args).await,
+        Some("unlink") => cmd_unlink(&mut client, args).await,
+        Some("rotate") => cmd_rotate(&mut client, args).await,
+        Some("abandon") => cmd_abandon(&mut client, args).await,
+        Some("rotate-envelope") => cmd_rotate_envelope(&mut client).await,
         Some(other) => {
             eprintln!(
                 "unknown command {other:?}; expected node|drain|link|unlink|rotate|abandon|rotate-envelope"
@@ -252,9 +92,19 @@ async fn run(socket: &Path, args: &[String]) -> ExitCode {
     }
 }
 
-fn fail(e: &lattice_client::Error) -> ExitCode {
-    eprintln!("error: {e}");
-    ExitCode::from(1)
+async fn cmd_node(client: &mut Client) -> ExitCode {
+    match client.node().await {
+        Ok(n) => {
+            println!("id:            {}", hex(n.id.as_ref()));
+            println!("mode:          {}", n.mode);
+            println!("links:         {}", n.links);
+            println!("records:       {}", n.records);
+            println!("custody_bytes: {}", n.custody_bytes);
+            println!("draining:      {}", n.draining);
+            ExitCode::SUCCESS
+        }
+        Err(e) => fail(&e),
+    }
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -264,6 +114,176 @@ fn hex(bytes: &[u8]) -> String {
         let _ = write!(s, "{b:02x}");
     }
     s
+}
+
+async fn cmd_drain(client: &mut Client, args: &[String]) -> ExitCode {
+    let request = match args.get(1).map(String::as_str) {
+        None | Some("status") => lattice_client::DrainRequest::Query,
+        Some("on") => lattice_client::DrainRequest::Set(lattice_client::DrainState::Draining),
+        Some("off") => lattice_client::DrainRequest::Set(lattice_client::DrainState::Serving),
+        Some(other) => {
+            eprintln!("drain: expected on|off|status, got {other:?}");
+            return ExitCode::from(2);
+        }
+    };
+    match client.drain(request).await {
+        Ok(state) => {
+            println!("draining:      {}", state.draining);
+            println!("custody_bytes: {}", state.custody_bytes);
+            ExitCode::SUCCESS
+        }
+        Err(e) => fail(&e),
+    }
+}
+
+async fn cmd_link(client: &mut Client, args: &[String]) -> ExitCode {
+    let mut addr: Option<String> = None;
+    let mut key: Option<lattice_types::ChannelPublicKey> = None;
+    let mut path: Option<String> = None;
+    let mut id: Option<lattice_types::Identifier> = None;
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--key" => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!("--key needs a value");
+                    return ExitCode::from(2);
+                };
+                match decode_hex32(v) {
+                    Ok(k) => key = Some(lattice_types::ChannelPublicKey::from_bytes(k)),
+                    Err(e) => {
+                        eprintln!("--key: {e}");
+                        return ExitCode::from(2);
+                    }
+                }
+                i += 2;
+            }
+            "--path" => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!("--path needs a value");
+                    return ExitCode::from(2);
+                };
+                path = Some(v.clone());
+                i += 2;
+            }
+            "--id" => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!("--id needs a value");
+                    return ExitCode::from(2);
+                };
+                match decode_hex32(v) {
+                    Ok(k) => id = Some(lattice_types::Identifier::from_bytes(k)),
+                    Err(e) => {
+                        eprintln!("--id: {e}");
+                        return ExitCode::from(2);
+                    }
+                }
+                i += 2;
+            }
+            other => {
+                if addr.replace(other.to_string()).is_some() {
+                    eprintln!("unexpected extra argument {other:?}");
+                    return ExitCode::from(2);
+                }
+                i += 1;
+            }
+        }
+    }
+    let Some(addr) = addr else {
+        eprintln!("usage: latticectl link <addr> [--key HEX | --path STR] [--id HEX]");
+        return ExitCode::from(2);
+    };
+    if key.is_none() && path.is_none() {
+        eprintln!("link needs --key (IK) or --path (XX upgrade path)");
+        return ExitCode::from(2);
+    }
+    match client.link(&addr, key, path, id).await {
+        Ok(()) => {
+            println!("dial queued");
+            ExitCode::SUCCESS
+        }
+        Err(e) => fail(&e),
+    }
+}
+
+async fn cmd_unlink(client: &mut Client, args: &[String]) -> ExitCode {
+    let Some(hex) = args.get(1) else {
+        eprintln!("usage: latticectl unlink <id-hex>");
+        return ExitCode::from(2);
+    };
+    match decode_hex32(hex).map(lattice_types::Identifier::from_bytes) {
+        Ok(id) => match client.unlink(&id).await {
+            Ok(lattice_client::UnlinkOutcome::Removed) => {
+                println!("unlinked");
+                ExitCode::SUCCESS
+            }
+            Ok(lattice_client::UnlinkOutcome::NotFound) => {
+                println!("no such link");
+                ExitCode::SUCCESS
+            }
+            Err(e) => fail(&e),
+        },
+        Err(e) => {
+            eprintln!("bad peer id: {e}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+async fn cmd_rotate(client: &mut Client, args: &[String]) -> ExitCode {
+    rotate_or_abandon(client, args, false).await
+}
+
+async fn cmd_abandon(client: &mut Client, args: &[String]) -> ExitCode {
+    rotate_or_abandon(client, args, true).await
+}
+
+async fn rotate_or_abandon(client: &mut Client, args: &[String], abandon: bool) -> ExitCode {
+    let mut next_key_file = None;
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--next-key-file" => {
+                let Some(p) = args.get(i + 1) else {
+                    eprintln!("--next-key-file needs a path");
+                    return ExitCode::from(2);
+                };
+                next_key_file = Some(p.clone());
+                i += 2;
+            }
+            other => {
+                eprintln!("unknown flag {other:?}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let result = if abandon {
+        client.abandon(next_key_file.as_deref()).await
+    } else {
+        client.rotate(next_key_file.as_deref()).await
+    };
+    match result {
+        Ok(msg) => {
+            println!("{msg}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => fail(&e),
+    }
+}
+
+async fn cmd_rotate_envelope(client: &mut Client) -> ExitCode {
+    match client.rotate_envelope().await {
+        Ok(msg) => {
+            println!("{msg}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => fail(&e),
+    }
+}
+
+fn fail(e: &lattice_client::Error) -> ExitCode {
+    eprintln!("error: {e}");
+    ExitCode::from(1)
 }
 
 fn decode_hex32(s: &str) -> Result<[u8; 32], String> {
