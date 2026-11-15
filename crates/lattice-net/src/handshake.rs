@@ -21,7 +21,6 @@ pub const IK_MSG1_LEN: usize = 96;
 
 pub struct Pending {
     pub state: HandshakeState,
-    pub ik: bool,
 }
 
 impl Pending {
@@ -36,7 +35,7 @@ impl Pending {
             .local_private_key(x_seed.as_ref())?
             .remote_public_key(x_pub.as_ref())?
             .build_initiator()?;
-        Ok(Self { state, ik: true })
+        Ok(Self { state })
     }
 
     pub fn initiator_xx(seed: &ChannelSeed) -> Result<Self, snow::Error> {
@@ -44,7 +43,7 @@ impl Pending {
         let state = Builder::new(PARAMS_XX.parse()?)
             .local_private_key(x_seed.as_ref())?
             .build_initiator()?;
-        Ok(Self { state, ik: false })
+        Ok(Self { state })
     }
 
     pub fn responder_ik(seed: &ChannelSeed) -> Result<Self, snow::Error> {
@@ -52,7 +51,7 @@ impl Pending {
         let state = Builder::new(PARAMS_IK.parse()?)
             .local_private_key(x_seed.as_ref())?
             .build_responder()?;
-        Ok(Self { state, ik: true })
+        Ok(Self { state })
     }
 
     pub fn responder_xx(seed: &ChannelSeed) -> Result<Self, snow::Error> {
@@ -60,7 +59,7 @@ impl Pending {
         let state = Builder::new(PARAMS_XX.parse()?)
             .local_private_key(x_seed.as_ref())?
             .build_responder()?;
-        Ok(Self { state, ik: false })
+        Ok(Self { state })
     }
 
     pub fn write_message(&mut self, payload: &[u8]) -> Result<Vec<u8>, snow::Error> {

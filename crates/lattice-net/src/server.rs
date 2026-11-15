@@ -97,7 +97,7 @@ impl LoadState {
         }
     }
     /// Try to admit a new connection. Returns false when at capacity.
-    fn admit(&self) -> bool {
+    fn try_admit(&self) -> bool {
         let n = self
             .total_connections
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -250,7 +250,7 @@ pub async fn serve(cfg: ListenerConfig, bind: Vec<SocketAddr>) -> io::Result<Ser
                 continue;
             };
             let _ = crate::set_tcp_keepalive(&stream);
-            if !load.admit() {
+            if !load.try_admit() {
                 // At capacity: close immediately rather than queue.
                 drop(stream);
                 continue;
