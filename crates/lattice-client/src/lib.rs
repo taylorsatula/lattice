@@ -14,7 +14,11 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::path::Path;
 
-use lattice_proto::local::*;
+use lattice_proto::local::{
+    ERR_BAD_ARGS, ERR_NOT_FOUND, Event, LOCAL_MAX_FRAME, LOCAL_PREFIX_LEN, OP_ABANDON, OP_ACK,
+    OP_DRAIN, OP_FETCH, OP_HELLO, OP_LINK, OP_LOOKUP, OP_NODE, OP_ROTATE, OP_ROTATE_ENVELOPE,
+    OP_SEND, OP_STATUS, OP_UNLINK, Request, Response, deframe_local, err_name, frame_local,
+};
 use lattice_proto::{ProtoError, Value, decode, encode};
 use lattice_types::{ChannelPublicKey, DeliveryId, Identifier, MessageId};
 

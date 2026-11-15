@@ -22,7 +22,9 @@ use lattice_client::Client;
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() {
-        eprintln!("usage: latticectl [--socket PATH] <node|drain|link|unlink> [args]");
+        eprintln!(
+            "usage: latticectl [--socket PATH] <node|drain|link|unlink|rotate|abandon|rotate-envelope> [args]"
+        );
         return ExitCode::from(2);
     }
     let mut socket = std::env::var("LATTICE_ADMIN_SOCKET")
@@ -78,7 +80,7 @@ async fn run(socket: &Path, args: &[String]) -> ExitCode {
                 println!("draining:      {}", n.draining);
                 ExitCode::SUCCESS
             }
-            Err(e) => fail(e),
+            Err(e) => fail(&e),
         },
         Some("drain") => {
             let request = match args.get(1).map(String::as_str) {
@@ -100,7 +102,7 @@ async fn run(socket: &Path, args: &[String]) -> ExitCode {
                     println!("custody_bytes: {}", state.custody_bytes);
                     ExitCode::SUCCESS
                 }
-                Err(e) => fail(e),
+                Err(e) => fail(&e),
             }
         }
         Some("link") => {
@@ -111,28 +113,39 @@ async fn run(socket: &Path, args: &[String]) -> ExitCode {
             let mut i = 1;
             while i < args.len() {
                 match args[i].as_str() {
-                    "--key" | "--path" | "--id" => {
+                    "--key" => {
                         let Some(v) = args.get(i + 1) else {
-                            eprintln!("{} needs a value", args[i]);
+                            eprintln!("--key needs a value");
                             return ExitCode::from(2);
                         };
-                        match args[i].as_str() {
-                            "--key" => match decode_hex32(v) {
-                                Ok(k) => key = Some(lattice_types::ChannelPublicKey::from_bytes(k)),
-                                Err(e) => {
-                                    eprintln!("--key: {e}");
-                                    return ExitCode::from(2);
-                                }
-                            },
-                            "--path" => path = Some(v.clone()),
-                            "--id" => match decode_hex32(v) {
-                                Ok(k) => id = Some(lattice_types::Identifier::from_bytes(k)),
-                                Err(e) => {
-                                    eprintln!("--id: {e}");
-                                    return ExitCode::from(2);
-                                }
-                            },
-                            _ => unreachable!(),
+                        match decode_hex32(v) {
+                            Ok(k) => key = Some(lattice_types::ChannelPublicKey::from_bytes(k)),
+                            Err(e) => {
+                                eprintln!("--key: {e}");
+                                return ExitCode::from(2);
+                            }
+                        }
+                        i += 2;
+                    }
+                    "--path" => {
+                        let Some(v) = args.get(i + 1) else {
+                            eprintln!("--path needs a value");
+                            return ExitCode::from(2);
+                        };
+                        path = Some(v.clone());
+                        i += 2;
+                    }
+                    "--id" => {
+                        let Some(v) = args.get(i + 1) else {
+                            eprintln!("--id needs a value");
+                            return ExitCode::from(2);
+                        };
+                        match decode_hex32(v) {
+                            Ok(k) => id = Some(lattice_types::Identifier::from_bytes(k)),
+                            Err(e) => {
+                                eprintln!("--id: {e}");
+                                return ExitCode::from(2);
+                            }
                         }
                         i += 2;
                     }
@@ -158,7 +171,7 @@ async fn run(socket: &Path, args: &[String]) -> ExitCode {
                     println!("dial queued");
                     ExitCode::SUCCESS
                 }
-                Err(e) => fail(e),
+                Err(e) => fail(&e),
             }
         }
         Some("unlink") => {
@@ -176,7 +189,7 @@ async fn run(socket: &Path, args: &[String]) -> ExitCode {
                         println!("no such link");
                         ExitCode::SUCCESS
                     }
-                    Err(e) => fail(e),
+                    Err(e) => fail(&e),
                 },
                 Err(e) => {
                     eprintln!("bad peer id: {e}");
@@ -184,7 +197,7 @@ async fn run(socket: &Path, args: &[String]) -> ExitCode {
                 }
             }
         }
-        Some("rotate") | Some("abandon") => {
+        Some("rotate" | "abandon") => {
             let abandon = args[0] == "abandon";
             let mut next_key_file = None;
             let mut i = 1;
@@ -214,7 +227,7 @@ async fn run(socket: &Path, args: &[String]) -> ExitCode {
                     println!("{msg}");
                     ExitCode::SUCCESS
                 }
-                Err(e) => fail(e),
+                Err(e) => fail(&e),
             }
         }
         Some("rotate-envelope") => match client.rotate_envelope().await {
@@ -222,7 +235,7 @@ async fn run(socket: &Path, args: &[String]) -> ExitCode {
                 println!("{msg}");
                 ExitCode::SUCCESS
             }
-            Err(e) => fail(e),
+            Err(e) => fail(&e),
         },
         Some(other) => {
             eprintln!(
@@ -239,13 +252,18 @@ async fn run(socket: &Path, args: &[String]) -> ExitCode {
     }
 }
 
-fn fail(e: lattice_client::Error) -> ExitCode {
+fn fail(e: &lattice_client::Error) -> ExitCode {
     eprintln!("error: {e}");
     ExitCode::from(1)
 }
 
 fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
 }
 
 fn decode_hex32(s: &str) -> Result<[u8; 32], String> {
