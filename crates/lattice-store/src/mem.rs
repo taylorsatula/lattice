@@ -27,6 +27,7 @@ pub struct MemStore {
 }
 
 impl MemStore {
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -277,7 +278,7 @@ impl Store for MemStore {
         Ok(before - entries.len())
     }
     fn inbox_len(&self, service: &str) -> Result<u64, StoreError> {
-        Ok(self.inbox.get(service).map(|v| v.len() as u64).unwrap_or(0))
+        Ok(self.inbox.get(service).map_or(0, |v| v.len() as u64))
     }
     fn inbox_len_total(&self) -> Result<u64, StoreError> {
         Ok(self.inbox.values().map(|v| v.len() as u64).sum())
