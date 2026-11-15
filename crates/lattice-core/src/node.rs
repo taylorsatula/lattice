@@ -296,7 +296,6 @@ pub struct Node<S: Store> {
     rng: Rng,
     now: u64,
     draining: local::DrainState,
-    equivocations: u64,
     /// channel_key -> set of node ids whose records claim that key.
     /// Attribution of a link to a peer is allowed only when exactly one id
     /// claims the link's channel key; more than one fails closed.
@@ -371,7 +370,6 @@ impl<S: Store> Node<S> {
             rng: Rng::new(rng_seed),
             now,
             draining: local::DrainState::Serving,
-            equivocations: 0,
             ck_claims: HashMap::new(),
             next_claim_sweep_at: now + CLAIM_SWEEP_SECS,
             next_data_sweep_at: now + DATA_SWEEP_SECS,
@@ -391,11 +389,8 @@ impl<S: Store> Node<S> {
             Ok(records) => {
                 for record in records {
                     if let Ok(parsed) = PeerRecord::from_bytes(&record.bytes, now, None) {
-                        if let Some(k) = Self::claim_key(&parsed.record) {
-                            node.ck_claims
-                                .entry(k)
-                                .or_default()
-                                .insert(parsed.record.id);
+                        if let Some(k) = Self::claim_key(&parsed) {
+                            node.ck_claims.entry(k).or_default().insert(parsed.id);
                         }
                     }
                 }
@@ -406,7 +401,7 @@ impl<S: Store> Node<S> {
             node.publish_record(now)?;
         } else if let Some(stored) = node.store.record_get(&id, Scope::Wan)? {
             node.own_seq = lattice_proto::record::PeerRecord::from_bytes(&stored.bytes, now, None)
-                .map_or(1, |p| p.record.seq);
+                .map_or(1, |p| p.seq);
         }
         // Crash recovery: anything InFlight at boot may or may not have
         // reached the next hop. Requeue it now; the recipient dedups by mid,
@@ -668,7 +663,10 @@ impl<S: Store> Node<S> {
             .filter_map(|record| {
                 PeerRecord::from_bytes(&record.bytes, self.now, None)
                     .ok()
-                    .map(|p| (record.id, p.record.links, p.record.gateways))
+                    .map(|p| {
+                        let r = p.into_inner();
+                        (record.id, r.links, r.gateways)
+                    })
             })
             .collect();
         let mut graph = Graph::build(
@@ -714,7 +712,7 @@ impl<S: Store> Node<S> {
                     .map(|p| reconcile::Item {
                         id: record.id,
                         scope: scope_as_u8(record.scope),
-                        seq: p.record.seq,
+                        seq: p.seq,
                     })
             })
             .collect();
@@ -809,8 +807,8 @@ impl<S: Store> Node<S> {
             Ok(records) => {
                 for record in records {
                     if let Ok(parsed) = PeerRecord::from_bytes(&record.bytes, now, None) {
-                        if let Some(k) = Self::claim_key(&parsed.record) {
-                            fresh.entry(k).or_default().insert(parsed.record.id);
+                        if let Some(k) = Self::claim_key(&parsed) {
+                            fresh.entry(k).or_default().insert(parsed.id);
                         }
                     }
                 }
@@ -842,7 +840,7 @@ impl<S: Store> Node<S> {
                     // Skip the time check: expired records must still decode so
                     // the grace period can elapse; undecodable records are dropped.
                     let expired = match PeerRecord::from_bytes_unchecked_time(&record.bytes, None) {
-                        Ok(parsed) => parsed.record.exp.saturating_add(RETENTION_GRACE_SECS) < now,
+                        Ok(parsed) => parsed.exp.saturating_add(RETENTION_GRACE_SECS) < now,
                         Err(_) => true,
                     };
                     if expired {
@@ -999,16 +997,16 @@ impl<S: Store> Node<S> {
         }
     }
     /// Admit a record into the store. Rejections are silent by design:
-    /// the caller (`on_records`) cannot act on them, and the interesting
-    /// cases (equivocation, store failure) are already counted or logged.
+    /// the caller (`on_records`) cannot act on them, and store failures
+    /// are logged.
     fn admit_record(&mut self, at: u64, bytes: &[u8]) {
-        // Decode once to learn the claimed id, look up the known head,
+        // Parse once to learn the claimed id, look up the known head,
         // then validate exactly once. Validating the bytes twice (the old
         // behavior) doubled the KEL signature checks on every admission.
-        let Ok(decoded) = lattice_proto::record::PeerRecord::decode(bytes) else {
+        let Ok(parsed) = PeerRecord::parse(bytes) else {
             return;
         };
-        let known = match self.store.kel_head(&decoded.id()) {
+        let known = match self.store.kel_head(&parsed.id()) {
             Ok(k) => k.map(|h| KnownHead {
                 seq: h.seq,
                 commitment: h.commitment,
@@ -1020,9 +1018,9 @@ impl<S: Store> Node<S> {
                 return;
             }
         };
-        if let Ok(parsed) = decoded.validate(Some(at), known) {
-            let rec = parsed.record;
-            let head = parsed.head;
+        if let Ok(validated) = parsed.validate(Some(at), known) {
+            let head = validated.kel.head();
+            let rec = validated.into_inner();
             let scope = rec.scope;
             let existing = match self.store.record_get(&rec.id, scope) {
                 Ok(e) => e,
@@ -1037,11 +1035,7 @@ impl<S: Store> Node<S> {
                 let old_bytes = &existing.bytes;
                 // Lower-hash wins at equal seq (equivocation rule);
                 // otherwise normal last-writer-wins by seq.
-                let old_seq =
-                    PeerRecord::from_bytes(old_bytes, at, None).map_or(0, |p| p.record.seq);
-                if rec.seq == old_seq && bytes != old_bytes.as_slice() {
-                    self.equivocations += 1;
-                }
+                let old_seq = PeerRecord::from_bytes(old_bytes, at, None).map_or(0, |p| p.seq);
                 if compare_lww(bytes, rec.seq, old_bytes, old_seq) != std::cmp::Ordering::Greater {
                     return; // keep ours
                 }
@@ -1236,7 +1230,7 @@ impl<S: Store> Node<S> {
         let rec = match self.store.record_get(id, scope) {
             Ok(Some(stored)) => PeerRecord::from_bytes(&stored.bytes, self.now, None)
                 .ok()
-                .map(|p| p.record),
+                .map(|p| p.into_inner()),
             Ok(None) => None,
             // Store error: treat as missing (callers fail closed), but say so.
             Err(e) => {
@@ -1400,9 +1394,9 @@ impl<S: Store> Node<S> {
             .into_iter()
             .filter_map(|record| {
                 let parsed = PeerRecord::from_bytes(&record.bytes, self.now, None).ok()?;
-                (parsed.record.mode == Mode::Public).then_some(WaypointChoice {
+                (parsed.mode == Mode::Public).then(|| WaypointChoice {
                     id: record.id,
-                    envelope_key: parsed.record.envelope_key,
+                    envelope_key: parsed.into_inner().envelope_key,
                 })
             })
             .collect();
@@ -2929,11 +2923,6 @@ impl<S: Store> Node<S> {
         self.contested
     }
 
-    #[doc(hidden)]
-    pub fn debug_equivocations(&self) -> u64 {
-        self.equivocations
-    }
-
     /// Peer id a link is currently bound to, if any. Test/diagnostic only.
     #[doc(hidden)]
     pub fn debug_link_peer(&self, link: u64) -> Option<Option<Identifier>> {
@@ -3024,7 +3013,7 @@ impl<S: Store> Node<S> {
                         self.now,
                         None,
                     )
-                    .map(|p| p.record.mode)
+                    .map(|p| p.mode)
                     .ok();
                     return LookupResult::Present { mode };
                 }

@@ -10,7 +10,7 @@ use lattice_types::{
 
 use crate::cbor::{Value, encode};
 use crate::error::ProtoError;
-use crate::kel::{KelHead, KelRelation, KeyEvent, ValidatedKel, classify};
+use crate::kel::{KelRelation, KeyEvent, ValidatedKel, classify};
 use crate::obj::{decode_limited, fixed_bytes};
 use crate::{CLOCK_SKEW, MAX_RECORD_HORIZON, RECORD_MAX};
 
@@ -297,20 +297,13 @@ pub struct KnownHead {
     pub commitment: Commitment,
 }
 
-/// A record that passed validation, paired with its KEL head.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ParsedRecord {
-    pub record: PeerRecord,
-    pub head: KelHead,
-}
-
 /// A record decoded from the wire, before any validation.
 ///
 /// Carries no trust: every field is attacker-controlled until
-/// [`DecodedRecord::validate`] succeeds. Exists so callers can learn the
+/// [`ParsedRecord::validate`] succeeds. Exists so callers can learn the
 /// record's claimed id (e.g. to look up a known KEL head) without paying
 /// for full validation, then validate exactly once.
-pub struct DecodedRecord {
+pub struct ParsedRecord {
     id: Identifier,
     scope: Scope,
     seq: u64,
@@ -327,7 +320,30 @@ pub struct DecodedRecord {
     channel_sig: Signature,
 }
 
-impl DecodedRecord {
+/// A record that passed full validation: structure, KEL chain, identifier
+/// binding, known-head monotonicity, and both signatures.
+///
+/// Derefs to [`PeerRecord`]; call [`ValidatedRecord::into_inner`] to
+/// consume the wrapper.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ValidatedRecord(PeerRecord);
+
+impl ValidatedRecord {
+    /// Consume the wrapper and return the inner record.
+    pub fn into_inner(self) -> PeerRecord {
+        self.0
+    }
+}
+
+impl std::ops::Deref for ValidatedRecord {
+    type Target = PeerRecord;
+
+    fn deref(&self) -> &PeerRecord {
+        &self.0
+    }
+}
+
+impl ParsedRecord {
     /// The record's claimed identifier. Not yet verified against the KEL;
     /// only meaningful for lookups, never for trust decisions.
     pub fn id(&self) -> Identifier {
@@ -336,11 +352,11 @@ impl DecodedRecord {
 }
 
 impl PeerRecord {
-    /// Decode a record from the wire without validating it.
+    /// Parse a record from the wire without validating it.
     ///
     /// The result proves nothing about the bytes; call
-    /// [`DecodedRecord::validate`] before trusting any field.
-    pub fn decode(bytes: &[u8]) -> Result<DecodedRecord, ProtoError> {
+    /// [`ParsedRecord::validate`] before trusting any field.
+    pub fn parse(bytes: &[u8]) -> Result<ParsedRecord, ProtoError> {
         let value = decode_limited(bytes, RECORD_MAX)?;
         value.deny_unknown_keys(&RECORD_KEYS)?;
         if value.req_uint(0)? != crate::kel::PROTOCOL_VERSION {
@@ -403,7 +419,7 @@ impl PeerRecord {
                 .collect::<Result<_, _>>()?,
         };
 
-        Ok(DecodedRecord {
+        Ok(ParsedRecord {
             id,
             scope,
             seq,
@@ -431,8 +447,8 @@ impl PeerRecord {
         bytes: &[u8],
         now: u64,
         known_head: Option<KnownHead>,
-    ) -> Result<ParsedRecord, ProtoError> {
-        Self::decode(bytes)?.validate(Some(now), known_head)
+    ) -> Result<ValidatedRecord, ProtoError> {
+        Self::parse(bytes)?.validate(Some(now), known_head)
     }
 
     /// Parse and validate a record without checking the expiry horizon.
@@ -441,19 +457,19 @@ impl PeerRecord {
     pub fn from_bytes_unchecked_time(
         bytes: &[u8],
         known_head: Option<KnownHead>,
-    ) -> Result<ParsedRecord, ProtoError> {
-        Self::decode(bytes)?.validate(None, known_head)
+    ) -> Result<ValidatedRecord, ProtoError> {
+        Self::parse(bytes)?.validate(None, known_head)
     }
 }
 
-impl DecodedRecord {
-    /// Validate the decoded record: expiry horizon, structure, KEL chain,
+impl ParsedRecord {
+    /// Validate the parsed record: expiry horizon, structure, KEL chain,
     /// identifier binding, known-head monotonicity, and both signatures.
     pub fn validate(
         self,
         now: Option<u64>,
         known_head: Option<KnownHead>,
-    ) -> Result<ParsedRecord, ProtoError> {
+    ) -> Result<ValidatedRecord, ProtoError> {
         let Self {
             id,
             scope,
@@ -529,7 +545,6 @@ impl DecodedRecord {
             }
         }
 
-        let head = kel.head();
         let record = PeerRecord {
             id,
             scope,
@@ -547,7 +562,7 @@ impl DecodedRecord {
             channel_sig,
         };
         let preimage = encode(&record.unsigned_value());
-        if !verify(&head.current_key, &preimage, &record.sig) {
+        if !verify(&record.kel.current_key(), &preimage, &record.sig) {
             return Err(ProtoError::BadSignature);
         }
         // The channel key must endorse the record too: without this, anyone
@@ -555,7 +570,7 @@ impl DecodedRecord {
         if !verify(&channel_key, &preimage, &record.channel_sig) {
             return Err(ProtoError::BadSignature);
         }
-        Ok(ParsedRecord { record, head })
+        Ok(ValidatedRecord(record))
     }
 }
 
@@ -571,9 +586,14 @@ pub fn record_hash(bytes: &[u8]) -> Hash32 {
 }
 
 /// Equivocation: two records, same (id, scope, seq), different bytes.
-/// Callers must have validated both signatures before calling.
+/// Only validated records can be passed, so both signatures are known good.
 #[must_use]
-pub fn is_equivocation(a: &PeerRecord, a_bytes: &[u8], b: &PeerRecord, b_bytes: &[u8]) -> bool {
+pub fn is_equivocation(
+    a: &ValidatedRecord,
+    a_bytes: &[u8],
+    b: &ValidatedRecord,
+    b_bytes: &[u8],
+) -> bool {
     a.id == b.id && a.scope == b.scope && a.seq == b.seq && a_bytes != b_bytes
 }
 

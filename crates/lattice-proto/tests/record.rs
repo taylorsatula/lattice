@@ -69,10 +69,10 @@ fn public_record_roundtrip() {
     let bytes = rec.encode();
     assert!(bytes.len() <= 3072);
     let parsed = PeerRecord::from_bytes(&bytes, NOW, None).unwrap();
-    assert_eq!(parsed.record.id, rec.id);
-    assert_eq!(parsed.record.seq, 1);
-    assert_eq!(parsed.record.kel.len(), 1);
-    assert_eq!(parsed.head.seq, 0);
+    assert_eq!(parsed.id, rec.id);
+    assert_eq!(parsed.seq, 1);
+    assert_eq!(parsed.kel.len(), 1);
+    assert_eq!(parsed.kel.head().seq, 0);
 }
 
 #[test]
@@ -233,7 +233,14 @@ fn equivocation_detection() {
         &f.seed,
     )
     .unwrap();
-    assert!(is_equivocation(&a, &a.encode(), &signed, &signed.encode()));
+    let a_v = PeerRecord::from_bytes(&a.encode(), NOW, None).unwrap();
+    let signed_v = PeerRecord::from_bytes(&signed.encode(), NOW, None).unwrap();
+    assert!(is_equivocation(
+        &a_v,
+        &a.encode(),
+        &signed_v,
+        &signed.encode()
+    ));
 }
 
 #[test]

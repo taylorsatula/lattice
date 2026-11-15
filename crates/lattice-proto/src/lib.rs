@@ -25,7 +25,7 @@ pub use message::{
     BuildParams, Envelope, GatewaySeal, Header, HopLayerPlain, Message, SealedLayer, WaypointSeal,
 };
 pub use record::{
-    DecodedRecord, Endpoint, KnownHead, Mode, ParsedRecord, PeerRecord, Scope, compare_lww,
+    Endpoint, KnownHead, Mode, ParsedRecord, PeerRecord, Scope, ValidatedRecord, compare_lww,
     is_equivocation, is_globally_routable, record_hash,
 };
 

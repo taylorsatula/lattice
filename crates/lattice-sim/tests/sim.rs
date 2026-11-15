@@ -445,7 +445,7 @@ fn forged_envelope_is_not_delivered() {
         .unwrap()
         .unwrap()
         .bytes;
-    let target_rec = PeerRecord::from_bytes(&target_rec, 0, None).unwrap().record;
+    let target_rec = PeerRecord::from_bytes(&target_rec, 0, None).unwrap().into_inner();
 
     let envelope = Envelope {
         kind: KIND_MESSAGE,

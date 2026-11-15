@@ -514,7 +514,7 @@ impl<S: Store> Sim<S> {
             .expect("own record present");
         lattice_proto::record::PeerRecord::from_bytes(&stored.bytes, self.now, None)
             .expect("own record parses")
-            .record
+            .into_inner()
             .channel_key
     }
 
