@@ -97,7 +97,7 @@ impl LoadState {
         }
     }
     /// Try to admit a new connection. Returns false when at capacity.
-    fn admit(&self) -> bool {
+    fn try_admit(&self) -> bool {
         let n = self
             .total_connections
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -250,7 +250,7 @@ pub async fn serve(cfg: ListenerConfig, bind: Vec<SocketAddr>) -> io::Result<Ser
                 continue;
             };
             let _ = crate::set_tcp_keepalive(&stream);
-            if !load.admit() {
+            if !load.try_admit() {
                 // At capacity: close immediately rather than queue.
                 drop(stream);
                 continue;
@@ -322,7 +322,7 @@ async fn handle_conn(
     if parsed.path == "/status" && cfg.status_enabled && parsed.method == "GET" {
         let draining = cfg.draining.load(std::sync::atomic::Ordering::Relaxed);
         let accepting = !draining && !load.under_load();
-        let body = lattice_proto::local::encode_status(true, accepting, &[1]);
+        let body = lattice_proto::local::encode_status(accepting, &[1]);
         let resp = format!(
             "HTTP/1.1 200 OK\r\ncontent-type: application/cbor\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
             body.len()

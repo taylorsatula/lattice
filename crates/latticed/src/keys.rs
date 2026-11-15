@@ -215,12 +215,12 @@ pub struct Rotation {
 }
 
 /// Rotate the signing key. `next_key_file` overrides the default location
-/// (`<dir>/next_signing_seed`). `abandon` performs a rotation with no
-/// next-key commitment, permanently ending the identity.
+/// (`<dir>/next_signing_seed`). `kind` is [`lattice_core::RotationKind::Abandon`]
+/// for a rotation with no next-key commitment, permanently ending the identity.
 pub fn rotate_signing_key(
     dir: &Path,
     next_key_file: Option<&Path>,
-    abandon: bool,
+    kind: lattice_core::RotationKind,
 ) -> io::Result<Rotation> {
     let mut identity = load_identity(dir)?;
     let next_path = match next_key_file {
@@ -264,10 +264,9 @@ pub fn rotate_signing_key(
             )
         })?);
 
-    let new_next = if abandon {
-        None
-    } else {
-        Some(lattice_crypto::generate_seed())
+    let new_next = match kind {
+        lattice_core::RotationKind::Abandon => None,
+        lattice_core::RotationKind::Rotate => Some(lattice_crypto::generate_seed()),
     };
     identity
         .rotate(&next_seed, new_next.clone())
@@ -295,7 +294,7 @@ pub fn rotate_signing_key(
         lattice_proto::kel::encode_kel(&identity.kel),
     )?;
     write_seed(dir, "signing_seed", &identity.signing_seed)?;
-    let next_key_path = if abandon {
+    let next_key_path = if kind == lattice_core::RotationKind::Abandon {
         if let Err(e) = fs::remove_file(&next_path) {
             // The identity is abandoned but the pre-committed next key is still
             // on disk; the operator believes it is gone. Say so loudly.
@@ -349,7 +348,7 @@ mod tests {
         let id_before = before.id();
 
         // Rotate: identity id is stable, signing key changes, KEL grows.
-        let rotation = rotate_signing_key(&dir, None, false).unwrap();
+        let rotation = rotate_signing_key(&dir, None, lattice_core::RotationKind::Rotate).unwrap();
         assert!(rotation.next_key_path.is_some());
         let after = load_identity(&dir).unwrap();
         assert_eq!(after.id(), id_before);
@@ -357,7 +356,7 @@ mod tests {
         assert_eq!(after.kel.len(), before.kel.len() + 1);
 
         // Abandon: terminal; the node must refuse to start afterwards.
-        let rotation = rotate_signing_key(&dir, None, true).unwrap();
+        let rotation = rotate_signing_key(&dir, None, lattice_core::RotationKind::Abandon).unwrap();
         assert!(rotation.next_key_path.is_none());
         let abandoned = load_identity(&dir).unwrap();
         assert!(abandoned.is_abandoned());

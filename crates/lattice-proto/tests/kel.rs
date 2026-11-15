@@ -31,7 +31,7 @@ fn inception_validates_and_id_stable() {
     let events = chain(1);
     let head = KeyEvent::validate_chain(&events).unwrap();
     assert_eq!(head.seq, 0);
-    assert!(!head.abandoned);
+    assert!(!head.is_abandoned());
     assert_eq!(identifier(&events).unwrap(), identifier(&events).unwrap());
     assert_ne!(
         identifier(&events).unwrap(),
@@ -44,7 +44,7 @@ fn rotation_chain_validates_and_abandonment_terminates() {
     let events = chain(3);
     let head = KeyEvent::validate_chain(&events).unwrap();
     assert_eq!(head.seq, 2);
-    assert!(head.abandoned);
+    assert!(head.is_abandoned());
 
     // Nothing may follow an abandonment.
     let extra = KeyEvent::rotation(events.last().unwrap(), &generate_seed(), None);

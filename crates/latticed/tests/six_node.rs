@@ -19,7 +19,7 @@ mod common;
 use std::time::{Duration, Instant};
 
 use common::*;
-use lattice_client::Client;
+use lattice_client::{Client, DrainRequest, DrainState};
 
 const SERVICES: &[ServiceSpec] = &[ServiceSpec {
     name: "test",
@@ -226,7 +226,11 @@ async fn six_node_gate() {
 
     // ---- 6. Drain: h3 drains; new custody is refused; after un-drain, delivery resumes. ----
     let mut admin_h3 = Client::connect_admin(&h3.admin).await.expect("admin h3");
-    let draining = admin_h3.drain(Some(true)).await.expect("drain on").draining;
+    let draining = admin_h3
+        .drain(DrainRequest::Set(DrainState::Draining))
+        .await
+        .expect("drain on")
+        .draining;
     assert!(draining);
     let mid = c_h2
         .send(&lattice_client::Send {
@@ -254,7 +258,7 @@ async fn six_node_gate() {
         "draining node must not accept new messages"
     );
     let draining = admin_h3
-        .drain(Some(false))
+        .drain(DrainRequest::Set(DrainState::Serving))
         .await
         .expect("drain off")
         .draining;

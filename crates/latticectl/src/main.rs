@@ -81,16 +81,20 @@ async fn run(socket: &Path, args: &[String]) -> ExitCode {
             Err(e) => fail(e),
         },
         Some("drain") => {
-            let setting = match args.get(1).map(String::as_str) {
-                None | Some("status") => None,
-                Some("on") => Some(true),
-                Some("off") => Some(false),
+            let request = match args.get(1).map(String::as_str) {
+                None | Some("status") => lattice_client::DrainRequest::Query,
+                Some("on") => {
+                    lattice_client::DrainRequest::Set(lattice_client::DrainState::Draining)
+                }
+                Some("off") => {
+                    lattice_client::DrainRequest::Set(lattice_client::DrainState::Serving)
+                }
                 Some(other) => {
                     eprintln!("drain: expected on|off|status, got {other:?}");
                     return ExitCode::from(2);
                 }
             };
-            match client.drain(setting).await {
+            match client.drain(request).await {
                 Ok(state) => {
                     println!("draining:      {}", state.draining);
                     println!("custody_bytes: {}", state.custody_bytes);
@@ -150,13 +154,9 @@ async fn run(socket: &Path, args: &[String]) -> ExitCode {
                 return ExitCode::from(2);
             }
             match client.link(&addr, key, path, id).await {
-                Ok(true) => {
+                Ok(()) => {
                     println!("dial queued");
                     ExitCode::SUCCESS
-                }
-                Ok(false) => {
-                    eprintln!("daemon refused the dial (bad address or missing key/path)");
-                    ExitCode::from(1)
                 }
                 Err(e) => fail(e),
             }
@@ -168,11 +168,11 @@ async fn run(socket: &Path, args: &[String]) -> ExitCode {
             };
             match decode_hex32(hex).map(lattice_types::Identifier::from_bytes) {
                 Ok(id) => match client.unlink(&id).await {
-                    Ok(true) => {
+                    Ok(lattice_client::UnlinkOutcome::Removed) => {
                         println!("unlinked");
                         ExitCode::SUCCESS
                     }
-                    Ok(false) => {
+                    Ok(lattice_client::UnlinkOutcome::NotFound) => {
                         println!("no such link");
                         ExitCode::SUCCESS
                     }

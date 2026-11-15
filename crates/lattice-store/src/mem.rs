@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 
 use crate::*;
+use lattice_proto::local::DrainState;
 use lattice_types::{Commitment, DeliveryId, Hash32, Identifier, LegId, MessageId};
 
 #[derive(Default)]
@@ -22,7 +23,7 @@ pub struct MemStore {
     buckets: [u64; 3],
     custody_bytes: u64,
     custody_class_bytes: [u64; 16],
-    drain: bool,
+    drain: DrainState,
 }
 
 impl MemStore {
@@ -313,11 +314,11 @@ impl Store for MemStore {
         Ok(self.buckets)
     }
 
-    fn drain_get(&self) -> Result<bool, StoreError> {
+    fn drain_get(&self) -> Result<DrainState, StoreError> {
         Ok(self.drain)
     }
-    fn drain_set(&mut self, draining: bool) -> Result<(), StoreError> {
-        self.drain = draining;
+    fn drain_set(&mut self, state: DrainState) -> Result<(), StoreError> {
+        self.drain = state;
         Ok(())
     }
 }

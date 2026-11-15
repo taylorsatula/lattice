@@ -17,11 +17,18 @@ use lattice_types::{Identifier, MessageId, X25519PublicKey};
 
 pub type NodeIndex = usize;
 
+/// Whether a simulated link is carrying traffic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LinkState {
+    Up,
+    Down,
+}
+
 struct Link {
     id: u64,
     a: NodeIndex,
     b: NodeIndex,
-    up: bool,
+    state: LinkState,
     latency_ticks: u64,
 }
 
@@ -164,7 +171,7 @@ impl<S: Store> Sim<S> {
             id,
             a,
             b,
-            up: true,
+            state: LinkState::Up,
             latency_ticks: 0,
         });
         self.link_up(a, id, Some(self.ids[b]), self.channel_keys[&self.ids[b]]);
@@ -181,7 +188,7 @@ impl<S: Store> Sim<S> {
             id,
             a,
             b,
-            up: true,
+            state: LinkState::Up,
             latency_ticks: 0,
         });
         for (from, to) in [(a, b), (b, a)] {
@@ -205,23 +212,22 @@ impl<S: Store> Sim<S> {
             link,
             peer,
             remote_ck,
-            wan: true,
         });
         self.apply_actions(node, actions);
     }
 
-    pub fn set_link(&mut self, link_id: u64, up: bool) {
+    pub fn set_link(&mut self, link_id: u64, state: LinkState) {
         let idx = self
             .links
             .iter()
             .position(|l| l.id == link_id)
             .expect("link exists");
-        if self.links[idx].up == up {
+        if self.links[idx].state == state {
             return;
         }
-        self.links[idx].up = up;
+        self.links[idx].state = state;
         let (a, b) = (self.links[idx].a, self.links[idx].b);
-        if up {
+        if state == LinkState::Up {
             self.link_up(
                 a,
                 link_id,
@@ -439,7 +445,7 @@ impl<S: Store> Sim<S> {
         let Some(link) = self.links.iter().find(|l| l.id == link_id) else {
             return;
         };
-        if !link.up {
+        if link.state == LinkState::Down {
             return; // dropped: link down
         }
         let to = if link.a == from { link.b } else { link.a };
@@ -467,7 +473,7 @@ impl<S: Store> Sim<S> {
         let up_links: Vec<(usize, usize, u64)> = self
             .links
             .iter()
-            .filter(|l| l.up)
+            .filter(|l| l.state == LinkState::Up)
             .map(|l| (l.a, l.b, l.id))
             .collect();
         for (a, b, lid) in up_links {

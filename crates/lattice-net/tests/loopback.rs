@@ -21,10 +21,18 @@ fn test_seeds() -> TestSeeds {
     }
 }
 
+/// Knobs for the test listener; both default to off.
+#[derive(Default, Clone, Copy)]
+struct ServerOpts {
+    /// Force the cookie/load path to report under-load.
+    under_load: bool,
+    /// Serve the /status endpoint.
+    status: bool,
+}
+
 async fn start_server(
     server_seed: lattice_types::ChannelSeed,
-    under_load: bool,
-    status: bool,
+    opts: ServerOpts,
 ) -> (
     std::net::SocketAddr,
     mpsc::UnboundedReceiver<lattice_net::PeerIo>,
@@ -34,9 +42,9 @@ async fn start_server(
     let draining = Arc::new(AtomicBool::new(false));
     let cfg = lattice_net::ListenerConfig {
         channel_seed: server_seed,
-        status_enabled: status,
+        status_enabled: opts.status,
         draining: draining.clone(),
-        force_under_load: under_load,
+        force_under_load: opts.under_load,
         on_peer: tx,
     };
     let served = serve(cfg, vec!["127.0.0.1:0".parse().unwrap()])
@@ -51,7 +59,7 @@ async fn ik_handshake_and_ping_pong() {
     let server_seed = seeds.server;
     let client_seed = seeds.client;
     let server_ck = lattice_crypto::channel_public(&server_seed);
-    let (addr, mut peers, _flag) = start_server(server_seed, false, false).await;
+    let (addr, mut peers, _flag) = start_server(server_seed, ServerOpts::default()).await;
 
     let client = tokio::spawn(async move {
         connect(
@@ -94,7 +102,7 @@ async fn xx_handshake_works() {
     let client_seed = seeds.client;
     let client_seed_check = client_seed.clone();
     let path = lattice_net::upgrade_path(&lattice_crypto::channel_public(&server_seed));
-    let (addr, mut peers, _flag) = start_server(server_seed.clone(), false, false).await;
+    let (addr, mut peers, _flag) = start_server(server_seed.clone(), ServerOpts::default()).await;
 
     let client = tokio::spawn(async move {
         connect(PeerContact::Xx { addr, path }, &client_seed)
@@ -126,7 +134,14 @@ async fn cookie_flow_enforced_under_load() {
     let server_seed = seeds.server;
     let client_seed = seeds.client;
     let server_ck = lattice_crypto::channel_public(&server_seed);
-    let (addr, mut peers, _flag) = start_server(server_seed, true, false).await;
+    let (addr, mut peers, _flag) = start_server(
+        server_seed,
+        ServerOpts {
+            under_load: true,
+            ..ServerOpts::default()
+        },
+    )
+    .await;
 
     let client = tokio::spawn(async move {
         connect(
@@ -153,7 +168,14 @@ async fn cookie_flow_enforced_under_load() {
 async fn status_endpoint_and_404() {
     let seeds = test_seeds();
     let server_seed = seeds.server;
-    let (addr, _peers, _flag) = start_server(server_seed.clone(), false, true).await;
+    let (addr, _peers, _flag) = start_server(
+        server_seed.clone(),
+        ServerOpts {
+            status: true,
+            ..ServerOpts::default()
+        },
+    )
+    .await;
 
     // /status returns CBOR with keys 0..3
     let status = reqwest_get(&format!("http://{addr}/status")).await;
@@ -168,7 +190,7 @@ async fn status_endpoint_and_404() {
     assert!(resp.starts_with(b"HTTP/1.1 404"));
 
     // disabled status -> same 404
-    let (addr2, _peers2, _flag2) = start_server(server_seed, false, false).await;
+    let (addr2, _peers2, _flag2) = start_server(server_seed, ServerOpts::default()).await;
     let resp2 = reqwest_get_raw(&format!("http://{addr2}/status")).await;
     assert!(resp2.starts_with(b"HTTP/1.1 404"));
 }

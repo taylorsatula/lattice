@@ -191,12 +191,19 @@ fn public_key_of(seed: &SigningSeed) -> SigningPublicKey {
 pub struct KelHead {
     pub seq: u64,
     pub commitment: Commitment,
-    pub abandoned: bool,
     pub current_key: SigningPublicKey,
     /// The head event's commitment to the next key, if any. `None` iff the
     /// chain ends in an abandonment. Carried so rotation can check the
     /// pre-committed next key without re-reading the event log.
     pub next: Option<Commitment>,
+}
+
+impl KelHead {
+    /// True if the chain ends in an abandonment (a rotation with no
+    /// next-key commitment).
+    pub fn is_abandoned(&self) -> bool {
+        self.next.is_none()
+    }
 }
 
 impl KeyEvent {
@@ -248,7 +255,6 @@ impl KeyEvent {
         Ok(KelHead {
             seq: last.seq,
             commitment: last.commitment(),
-            abandoned: last.next.is_none(),
             current_key: last.key,
             next: last.next,
         })
@@ -312,7 +318,7 @@ impl ValidatedKel {
     /// next-key commitment).
     #[must_use]
     pub fn is_abandoned(&self) -> bool {
-        self.head.abandoned
+        self.head.is_abandoned()
     }
 
     /// Append `event`, re-validating the whole chain. Used by rotation;

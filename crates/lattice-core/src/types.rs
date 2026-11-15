@@ -45,7 +45,6 @@ pub enum Event {
         link: LinkId,
         peer: Option<Identifier>,
         remote_ck: X25519PublicKey,
-        wan: bool,
     },
     LinkDown {
         at: u64,
