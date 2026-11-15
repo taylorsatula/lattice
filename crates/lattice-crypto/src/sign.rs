@@ -76,6 +76,7 @@ pub fn sign(seed: &impl Ed25519Seed, message: &[u8]) -> Signature {
 }
 
 /// Verify a signature. Returns false on any mismatch, never panics.
+#[must_use]
 pub fn verify(public: &impl Ed25519PublicKey, message: &[u8], signature: &Signature) -> bool {
     let Ok(public) = <&[u8; 32]>::try_from(public.as_ref()) else {
         return false;

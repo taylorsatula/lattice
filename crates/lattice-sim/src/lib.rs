@@ -101,7 +101,7 @@ impl<S: Store> Sim<S> {
     /// A simulator whose nodes are backed by stores from `factory`
     /// (called once per added node, with the node index).
     pub fn with_stores(config: Config, factory: impl FnMut(usize) -> S + 'static) -> Self {
-        let prototype = config.clone();
+        let prototype = config;
         Sim {
             nodes: Vec::new(),
             ids: Vec::new(),
@@ -128,30 +128,30 @@ impl<S: Store> Sim<S> {
     pub fn add_node_with(&mut self, f: impl FnOnce(&mut Config)) -> NodeIndex {
         let mut cfg = self.configs_prototype();
         f(&mut cfg);
-        let seed =
-            0x5EED_0000u64.wrapping_add((self.nodes.len() as u64).wrapping_mul(0x9E3779B97F4A7C15));
+        let seed = 0x5EED_0000u64
+            .wrapping_add((self.nodes.len() as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
         cfg.rng_seed = seed;
         let store = (self.store_factory)(self.nodes.len());
         let idx = self.nodes.len() as u64;
-        let mut seed = [0u8; 32];
-        seed[..8].copy_from_slice(&idx.to_le_bytes());
-        seed[8..16].copy_from_slice(&0x5EED_5EED_5EED_5EED_u64.to_le_bytes());
-        let identity = lattice_core::Identity::from_seed(&seed);
+        let mut id_bytes = [0u8; 32];
+        id_bytes[..8].copy_from_slice(&idx.to_le_bytes());
+        id_bytes[8..16].copy_from_slice(&0x5EED_5EED_5EED_5EED_u64.to_le_bytes());
+        let identity = lattice_core::Identity::from_seed(&id_bytes);
         let channel_key = lattice_crypto::channel_x25519_public(&identity.channel_seed);
         let node = Node::new(cfg.clone(), identity, store, self.now).expect("node construction");
         let id = node.own_id;
         self.channel_keys.insert(id, channel_key);
         self.nodes.push(node);
         self.ids.push(id);
-        let idx = self.nodes.len() - 1;
+        let node_idx = self.nodes.len() - 1;
         self.configs.push(cfg);
         let seq = self.next_seq();
         self.queue.push_back(ScheduledEvent {
             at: self.now + 1,
             seq,
-            event: SimEvent::Tick { node: idx },
+            event: SimEvent::Tick { node: node_idx },
         });
-        idx
+        node_idx
     }
 
     fn next_seq(&mut self) -> u64 {
@@ -416,7 +416,7 @@ impl<S: Store> Sim<S> {
                         Frame::Attest(_) => "attest",
                     };
                     *self.frame_counts.entry(tag).or_insert(0) += 1;
-                    self.route_frame(from, link, frame)
+                    self.route_frame(from, link, frame);
                 }
                 Action::Deliver {
                     service,
@@ -530,9 +530,9 @@ impl<S: Store> Sim<S> {
 
 fn test_mid() -> MessageId {
     use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0x9e3779b97f4a7c15);
+    static COUNTER: AtomicU64 = AtomicU64::new(0x9e37_79b9_7f4a_7c15);
     let mut mid = [0u8; 16];
-    let v = COUNTER.fetch_add(0x9E3779B97F4A7C15, Ordering::Relaxed);
+    let v = COUNTER.fetch_add(0x9E37_79B9_7F4A_7C15, Ordering::Relaxed);
     mid[..8].copy_from_slice(&v.to_le_bytes());
     mid[8..].copy_from_slice(&v.rotate_left(32).to_le_bytes());
     MessageId::from_bytes(mid)

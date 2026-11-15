@@ -77,7 +77,7 @@ impl Pending {
     }
 
     pub fn remote_static(&self) -> Option<Vec<u8>> {
-        self.state.get_remote_static().map(|s| s.to_vec())
+        self.state.get_remote_static().map(<[u8]>::to_vec)
     }
 
     pub fn finish(self) -> Result<TransportState, snow::Error> {
