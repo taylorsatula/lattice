@@ -36,6 +36,18 @@ fn mac_bytes(v: &Value, key: u64) -> Result<Mac16, ProtoError> {
     Ok(Mac16::from_bytes(fixed_bytes(v, key)?))
 }
 
+fn kind_pair(kind: u64) -> (Value, Value) {
+    (Value::UInt(0), Value::UInt(kind))
+}
+
+fn padding_pair(padding: &[u8]) -> (Value, Value) {
+    (Value::UInt(5), Value::Bytes(padding.to_vec()))
+}
+
+fn req_padding(v: &Value) -> Result<Vec<u8>, ProtoError> {
+    Ok(v.req_bytes(5)?.to_vec())
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InitFrame {
     pub noise_msg: Vec<u8>,
@@ -340,6 +352,246 @@ impl Range {
     }
 }
 
+fn encode_init(f: &InitFrame) -> Value {
+    let mut pairs = vec![
+        kind_pair(T_INIT),
+        (Value::UInt(2), Value::Bytes(f.noise_msg.clone())),
+        (Value::UInt(3), Value::Bytes(f.mac1.to_vec())),
+    ];
+    if let Some(m2) = &f.mac2 {
+        pairs.push((Value::UInt(4), Value::Bytes(m2.to_vec())));
+    }
+    pairs.push(padding_pair(&f.padding));
+    Value::map(pairs)
+}
+
+fn encode_cookie(f: &CookieFrame) -> Value {
+    Value::map(vec![
+        kind_pair(T_COOKIE),
+        (Value::UInt(2), Value::Bytes(f.cookie.to_vec())),
+        padding_pair(&f.padding),
+    ])
+}
+
+fn encode_resp(f: &RespFrame) -> Value {
+    Value::map(vec![
+        kind_pair(T_RESP),
+        (Value::UInt(2), Value::Bytes(f.noise_msg.clone())),
+        padding_pair(&f.padding),
+    ])
+}
+
+fn encode_offer(f: &OfferFrame) -> Value {
+    Value::map(vec![
+        kind_pair(T_OFFER),
+        (Value::UInt(2), Value::Bytes(f.message.clone())),
+    ])
+}
+
+fn encode_custody(f: &CustodyFrame) -> Value {
+    let mut pairs = vec![
+        kind_pair(T_CUSTODY),
+        (Value::UInt(2), Value::Bytes(f.leg.to_vec())),
+        (Value::UInt(3), Value::UInt(f.result)),
+    ];
+    if let Some(ra) = f.retry_after {
+        pairs.push((Value::UInt(4), Value::UInt(ra)));
+    }
+    Value::map(pairs)
+}
+
+fn encode_reconcile(f: &ReconcileFrame) -> Value {
+    Value::map(vec![
+        kind_pair(T_RECONCILE),
+        (
+            Value::UInt(2),
+            Value::Array(f.ranges.iter().map(Range::to_value).collect()),
+        ),
+    ])
+}
+
+fn encode_want(f: &WantFrame) -> Value {
+    Value::map(vec![
+        kind_pair(T_WANT),
+        (
+            Value::UInt(2),
+            Value::Array(
+                f.wants
+                    .iter()
+                    .map(|w| {
+                        Value::Array(vec![
+                            Value::Bytes(w.id.to_vec()),
+                            Value::UInt(w.scope as u64),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ),
+    ])
+}
+
+fn encode_records(f: &RecordsFrame) -> Value {
+    Value::map(vec![
+        kind_pair(T_RECORDS),
+        (
+            Value::UInt(2),
+            Value::Array(f.records.iter().map(|r| Value::Bytes(r.clone())).collect()),
+        ),
+    ])
+}
+
+fn encode_ping(f: &PingFrame) -> Value {
+    Value::map(vec![
+        kind_pair(T_PING),
+        (Value::UInt(2), Value::UInt(f.nonce)),
+    ])
+}
+
+fn encode_dummy(f: &DummyFrame) -> Value {
+    Value::map(vec![
+        kind_pair(T_DUMMY),
+        (Value::UInt(2), Value::Bool(f.echo)),
+    ])
+}
+
+fn encode_attest(f: &AttestFrame) -> Value {
+    Value::map(vec![
+        kind_pair(T_ATTEST),
+        (Value::UInt(2), Value::Bytes(f.id.to_vec())),
+        (Value::UInt(3), Value::Bytes(f.sig.to_vec())),
+    ])
+}
+
+fn decode_init(v: &Value) -> Result<Frame, ProtoError> {
+    v.deny_unknown_keys(&[0, 2, 3, 4, 5])?;
+    Ok(Frame::Init(InitFrame {
+        noise_msg: v.req_bytes(2)?.to_vec(),
+        mac1: mac_bytes(v, 3)?,
+        mac2: match v.get_key(4)? {
+            None => None,
+            Some(_) => Some(Mac16::from_bytes(fixed_bytes(v, 4)?)),
+        },
+        padding: req_padding(v)?,
+    }))
+}
+
+fn decode_cookie(v: &Value) -> Result<Frame, ProtoError> {
+    v.deny_unknown_keys(&[0, 2, 5])?;
+    Ok(Frame::Cookie(CookieFrame {
+        cookie: Cookie::from_bytes(fixed_bytes(v, 2)?),
+        padding: req_padding(v)?,
+    }))
+}
+
+fn decode_resp(v: &Value) -> Result<Frame, ProtoError> {
+    v.deny_unknown_keys(&[0, 2, 5])?;
+    Ok(Frame::Resp(RespFrame {
+        noise_msg: v.req_bytes(2)?.to_vec(),
+        padding: req_padding(v)?,
+    }))
+}
+
+fn decode_offer(v: &Value) -> Result<Frame, ProtoError> {
+    v.deny_unknown_keys(&[0, 2])?;
+    Ok(Frame::Offer(OfferFrame {
+        message: v.req_bytes(2)?.to_vec(),
+    }))
+}
+
+fn decode_custody(v: &Value) -> Result<Frame, ProtoError> {
+    v.deny_unknown_keys(&[0, 2, 3, 4])?;
+    let result = v.req_uint(3)?;
+    if result > CUSTODY_REFUSED {
+        return Err(ProtoError::Invalid("unknown custody result"));
+    }
+    Ok(Frame::Custody(CustodyFrame {
+        leg: LegId::from_bytes(fixed_bytes(v, 2)?),
+        result,
+        retry_after: match v.get_key(4)? {
+            None => None,
+            Some(x) => Some(x.as_uint().ok_or(ProtoError::WrongType(4, "uint"))?),
+        },
+    }))
+}
+
+fn decode_reconcile(v: &Value) -> Result<Frame, ProtoError> {
+    v.deny_unknown_keys(&[0, 2])?;
+    let raw = v.req_array(2)?;
+    if raw.len() > MAX_RANGES_PER_MSG {
+        return Err(ProtoError::Invalid("too many reconcile ranges"));
+    }
+    let ranges = raw
+        .iter()
+        .map(Range::from_value)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Frame::Reconcile(ReconcileFrame { ranges }))
+}
+
+fn decode_want(v: &Value) -> Result<Frame, ProtoError> {
+    v.deny_unknown_keys(&[0, 2])?;
+    let wants = v
+        .req_array(2)?
+        .iter()
+        .map(|e| {
+            let a = e.as_array().ok_or(ProtoError::WrongType(2, "array"))?;
+            if a.len() != 2 {
+                return Err(ProtoError::Invalid("want entry must be [id, scope]"));
+            }
+            let id = Identifier::from_bytes(
+                a[0].as_bytes()
+                    .and_then(|b| <[u8; 32]>::try_from(b).ok())
+                    .ok_or(ProtoError::WrongType(2, "32-byte id"))?,
+            );
+            let scope = u8::try_from(
+                a[1].as_uint()
+                    .ok_or(ProtoError::WrongType(2, "uint scope"))?,
+            )
+            .map_err(|_| ProtoError::Invalid("scope out of range"))?;
+            if scope > 1 {
+                return Err(ProtoError::Invalid("scope out of range"));
+            }
+            Ok(RecordRef { id, scope })
+        })
+        .collect::<Result<Vec<_>, ProtoError>>()?;
+    Ok(Frame::Want(WantFrame { wants }))
+}
+
+fn decode_records(v: &Value) -> Result<Frame, ProtoError> {
+    v.deny_unknown_keys(&[0, 2])?;
+    let records = v
+        .req_array(2)?
+        .iter()
+        .map(|e| {
+            e.as_bytes()
+                .map(<[u8]>::to_vec)
+                .ok_or(ProtoError::WrongType(2, "bytes"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Frame::Records(RecordsFrame { records }))
+}
+
+fn decode_ping(v: &Value) -> Result<Frame, ProtoError> {
+    v.deny_unknown_keys(&[0, 2])?;
+    Ok(Frame::Ping(PingFrame {
+        nonce: v.req_uint(2)?,
+    }))
+}
+
+fn decode_dummy(v: &Value) -> Result<Frame, ProtoError> {
+    v.deny_unknown_keys(&[0, 2])?;
+    Ok(Frame::Dummy(DummyFrame {
+        echo: v.req_bool(2)?,
+    }))
+}
+
+fn decode_attest(v: &Value) -> Result<Frame, ProtoError> {
+    v.deny_unknown_keys(&[0, 2, 3])?;
+    Ok(Frame::Attest(AttestFrame {
+        id: Identifier::from_bytes(fixed_bytes(v, 2)?),
+        sig: Signature::from_bytes(fixed_bytes(v, 3)?),
+    }))
+}
+
 impl Frame {
     pub fn kind(&self) -> u64 {
         match self {
@@ -359,87 +611,17 @@ impl Frame {
 
     pub fn to_value(&self) -> Value {
         match self {
-            Frame::Init(f) => {
-                let mut pairs = vec![
-                    (Value::UInt(0), Value::UInt(T_INIT)),
-                    (Value::UInt(2), Value::Bytes(f.noise_msg.clone())),
-                    (Value::UInt(3), Value::Bytes(f.mac1.to_vec())),
-                ];
-                if let Some(m2) = &f.mac2 {
-                    pairs.push((Value::UInt(4), Value::Bytes(m2.to_vec())));
-                }
-                pairs.push((Value::UInt(5), Value::Bytes(f.padding.clone())));
-                Value::map(pairs)
-            }
-            Frame::Cookie(f) => Value::map(vec![
-                (Value::UInt(0), Value::UInt(T_COOKIE)),
-                (Value::UInt(2), Value::Bytes(f.cookie.to_vec())),
-                (Value::UInt(5), Value::Bytes(f.padding.clone())),
-            ]),
-            Frame::Resp(f) => Value::map(vec![
-                (Value::UInt(0), Value::UInt(T_RESP)),
-                (Value::UInt(2), Value::Bytes(f.noise_msg.clone())),
-                (Value::UInt(5), Value::Bytes(f.padding.clone())),
-            ]),
-            Frame::Offer(f) => Value::map(vec![
-                (Value::UInt(0), Value::UInt(T_OFFER)),
-                (Value::UInt(2), Value::Bytes(f.message.clone())),
-            ]),
-            Frame::Custody(f) => {
-                let mut pairs = vec![
-                    (Value::UInt(0), Value::UInt(T_CUSTODY)),
-                    (Value::UInt(2), Value::Bytes(f.leg.to_vec())),
-                    (Value::UInt(3), Value::UInt(f.result)),
-                ];
-                if let Some(ra) = f.retry_after {
-                    pairs.push((Value::UInt(4), Value::UInt(ra)));
-                }
-                Value::map(pairs)
-            }
-            Frame::Reconcile(f) => Value::map(vec![
-                (Value::UInt(0), Value::UInt(T_RECONCILE)),
-                (
-                    Value::UInt(2),
-                    Value::Array(f.ranges.iter().map(Range::to_value).collect()),
-                ),
-            ]),
-            Frame::Want(f) => Value::map(vec![
-                (Value::UInt(0), Value::UInt(T_WANT)),
-                (
-                    Value::UInt(2),
-                    Value::Array(
-                        f.wants
-                            .iter()
-                            .map(|w| {
-                                Value::Array(vec![
-                                    Value::Bytes(w.id.to_vec()),
-                                    Value::UInt(w.scope as u64),
-                                ])
-                            })
-                            .collect(),
-                    ),
-                ),
-            ]),
-            Frame::Records(f) => Value::map(vec![
-                (Value::UInt(0), Value::UInt(T_RECORDS)),
-                (
-                    Value::UInt(2),
-                    Value::Array(f.records.iter().map(|r| Value::Bytes(r.clone())).collect()),
-                ),
-            ]),
-            Frame::Ping(f) => Value::map(vec![
-                (Value::UInt(0), Value::UInt(T_PING)),
-                (Value::UInt(2), Value::UInt(f.nonce)),
-            ]),
-            Frame::Dummy(f) => Value::map(vec![
-                (Value::UInt(0), Value::UInt(T_DUMMY)),
-                (Value::UInt(2), Value::Bool(f.echo)),
-            ]),
-            Frame::Attest(f) => Value::map(vec![
-                (Value::UInt(0), Value::UInt(T_ATTEST)),
-                (Value::UInt(2), Value::Bytes(f.id.to_vec())),
-                (Value::UInt(3), Value::Bytes(f.sig.to_vec())),
-            ]),
+            Frame::Init(f) => encode_init(f),
+            Frame::Cookie(f) => encode_cookie(f),
+            Frame::Resp(f) => encode_resp(f),
+            Frame::Offer(f) => encode_offer(f),
+            Frame::Custody(f) => encode_custody(f),
+            Frame::Reconcile(f) => encode_reconcile(f),
+            Frame::Want(f) => encode_want(f),
+            Frame::Records(f) => encode_records(f),
+            Frame::Ping(f) => encode_ping(f),
+            Frame::Dummy(f) => encode_dummy(f),
+            Frame::Attest(f) => encode_attest(f),
         }
     }
 
@@ -450,125 +632,17 @@ impl Frame {
     pub fn from_value(v: &Value) -> Result<Self, ProtoError> {
         let kind = v.req_uint(0)?;
         match kind {
-            T_INIT => {
-                v.deny_unknown_keys(&[0, 2, 3, 4, 5])?;
-                Ok(Frame::Init(InitFrame {
-                    noise_msg: v.req_bytes(2)?.to_vec(),
-                    mac1: mac_bytes(v, 3)?,
-                    mac2: match v.get_key(4)? {
-                        None => None,
-                        Some(_) => Some(Mac16::from_bytes(fixed_bytes(v, 4)?)),
-                    },
-                    padding: v.req_bytes(5)?.to_vec(),
-                }))
-            }
-            T_COOKIE => {
-                v.deny_unknown_keys(&[0, 2, 5])?;
-                Ok(Frame::Cookie(CookieFrame {
-                    cookie: Cookie::from_bytes(fixed_bytes(v, 2)?),
-                    padding: v.req_bytes(5)?.to_vec(),
-                }))
-            }
-            T_RESP => {
-                v.deny_unknown_keys(&[0, 2, 5])?;
-                Ok(Frame::Resp(RespFrame {
-                    noise_msg: v.req_bytes(2)?.to_vec(),
-                    padding: v.req_bytes(5)?.to_vec(),
-                }))
-            }
-            T_OFFER => {
-                v.deny_unknown_keys(&[0, 2])?;
-                Ok(Frame::Offer(OfferFrame {
-                    message: v.req_bytes(2)?.to_vec(),
-                }))
-            }
-            T_CUSTODY => {
-                v.deny_unknown_keys(&[0, 2, 3, 4])?;
-                let result = v.req_uint(3)?;
-                if result > CUSTODY_REFUSED {
-                    return Err(ProtoError::Invalid("unknown custody result"));
-                }
-                Ok(Frame::Custody(CustodyFrame {
-                    leg: LegId::from_bytes(fixed_bytes(v, 2)?),
-                    result,
-                    retry_after: match v.get_key(4)? {
-                        None => None,
-                        Some(x) => Some(x.as_uint().ok_or(ProtoError::WrongType(4, "uint"))?),
-                    },
-                }))
-            }
-            T_RECONCILE => {
-                v.deny_unknown_keys(&[0, 2])?;
-                let raw = v.req_array(2)?;
-                if raw.len() > MAX_RANGES_PER_MSG {
-                    return Err(ProtoError::Invalid("too many reconcile ranges"));
-                }
-                let ranges = raw
-                    .iter()
-                    .map(Range::from_value)
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(Frame::Reconcile(ReconcileFrame { ranges }))
-            }
-            T_WANT => {
-                v.deny_unknown_keys(&[0, 2])?;
-                let wants = v
-                    .req_array(2)?
-                    .iter()
-                    .map(|e| {
-                        let a = e.as_array().ok_or(ProtoError::WrongType(2, "array"))?;
-                        if a.len() != 2 {
-                            return Err(ProtoError::Invalid("want entry must be [id, scope]"));
-                        }
-                        let id = Identifier::from_bytes(
-                            a[0].as_bytes()
-                                .and_then(|b| <[u8; 32]>::try_from(b).ok())
-                                .ok_or(ProtoError::WrongType(2, "32-byte id"))?,
-                        );
-                        let scope = u8::try_from(
-                            a[1].as_uint()
-                                .ok_or(ProtoError::WrongType(2, "uint scope"))?,
-                        )
-                        .map_err(|_| ProtoError::Invalid("scope out of range"))?;
-                        if scope > 1 {
-                            return Err(ProtoError::Invalid("scope out of range"));
-                        }
-                        Ok(RecordRef { id, scope })
-                    })
-                    .collect::<Result<Vec<_>, ProtoError>>()?;
-                Ok(Frame::Want(WantFrame { wants }))
-            }
-            T_RECORDS => {
-                v.deny_unknown_keys(&[0, 2])?;
-                let records = v
-                    .req_array(2)?
-                    .iter()
-                    .map(|e| {
-                        e.as_bytes()
-                            .map(<[u8]>::to_vec)
-                            .ok_or(ProtoError::WrongType(2, "bytes"))
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(Frame::Records(RecordsFrame { records }))
-            }
-            T_PING => {
-                v.deny_unknown_keys(&[0, 2])?;
-                Ok(Frame::Ping(PingFrame {
-                    nonce: v.req_uint(2)?,
-                }))
-            }
-            T_DUMMY => {
-                v.deny_unknown_keys(&[0, 2])?;
-                Ok(Frame::Dummy(DummyFrame {
-                    echo: v.req_bool(2)?,
-                }))
-            }
-            T_ATTEST => {
-                v.deny_unknown_keys(&[0, 2, 3])?;
-                Ok(Frame::Attest(AttestFrame {
-                    id: Identifier::from_bytes(fixed_bytes(v, 2)?),
-                    sig: Signature::from_bytes(fixed_bytes(v, 3)?),
-                }))
-            }
+            T_INIT => decode_init(v),
+            T_COOKIE => decode_cookie(v),
+            T_RESP => decode_resp(v),
+            T_OFFER => decode_offer(v),
+            T_CUSTODY => decode_custody(v),
+            T_RECONCILE => decode_reconcile(v),
+            T_WANT => decode_want(v),
+            T_RECORDS => decode_records(v),
+            T_PING => decode_ping(v),
+            T_DUMMY => decode_dummy(v),
+            T_ATTEST => decode_attest(v),
             _ => Err(ProtoError::Invalid("unknown frame type")),
         }
     }
