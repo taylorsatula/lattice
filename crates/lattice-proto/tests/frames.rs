@@ -1,5 +1,9 @@
 use lattice_proto::CLOCK_SKEW;
-use lattice_proto::frames::*;
+use lattice_proto::frames::{
+    CUSTODY_ACCEPTED, CUSTODY_BUSY, CookieFrame, CustodyFrame, DummyFrame, Frame, InitFrame,
+    OfferFrame, PingFrame, Range, RangeBound, ReconcileFrame, RecordEntry, RecordRef, RecordsFrame,
+    RespFrame, WantFrame,
+};
 use lattice_types::{Cookie, Hash32, Identifier, LegId, Mac16};
 
 #[test]

@@ -201,20 +201,18 @@ fn parse_bound(v: &Value) -> Result<RangeBound, ProtoError> {
 }
 
 impl Range {
-    fn bound_value(b: &Option<RangeBound>) -> Option<Value> {
-        b.as_ref().map(bound_value)
+    fn bound_value(b: Option<&RangeBound>) -> Option<Value> {
+        b.map(bound_value)
     }
 
     fn bounds(&self) -> RangeBounds {
         match self {
-            Range::Fingerprint { lower, upper, .. } => RangeBounds {
-                lower: *lower,
-                upper: *upper,
-            },
-            Range::Entries { lower, upper, .. } => RangeBounds {
-                lower: *lower,
-                upper: *upper,
-            },
+            Range::Fingerprint { lower, upper, .. } | Range::Entries { lower, upper, .. } => {
+                RangeBounds {
+                    lower: *lower,
+                    upper: *upper,
+                }
+            }
         }
     }
 
@@ -233,10 +231,10 @@ impl Range {
     fn to_value(&self) -> Value {
         let RangeBounds { lower, upper } = self.bounds();
         let mut pairs = Vec::with_capacity(4);
-        if let Some(b) = Self::bound_value(&lower) {
+        if let Some(b) = Self::bound_value(lower.as_ref()) {
             pairs.push((Value::UInt(0), b));
         }
-        if let Some(b) = Self::bound_value(&upper) {
+        if let Some(b) = Self::bound_value(upper.as_ref()) {
             pairs.push((Value::UInt(1), b));
         }
         match self {
@@ -546,7 +544,7 @@ impl Frame {
                     .iter()
                     .map(|e| {
                         e.as_bytes()
-                            .map(|b| b.to_vec())
+                            .map(<[u8]>::to_vec)
                             .ok_or(ProtoError::WrongType(2, "bytes"))
                     })
                     .collect::<Result<Vec<_>, _>>()?;

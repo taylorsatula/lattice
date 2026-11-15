@@ -4,11 +4,13 @@
 //! captured at generation time; committing the output re-pins it.
 
 use lattice_crypto::{hash, public_key};
-use lattice_proto::frames::*;
+use lattice_proto::frames::{
+    CUSTODY_ACCEPTED, CookieFrame, CustodyFrame, DummyFrame, Frame, InitFrame, PingFrame, Range,
+    RangeBound, ReconcileFrame, RecordEntry, RecordRef, RecordsFrame, RespFrame, WantFrame,
+};
 use lattice_proto::kel::KeyEvent;
-use lattice_proto::message::*;
-use lattice_proto::record::*;
-use lattice_proto::{Value, encode};
+use lattice_proto::message::{BuildParams, Envelope, KIND_MESSAGE, Message};
+use lattice_proto::record::{Endpoint, Mode, PeerRecord, Scope};
 use lattice_types::{
     ChannelSeed, Commitment, Cookie, Hash32, Identifier, LegId, Mac16, MessageId, SigningSeed,
     XWingPublicKey, XWingSecretKey,
@@ -269,12 +271,4 @@ fn hex_of(b: impl AsRef<[u8]>) -> String {
 }
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
-}
-
-// silence unused import in some build configs
-#[allow(dead_code)]
-fn _t(_: Value) {}
-#[allow(dead_code)]
-fn _u(_: &Value) {
-    let _ = encode;
 }

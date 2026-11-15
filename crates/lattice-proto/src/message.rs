@@ -300,7 +300,7 @@ impl Envelope {
                     return Err(ProtoError::Invalid("receipt carries no reason"));
                 }
             }
-            _ => unreachable!(),
+            _ => unreachable!("kind checked above"),
         }
         Ok(Self {
             kind,
@@ -366,7 +366,7 @@ pub struct BuildParams<'a> {
 /// padding. Returns the encoded message.
 fn assemble(
     outer: &Header,
-    hop: &Option<SealedLayer>,
+    hop: Option<&SealedLayer>,
     envelope: &SealedLayer,
     bucket: usize,
 ) -> Option<Vec<u8>> {
@@ -453,7 +453,7 @@ impl Message {
         };
 
         for bucket in MESSAGE_BUCKETS {
-            if let Some(bytes) = assemble(&outer, &outer_layer, &env_layer, bucket) {
+            if let Some(bytes) = assemble(&outer, outer_layer.as_ref(), &env_layer, bucket) {
                 return Ok(bytes);
             }
         }
@@ -537,7 +537,7 @@ impl Message {
             }
         };
         // Preserve the arrival bucket exactly; refuse rather than shrink.
-        assemble(&hdr, &gw_layer, &self.envelope, self.total_len)
+        assemble(&hdr, gw_layer.as_ref(), &self.envelope, self.total_len)
             .ok_or(ProtoError::TooBig(self.total_len))
     }
 
@@ -547,7 +547,7 @@ impl Message {
     /// header and the envelope are unchanged: the header is the envelope's
     /// associated data, so it cannot be rewritten.
     pub fn into_after_gateway(self) -> Result<Vec<u8>, ProtoError> {
-        assemble(&self.header, &None, &self.envelope, self.total_len)
+        assemble(&self.header, None, &self.envelope, self.total_len)
             .ok_or(ProtoError::TooBig(self.total_len))
     }
 

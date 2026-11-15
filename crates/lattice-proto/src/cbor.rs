@@ -120,10 +120,6 @@ impl Value {
             _ => None,
         }
     }
-    #[must_use]
-    pub fn is_null(&self) -> bool {
-        matches!(self, Value::Null)
-    }
 }
 
 /// Look up a uint-keyed field in a CBOR map. Returns `None` if `v` is not a

@@ -208,9 +208,8 @@ impl PeerRecord {
     }
 
     fn to_value(&self) -> Value {
-        let mut pairs = match self.unsigned_value() {
-            Value::Map(m) => m,
-            _ => unreachable!(),
+        let Value::Map(mut pairs) = self.unsigned_value() else {
+            unreachable!("unsigned_value always returns a map")
         };
         pairs.push((Value::UInt(14), Value::Bytes(self.sig.to_vec())));
         pairs.push((Value::UInt(15), Value::Bytes(self.channel_sig.to_vec())));
@@ -694,7 +693,7 @@ fn is_v4_global(ip: Ipv4Addr) -> bool {
             | [192, 88, 99, _]
             | [192, 175, 48, _]
             | [192, 168, ..]
-            | [198, 18 | 19, ..]
+            | [198, 18..=19, ..]
             | [198, 51, 100, _]
             | [203, 0, 113, _]
             | [224..=255, ..]

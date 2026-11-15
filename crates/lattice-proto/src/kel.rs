@@ -75,9 +75,8 @@ impl KeyEvent {
     }
 
     pub fn to_value(&self) -> Value {
-        let mut pairs = match self.unsigned_value() {
-            Value::Map(m) => m,
-            _ => unreachable!(),
+        let Value::Map(mut pairs) = self.unsigned_value() else {
+            unreachable!("unsigned_value always returns a map")
         };
         pairs.push((Value::UInt(6), Value::Bytes(self.sig.to_vec())));
         Value::map(pairs)
@@ -378,7 +377,7 @@ pub fn classify(
     known_commitment: &Commitment,
     candidate: &[KeyEvent],
 ) -> KelRelation {
-    let commitments: Vec<Commitment> = candidate.iter().map(|e| e.commitment()).collect();
+    let commitments: Vec<Commitment> = candidate.iter().map(KeyEvent::commitment).collect();
     // We only hold the head commitment, not the full known chain: only the
     // boundary position can be compared directly. A candidate that at least
     // reaches our known seq must commit to the same event there.
