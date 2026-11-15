@@ -174,8 +174,7 @@ pub struct Runtime {
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_secs())
 }
 
 /// Surface non-fatal internal failures reported by the sans-IO core.
@@ -296,6 +295,18 @@ impl Runtime {
         self.api_tx.clone()
     }
 
+    /// Lock the node, recovering a poisoned mutex by taking the inner
+    /// value. The node is the source of truth for custody state; a panic
+    /// elsewhere must not wedge the daemon, so poisoning is recovered here
+    /// and nowhere else.
+    fn with_node<R>(&self, f: impl FnOnce(&mut Node<RedbStore>) -> R) -> R {
+        let mut node = self
+            .node
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        f(&mut node)
+    }
+
     /// Register an established peer connection.
     pub fn attach_link(
         &mut self,
@@ -320,15 +331,14 @@ impl Runtime {
         );
         // The link is registered, so the actions returned by LinkUp (the
         // attestation frame) can be routed to it.
-        let (actions, diags) = {
-            let mut node = self.node.lock().unwrap_or_else(|e| e.into_inner());
+        let (actions, diags) = self.with_node(|node| {
             node.handle(Event::LinkUp {
                 at: now_secs(),
                 link: id,
                 peer,
                 remote_ck,
             })
-        };
+        });
         report_diagnostics(diags);
         self.apply_actions(actions);
         id
@@ -383,11 +393,12 @@ impl Runtime {
     /// Called on SIGTERM/SIGINT before the process exits.
     fn begin_drain(&mut self) {
         self.draining.store(true, Ordering::Relaxed);
-        let mut node = self.node.lock().unwrap_or_else(|e| e.into_inner());
-        node.set_drain(DrainState::Draining);
-        if let Err(e) = node.store_mut().drain_set(DrainState::Draining) {
-            eprintln!("lattice: failed to persist drain flag: {e}");
-        }
+        self.with_node(|node| {
+            node.set_drain(DrainState::Draining);
+            if let Err(e) = node.store_mut().drain_set(DrainState::Draining) {
+                eprintln!("lattice: failed to persist drain flag: {e}");
+            }
+        });
         eprintln!("lattice: draining (refusing new custody); exiting");
     }
 
@@ -432,10 +443,7 @@ impl Runtime {
     }
 
     fn apply(&mut self, event: Event) {
-        let (actions, diags) = {
-            let mut node = self.node.lock().unwrap_or_else(|e| e.into_inner());
-            node.handle(event)
-        };
+        let (actions, diags) = self.with_node(|node| node.handle(event));
         report_diagnostics(diags);
         self.apply_actions(actions);
     }
@@ -486,17 +494,13 @@ impl Runtime {
                     mid_hint: Some(mid),
                     ..send
                 };
-                let (actions, diags) = {
-                    let mut node = self.node.lock().unwrap_or_else(|e| e.into_inner());
-                    node.handle(Event::AppSend(send))
-                };
+                let (actions, diags) = self.with_node(|node| node.handle(Event::AppSend(send)));
                 report_diagnostics(diags);
                 self.apply_actions(actions);
                 let _ = respond.send(mid);
             }
             ApiCmd::Status { mid, respond } => {
-                let node = self.node.lock().unwrap_or_else(|e| e.into_inner());
-                let value = node.store_ref().status_get(&mid);
+                let value = self.with_node(|node| node.store_ref().status_get(&mid));
                 let _ = respond.send(value);
             }
             ApiCmd::Fetch {
@@ -504,8 +508,7 @@ impl Runtime {
                 max,
                 respond,
             } => {
-                let node = self.node.lock().unwrap_or_else(|e| e.into_inner());
-                let rows = node.store_ref().inbox_fetch(&service, max);
+                let rows = self.with_node(|node| node.store_ref().inbox_fetch(&service, max));
                 let _ = respond.send(rows);
             }
             ApiCmd::Ack {
@@ -513,44 +516,47 @@ impl Runtime {
                 ids,
                 respond,
             } => {
-                let mut node = self.node.lock().unwrap_or_else(|e| e.into_inner());
-                let n = node.store_mut().inbox_ack(&service, &ids);
+                let n = self.with_node(|node| node.store_mut().inbox_ack(&service, &ids));
                 let _ = respond.send(n);
             }
             ApiCmd::Lookup { id, respond } => {
-                let mut node = self.node.lock().unwrap_or_else(|e| e.into_inner());
-                let path = node.has_path(&id);
-                let lookup = match node.lookup(&id) {
-                    lattice_core::LookupResult::Absent => Lookup::Absent { path },
-                    lattice_core::LookupResult::Present { mode } => Lookup::Present { mode, path },
-                };
+                let lookup = self.with_node(|node| {
+                    let path = node.has_path(&id);
+                    match node.lookup(&id) {
+                        lattice_core::LookupResult::Absent => Lookup::Absent { path },
+                        lattice_core::LookupResult::Present { mode } => {
+                            Lookup::Present { mode, path }
+                        }
+                    }
+                });
                 let _ = respond.send(lookup);
             }
             ApiCmd::NodeInfo { respond } => {
-                let mut node = self.node.lock().unwrap_or_else(|e| e.into_inner());
-                let info = NodeInfo {
+                let info = self.with_node(|node| NodeInfo {
                     id: node.own_id,
                     mode: self.mode,
                     links: self.links.len(),
                     records: node.debug_record_count(),
                     custody_bytes: node.custody_bytes(),
                     draining: node.drain_state().is_draining(),
-                };
+                });
                 let _ = respond.send(info);
             }
             ApiCmd::Drain { request, respond } => {
-                let mut node = self.node.lock().unwrap_or_else(|e| e.into_inner());
-                if let DrainRequest::Set(state) = request {
-                    node.set_drain(state);
-                    self.draining.store(state.is_draining(), Ordering::Relaxed);
-                    if let Err(e) = node.store_mut().drain_set(state) {
-                        eprintln!("lattice: failed to persist drain flag: {e}");
+                let status = self.with_node(|node| {
+                    if let DrainRequest::Set(state) = request {
+                        node.set_drain(state);
+                        self.draining.store(state.is_draining(), Ordering::Relaxed);
+                        if let Err(e) = node.store_mut().drain_set(state) {
+                            eprintln!("lattice: failed to persist drain flag: {e}");
+                        }
                     }
-                }
-                let _ = respond.send(DrainStatus {
-                    draining: node.drain_state().is_draining(),
-                    custody_bytes: node.custody_bytes(),
+                    DrainStatus {
+                        draining: node.drain_state().is_draining(),
+                        custody_bytes: node.custody_bytes(),
+                    }
                 });
+                let _ = respond.send(status);
             }
             ApiCmd::Link {
                 addr,
@@ -589,16 +595,18 @@ impl Runtime {
                     )
                     .map_err(|e| e.to_string())?;
                     let now = now_secs();
-                    let mut node = self.node.lock().unwrap_or_else(|e| e.into_inner());
-                    node.reload_identity(rotation.identity, now, kind)
-                        .map_err(|e| e.to_string())?;
-                    if kind == RotationKind::Abandon {
-                        node.set_drain(DrainState::Draining);
-                        self.draining.store(true, Ordering::Relaxed);
-                        if let Err(e) = node.store_mut().drain_set(DrainState::Draining) {
-                            eprintln!("lattice: failed to persist drain flag: {e}");
+                    self.with_node(|node| -> Result<(), String> {
+                        node.reload_identity(rotation.identity, now, kind)
+                            .map_err(|e| e.to_string())?;
+                        if kind == RotationKind::Abandon {
+                            node.set_drain(DrainState::Draining);
+                            self.draining.store(true, Ordering::Relaxed);
+                            if let Err(e) = node.store_mut().drain_set(DrainState::Draining) {
+                                eprintln!("lattice: failed to persist drain flag: {e}");
+                            }
                         }
-                    }
+                        Ok(())
+                    })?;
                     Ok(if kind == RotationKind::Abandon {
                         "identity abandoned".to_string()
                     } else {
@@ -606,8 +614,7 @@ impl Runtime {
                             "rotated; next key written to {}",
                             rotation
                                 .next_key_path
-                                .map(|p| p.display().to_string())
-                                .unwrap_or_else(|| "<none>".into())
+                                .map_or_else(|| "<none>".into(), |p| p.display().to_string())
                         )
                     })
                 })();
@@ -619,9 +626,10 @@ impl Runtime {
                     let identity = crate::keys::rotate_envelope_key(&dir, 2 * 24 * 3600)
                         .map_err(|e| e.to_string())?;
                     let now = now_secs();
-                    let mut node = self.node.lock().unwrap_or_else(|e| e.into_inner());
-                    node.reload_identity(identity, now, RotationKind::Rotate)
-                        .map_err(|e| e.to_string())?;
+                    self.with_node(|node| {
+                        node.reload_identity(identity, now, RotationKind::Rotate)
+                            .map_err(|e| e.to_string())
+                    })?;
                     Ok("envelope key rotated; old key kept decrypt-only for 2 days".to_string())
                 })();
                 let _ = respond.send(result);

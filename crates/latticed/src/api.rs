@@ -11,11 +11,16 @@ use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::Path;
 use std::sync::Arc;
 
-use lattice_proto::local::*;
+use lattice_proto::local::{
+    DrainRequest, DrainState, ERR_AUTH, ERR_BAD_ARGS, ERR_FAILED, ERR_INTERNAL, ERR_NOT_FOUND,
+    ERR_UNKNOWN_OP, LOCAL_MAX_FRAME, LOCAL_PREFIX_LEN, Lookup, OP_ABANDON, OP_ACK, OP_DRAIN,
+    OP_FETCH, OP_HELLO, OP_LINK, OP_LOOKUP, OP_NODE, OP_ROTATE, OP_ROTATE_ENVELOPE, OP_SEND,
+    OP_STATUS, OP_UNLINK, ROUTE_DEFAULT, Request, Response, SendArgs, deframe_local, frame_local,
+};
 use lattice_proto::{Value, decode, encode};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, oneshot};
 
 use subtle::ConstantTimeEq;
 
@@ -68,6 +73,25 @@ fn resp_ok(id: u64, result: Value) -> Vec<u8> {
 }
 fn resp_err(id: u64, code: u64) -> Vec<u8> {
     encode(&Response::Err { id, code }.to_value())
+}
+
+/// Send `cmd` (built around a fresh oneshot) to the runtime and map the
+/// reply to response bytes. A send failure or a cancelled oneshot both
+/// yield `ERR_INTERNAL`; `on_resp` encodes a successful reply.
+async fn call_api<T>(
+    api: &mpsc::UnboundedSender<ApiCmd>,
+    req_id: u64,
+    make_cmd: impl FnOnce(oneshot::Sender<T>) -> ApiCmd,
+    on_resp: impl FnOnce(T) -> Vec<u8>,
+) -> Vec<u8> {
+    let (tx, rx) = oneshot::channel();
+    if api.send(make_cmd(tx)).is_err() {
+        return resp_err(req_id, ERR_INTERNAL);
+    }
+    match rx.await {
+        Ok(resp) => on_resp(resp),
+        Err(_) => resp_err(req_id, ERR_INTERNAL),
+    }
 }
 
 fn args_map(v: &Value) -> Option<&[(Value, Value)]> {
@@ -136,53 +160,44 @@ async fn handle_app(
         }
         Err(_) => return,
     };
-    let req = match decode(&hello)
+    let Some(req) = decode(&hello)
         .ok()
         .and_then(|v| Request::from_value(&v).ok())
-    {
-        Some(r) => r,
-        None => {
-            eprintln!("lattice: app socket: hello frame did not decode as a request; closing");
-            return;
-        }
+    else {
+        eprintln!("lattice: app socket: hello frame did not decode as a request; closing");
+        return;
     };
     if req.op != OP_HELLO {
         let _ = write_frame(&mut stream, &resp_err(req.id, ERR_AUTH)).await;
         return;
     }
-    let (service, secret) = match (
+    let (Some(service), Some(secret)) = (
         args_get(&req.args, 0)
             .and_then(Value::as_text)
             .map(String::from),
         args_get(&req.args, 1)
             .and_then(Value::as_bytes)
-            .map(|b| b.to_vec()),
-    ) {
-        (Some(s), Some(k)) => (s, k),
-        _ => {
-            let _ = write_frame(&mut stream, &resp_err(req.id, ERR_BAD_ARGS)).await;
-            return;
-        }
+            .map(<[u8]>::to_vec),
+    ) else {
+        let _ = write_frame(&mut stream, &resp_err(req.id, ERR_BAD_ARGS)).await;
+        return;
     };
     let ok = cfg
         .services
         .get(&service)
-        .map(|s| secret_eq(&secret, &s.secret))
-        .unwrap_or(false);
+        .is_some_and(|s| secret_eq(&secret, &s.secret));
     if !ok {
         let _ = write_frame(&mut stream, &resp_err(req.id, ERR_AUTH)).await;
         return;
     }
     // Hello reply carries the node identifier so apps can pin it.
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    let node_id = match api.send(ApiCmd::NodeInfo { respond: tx }) {
-        Ok(()) => match rx.await {
-            Ok(info) => info.id,
-            Err(_) => {
-                let _ = write_frame(&mut stream, &resp_err(req.id, ERR_INTERNAL)).await;
-                return;
-            }
-        },
+    let (tx, rx) = oneshot::channel();
+    let Ok(()) = api.send(ApiCmd::NodeInfo { respond: tx }) else {
+        let _ = write_frame(&mut stream, &resp_err(req.id, ERR_INTERNAL)).await;
+        return;
+    };
+    let node_id = match rx.await {
+        Ok(info) => info.id,
         Err(_) => {
             let _ = write_frame(&mut stream, &resp_err(req.id, ERR_INTERNAL)).await;
             return;
@@ -241,7 +256,7 @@ async fn handle_app(
 
 async fn dispatch_app(
     api: &mpsc::UnboundedSender<ApiCmd>,
-    _service: &str,
+    service: &str,
     req: &Request,
 ) -> Vec<u8> {
     match req.op {
@@ -250,7 +265,7 @@ async fn dispatch_app(
                 return resp_err(req.id, ERR_BAD_ARGS);
             };
             let send = lattice_core::AppSend {
-                service: _service.to_string(),
+                service: service.to_string(),
                 mid_hint: Some(lattice_types::MessageId::from_bytes(
                     lattice_crypto::os_bytes::<16>(),
                 )),
@@ -263,17 +278,18 @@ async fn dispatch_app(
                 priority: args.priority.unwrap_or(1) as u8,
                 route: args.route.unwrap_or(ROUTE_DEFAULT) as u8,
             };
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            if api.send(ApiCmd::AppSend { send, respond: tx }).is_err() {
-                return resp_err(req.id, ERR_INTERNAL);
-            }
-            match rx.await {
-                Ok(mid) => resp_ok(
-                    req.id,
-                    Value::map(vec![(Value::UInt(0), Value::Bytes(mid.to_vec()))]),
-                ),
-                Err(_) => resp_err(req.id, ERR_INTERNAL),
-            }
+            call_api(
+                api,
+                req.id,
+                |tx| ApiCmd::AppSend { send, respond: tx },
+                |mid| {
+                    resp_ok(
+                        req.id,
+                        Value::map(vec![(Value::UInt(0), Value::Bytes(mid.to_vec()))]),
+                    )
+                },
+            )
+            .await
         }
         OP_STATUS => {
             if deny_unknown_args(&req.args, &[0]).is_err() {
@@ -286,25 +302,26 @@ async fn dispatch_app(
             else {
                 return resp_err(req.id, ERR_BAD_ARGS);
             };
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            if api.send(ApiCmd::Status { mid, respond: tx }).is_err() {
-                return resp_err(req.id, ERR_INTERNAL);
-            }
-            match rx.await {
-                Ok(Ok(Some(status))) => {
-                    let mut pairs = vec![(Value::UInt(0), Value::UInt(status.status))];
-                    if let Some(d) = status.detail {
-                        pairs.push((Value::UInt(1), Value::UInt(d)));
+            call_api(
+                api,
+                req.id,
+                |tx| ApiCmd::Status { mid, respond: tx },
+                |resp| match resp {
+                    Ok(Some(status)) => {
+                        let mut pairs = vec![(Value::UInt(0), Value::UInt(status.status))];
+                        if let Some(d) = status.detail {
+                            pairs.push((Value::UInt(1), Value::UInt(d)));
+                        }
+                        resp_ok(req.id, Value::map(pairs))
                     }
-                    resp_ok(req.id, Value::map(pairs))
-                }
-                Ok(Ok(None)) => resp_err(req.id, ERR_NOT_FOUND),
-                Ok(Err(e)) => {
-                    eprintln!("lattice: status_get failed: {e}");
-                    resp_err(req.id, ERR_INTERNAL)
-                }
-                Err(_) => resp_err(req.id, ERR_INTERNAL),
-            }
+                    Ok(None) => resp_err(req.id, ERR_NOT_FOUND),
+                    Err(e) => {
+                        eprintln!("lattice: status_get failed: {e}");
+                        resp_err(req.id, ERR_INTERNAL)
+                    }
+                },
+            )
+            .await
         }
         OP_FETCH => {
             if deny_unknown_args(&req.args, &[0]).is_err() {
@@ -314,45 +331,43 @@ async fn dispatch_app(
                 .and_then(Value::as_uint)
                 .unwrap_or(16)
                 .min(64) as usize;
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            if api
-                .send(ApiCmd::Fetch {
-                    service: _service.to_string(),
+            call_api(
+                api,
+                req.id,
+                |tx| ApiCmd::Fetch {
+                    service: service.to_string(),
                     max,
                     respond: tx,
-                })
-                .is_err()
-            {
-                return resp_err(req.id, ERR_INTERNAL);
-            }
-            match rx.await {
-                Ok(Ok(rows)) => {
-                    let items: Vec<Value> = rows
-                        .into_iter()
-                        .map(|e| {
-                            Value::map(vec![
-                                (Value::UInt(0), Value::Bytes(e.delivery_id.to_vec())),
-                                (Value::UInt(1), Value::Bytes(e.mid.to_vec())),
-                                (Value::UInt(2), Value::Bytes(e.from.to_vec())),
-                                (Value::UInt(3), Value::Text(e.fsvc)),
-                                (Value::UInt(4), Value::Bytes(e.fmbx)),
-                                (Value::UInt(5), Value::Bytes(e.tmbx)),
-                                (Value::UInt(6), Value::Bytes(e.body)),
-                                (Value::UInt(7), Value::UInt(e.received)),
-                            ])
-                        })
-                        .collect();
-                    resp_ok(
-                        req.id,
-                        Value::map(vec![(Value::UInt(0), Value::Array(items))]),
-                    )
-                }
-                Ok(Err(e)) => {
-                    eprintln!("lattice: inbox_fetch failed: {e}");
-                    resp_err(req.id, ERR_INTERNAL)
-                }
-                Err(_) => resp_err(req.id, ERR_INTERNAL),
-            }
+                },
+                |resp| match resp {
+                    Ok(rows) => {
+                        let items: Vec<Value> = rows
+                            .into_iter()
+                            .map(|e| {
+                                Value::map(vec![
+                                    (Value::UInt(0), Value::Bytes(e.delivery_id.to_vec())),
+                                    (Value::UInt(1), Value::Bytes(e.mid.to_vec())),
+                                    (Value::UInt(2), Value::Bytes(e.from.to_vec())),
+                                    (Value::UInt(3), Value::Text(e.fsvc)),
+                                    (Value::UInt(4), Value::Bytes(e.fmbx)),
+                                    (Value::UInt(5), Value::Bytes(e.tmbx)),
+                                    (Value::UInt(6), Value::Bytes(e.body)),
+                                    (Value::UInt(7), Value::UInt(e.received)),
+                                ])
+                            })
+                            .collect();
+                        resp_ok(
+                            req.id,
+                            Value::map(vec![(Value::UInt(0), Value::Array(items))]),
+                        )
+                    }
+                    Err(e) => {
+                        eprintln!("lattice: inbox_fetch failed: {e}");
+                        resp_err(req.id, ERR_INTERNAL)
+                    }
+                },
+            )
+            .await
         }
         OP_ACK => {
             if deny_unknown_args(&req.args, &[0]).is_err() {
@@ -372,28 +387,26 @@ async fn dispatch_app(
                     }
                     None => return resp_err(req.id, ERR_BAD_ARGS),
                 };
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            if api
-                .send(ApiCmd::Ack {
-                    service: _service.to_string(),
+            call_api(
+                api,
+                req.id,
+                |tx| ApiCmd::Ack {
+                    service: service.to_string(),
                     ids,
                     respond: tx,
-                })
-                .is_err()
-            {
-                return resp_err(req.id, ERR_INTERNAL);
-            }
-            match rx.await {
-                Ok(Ok(n)) => resp_ok(
-                    req.id,
-                    Value::map(vec![(Value::UInt(0), Value::UInt(n as u64))]),
-                ),
-                Ok(Err(e)) => {
-                    eprintln!("lattice: inbox_ack failed: {e}");
-                    resp_err(req.id, ERR_INTERNAL)
-                }
-                Err(_) => resp_err(req.id, ERR_INTERNAL),
-            }
+                },
+                |resp| match resp {
+                    Ok(n) => resp_ok(
+                        req.id,
+                        Value::map(vec![(Value::UInt(0), Value::UInt(n as u64))]),
+                    ),
+                    Err(e) => {
+                        eprintln!("lattice: inbox_ack failed: {e}");
+                        resp_err(req.id, ERR_INTERNAL)
+                    }
+                },
+            )
+            .await
         }
         OP_LOOKUP => {
             if deny_unknown_args(&req.args, &[0]).is_err() {
@@ -406,12 +419,11 @@ async fn dispatch_app(
             else {
                 return resp_err(req.id, ERR_BAD_ARGS);
             };
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            if api.send(ApiCmd::Lookup { id, respond: tx }).is_err() {
-                return resp_err(req.id, ERR_INTERNAL);
-            }
-            match rx.await {
-                Ok(lookup) => {
+            call_api(
+                api,
+                req.id,
+                |tx| ApiCmd::Lookup { id, respond: tx },
+                |lookup| {
                     let mut pairs = vec![
                         (Value::UInt(0), Value::Bool(lookup.have())),
                         (Value::UInt(2), Value::Bool(lookup.path())),
@@ -420,9 +432,9 @@ async fn dispatch_app(
                         pairs.push((Value::UInt(1), Value::UInt(m.as_u64())));
                     }
                     resp_ok(req.id, Value::map(pairs))
-                }
-                Err(_) => resp_err(req.id, ERR_INTERNAL),
-            }
+                },
+            )
+            .await
         }
         _ => resp_err(req.id, ERR_UNKNOWN_OP),
     }
@@ -466,24 +478,25 @@ async fn dispatch_admin(api: &mpsc::UnboundedSender<ApiCmd>, req: &Request) -> V
             if deny_unknown_args(&req.args, &[]).is_err() {
                 return resp_err(req.id, ERR_BAD_ARGS);
             }
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            if api.send(ApiCmd::NodeInfo { respond: tx }).is_err() {
-                return resp_err(req.id, ERR_INTERNAL);
-            }
-            match rx.await {
-                Ok(info) => resp_ok(
-                    req.id,
-                    Value::map(vec![
-                        (Value::UInt(0), Value::Bytes(info.id.to_vec())),
-                        (Value::UInt(1), Value::Text(info.mode.into())),
-                        (Value::UInt(2), Value::UInt(info.links as u64)),
-                        (Value::UInt(3), Value::UInt(info.records as u64)),
-                        (Value::UInt(4), Value::UInt(info.custody_bytes)),
-                        (Value::UInt(5), Value::Bool(info.draining)),
-                    ]),
-                ),
-                Err(_) => resp_err(req.id, ERR_INTERNAL),
-            }
+            call_api(
+                api,
+                req.id,
+                |tx| ApiCmd::NodeInfo { respond: tx },
+                |info| {
+                    resp_ok(
+                        req.id,
+                        Value::map(vec![
+                            (Value::UInt(0), Value::Bytes(info.id.to_vec())),
+                            (Value::UInt(1), Value::Text(info.mode.into())),
+                            (Value::UInt(2), Value::UInt(info.links as u64)),
+                            (Value::UInt(3), Value::UInt(info.records as u64)),
+                            (Value::UInt(4), Value::UInt(info.custody_bytes)),
+                            (Value::UInt(5), Value::Bool(info.draining)),
+                        ]),
+                    )
+                },
+            )
+            .await
         }
         OP_DRAIN => {
             if deny_unknown_args(&req.args, &[0]).is_err() {
@@ -498,26 +511,24 @@ async fn dispatch_admin(api: &mpsc::UnboundedSender<ApiCmd>, req: &Request) -> V
                     None => return resp_err(req.id, ERR_BAD_ARGS),
                 },
             };
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            if api
-                .send(ApiCmd::Drain {
+            call_api(
+                api,
+                req.id,
+                |tx| ApiCmd::Drain {
                     request,
                     respond: tx,
-                })
-                .is_err()
-            {
-                return resp_err(req.id, ERR_INTERNAL);
-            }
-            match rx.await {
-                Ok(state) => resp_ok(
-                    req.id,
-                    Value::map(vec![
-                        (Value::UInt(0), Value::Bool(state.draining)),
-                        (Value::UInt(1), Value::UInt(state.custody_bytes)),
-                    ]),
-                ),
-                Err(_) => resp_err(req.id, ERR_INTERNAL),
-            }
+                },
+                |state| {
+                    resp_ok(
+                        req.id,
+                        Value::map(vec![
+                            (Value::UInt(0), Value::Bool(state.draining)),
+                            (Value::UInt(1), Value::UInt(state.custody_bytes)),
+                        ]),
+                    )
+                },
+            )
+            .await
         }
         OP_LINK => {
             if deny_unknown_args(&req.args, &[0, 1, 2, 3]).is_err() {
@@ -551,27 +562,25 @@ async fn dispatch_admin(api: &mpsc::UnboundedSender<ApiCmd>, req: &Request) -> V
             if ik_key.is_none() && path.is_none() {
                 return resp_err(req.id, ERR_BAD_ARGS);
             }
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            if api
-                .send(ApiCmd::Link {
+            call_api(
+                api,
+                req.id,
+                |tx| ApiCmd::Link {
                     addr,
                     ik_key,
                     path,
                     peer_id,
                     respond: tx,
-                })
-                .is_err()
-            {
-                return resp_err(req.id, ERR_INTERNAL);
-            }
-            match rx.await {
-                Ok(LinkOutcome::Queued) => resp_ok(
-                    req.id,
-                    Value::map(vec![(Value::UInt(0), Value::Bool(true))]),
-                ),
-                Ok(LinkOutcome::Rejected) => resp_err(req.id, ERR_BAD_ARGS),
-                Err(_) => resp_err(req.id, ERR_INTERNAL),
-            }
+                },
+                |outcome| match outcome {
+                    LinkOutcome::Queued => resp_ok(
+                        req.id,
+                        Value::map(vec![(Value::UInt(0), Value::Bool(true))]),
+                    ),
+                    LinkOutcome::Rejected => resp_err(req.id, ERR_BAD_ARGS),
+                },
+            )
+            .await
         }
         OP_ROTATE | OP_ABANDON => {
             if deny_unknown_args(&req.args, &[0]).is_err() {
@@ -587,46 +596,45 @@ async fn dispatch_admin(api: &mpsc::UnboundedSender<ApiCmd>, req: &Request) -> V
             } else {
                 RotationKind::Rotate
             };
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            if api
-                .send(ApiCmd::Rotate {
+            call_api(
+                api,
+                req.id,
+                |tx| ApiCmd::Rotate {
                     next_key_file,
                     kind,
                     respond: tx,
-                })
-                .is_err()
-            {
-                return resp_err(req.id, ERR_INTERNAL);
-            }
-            match rx.await {
-                Ok(Ok(msg)) => {
-                    resp_ok(req.id, Value::map(vec![(Value::UInt(0), Value::Text(msg))]))
-                }
-                Ok(Err(e)) => {
-                    eprintln!("lattice: rotate failed: {e}");
-                    resp_err(req.id, ERR_FAILED)
-                }
-                Err(_) => resp_err(req.id, ERR_INTERNAL),
-            }
+                },
+                |result| match result {
+                    Ok(msg) => {
+                        resp_ok(req.id, Value::map(vec![(Value::UInt(0), Value::Text(msg))]))
+                    }
+                    Err(e) => {
+                        eprintln!("lattice: rotate failed: {e}");
+                        resp_err(req.id, ERR_FAILED)
+                    }
+                },
+            )
+            .await
         }
         OP_ROTATE_ENVELOPE => {
             if deny_unknown_args(&req.args, &[]).is_err() {
                 return resp_err(req.id, ERR_BAD_ARGS);
             }
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            if api.send(ApiCmd::RotateEnvelope { respond: tx }).is_err() {
-                return resp_err(req.id, ERR_INTERNAL);
-            }
-            match rx.await {
-                Ok(Ok(msg)) => {
-                    resp_ok(req.id, Value::map(vec![(Value::UInt(0), Value::Text(msg))]))
-                }
-                Ok(Err(e)) => {
-                    eprintln!("lattice: envelope rotation failed: {e}");
-                    resp_err(req.id, ERR_FAILED)
-                }
-                Err(_) => resp_err(req.id, ERR_INTERNAL),
-            }
+            call_api(
+                api,
+                req.id,
+                |tx| ApiCmd::RotateEnvelope { respond: tx },
+                |result| match result {
+                    Ok(msg) => {
+                        resp_ok(req.id, Value::map(vec![(Value::UInt(0), Value::Text(msg))]))
+                    }
+                    Err(e) => {
+                        eprintln!("lattice: envelope rotation failed: {e}");
+                        resp_err(req.id, ERR_FAILED)
+                    }
+                },
+            )
+            .await
         }
         OP_UNLINK => {
             if deny_unknown_args(&req.args, &[0]).is_err() {
@@ -639,20 +647,18 @@ async fn dispatch_admin(api: &mpsc::UnboundedSender<ApiCmd>, req: &Request) -> V
             else {
                 return resp_err(req.id, ERR_BAD_ARGS);
             };
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            if api
-                .send(ApiCmd::UnlinkByPeer { peer, respond: tx })
-                .is_err()
-            {
-                return resp_err(req.id, ERR_INTERNAL);
-            }
-            match rx.await {
-                Ok(removed) => resp_ok(
-                    req.id,
-                    Value::map(vec![(Value::UInt(0), Value::Bool(removed > 0))]),
-                ),
-                Err(_) => resp_err(req.id, ERR_INTERNAL),
-            }
+            call_api(
+                api,
+                req.id,
+                |tx| ApiCmd::UnlinkByPeer { peer, respond: tx },
+                |removed| {
+                    resp_ok(
+                        req.id,
+                        Value::map(vec![(Value::UInt(0), Value::Bool(removed > 0))]),
+                    )
+                },
+            )
+            .await
         }
         _ => resp_err(req.id, ERR_UNKNOWN_OP),
     }

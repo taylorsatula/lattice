@@ -51,13 +51,7 @@ fn cmd_init(args: &[String]) -> std::process::ExitCode {
             if let Ok(Ok(id)) =
                 keys::load_identity(&dir).map(|id| lattice_proto::kel::identifier(&id.kel))
             {
-                println!(
-                    "node id: {}",
-                    id.as_ref()
-                        .iter()
-                        .map(|b| format!("{b:02x}"))
-                        .collect::<String>()
-                );
+                println!("node id: {}", hex(id.as_ref()));
             }
             println!("next: create a config, e.g. /etc/lattice/lattice.toml");
             std::process::ExitCode::SUCCESS
@@ -69,12 +63,21 @@ fn cmd_init(args: &[String]) -> std::process::ExitCode {
     }
 }
 
+/// Lowercase hex, no separators.
+fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
 /// Build the record this node will publish and check it passes validation.
 fn record_self_test(cfg: &config::Config, identity: &lattice_core::Identity) -> Result<(), String> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_secs());
     let private = cfg.mode == "private";
     let mode = if private {
         lattice_proto::record::Mode::Private
@@ -119,6 +122,96 @@ fn record_self_test(cfg: &config::Config, identity: &lattice_core::Identity) -> 
         .map_err(|e| e.to_string())
 }
 
+/// Load and verify the configuration and identity: parse the config, load
+/// the identity, run the key self-test and the record self-test. On failure
+/// the reason is printed and the exit code to return is handed back.
+fn load_and_verify(
+    config_path: &std::path::Path,
+) -> Result<(config::Config, lattice_core::Identity), std::process::ExitCode> {
+    let cfg = config::load(config_path).map_err(|e| {
+        eprintln!("config: {e}");
+        std::process::ExitCode::from(1)
+    })?;
+    let identity = keys::load_identity(&cfg.identity_dir).map_err(|e| {
+        eprintln!(
+            "key material: {e}. Run `latticed init --dir {}` first.",
+            cfg.identity_dir.display()
+        );
+        std::process::ExitCode::from(1)
+    })?;
+    if let Err(e) = keys::self_test(&identity) {
+        eprintln!("key self-test failed: {e}");
+        return Err(std::process::ExitCode::from(1));
+    }
+    if !cfg.hive.is_empty() {
+        eprintln!(
+            "lattice: note: hive CIDRs are parsed but multicast discovery is not implemented yet; ignoring"
+        );
+    }
+    // Record self-test: the record we will publish must pass validation, or
+    // this node is unreachable the moment it goes live. Fail fast at boot.
+    if let Err(e) = record_self_test(&cfg, &identity) {
+        eprintln!("record self-test failed: {e}");
+        return Err(std::process::ExitCode::from(1));
+    }
+    Ok((cfg, identity))
+}
+
+/// Open the store and read the persisted drain flag. Refuses to start if
+/// the flag cannot be read: a node that cannot tell whether the operator
+/// drained it must not take custody, and a store that cannot serve this
+/// read is not one to run on.
+fn open_store(
+    cfg: &config::Config,
+) -> Result<(lattice_store::RedbStore, bool), std::process::ExitCode> {
+    let store_path = cfg.identity_dir.join("node.redb");
+    let store = lattice_store::RedbStore::open(&store_path).map_err(|e| {
+        eprintln!("store: {e}");
+        std::process::ExitCode::from(1)
+    })?;
+    // Restore the persisted drain flag. Drain is a maintenance state, not a
+    // transient one: an operator who drained a node for maintenance expects
+    // it to stay drained across a restart (e.g. after a crash or a package
+    // upgrade), not to silently resume accepting custody. Clearing it is an
+    // explicit operator action (`latticectl drain off`).
+    let drain_flag = store.drain_get().map_err(|e| {
+        eprintln!(
+            "store: reading the drain flag failed: {e}. Refusing to start: \
+             the drain flag is the maintenance safety hatch and must not fail open. \
+             Inspect or restore the store, then retry."
+        );
+        std::process::ExitCode::from(1)
+    })?;
+    Ok((store, drain_flag.is_draining()))
+}
+
+/// Bind the inbound listeners from the config, handing accepted peers to
+/// `peer_tx`.
+async fn bind_listeners(
+    cfg: &config::Config,
+    identity: &lattice_core::Identity,
+    draining: &Arc<std::sync::atomic::AtomicBool>,
+    peer_tx: &tokio::sync::mpsc::UnboundedSender<lattice_net::PeerIo>,
+) -> Result<(), std::process::ExitCode> {
+    for addr in &cfg.listen {
+        let listener_cfg = lattice_net::ListenerConfig {
+            channel_seed: identity.channel_seed.clone(),
+            status_enabled: cfg.status,
+            draining: draining.clone(),
+            force_under_load: false,
+            on_peer: peer_tx.clone(),
+        };
+        match lattice_net::serve(listener_cfg, vec![*addr]).await {
+            Ok(served) => eprintln!("lattice: listening on {}", served.addr),
+            Err(e) => {
+                eprintln!("listen on {addr} failed: {e}");
+                return Err(std::process::ExitCode::from(1));
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn cmd_run(args: &[String]) -> std::process::ExitCode {
     let mut config_path = PathBuf::from("/etc/lattice/lattice.toml");
     let mut i = 0;
@@ -131,71 +224,18 @@ async fn cmd_run(args: &[String]) -> std::process::ExitCode {
             return std::process::ExitCode::from(2);
         }
     }
-    let cfg = match config::load(&config_path) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("config: {e}");
-            return std::process::ExitCode::from(1);
-        }
+    let (cfg, identity) = match load_and_verify(&config_path) {
+        Ok(v) => v,
+        Err(code) => return code,
     };
-    let identity = match keys::load_identity(&cfg.identity_dir) {
-        Ok(id) => id,
-        Err(e) => {
-            eprintln!(
-                "key material: {e}. Run `latticed init --dir {}` first.",
-                cfg.identity_dir.display()
-            );
-            return std::process::ExitCode::from(1);
-        }
+    let (store, drain_flag) = match open_store(&cfg) {
+        Ok(v) => v,
+        Err(code) => return code,
     };
-    if let Err(e) = keys::self_test(&identity) {
-        eprintln!("key self-test failed: {e}");
-        return std::process::ExitCode::from(1);
-    }
-    if !cfg.hive.is_empty() {
-        eprintln!(
-            "lattice: note: hive CIDRs are parsed but multicast discovery is not implemented yet; ignoring"
-        );
-    }
-    // Record self-test: the record we will publish must pass validation, or
-    // this node is unreachable the moment it goes live. Fail fast at boot.
-    if let Err(e) = record_self_test(&cfg, &identity) {
-        eprintln!("record self-test failed: {e}");
-        return std::process::ExitCode::from(1);
-    }
-    let store_path = cfg.identity_dir.join("node.redb");
-    let store = match lattice_store::RedbStore::open(&store_path) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("store: {e}");
-            return std::process::ExitCode::from(1);
-        }
-    };
-
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    // Restore the persisted drain flag. Drain is a maintenance state, not a
-    // transient one: an operator who drained a node for maintenance expects
-    // it to stay drained across a restart (e.g. after a crash or a package
-    // upgrade), not to silently resume accepting custody. Clearing it is an
-    // explicit operator action (`latticectl drain off`). If the flag cannot
-    // be read, refuse to start: a node that cannot tell whether the operator
-    // drained it must not take custody, and a store that cannot serve this
-    // read is not one to run on.
-    let drain_flag = match store.drain_get() {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!(
-                "store: reading the drain flag failed: {e}. Refusing to start: \
-                 the drain flag is the maintenance safety hatch and must not fail open. \
-                 Inspect or restore the store, then retry."
-            );
-            return std::process::ExitCode::from(1);
-        }
-    };
-    let draining = Arc::new(std::sync::atomic::AtomicBool::new(drain_flag.is_draining()));
+        .map_or(0, |d| d.as_secs());
+    let draining = Arc::new(std::sync::atomic::AtomicBool::new(drain_flag));
     let cfg = Arc::new(cfg);
 
     // Install signal handlers before binding any socket, so SIGTERM/SIGINT
@@ -234,21 +274,8 @@ async fn cmd_run(args: &[String]) -> std::process::ExitCode {
 
     // Inbound listener: accept connections, hand peers to the runtime.
     let (peer_tx, peer_rx) = tokio::sync::mpsc::unbounded_channel::<lattice_net::PeerIo>();
-    for addr in &cfg.listen {
-        let listener_cfg = lattice_net::ListenerConfig {
-            channel_seed: identity.channel_seed.clone(),
-            status_enabled: cfg.status,
-            draining: draining.clone(),
-            force_under_load: false,
-            on_peer: peer_tx.clone(),
-        };
-        match lattice_net::serve(listener_cfg, vec![*addr]).await {
-            Ok(served) => eprintln!("lattice: listening on {}", served.addr),
-            Err(e) => {
-                eprintln!("listen on {addr} failed: {e}");
-                return std::process::ExitCode::from(1);
-            }
-        }
+    if let Err(code) = bind_listeners(&cfg, &identity, &draining, &peer_tx).await {
+        return code;
     }
 
     let mut runtime =
