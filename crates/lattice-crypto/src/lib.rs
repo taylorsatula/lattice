@@ -31,6 +31,7 @@ pub fn hash(data: &[u8]) -> Hash32 {
 }
 
 /// Constant-time equality for fixed-size secrets and commitments.
+#[must_use]
 pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     use subtle::ConstantTimeEq;
     a.ct_eq(b).into()

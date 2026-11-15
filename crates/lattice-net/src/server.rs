@@ -72,6 +72,7 @@ impl LoadState {
             force_under_load,
         }
     }
+    #[must_use]
     fn under_load(&self) -> bool {
         self.force_under_load || self.under_load.load(std::sync::atomic::Ordering::Relaxed)
     }
@@ -134,8 +135,7 @@ impl Drop for PreAuthGuard {
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_secs())
 }
 
 /// A TCP stream whose first bytes were already peeked for HTTP parsing.
@@ -181,6 +181,7 @@ struct HeadParsed {
     path: String,
 }
 
+#[must_use]
 fn head_has_header(head: &[u8], name: &str, value_substr: &str) -> bool {
     let text = String::from_utf8_lossy(head).to_ascii_lowercase();
     text.lines().skip(1).any(|line| match line.split_once(':') {
@@ -287,6 +288,7 @@ pub async fn serve(cfg: ListenerConfig, bind: Vec<SocketAddr>) -> io::Result<Ser
 /// garbage bytes, or silence. Everything past the HTTP head — the WebSocket
 /// upgrade, the Noise handshake, MAC failures — is logged by the caller,
 /// because it means a real peer or a real misconfiguration.
+#[must_use]
 fn is_probe_noise(e: &NetError) -> bool {
     matches!(
         e,
@@ -313,7 +315,7 @@ async fn handle_conn(
     let _preauth = PreAuthGuard(load.clone());
     cookie_state
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .tick();
     let head = read_head(&mut stream).await?;
     let parsed = parse_head(&head).ok_or(NetError::InvalidInput("malformed request head"))?;
@@ -440,7 +442,7 @@ fn validate_init(
     let mac2_ok = match &init.mac2 {
         Some(m2) => cookie_state
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .verify_mac2(addr_bytes, &init.noise_msg, m2),
         None => false,
     };
@@ -482,7 +484,7 @@ async fn handshake_server(
         InitVerdict::NeedCookie => {
             let cookie = cookie_state
                 .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .issue(&addr_bytes);
             let frame = Frame::Cookie(CookieFrame {
                 cookie,

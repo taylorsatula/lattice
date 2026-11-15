@@ -68,8 +68,7 @@ impl CookieState {
     pub fn tick(&mut self) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_secs());
         self.advance(now);
     }
 
@@ -94,6 +93,7 @@ impl CookieState {
     }
 
     /// Verify `mac2` for the given client address and init message.
+    #[must_use]
     pub fn verify_mac2(&self, addr: &[u8], init_msg: &[u8], mac2: &Mac16) -> bool {
         self.cookie_candidates(addr).iter().any(|cookie| {
             mac16(cookie.as_bytes(), init_msg)
