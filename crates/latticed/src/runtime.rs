@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use lattice_core::{Action, Event, Node};
 use lattice_crypto::os_bytes;
 use lattice_proto::frames::Frame;
-use lattice_store::{RedbStore, Store};
+use lattice_store::{RedbStore, Store, StoreError};
 use lattice_types::{
     ChannelPublicKey, ChannelSeed, DeliveryId, Identifier, MessageId, X25519PublicKey,
 };
@@ -31,6 +31,10 @@ pub enum Cmd {
     },
 }
 
+/// Oneshot reply channel for store-backed queries; the socket layer maps
+/// the error to ERR_INTERNAL.
+type StoreReply<T> = tokio::sync::oneshot::Sender<Result<T, StoreError>>;
+
 /// Requests arriving over the local API sockets. Each carries a oneshot for
 /// its reply. Processed inside the runtime loop so the Node is never
 /// contended across tasks.
@@ -41,17 +45,17 @@ pub enum ApiCmd {
     },
     Status {
         mid: MessageId,
-        respond: tokio::sync::oneshot::Sender<Option<(u64, Option<u64>)>>,
+        respond: StoreReply<Option<(u64, Option<u64>)>>,
     },
     Fetch {
         service: String,
         max: usize,
-        respond: tokio::sync::oneshot::Sender<Vec<lattice_store::InboxEntry>>,
+        respond: StoreReply<Vec<lattice_store::InboxEntry>>,
     },
     Ack {
         service: String,
         ids: Vec<DeliveryId>,
-        respond: tokio::sync::oneshot::Sender<usize>,
+        respond: StoreReply<usize>,
     },
     Lookup {
         id: Identifier,
@@ -461,7 +465,7 @@ impl Runtime {
             }
             ApiCmd::Status { mid, respond } => {
                 let node = self.node.lock().unwrap_or_else(|e| e.into_inner());
-                let value = node.store_ref().status_get(&mid).ok().flatten();
+                let value = node.store_ref().status_get(&mid);
                 let _ = respond.send(value);
             }
             ApiCmd::Fetch {
@@ -470,10 +474,7 @@ impl Runtime {
                 respond,
             } => {
                 let node = self.node.lock().unwrap_or_else(|e| e.into_inner());
-                let rows = node
-                    .store_ref()
-                    .inbox_fetch(&service, max)
-                    .unwrap_or_default();
+                let rows = node.store_ref().inbox_fetch(&service, max);
                 let _ = respond.send(rows);
             }
             ApiCmd::Ack {
@@ -482,7 +483,7 @@ impl Runtime {
                 respond,
             } => {
                 let mut node = self.node.lock().unwrap_or_else(|e| e.into_inner());
-                let n = node.store_mut().inbox_ack(&service, &ids).unwrap_or(0);
+                let n = node.store_mut().inbox_ack(&service, &ids);
                 let _ = respond.send(n);
             }
             ApiCmd::Lookup { id, respond } => {
@@ -553,7 +554,9 @@ impl Runtime {
                     if abandon {
                         node.set_draining(true);
                         self.draining.store(true, Ordering::Relaxed);
-                        let _ = node.store_mut().drain_set(true);
+                        if let Err(e) = node.store_mut().drain_set(true) {
+                            eprintln!("lattice: failed to persist drain flag: {e}");
+                        }
                     }
                     Ok(if abandon {
                         "identity abandoned".to_string()

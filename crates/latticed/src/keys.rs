@@ -184,7 +184,12 @@ fn load_retired_envelope_keys(dir: &Path) -> io::Result<Vec<(XWingSecretKey, u64
             continue;
         };
         if exp <= now {
-            let _ = fs::remove_file(entry.path());
+            if let Err(e) = fs::remove_file(entry.path()) {
+                eprintln!(
+                    "lattice: failed to remove expired retired envelope key {}: {e}",
+                    entry.path().display()
+                );
+            }
             continue;
         }
         let bytes = fs::read(entry.path())?;
@@ -266,13 +271,37 @@ pub fn rotate_signing_key(
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
     // Persist: new KEL, new current signing seed, new next seed (or none).
+    //
+    // kel.bin is written BEFORE signing_seed: a crash between the two leaves
+    // the KEL head committing to the new key while signing_seed on disk still
+    // holds the old one, and load_identity then refuses to start ("signing_seed
+    // does not match the KEL head"). Writing the seed first fails the other
+    // way and is unrecoverable from on-disk state (the old seed is gone), so
+    // the order is not arbitrary — but neither order is atomic; there is no
+    // two-file commit. Recovery from the kel-first crash: the new current
+    // seed is the pre-rotation next key, still at `next_path` (it is
+    // overwritten or removed only after signing_seed is written). Copy it
+    // over signing_seed, then start the daemon; the self-test and the KEL
+    // head check will pass. If kel.bin itself is torn, restore it from
+    // backup instead — the identity cannot be rebuilt from the seeds alone.
+    // After an abandon rotation the identity is terminal either way
+    // (Node::new refuses abandoned identities), so recovery applies only to
+    // ordinary rotations.
     fs::write(
         dir.join("kel.bin"),
         lattice_proto::kel::encode_kel(&identity.kel),
     )?;
     write_seed(dir, "signing_seed", &identity.signing_seed)?;
     let next_key_path = if abandon {
-        let _ = fs::remove_file(&next_path);
+        if let Err(e) = fs::remove_file(&next_path) {
+            // The identity is abandoned but the pre-committed next key is still
+            // on disk; the operator believes it is gone. Say so loudly.
+            eprintln!(
+                "lattice: identity abandoned but failed to remove next signing key {}: {e}. \
+                 Remove it manually; the identity is already terminal.",
+                next_path.display()
+            );
+        }
         None
     } else {
         let new_next = new_next.expect("non-abandon rotation generates a next key");
@@ -298,7 +327,8 @@ pub fn rotate_envelope_key(dir: &Path, grace_secs: u64) -> io::Result<lattice_co
     // not strand envelopes encrypted to it.
     let retired_name = format!("{RETIRED_ENVELOPE_PREFIX}{retire_at}");
     write_seed(dir, &retired_name, &identity.xwing_secret)?;
-    let _ = identity.rotate_envelope(retire_at);
+    // The returned public key is re-derivable from the secret just written.
+    identity.rotate_envelope(retire_at);
     write_seed(dir, "envelope_seed", &identity.xwing_secret)?;
     Ok(identity)
 }
