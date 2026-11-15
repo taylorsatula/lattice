@@ -334,11 +334,7 @@ fn seen_add_txn(txn: &redb::WriteTransaction, hash: Hash32, exp: u64) -> Result<
 }
 
 impl Store for RedbStore {
-    fn record_get(
-        &self,
-        id: &Identifier,
-        scope: Scope,
-    ) -> Result<Option<(Vec<u8>, u64)>, StoreError> {
+    fn record_get(&self, id: &Identifier, scope: Scope) -> Result<Option<RecordBytes>, StoreError> {
         let key = record_key(id, scope);
         self.read("record_get", |txn| {
             let t = txn.open_table(RECORDS)?;
@@ -347,7 +343,10 @@ impl Store for RedbStore {
             };
             let recv = txn.open_table(RECORD_RECV)?;
             let at = recv.get(key)?.map(|v| v.value()).unwrap_or(0);
-            Ok(Some((bytes, at)))
+            Ok(Some(RecordBytes {
+                bytes,
+                received: at,
+            }))
         })
     }
 
@@ -397,7 +396,12 @@ impl Store for RedbStore {
                     Scope::Hive
                 };
                 let recv = r.get(key)?.map(|v| v.value()).unwrap_or(0);
-                out.push((id, scope, v.value(), recv));
+                out.push(StoredRecord {
+                    id,
+                    scope,
+                    bytes: v.value(),
+                    received: recv,
+                });
             }
             Ok(out)
         })
@@ -410,7 +414,7 @@ impl Store for RedbStore {
         })
     }
 
-    fn kel_head(&self, id: &Identifier) -> Result<Option<(u64, Commitment, u64)>, StoreError> {
+    fn kel_head(&self, id: &Identifier) -> Result<Option<KelHeadSeen>, StoreError> {
         self.read("kel_head", |txn| {
             let t = txn.open_table(KEL_HEADS)?;
             match t.get(id.as_bytes())? {
@@ -423,7 +427,11 @@ impl Store for RedbStore {
                     let seq = u64::from_le_bytes(fixed(&raw[..8], "kel_heads value")?);
                     let commitment = Commitment::from_bytes(fixed(&raw[8..40], "kel_heads value")?);
                     let seen = u64::from_le_bytes(fixed(&raw[40..], "kel_heads value")?);
-                    Ok(Some((seq, commitment, seen)))
+                    Ok(Some(KelHeadSeen {
+                        seq,
+                        commitment,
+                        seen,
+                    }))
                 }
             }
         })
@@ -481,13 +489,16 @@ impl Store for RedbStore {
         })
     }
 
-    fn peer_saved(&self) -> Result<Vec<(Identifier, String)>, StoreError> {
+    fn peer_saved(&self) -> Result<Vec<SavedPeer>, StoreError> {
         self.read("peer_saved", |txn| {
             let t = txn.open_table(PEERS)?;
             let mut out = Vec::new();
             for entry in t.iter()? {
                 let (k, v) = entry?;
-                out.push((Identifier::from_bytes(k.value()), v.value().to_string()));
+                out.push(SavedPeer {
+                    id: Identifier::from_bytes(k.value()),
+                    address: v.value().to_string(),
+                });
             }
             Ok(out)
         })
@@ -860,9 +871,11 @@ impl Store for RedbStore {
         status: u64,
         detail: Option<u64>,
     ) -> Result<(), StoreError> {
-        let bytes = serde_json::to_vec(&(status, detail)).map_err(|e| StoreError::Codec {
-            context: "encode status",
-            source: e,
+        let bytes = serde_json::to_vec(&MessageStatus { status, detail }).map_err(|e| {
+            StoreError::Codec {
+                context: "encode status",
+                source: e,
+            }
         })?;
         self.write("status_set", |txn| {
             let mut t = txn.open_table(STATUS)?;
@@ -871,7 +884,7 @@ impl Store for RedbStore {
         })
     }
 
-    fn status_get(&self, mid: &MessageId) -> Result<Option<(u64, Option<u64>)>, StoreError> {
+    fn status_get(&self, mid: &MessageId) -> Result<Option<MessageStatus>, StoreError> {
         self.read("status_get", |txn| {
             let t = txn.open_table(STATUS)?;
             match t.get(mid.as_bytes())? {

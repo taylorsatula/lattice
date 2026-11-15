@@ -1,9 +1,11 @@
 //! redb backend: persistence, schema guard, and MemStore equivalence.
 
+use lattice_proto::local::MessageStatus;
 use lattice_proto::message::Envelope;
 use lattice_proto::record::Scope;
 use lattice_store::{
-    CustodyEntry, InboxEntry, MemStore, OutboundMessage, OutboundState, RedbStore, Store,
+    CustodyEntry, InboxEntry, KelHeadSeen, MemStore, OutboundMessage, OutboundState, RedbStore,
+    Store,
 };
 use lattice_types::{Commitment, DeliveryId, Hash32, Identifier, LegId, MessageId, Signature};
 
@@ -75,7 +77,7 @@ fn exercise<S: Store>(s: &mut S) -> String {
         .unwrap();
     assert_eq!(s.record_count().unwrap(), 2);
     assert_eq!(
-        s.record_get(&id(1), Scope::Wan).unwrap().unwrap().0,
+        s.record_get(&id(1), Scope::Wan).unwrap().unwrap().bytes,
         b"record-one"
     );
     assert_eq!(s.record_get(&id(1), Scope::Hive).unwrap(), None);
@@ -84,7 +86,11 @@ fn exercise<S: Store>(s: &mut S) -> String {
         .unwrap();
     assert_eq!(
         s.kel_head(&id(1)).unwrap(),
-        Some((3, Commitment::from_bytes([0xAB; 32]), 500))
+        Some(KelHeadSeen {
+            seq: 3,
+            commitment: Commitment::from_bytes([0xAB; 32]),
+            seen: 500,
+        })
     );
 
     s.outbound_push(&outbound(1)).unwrap();
@@ -136,7 +142,13 @@ fn exercise<S: Store>(s: &mut S) -> String {
     assert_eq!(s.inbox_len("svc").unwrap(), 0);
 
     s.status_set(&mid(4), 3, None).unwrap();
-    assert_eq!(s.status_get(&mid(4)).unwrap(), Some((3, None)));
+    assert_eq!(
+        s.status_get(&mid(4)).unwrap(),
+        Some(MessageStatus {
+            status: 3,
+            detail: None,
+        })
+    );
 
     s.size_bucket_sample(0).unwrap();
     s.size_bucket_sample(0).unwrap();
@@ -172,13 +184,17 @@ fn redb_persists_across_reopen() {
     }
     let s = RedbStore::open(&path).unwrap();
     assert_eq!(
-        s.record_get(&id(7), Scope::Wan).unwrap().unwrap().0,
+        s.record_get(&id(7), Scope::Wan).unwrap().unwrap().bytes,
         b"persistent-record"
     );
     assert_eq!(s.custody_get(&leg(9)).unwrap().unwrap().destination, id(3));
     assert_eq!(
         s.kel_head(&id(7)).unwrap(),
-        Some((11, Commitment::from_bytes([0xCD; 32]), 4242))
+        Some(KelHeadSeen {
+            seq: 11,
+            commitment: Commitment::from_bytes([0xCD; 32]),
+            seen: 4242,
+        })
     );
 }
 
@@ -411,4 +427,58 @@ fn custody_class_bytes_track_accept_and_remove() {
     assert_eq!(classes[3], 250);
     assert_eq!(classes[7], 40);
     assert_eq!(s.custody_bytes().unwrap(), 290);
+}
+
+/// The on-disk JSON shapes must stay byte-identical to the pre-struct
+/// format: STATUS rows are `[status, detail]`, custody `excluded` entries
+/// are `[link, until]`. These pin the serde shims.
+#[test]
+fn serde_shapes_match_legacy_format() {
+    use lattice_store::Exclusion;
+    assert_eq!(
+        serde_json::to_vec(&MessageStatus {
+            status: 3,
+            detail: None,
+        })
+        .unwrap(),
+        b"[3,null]"
+    );
+    assert_eq!(
+        serde_json::to_vec(&MessageStatus {
+            status: 4,
+            detail: Some(7),
+        })
+        .unwrap(),
+        b"[4,7]"
+    );
+    assert_eq!(
+        serde_json::from_slice::<MessageStatus>(b"[3,null]").unwrap(),
+        MessageStatus {
+            status: 3,
+            detail: None,
+        }
+    );
+    assert_eq!(
+        serde_json::to_vec(&Exclusion {
+            link: 42,
+            until: 1700
+        })
+        .unwrap(),
+        b"[42,1700]"
+    );
+    assert_eq!(
+        serde_json::from_slice::<Exclusion>(b"[42,1700]").unwrap(),
+        Exclusion {
+            link: 42,
+            until: 1700
+        }
+    );
+    let entry = custody(1);
+    let mut with_exclusions = entry.clone();
+    with_exclusions.excluded = vec![Exclusion {
+        link: 9,
+        until: 123,
+    }];
+    let json = serde_json::to_value(&with_exclusions).unwrap();
+    assert_eq!(json["excluded"], serde_json::json!([[9, 123]]));
 }

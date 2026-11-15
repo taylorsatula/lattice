@@ -9,8 +9,8 @@ use lattice_types::{Commitment, DeliveryId, Hash32, Identifier, LegId, MessageId
 
 #[derive(Default)]
 pub struct MemStore {
-    records: HashMap<(Identifier, u8), (Vec<u8>, u64)>,
-    kel_heads: HashMap<Identifier, (u64, Commitment, u64)>,
+    records: HashMap<(Identifier, u8), RecordBytes>,
+    kel_heads: HashMap<Identifier, KelHeadSeen>,
     saved_peers: HashMap<Identifier, String>,
     outbound: HashMap<MessageId, OutboundMessage>,
     custody: HashMap<LegId, CustodyEntry>,
@@ -18,7 +18,7 @@ pub struct MemStore {
     seen: HashMap<Hash32, u64>,
     delivered: HashMap<Hash32, u64>,
     inbox: HashMap<String, Vec<InboxEntry>>,
-    status: HashMap<MessageId, (u64, Option<u64>)>,
+    status: HashMap<MessageId, MessageStatus>,
     buckets: [u64; 3],
     custody_bytes: u64,
     custody_class_bytes: [u64; 16],
@@ -43,11 +43,7 @@ fn scope_of(b: u8) -> Scope {
 }
 
 impl Store for MemStore {
-    fn record_get(
-        &self,
-        id: &Identifier,
-        scope: Scope,
-    ) -> Result<Option<(Vec<u8>, u64)>, StoreError> {
+    fn record_get(&self, id: &Identifier, scope: Scope) -> Result<Option<RecordBytes>, StoreError> {
         Ok(self.records.get(&(*id, scope_key(scope))).cloned())
     }
     fn record_put(
@@ -57,8 +53,13 @@ impl Store for MemStore {
         bytes: &[u8],
         received: u64,
     ) -> Result<(), StoreError> {
-        self.records
-            .insert((*id, scope_key(scope)), (bytes.to_vec(), received));
+        self.records.insert(
+            (*id, scope_key(scope)),
+            RecordBytes {
+                bytes: bytes.to_vec(),
+                received,
+            },
+        );
         Ok(())
     }
     fn record_remove(&mut self, id: &Identifier, scope: Scope) -> Result<(), StoreError> {
@@ -69,14 +70,19 @@ impl Store for MemStore {
         Ok(self
             .records
             .iter()
-            .map(|((id, s), (b, t))| (*id, scope_of(*s), b.clone(), *t))
+            .map(|((id, s), rb)| StoredRecord {
+                id: *id,
+                scope: scope_of(*s),
+                bytes: rb.bytes.clone(),
+                received: rb.received,
+            })
             .collect())
     }
     fn record_count(&self) -> Result<usize, StoreError> {
         Ok(self.records.len())
     }
 
-    fn kel_head(&self, id: &Identifier) -> Result<Option<(u64, Commitment, u64)>, StoreError> {
+    fn kel_head(&self, id: &Identifier) -> Result<Option<KelHeadSeen>, StoreError> {
         Ok(self.kel_heads.get(id).copied())
     }
     fn kel_head_put(
@@ -86,12 +92,19 @@ impl Store for MemStore {
         commitment: Commitment,
         seen: u64,
     ) -> Result<(), StoreError> {
-        self.kel_heads.insert(*id, (seq, commitment, seen));
+        self.kel_heads.insert(
+            *id,
+            KelHeadSeen {
+                seq,
+                commitment,
+                seen,
+            },
+        );
         Ok(())
     }
     fn kel_head_sweep(&mut self, older_than: u64) -> Result<usize, StoreError> {
         let before = self.kel_heads.len();
-        self.kel_heads.retain(|_, (_, _, seen)| *seen >= older_than);
+        self.kel_heads.retain(|_, h| h.seen >= older_than);
         Ok(before - self.kel_heads.len())
     }
 
@@ -99,11 +112,14 @@ impl Store for MemStore {
         self.saved_peers.insert(*id, address.to_string());
         Ok(())
     }
-    fn peer_saved(&self) -> Result<Vec<(Identifier, String)>, StoreError> {
+    fn peer_saved(&self) -> Result<Vec<SavedPeer>, StoreError> {
         Ok(self
             .saved_peers
             .iter()
-            .map(|(k, v)| (*k, v.clone()))
+            .map(|(k, v)| SavedPeer {
+                id: *k,
+                address: v.clone(),
+            })
             .collect())
     }
 
@@ -282,10 +298,10 @@ impl Store for MemStore {
         status: u64,
         detail: Option<u64>,
     ) -> Result<(), StoreError> {
-        self.status.insert(*mid, (status, detail));
+        self.status.insert(*mid, MessageStatus { status, detail });
         Ok(())
     }
-    fn status_get(&self, mid: &MessageId) -> Result<Option<(u64, Option<u64>)>, StoreError> {
+    fn status_get(&self, mid: &MessageId) -> Result<Option<MessageStatus>, StoreError> {
         Ok(self.status.get(mid).copied())
     }
 

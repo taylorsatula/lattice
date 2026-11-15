@@ -14,6 +14,7 @@ mod redb_store;
 pub use mem::MemStore;
 pub use redb_store::RedbStore;
 
+use lattice_proto::local::MessageStatus;
 use lattice_proto::record::Scope;
 use lattice_types::{Commitment, DeliveryId, Hash32, Identifier, LegId, MessageId};
 
@@ -71,8 +72,61 @@ impl StoreError {
     }
 }
 
-/// Stored record as returned by `record_all`: (id, scope, bytes, received_at).
-pub type StoredRecord = (Identifier, Scope, Vec<u8>, u64);
+/// A stored record as returned by `record_all`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredRecord {
+    pub id: Identifier,
+    pub scope: Scope,
+    /// The record bytes exactly as received.
+    pub bytes: Vec<u8>,
+    /// Unix time the record was received.
+    pub received: u64,
+}
+
+/// A stored record's bytes and the time they were received.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecordBytes {
+    pub bytes: Vec<u8>,
+    pub received: u64,
+}
+
+/// The KEL head this node last saw for an identity, and when.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KelHeadSeen {
+    pub seq: u64,
+    pub commitment: Commitment,
+    pub seen: u64,
+}
+
+/// A saved peer address.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SavedPeer {
+    pub id: Identifier,
+    pub address: String,
+}
+
+/// A neighbor excluded from custody forwarding until `until` (unix time).
+///
+/// Serialized as `[link, until]` inside custody entries; the serde impls
+/// round-trip through `(u64, u64)` so the on-disk format is unchanged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(from = "(u64, u64)", into = "(u64, u64)")]
+pub struct Exclusion {
+    pub link: u64,
+    pub until: u64,
+}
+
+impl From<(u64, u64)> for Exclusion {
+    fn from((link, until): (u64, u64)) -> Self {
+        Self { link, until }
+    }
+}
+
+impl From<Exclusion> for (u64, u64) {
+    fn from(e: Exclusion) -> Self {
+        (e.link, e.until)
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct OutboundMessage {
@@ -116,10 +170,9 @@ pub struct CustodyEntry {
     pub destination: Identifier,
     pub class: u8,
     pub exp: u64,
-    /// Neighbors that already answered busy/already-have for this leg.
     /// Neighbors that already replied busy/already-have for this leg,
     /// with the unix time after which they may be retried.
-    pub excluded: Vec<(u64, u64)>,
+    pub excluded: Vec<Exclusion>,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -150,11 +203,7 @@ pub struct CustodyAccept {
 
 pub trait Store {
     // peer records (raw bytes + received time), keyed by (id, scope)
-    fn record_get(
-        &self,
-        id: &Identifier,
-        scope: Scope,
-    ) -> Result<Option<(Vec<u8>, u64)>, StoreError>;
+    fn record_get(&self, id: &Identifier, scope: Scope) -> Result<Option<RecordBytes>, StoreError>;
     fn record_put(
         &mut self,
         id: &Identifier,
@@ -167,7 +216,7 @@ pub trait Store {
     fn record_count(&self) -> Result<usize, StoreError>;
 
     // KEL heads (kept one year beyond last sighting by the caller)
-    fn kel_head(&self, id: &Identifier) -> Result<Option<(u64, Commitment, u64)>, StoreError>; // seq, commitment, seen
+    fn kel_head(&self, id: &Identifier) -> Result<Option<KelHeadSeen>, StoreError>;
     fn kel_head_put(
         &mut self,
         id: &Identifier,
@@ -180,7 +229,7 @@ pub trait Store {
 
     // saved peer addresses, kept beyond record expiry
     fn peer_save(&mut self, id: &Identifier, address: &str) -> Result<(), StoreError>;
-    fn peer_saved(&self) -> Result<Vec<(Identifier, String)>, StoreError>;
+    fn peer_saved(&self) -> Result<Vec<SavedPeer>, StoreError>;
 
     // outbound queue
     fn outbound_push(&mut self, msg: &OutboundMessage) -> Result<(), StoreError>;
@@ -238,7 +287,7 @@ pub trait Store {
         status: u64,
         detail: Option<u64>,
     ) -> Result<(), StoreError>;
-    fn status_get(&self, mid: &MessageId) -> Result<Option<(u64, Option<u64>)>, StoreError>;
+    fn status_get(&self, mid: &MessageId) -> Result<Option<MessageStatus>, StoreError>;
 
     // transmission counters used for snow sizing
     fn size_bucket_sample(&mut self, bucket: u8) -> Result<(), StoreError>;
