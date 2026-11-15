@@ -295,184 +295,196 @@ async fn dispatch_app(
     req: &Request,
 ) -> Vec<u8> {
     match req.op {
-        OP_SEND => {
-            let Some(args) = SendArgs::from_value(&req.args).ok() else {
-                return resp_err(req.id, ERR_BAD_ARGS);
-            };
-            let send = lattice_core::AppSend {
-                service: service.to_string(),
-                mid_hint: Some(lattice_types::MessageId::from_bytes(
-                    lattice_crypto::os_bytes::<16>(),
-                )),
-                to: args.to,
-                tsvc: args.tsvc,
-                tmbx: args.tmbx,
-                fmbx: args.fmbx,
-                body: args.body,
-                exp: args.exp,
-                priority: args.priority.unwrap_or(1) as u8,
-                route: args.route.unwrap_or(ROUTE_DEFAULT) as u8,
-            };
-            call_api(
-                api,
-                req.id,
-                |tx| ApiCmd::AppSend { send, respond: tx },
-                |mid| {
-                    resp_ok(
-                        req.id,
-                        Value::map(vec![(Value::UInt(0), Value::Bytes(mid.to_vec()))]),
-                    )
-                },
-            )
-            .await
-        }
-        OP_STATUS => {
-            if deny_unknown_args(&req.args, &[0]).is_err() {
-                return resp_err(req.id, ERR_BAD_ARGS);
-            }
-            let Some(mid_bytes) = args_get(&req.args, 0).and_then(Value::as_bytes) else {
-                return resp_err(req.id, ERR_BAD_ARGS);
-            };
-            let Ok(mid) = <[u8; 16]>::try_from(mid_bytes).map(lattice_types::MessageId::from_bytes)
-            else {
-                return resp_err(req.id, ERR_BAD_ARGS);
-            };
-            call_api(
-                api,
-                req.id,
-                |tx| ApiCmd::Status { mid, respond: tx },
-                |resp| match resp {
-                    Ok(Some(status)) => {
-                        let mut pairs = vec![(Value::UInt(0), Value::UInt(status.status))];
-                        if let Some(d) = status.detail {
-                            pairs.push((Value::UInt(1), Value::UInt(d)));
-                        }
-                        resp_ok(req.id, Value::map(pairs))
-                    }
-                    Ok(None) => resp_err(req.id, ERR_NOT_FOUND),
-                    Err(e) => {
-                        eprintln!("lattice: status_get failed: {e}");
-                        resp_err(req.id, ERR_INTERNAL)
-                    }
-                },
-            )
-            .await
-        }
-        OP_FETCH => {
-            if deny_unknown_args(&req.args, &[0]).is_err() {
-                return resp_err(req.id, ERR_BAD_ARGS);
-            }
-            let max = args_get(&req.args, 0)
-                .and_then(Value::as_uint)
-                .unwrap_or(16)
-                .min(64) as usize;
-            call_api(
-                api,
-                req.id,
-                |tx| ApiCmd::Fetch {
-                    service: service.to_string(),
-                    max,
-                    respond: tx,
-                },
-                |resp| match resp {
-                    Ok(rows) => {
-                        let items: Vec<Value> = rows
-                            .into_iter()
-                            .map(|e| {
-                                Value::map(vec![
-                                    (Value::UInt(0), Value::Bytes(e.delivery_id.to_vec())),
-                                    (Value::UInt(1), Value::Bytes(e.mid.to_vec())),
-                                    (Value::UInt(2), Value::Bytes(e.from.to_vec())),
-                                    (Value::UInt(3), Value::Text(e.fsvc)),
-                                    (Value::UInt(4), Value::Bytes(e.fmbx)),
-                                    (Value::UInt(5), Value::Bytes(e.tmbx)),
-                                    (Value::UInt(6), Value::Bytes(e.body)),
-                                    (Value::UInt(7), Value::UInt(e.received)),
-                                ])
-                            })
-                            .collect();
-                        resp_ok(
-                            req.id,
-                            Value::map(vec![(Value::UInt(0), Value::Array(items))]),
-                        )
-                    }
-                    Err(e) => {
-                        eprintln!("lattice: inbox_fetch failed: {e}");
-                        resp_err(req.id, ERR_INTERNAL)
-                    }
-                },
-            )
-            .await
-        }
-        OP_ACK => {
-            if deny_unknown_args(&req.args, &[0]).is_err() {
-                return resp_err(req.id, ERR_BAD_ARGS);
-            }
-            let ids: Vec<lattice_types::DeliveryId> =
-                match args_get(&req.args, 0).and_then(Value::as_array) {
-                    Some(arr) => {
-                        let mut out = Vec::with_capacity(arr.len());
-                        for v in arr {
-                            match v.as_bytes().and_then(|b| <[u8; 16]>::try_from(b).ok()) {
-                                Some(id) => out.push(lattice_types::DeliveryId::from_bytes(id)),
-                                None => return resp_err(req.id, ERR_BAD_ARGS),
-                            }
-                        }
-                        out
-                    }
-                    None => return resp_err(req.id, ERR_BAD_ARGS),
-                };
-            call_api(
-                api,
-                req.id,
-                |tx| ApiCmd::Ack {
-                    service: service.to_string(),
-                    ids,
-                    respond: tx,
-                },
-                |resp| match resp {
-                    Ok(n) => resp_ok(
-                        req.id,
-                        Value::map(vec![(Value::UInt(0), Value::UInt(n as u64))]),
-                    ),
-                    Err(e) => {
-                        eprintln!("lattice: inbox_ack failed: {e}");
-                        resp_err(req.id, ERR_INTERNAL)
-                    }
-                },
-            )
-            .await
-        }
-        OP_LOOKUP => {
-            if deny_unknown_args(&req.args, &[0]).is_err() {
-                return resp_err(req.id, ERR_BAD_ARGS);
-            }
-            let Some(id_bytes) = args_get(&req.args, 0).and_then(Value::as_bytes) else {
-                return resp_err(req.id, ERR_BAD_ARGS);
-            };
-            let Ok(id) = <[u8; 32]>::try_from(id_bytes).map(lattice_types::Identifier::from_bytes)
-            else {
-                return resp_err(req.id, ERR_BAD_ARGS);
-            };
-            call_api(
-                api,
-                req.id,
-                |tx| ApiCmd::Lookup { id, respond: tx },
-                |lookup| {
-                    let mut pairs = vec![
-                        (Value::UInt(0), Value::Bool(lookup.have())),
-                        (Value::UInt(2), Value::Bool(lookup.path())),
-                    ];
-                    if let Lookup::Present { mode: Some(m), .. } = lookup {
-                        pairs.push((Value::UInt(1), Value::UInt(m.as_u64())));
-                    }
-                    resp_ok(req.id, Value::map(pairs))
-                },
-            )
-            .await
-        }
+        OP_SEND => handle_send(api, service, req).await,
+        OP_STATUS => handle_status(api, req).await,
+        OP_FETCH => handle_fetch(api, service, req).await,
+        OP_ACK => handle_ack(api, service, req).await,
+        OP_LOOKUP => handle_lookup(api, req).await,
         _ => resp_err(req.id, ERR_UNKNOWN_OP),
     }
+}
+
+async fn handle_send(api: &mpsc::UnboundedSender<ApiCmd>, service: &str, req: &Request) -> Vec<u8> {
+    let Some(args) = SendArgs::from_value(&req.args).ok() else {
+        return resp_err(req.id, ERR_BAD_ARGS);
+    };
+    let send = lattice_core::AppSend {
+        service: service.to_string(),
+        mid_hint: Some(lattice_types::MessageId::from_bytes(
+            lattice_crypto::os_bytes::<16>(),
+        )),
+        to: args.to,
+        tsvc: args.tsvc,
+        tmbx: args.tmbx,
+        fmbx: args.fmbx,
+        body: args.body,
+        exp: args.exp,
+        priority: args.priority.unwrap_or(1) as u8,
+        route: args.route.unwrap_or(ROUTE_DEFAULT) as u8,
+    };
+    call_api(
+        api,
+        req.id,
+        |tx| ApiCmd::AppSend { send, respond: tx },
+        |mid| {
+            resp_ok(
+                req.id,
+                Value::map(vec![(Value::UInt(0), Value::Bytes(mid.to_vec()))]),
+            )
+        },
+    )
+    .await
+}
+
+async fn handle_status(api: &mpsc::UnboundedSender<ApiCmd>, req: &Request) -> Vec<u8> {
+    if deny_unknown_args(&req.args, &[0]).is_err() {
+        return resp_err(req.id, ERR_BAD_ARGS);
+    }
+    let Some(mid_bytes) = args_get(&req.args, 0).and_then(Value::as_bytes) else {
+        return resp_err(req.id, ERR_BAD_ARGS);
+    };
+    let Ok(mid) = <[u8; 16]>::try_from(mid_bytes).map(lattice_types::MessageId::from_bytes) else {
+        return resp_err(req.id, ERR_BAD_ARGS);
+    };
+    call_api(
+        api,
+        req.id,
+        |tx| ApiCmd::Status { mid, respond: tx },
+        |resp| match resp {
+            Ok(Some(status)) => {
+                let mut pairs = vec![(Value::UInt(0), Value::UInt(status.status))];
+                if let Some(d) = status.detail {
+                    pairs.push((Value::UInt(1), Value::UInt(d)));
+                }
+                resp_ok(req.id, Value::map(pairs))
+            }
+            Ok(None) => resp_err(req.id, ERR_NOT_FOUND),
+            Err(e) => {
+                eprintln!("lattice: status_get failed: {e}");
+                resp_err(req.id, ERR_INTERNAL)
+            }
+        },
+    )
+    .await
+}
+
+async fn handle_fetch(
+    api: &mpsc::UnboundedSender<ApiCmd>,
+    service: &str,
+    req: &Request,
+) -> Vec<u8> {
+    if deny_unknown_args(&req.args, &[0]).is_err() {
+        return resp_err(req.id, ERR_BAD_ARGS);
+    }
+    let max = args_get(&req.args, 0)
+        .and_then(Value::as_uint)
+        .unwrap_or(16)
+        .min(64) as usize;
+    call_api(
+        api,
+        req.id,
+        |tx| ApiCmd::Fetch {
+            service: service.to_string(),
+            max,
+            respond: tx,
+        },
+        |resp| match resp {
+            Ok(rows) => {
+                let items: Vec<Value> = rows
+                    .into_iter()
+                    .map(|e| {
+                        Value::map(vec![
+                            (Value::UInt(0), Value::Bytes(e.delivery_id.to_vec())),
+                            (Value::UInt(1), Value::Bytes(e.mid.to_vec())),
+                            (Value::UInt(2), Value::Bytes(e.from.to_vec())),
+                            (Value::UInt(3), Value::Text(e.fsvc)),
+                            (Value::UInt(4), Value::Bytes(e.fmbx)),
+                            (Value::UInt(5), Value::Bytes(e.tmbx)),
+                            (Value::UInt(6), Value::Bytes(e.body)),
+                            (Value::UInt(7), Value::UInt(e.received)),
+                        ])
+                    })
+                    .collect();
+                resp_ok(
+                    req.id,
+                    Value::map(vec![(Value::UInt(0), Value::Array(items))]),
+                )
+            }
+            Err(e) => {
+                eprintln!("lattice: inbox_fetch failed: {e}");
+                resp_err(req.id, ERR_INTERNAL)
+            }
+        },
+    )
+    .await
+}
+
+async fn handle_ack(api: &mpsc::UnboundedSender<ApiCmd>, service: &str, req: &Request) -> Vec<u8> {
+    if deny_unknown_args(&req.args, &[0]).is_err() {
+        return resp_err(req.id, ERR_BAD_ARGS);
+    }
+    let ids: Vec<lattice_types::DeliveryId> = match args_get(&req.args, 0).and_then(Value::as_array)
+    {
+        Some(arr) => {
+            let mut out = Vec::with_capacity(arr.len());
+            for v in arr {
+                match v.as_bytes().and_then(|b| <[u8; 16]>::try_from(b).ok()) {
+                    Some(id) => out.push(lattice_types::DeliveryId::from_bytes(id)),
+                    None => return resp_err(req.id, ERR_BAD_ARGS),
+                }
+            }
+            out
+        }
+        None => return resp_err(req.id, ERR_BAD_ARGS),
+    };
+    call_api(
+        api,
+        req.id,
+        |tx| ApiCmd::Ack {
+            service: service.to_string(),
+            ids,
+            respond: tx,
+        },
+        |resp| match resp {
+            Ok(n) => resp_ok(
+                req.id,
+                Value::map(vec![(Value::UInt(0), Value::UInt(n as u64))]),
+            ),
+            Err(e) => {
+                eprintln!("lattice: inbox_ack failed: {e}");
+                resp_err(req.id, ERR_INTERNAL)
+            }
+        },
+    )
+    .await
+}
+
+async fn handle_lookup(api: &mpsc::UnboundedSender<ApiCmd>, req: &Request) -> Vec<u8> {
+    if deny_unknown_args(&req.args, &[0]).is_err() {
+        return resp_err(req.id, ERR_BAD_ARGS);
+    }
+    let Some(id_bytes) = args_get(&req.args, 0).and_then(Value::as_bytes) else {
+        return resp_err(req.id, ERR_BAD_ARGS);
+    };
+    let Ok(id) = <[u8; 32]>::try_from(id_bytes).map(lattice_types::Identifier::from_bytes) else {
+        return resp_err(req.id, ERR_BAD_ARGS);
+    };
+    call_api(
+        api,
+        req.id,
+        |tx| ApiCmd::Lookup { id, respond: tx },
+        |lookup| {
+            let mut pairs = vec![
+                (Value::UInt(0), Value::Bool(lookup.have())),
+                (Value::UInt(2), Value::Bool(lookup.path())),
+            ];
+            if let Lookup::Present { mode: Some(m), .. } = lookup {
+                pairs.push((Value::UInt(1), Value::UInt(m.as_u64())));
+            }
+            resp_ok(req.id, Value::map(pairs))
+        },
+    )
+    .await
 }
 
 /// Admin-socket connection handler.
@@ -509,194 +521,201 @@ async fn handle_admin(mut stream: UnixStream, api: mpsc::UnboundedSender<ApiCmd>
 
 async fn dispatch_admin(api: &mpsc::UnboundedSender<ApiCmd>, req: &Request) -> Vec<u8> {
     match req.op {
-        OP_NODE => {
-            if deny_unknown_args(&req.args, &[]).is_err() {
-                return resp_err(req.id, ERR_BAD_ARGS);
-            }
-            call_api(
-                api,
-                req.id,
-                |tx| ApiCmd::NodeInfo { respond: tx },
-                |info| {
-                    resp_ok(
-                        req.id,
-                        Value::map(vec![
-                            (Value::UInt(0), Value::Bytes(info.id.to_vec())),
-                            (Value::UInt(1), Value::Text(info.mode.into())),
-                            (Value::UInt(2), Value::UInt(info.links as u64)),
-                            (Value::UInt(3), Value::UInt(info.records as u64)),
-                            (Value::UInt(4), Value::UInt(info.custody_bytes)),
-                            (Value::UInt(5), Value::Bool(info.draining)),
-                        ]),
-                    )
-                },
-            )
-            .await
-        }
-        OP_DRAIN => {
-            if deny_unknown_args(&req.args, &[0]).is_err() {
-                return resp_err(req.id, ERR_BAD_ARGS);
-            }
-            // Absent key 0 = query; present key 0 must be a bool.
-            let request = match args_get(&req.args, 0) {
-                None => DrainRequest::Query,
-                Some(v) => match v.as_bool() {
-                    Some(true) => DrainRequest::Set(DrainState::Draining),
-                    Some(false) => DrainRequest::Set(DrainState::Serving),
-                    None => return resp_err(req.id, ERR_BAD_ARGS),
-                },
-            };
-            call_api(
-                api,
-                req.id,
-                |tx| ApiCmd::Drain {
-                    request,
-                    respond: tx,
-                },
-                |state| {
-                    resp_ok(
-                        req.id,
-                        Value::map(vec![
-                            (Value::UInt(0), Value::Bool(state.draining)),
-                            (Value::UInt(1), Value::UInt(state.custody_bytes)),
-                        ]),
-                    )
-                },
-            )
-            .await
-        }
-        OP_LINK => {
-            if deny_unknown_args(&req.args, &[0, 1, 2, 3]).is_err() {
-                return resp_err(req.id, ERR_BAD_ARGS);
-            }
-            let Some(addr) = args_get(&req.args, 0)
-                .and_then(Value::as_text)
-                .map(String::from)
-            else {
-                return resp_err(req.id, ERR_BAD_ARGS);
-            };
-            let ik_key = match args_get(&req.args, 1) {
-                Some(Value::Bytes(b)) => match <[u8; 32]>::try_from(b.as_slice()) {
-                    Ok(k) => Some(lattice_types::ChannelPublicKey::from_bytes(k)),
-                    Err(_) => return resp_err(req.id, ERR_BAD_ARGS),
-                },
-                Some(_) => return resp_err(req.id, ERR_BAD_ARGS),
-                None => None,
-            };
-            let path = args_get(&req.args, 2)
-                .and_then(Value::as_text)
-                .map(String::from);
-            let peer_id = match args_get(&req.args, 3) {
-                Some(Value::Bytes(b)) => match <[u8; 32]>::try_from(b.as_slice()) {
-                    Ok(k) => Some(lattice_types::Identifier::from_bytes(k)),
-                    Err(_) => return resp_err(req.id, ERR_BAD_ARGS),
-                },
-                Some(_) => return resp_err(req.id, ERR_BAD_ARGS),
-                None => None,
-            };
-            if ik_key.is_none() && path.is_none() {
-                return resp_err(req.id, ERR_BAD_ARGS);
-            }
-            call_api(
-                api,
-                req.id,
-                |tx| ApiCmd::Link {
-                    addr,
-                    ik_key,
-                    path,
-                    peer_id,
-                    respond: tx,
-                },
-                |outcome| match outcome {
-                    LinkOutcome::Queued => resp_ok(
-                        req.id,
-                        Value::map(vec![(Value::UInt(0), Value::Bool(true))]),
-                    ),
-                    LinkOutcome::Rejected => resp_err(req.id, ERR_BAD_ARGS),
-                },
-            )
-            .await
-        }
-        OP_ROTATE | OP_ABANDON => {
-            if deny_unknown_args(&req.args, &[0]).is_err() {
-                return resp_err(req.id, ERR_BAD_ARGS);
-            }
-            let next_key_file = match args_get(&req.args, 0) {
-                None => None,
-                Some(Value::Text(t)) => Some(t.clone()),
-                Some(_) => return resp_err(req.id, ERR_BAD_ARGS),
-            };
-            let kind = if req.op == OP_ABANDON {
-                RotationKind::Abandon
-            } else {
-                RotationKind::Rotate
-            };
-            call_api(
-                api,
-                req.id,
-                |tx| ApiCmd::Rotate {
-                    next_key_file,
-                    kind,
-                    respond: tx,
-                },
-                |result| match result {
-                    Ok(msg) => {
-                        resp_ok(req.id, Value::map(vec![(Value::UInt(0), Value::Text(msg))]))
-                    }
-                    Err(e) => {
-                        eprintln!("lattice: rotate failed: {e}");
-                        resp_err(req.id, ERR_FAILED)
-                    }
-                },
-            )
-            .await
-        }
-        OP_ROTATE_ENVELOPE => {
-            if deny_unknown_args(&req.args, &[]).is_err() {
-                return resp_err(req.id, ERR_BAD_ARGS);
-            }
-            call_api(
-                api,
-                req.id,
-                |tx| ApiCmd::RotateEnvelope { respond: tx },
-                |result| match result {
-                    Ok(msg) => {
-                        resp_ok(req.id, Value::map(vec![(Value::UInt(0), Value::Text(msg))]))
-                    }
-                    Err(e) => {
-                        eprintln!("lattice: envelope rotation failed: {e}");
-                        resp_err(req.id, ERR_FAILED)
-                    }
-                },
-            )
-            .await
-        }
-        OP_UNLINK => {
-            if deny_unknown_args(&req.args, &[0]).is_err() {
-                return resp_err(req.id, ERR_BAD_ARGS);
-            }
-            let Some(id) = args_get(&req.args, 0).and_then(Value::as_bytes) else {
-                return resp_err(req.id, ERR_BAD_ARGS);
-            };
-            let Ok(peer) = <[u8; 32]>::try_from(id).map(lattice_types::Identifier::from_bytes)
-            else {
-                return resp_err(req.id, ERR_BAD_ARGS);
-            };
-            call_api(
-                api,
-                req.id,
-                |tx| ApiCmd::UnlinkByPeer { peer, respond: tx },
-                |removed| {
-                    resp_ok(
-                        req.id,
-                        Value::map(vec![(Value::UInt(0), Value::Bool(removed > 0))]),
-                    )
-                },
-            )
-            .await
-        }
+        OP_NODE => handle_node(api, req).await,
+        OP_DRAIN => handle_drain(api, req).await,
+        OP_LINK => handle_link(api, req).await,
+        OP_ROTATE | OP_ABANDON => handle_rotate(api, req).await,
+        OP_ROTATE_ENVELOPE => handle_rotate_envelope(api, req).await,
+        OP_UNLINK => handle_unlink(api, req).await,
         _ => resp_err(req.id, ERR_UNKNOWN_OP),
     }
+}
+
+async fn handle_node(api: &mpsc::UnboundedSender<ApiCmd>, req: &Request) -> Vec<u8> {
+    if deny_unknown_args(&req.args, &[]).is_err() {
+        return resp_err(req.id, ERR_BAD_ARGS);
+    }
+    call_api(
+        api,
+        req.id,
+        |tx| ApiCmd::NodeInfo { respond: tx },
+        |info| {
+            resp_ok(
+                req.id,
+                Value::map(vec![
+                    (Value::UInt(0), Value::Bytes(info.id.to_vec())),
+                    (Value::UInt(1), Value::Text(info.mode.into())),
+                    (Value::UInt(2), Value::UInt(info.links as u64)),
+                    (Value::UInt(3), Value::UInt(info.records as u64)),
+                    (Value::UInt(4), Value::UInt(info.custody_bytes)),
+                    (Value::UInt(5), Value::Bool(info.draining)),
+                ]),
+            )
+        },
+    )
+    .await
+}
+
+async fn handle_drain(api: &mpsc::UnboundedSender<ApiCmd>, req: &Request) -> Vec<u8> {
+    if deny_unknown_args(&req.args, &[0]).is_err() {
+        return resp_err(req.id, ERR_BAD_ARGS);
+    }
+    // Absent key 0 = query; present key 0 must be a bool.
+    let request = match args_get(&req.args, 0) {
+        None => DrainRequest::Query,
+        Some(v) => match v.as_bool() {
+            Some(true) => DrainRequest::Set(DrainState::Draining),
+            Some(false) => DrainRequest::Set(DrainState::Serving),
+            None => return resp_err(req.id, ERR_BAD_ARGS),
+        },
+    };
+    call_api(
+        api,
+        req.id,
+        |tx| ApiCmd::Drain {
+            request,
+            respond: tx,
+        },
+        |state| {
+            resp_ok(
+                req.id,
+                Value::map(vec![
+                    (Value::UInt(0), Value::Bool(state.draining)),
+                    (Value::UInt(1), Value::UInt(state.custody_bytes)),
+                ]),
+            )
+        },
+    )
+    .await
+}
+
+async fn handle_link(api: &mpsc::UnboundedSender<ApiCmd>, req: &Request) -> Vec<u8> {
+    if deny_unknown_args(&req.args, &[0, 1, 2, 3]).is_err() {
+        return resp_err(req.id, ERR_BAD_ARGS);
+    }
+    let Some(addr) = args_get(&req.args, 0)
+        .and_then(Value::as_text)
+        .map(String::from)
+    else {
+        return resp_err(req.id, ERR_BAD_ARGS);
+    };
+    let ik_key = match args_get(&req.args, 1) {
+        Some(Value::Bytes(b)) => match <[u8; 32]>::try_from(b.as_slice()) {
+            Ok(k) => Some(lattice_types::ChannelPublicKey::from_bytes(k)),
+            Err(_) => return resp_err(req.id, ERR_BAD_ARGS),
+        },
+        Some(_) => return resp_err(req.id, ERR_BAD_ARGS),
+        None => None,
+    };
+    let path = args_get(&req.args, 2)
+        .and_then(Value::as_text)
+        .map(String::from);
+    let peer_id = match args_get(&req.args, 3) {
+        Some(Value::Bytes(b)) => match <[u8; 32]>::try_from(b.as_slice()) {
+            Ok(k) => Some(lattice_types::Identifier::from_bytes(k)),
+            Err(_) => return resp_err(req.id, ERR_BAD_ARGS),
+        },
+        Some(_) => return resp_err(req.id, ERR_BAD_ARGS),
+        None => None,
+    };
+    if ik_key.is_none() && path.is_none() {
+        return resp_err(req.id, ERR_BAD_ARGS);
+    }
+    call_api(
+        api,
+        req.id,
+        |tx| ApiCmd::Link {
+            addr,
+            ik_key,
+            path,
+            peer_id,
+            respond: tx,
+        },
+        |outcome| match outcome {
+            LinkOutcome::Queued => resp_ok(
+                req.id,
+                Value::map(vec![(Value::UInt(0), Value::Bool(true))]),
+            ),
+            LinkOutcome::Rejected => resp_err(req.id, ERR_BAD_ARGS),
+        },
+    )
+    .await
+}
+
+async fn handle_rotate(api: &mpsc::UnboundedSender<ApiCmd>, req: &Request) -> Vec<u8> {
+    if deny_unknown_args(&req.args, &[0]).is_err() {
+        return resp_err(req.id, ERR_BAD_ARGS);
+    }
+    let next_key_file = match args_get(&req.args, 0) {
+        None => None,
+        Some(Value::Text(t)) => Some(t.clone()),
+        Some(_) => return resp_err(req.id, ERR_BAD_ARGS),
+    };
+    let kind = if req.op == OP_ABANDON {
+        RotationKind::Abandon
+    } else {
+        RotationKind::Rotate
+    };
+    call_api(
+        api,
+        req.id,
+        |tx| ApiCmd::Rotate {
+            next_key_file,
+            kind,
+            respond: tx,
+        },
+        |result| match result {
+            Ok(msg) => resp_ok(req.id, Value::map(vec![(Value::UInt(0), Value::Text(msg))])),
+            Err(e) => {
+                eprintln!("lattice: rotate failed: {e}");
+                resp_err(req.id, ERR_FAILED)
+            }
+        },
+    )
+    .await
+}
+
+async fn handle_rotate_envelope(api: &mpsc::UnboundedSender<ApiCmd>, req: &Request) -> Vec<u8> {
+    if deny_unknown_args(&req.args, &[]).is_err() {
+        return resp_err(req.id, ERR_BAD_ARGS);
+    }
+    call_api(
+        api,
+        req.id,
+        |tx| ApiCmd::RotateEnvelope { respond: tx },
+        |result| match result {
+            Ok(msg) => resp_ok(req.id, Value::map(vec![(Value::UInt(0), Value::Text(msg))])),
+            Err(e) => {
+                eprintln!("lattice: envelope rotation failed: {e}");
+                resp_err(req.id, ERR_FAILED)
+            }
+        },
+    )
+    .await
+}
+
+async fn handle_unlink(api: &mpsc::UnboundedSender<ApiCmd>, req: &Request) -> Vec<u8> {
+    if deny_unknown_args(&req.args, &[0]).is_err() {
+        return resp_err(req.id, ERR_BAD_ARGS);
+    }
+    let Some(id) = args_get(&req.args, 0).and_then(Value::as_bytes) else {
+        return resp_err(req.id, ERR_BAD_ARGS);
+    };
+    let Ok(peer) = <[u8; 32]>::try_from(id).map(lattice_types::Identifier::from_bytes) else {
+        return resp_err(req.id, ERR_BAD_ARGS);
+    };
+    call_api(
+        api,
+        req.id,
+        |tx| ApiCmd::UnlinkByPeer { peer, respond: tx },
+        |removed| {
+            resp_ok(
+                req.id,
+                Value::map(vec![(Value::UInt(0), Value::Bool(removed > 0))]),
+            )
+        },
+    )
+    .await
 }
 
 /// Bind a socket path with the given mode.
