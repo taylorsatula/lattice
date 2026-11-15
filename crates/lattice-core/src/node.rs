@@ -361,7 +361,9 @@ impl<S: Store> Node<S> {
                     }
                     _ => 0,
                 };
-                self.store.size_bucket_sample(bucket);
+                // Snow telemetry is best-effort; a failed counter write must
+                // not stall frame handling.
+                let _ = self.store.size_bucket_sample(bucket);
             }
         }
     }
@@ -1735,7 +1737,7 @@ impl<S: Store> Node<S> {
             body: opened.body.clone().unwrap_or_default(),
             received: now,
         };
-        if self.store.inbox_push(&opened.tsvc, entry.clone()).is_err() {
+        if self.store.inbox_push(entry.clone()).is_err() {
             actions.push(self.busy(link, leg));
             return actions;
         }
@@ -2342,11 +2344,15 @@ impl<S: Store> Node<S> {
 
     fn note_snow_send(&mut self, bucket: usize) {
         self.snow_history[bucket.min(2)] += 1;
-        self.store.size_bucket_sample(bucket.min(2) as u8);
+        // Snow telemetry is best-effort; a failed counter write must not
+        // stall sending.
+        let _ = self.store.size_bucket_sample(bucket.min(2) as u8);
     }
 
     fn sample_snow_bucket(&mut self) -> usize {
-        let counts = self.store.size_bucket_counts();
+        // On store failure fall back to the in-memory snow histogram rather
+        // than failing the send; the persisted counts are only a hint.
+        let counts = self.store.size_bucket_counts().unwrap_or(self.snow_history);
         let min_share = 0.10f64;
         let total: f64 = counts.iter().map(|&c| c as f64).sum();
         let mut weights = [0.0f64; 3];

@@ -1,9 +1,10 @@
-//! Lattice storage: the Store trait, an in-memory implementation for the
-//! simulator, and (later) a redb implementation for the daemon.
+//! Lattice storage: the Store trait and its two implementations — an
+//! in-memory store for the simulator and tests (`MemStore`), and a redb-backed
+//! store for the daemon (`RedbStore`).
 //!
-//! The trait is the contract the core depends on; redb slots in behind it.
-//! All time is passed in by the caller (Unix seconds); the store never
-//! reads a clock.
+//! The trait is the contract the core depends on. The two backends are
+//! contract-tested for equivalence. All time is passed in by the caller
+//! (Unix seconds); the store never reads a clock.
 
 #![forbid(unsafe_code)]
 
@@ -45,6 +46,9 @@ pub enum StoreError {
     /// An internal counter would underflow.
     #[error("counter {0} underflow")]
     CounterUnderflow(String),
+    /// A stored key or value failed a structural check (e.g. wrong length).
+    #[error("corrupt {0}")]
+    Corrupt(&'static str),
     /// The database schema version is newer than this build understands.
     #[error("schema version {found} is newer than this build understands ({supported})")]
     SchemaTooNew { found: u64, supported: u64 },
@@ -131,12 +135,6 @@ pub struct InboxEntry {
     pub received: u64,
 }
 
-/// One custody share counter per (destination, upstream link).
-#[derive(Clone, Debug, Default)]
-pub struct ShareCounters {
-    pub held_bytes: u64,
-}
-
 /// Everything that must commit atomically when a node accepts custody of a
 /// message: the custody row, the fair-share debit, and the dedup marker.
 /// Splitting these across transactions can strand a message (custody row
@@ -218,8 +216,9 @@ pub trait Store {
     fn delivered_add(&mut self, hash: Hash32, exp: u64) -> Result<(), StoreError>;
     fn sweep_expired(&mut self, now: u64) -> Result<(), StoreError>;
 
-    // inbox (per service)
-    fn inbox_push(&mut self, service: &str, entry: InboxEntry) -> Result<(), StoreError>;
+    // inbox (per service). Entries carry their target service in `tsvc`;
+    // the read-side methods filter on it.
+    fn inbox_push(&mut self, entry: InboxEntry) -> Result<(), StoreError>;
     fn inbox_fetch(&self, service: &str, max: usize) -> Result<Vec<InboxEntry>, StoreError>;
     fn inbox_ack(
         &mut self,
@@ -242,8 +241,8 @@ pub trait Store {
     fn status_get(&self, mid: &MessageId) -> Result<Option<(u64, Option<u64>)>, StoreError>;
 
     // transmission counters used for snow sizing
-    fn size_bucket_sample(&mut self, bucket: u8);
-    fn size_bucket_counts(&self) -> [u64; 3];
+    fn size_bucket_sample(&mut self, bucket: u8) -> Result<(), StoreError>;
+    fn size_bucket_counts(&self) -> Result<[u64; 3], StoreError>;
 
     // drain flag: persisted so a restart does not silently accept new work
     fn drain_get(&self) -> Result<bool, StoreError>;

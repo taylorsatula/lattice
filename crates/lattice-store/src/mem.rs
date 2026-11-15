@@ -1,4 +1,6 @@
-//! In-memory Store. Used by the simulator and tests; redb lands in Phase 3.
+//! In-memory Store. Used by the simulator and tests; the daemon uses the
+//! redb-backed `RedbStore`. Behavior is contract-tested for equivalence
+//! with the redb backend.
 
 use std::collections::HashMap;
 
@@ -228,9 +230,9 @@ impl Store for MemStore {
         Ok(())
     }
 
-    fn inbox_push(&mut self, service: &str, entry: InboxEntry) -> Result<(), StoreError> {
+    fn inbox_push(&mut self, entry: InboxEntry) -> Result<(), StoreError> {
         self.inbox
-            .entry(service.to_string())
+            .entry(entry.tsvc.clone())
             .or_default()
             .push(entry);
         Ok(())
@@ -287,13 +289,12 @@ impl Store for MemStore {
         Ok(self.status.get(mid).copied())
     }
 
-    fn size_bucket_sample(&mut self, bucket: u8) {
-        if (bucket as usize) < 3 {
-            self.buckets[bucket as usize] += 1;
-        }
+    fn size_bucket_sample(&mut self, bucket: u8) -> Result<(), StoreError> {
+        self.buckets[bucket.min(2) as usize] += 1;
+        Ok(())
     }
-    fn size_bucket_counts(&self) -> [u64; 3] {
-        self.buckets
+    fn size_bucket_counts(&self) -> Result<[u64; 3], StoreError> {
+        Ok(self.buckets)
     }
 
     fn drain_get(&self) -> Result<bool, StoreError> {
