@@ -148,15 +148,31 @@ fn main() {
     let reconcile = Frame::Reconcile(ReconcileFrame {
         ranges: vec![
             Range::Fingerprint {
-                lower: Some((Identifier::from_bytes([0x01; 32]), 0)),
-                upper: Some((Identifier::from_bytes([0x7f; 32]), 0)),
+                lower: Some(RangeBound {
+                    id: Identifier::from_bytes([0x01; 32]),
+                    scope: 0,
+                }),
+                upper: Some(RangeBound {
+                    id: Identifier::from_bytes([0x7f; 32]),
+                    scope: 0,
+                }),
                 count: 42,
                 sum: Hash32::from_bytes([0x55; 32]),
             },
             Range::Entries {
-                lower: Some((Identifier::from_bytes([0x80; 32]), 1)),
-                upper: Some((Identifier::from_bytes([0xfe; 32]), 1)),
-                entries: vec![(Identifier::from_bytes([0x90; 32]), 0, 7)],
+                lower: Some(RangeBound {
+                    id: Identifier::from_bytes([0x80; 32]),
+                    scope: 1,
+                }),
+                upper: Some(RangeBound {
+                    id: Identifier::from_bytes([0xfe; 32]),
+                    scope: 1,
+                }),
+                entries: vec![RecordEntry {
+                    id: Identifier::from_bytes([0x90; 32]),
+                    scope: 0,
+                    seq: 7,
+                }],
             },
         ],
     });
@@ -168,8 +184,14 @@ fn main() {
     }));
     let want = Frame::Want(WantFrame {
         wants: vec![
-            (Identifier::from_bytes([0x21; 32]), 0),
-            (Identifier::from_bytes([0x22; 32]), 1),
+            RecordRef {
+                id: Identifier::from_bytes([0x21; 32]),
+                scope: 0,
+            },
+            RecordRef {
+                id: Identifier::from_bytes([0x22; 32]),
+                scope: 1,
+            },
         ],
     });
     vectors.push(serde_json::json!({

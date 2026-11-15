@@ -68,11 +68,11 @@ fn public_record_roundtrip() {
     let rec = public_record(&f);
     let bytes = rec.encode();
     assert!(bytes.len() <= 3072);
-    let (parsed, head) = PeerRecord::from_bytes(&bytes, NOW, None).unwrap();
-    assert_eq!(parsed.id, rec.id);
-    assert_eq!(parsed.seq, 1);
-    assert_eq!(parsed.kel.len(), 1);
-    assert_eq!(head.seq, 0);
+    let parsed = PeerRecord::from_bytes(&bytes, NOW, None).unwrap();
+    assert_eq!(parsed.record.id, rec.id);
+    assert_eq!(parsed.record.seq, 1);
+    assert_eq!(parsed.record.kel.len(), 1);
+    assert_eq!(parsed.head.seq, 0);
 }
 
 #[test]
@@ -257,10 +257,28 @@ fn known_head_divergence_rejected() {
     let rec = public_record(&f);
     let bytes = rec.encode();
     assert!(
-        PeerRecord::from_bytes(&bytes, NOW, Some((0, Commitment::from_bytes([0xAA; 32])))).is_err()
+        PeerRecord::from_bytes(
+            &bytes,
+            NOW,
+            Some(KnownHead {
+                seq: 0,
+                commitment: Commitment::from_bytes([0xAA; 32]),
+            }),
+        )
+        .is_err()
     );
     let real_commitment = lattice_proto::kel::KeyEvent::validate_chain(&f.kel)
         .unwrap()
         .commitment;
-    assert!(PeerRecord::from_bytes(&bytes, NOW, Some((0, real_commitment))).is_ok());
+    assert!(
+        PeerRecord::from_bytes(
+            &bytes,
+            NOW,
+            Some(KnownHead {
+                seq: 0,
+                commitment: real_commitment,
+            }),
+        )
+        .is_ok()
+    );
 }

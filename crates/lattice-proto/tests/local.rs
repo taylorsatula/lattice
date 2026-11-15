@@ -66,9 +66,9 @@ fn send_args_roundtrip_and_limits() {
 fn length_prefix_roundtrip() {
     let payload = br#"{"0":1}"#;
     let framed = frame_local(payload).unwrap();
-    let (out, used) = deframe_local(&framed).unwrap().unwrap();
-    assert_eq!(out, payload);
-    assert_eq!(used, framed.len());
+    let frame = deframe_local(&framed).unwrap().unwrap();
+    assert_eq!(frame.payload, payload);
+    assert_eq!(frame.consumed, framed.len());
     // partial frame yields None, not an error
     assert!(deframe_local(&framed[..3]).unwrap().is_none());
     // oversized prefix rejected

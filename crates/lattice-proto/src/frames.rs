@@ -69,24 +69,61 @@ pub struct CustodyFrame {
     pub retry_after: Option<u64>,
 }
 
-/// A reconciliation range. `lower`/`upper` are (id, scope) bounds, half-open
-/// [lower, upper); `None` is unbounded on that side. Bounds have scope 0 at
-/// split points so both scopes of an id interval stay inside one range.
-/// A bound of a reconciliation range: `(id, scope)`.
-pub type RangeBound = (Identifier, u8);
+/// A reference to a record: its identifier and scope. Used for reconcile
+/// wants and anywhere a record is named without its bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RecordRef {
+    pub id: Identifier,
+    pub scope: u8,
+}
 
+/// An entry in a range's explicit list: the record's id, scope and seq.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RecordEntry {
+    pub id: Identifier,
+    pub scope: u8,
+    pub seq: u64,
+}
+
+impl RecordEntry {
+    /// The (id, scope) pair identifying the record, without the seq.
+    pub fn key(&self) -> RecordRef {
+        RecordRef {
+            id: self.id,
+            scope: self.scope,
+        }
+    }
+}
+
+/// A bound of a reconciliation range: `(id, scope)`. Bounds have scope 0 at
+/// split points so both scopes of an id interval stay inside one range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RangeBound {
+    pub id: Identifier,
+    pub scope: u8,
+}
+
+/// The half-open bounds of a range; `None` is unbounded on that side.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RangeBounds {
+    pub lower: Option<RangeBound>,
+    pub upper: Option<RangeBound>,
+}
+
+/// A reconciliation range. `lower`/`upper` are (id, scope) bounds, half-open
+/// [lower, upper); `None` is unbounded on that side.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Range {
     Fingerprint {
-        lower: Option<(Identifier, u8)>,
-        upper: Option<(Identifier, u8)>,
+        lower: Option<RangeBound>,
+        upper: Option<RangeBound>,
         count: u64,
         sum: Hash32,
     },
     Entries {
-        lower: Option<(Identifier, u8)>,
-        upper: Option<(Identifier, u8)>,
-        entries: Vec<(Identifier, u8, u64)>,
+        lower: Option<RangeBound>,
+        upper: Option<RangeBound>,
+        entries: Vec<RecordEntry>,
     },
 }
 
@@ -97,8 +134,8 @@ pub struct ReconcileFrame {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WantFrame {
-    /// (identifier, scope) pairs to fetch.
-    pub wants: Vec<(Identifier, u8)>,
+    /// Records to fetch.
+    pub wants: Vec<RecordRef>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -143,36 +180,45 @@ pub enum Frame {
     Attest(AttestFrame),
 }
 
-fn bound_value(b: &(Identifier, u8)) -> Value {
+fn bound_value(b: &RangeBound) -> Value {
     Value::map(vec![
-        (Value::UInt(0), Value::Bytes(b.0.to_vec())),
-        (Value::UInt(1), Value::UInt(b.1 as u64)),
+        (Value::UInt(0), Value::Bytes(b.id.to_vec())),
+        (Value::UInt(1), Value::UInt(b.scope as u64)),
     ])
 }
 
-fn parse_bound(v: &Value) -> Result<(Identifier, u8), ProtoError> {
+fn parse_bound(v: &Value) -> Result<RangeBound, ProtoError> {
     v.deny_unknown_keys(&[0, 1])?;
     let id = Identifier::from_bytes(fixed_bytes(v, 0)?);
     let scope = v.req_uint(1)?;
     if scope > 1 {
         return Err(ProtoError::Invalid("scope out of range"));
     }
-    Ok((id, scope as u8))
+    Ok(RangeBound {
+        id,
+        scope: scope as u8,
+    })
 }
 
 impl Range {
-    fn bound_value(b: &Option<(Identifier, u8)>) -> Option<Value> {
-        b.map(|(id, scope)| bound_value(&(id, scope)))
+    fn bound_value(b: &Option<RangeBound>) -> Option<Value> {
+        b.as_ref().map(bound_value)
     }
 
-    fn bounds(&self) -> (Option<RangeBound>, Option<RangeBound>) {
+    fn bounds(&self) -> RangeBounds {
         match self {
-            Range::Fingerprint { lower, upper, .. } => (*lower, *upper),
-            Range::Entries { lower, upper, .. } => (*lower, *upper),
+            Range::Fingerprint { lower, upper, .. } => RangeBounds {
+                lower: *lower,
+                upper: *upper,
+            },
+            Range::Entries { lower, upper, .. } => RangeBounds {
+                lower: *lower,
+                upper: *upper,
+            },
         }
     }
 
-    fn parse_bounds(v: &Value) -> Result<(Option<RangeBound>, Option<RangeBound>), ProtoError> {
+    fn parse_bounds(v: &Value) -> Result<RangeBounds, ProtoError> {
         let lower = match v.get_key(0)? {
             None => None,
             Some(b) => Some(parse_bound(b)?),
@@ -181,11 +227,11 @@ impl Range {
             None => None,
             Some(b) => Some(parse_bound(b)?),
         };
-        Ok((lower, upper))
+        Ok(RangeBounds { lower, upper })
     }
 
     fn to_value(&self) -> Value {
-        let (lower, upper) = self.bounds();
+        let RangeBounds { lower, upper } = self.bounds();
         let mut pairs = Vec::with_capacity(4);
         if let Some(b) = Self::bound_value(&lower) {
             pairs.push((Value::UInt(0), b));
@@ -206,11 +252,11 @@ impl Range {
                     Value::Array(
                         entries
                             .iter()
-                            .map(|(id, scope, seq)| {
+                            .map(|e| {
                                 Value::Array(vec![
-                                    Value::Bytes(id.to_vec()),
-                                    Value::UInt(*scope as u64),
-                                    Value::UInt(*seq),
+                                    Value::Bytes(e.id.to_vec()),
+                                    Value::UInt(e.scope as u64),
+                                    Value::UInt(e.seq),
                                 ])
                             })
                             .collect(),
@@ -223,14 +269,14 @@ impl Range {
 
     fn from_value(v: &Value) -> Result<Self, ProtoError> {
         v.deny_unknown_keys(&[0, 1, 2, 3])?;
-        let (lower, upper) = Self::parse_bounds(v)?;
+        let RangeBounds { lower, upper } = Self::parse_bounds(v)?;
         if v.get_key(2)?.is_some() && v.get_key(3)?.is_some() {
             return Err(ProtoError::Invalid(
                 "range must carry fingerprint (key 2) or entries (key 3), not both",
             ));
         }
-        if let (Some((lo_id, lo_scope)), Some((hi_id, hi_scope))) = (&lower, &upper) {
-            if (lo_id, lo_scope) > (hi_id, hi_scope) {
+        if let (Some(lo), Some(hi)) = (&lower, &upper) {
+            if lo > hi {
                 return Err(ProtoError::Invalid("range lower bound exceeds upper bound"));
             }
         }
@@ -281,7 +327,7 @@ impl Range {
                         return Err(ProtoError::Invalid("scope out of range"));
                     }
                     let seq = a[2].as_uint().ok_or(ProtoError::WrongType(3, "uint seq"))?;
-                    Ok((id, scope, seq))
+                    Ok(RecordEntry { id, scope, seq })
                 })
                 .collect::<Result<Vec<_>, ProtoError>>()?;
             return Ok(Range::Entries {
@@ -366,10 +412,10 @@ impl Frame {
                     Value::Array(
                         f.wants
                             .iter()
-                            .map(|(id, scope)| {
+                            .map(|w| {
                                 Value::Array(vec![
-                                    Value::Bytes(id.to_vec()),
-                                    Value::UInt(*scope as u64),
+                                    Value::Bytes(w.id.to_vec()),
+                                    Value::UInt(w.scope as u64),
                                 ])
                             })
                             .collect(),
@@ -488,7 +534,7 @@ impl Frame {
                         if scope > 1 {
                             return Err(ProtoError::Invalid("scope out of range"));
                         }
-                        Ok((id, scope))
+                        Ok(RecordRef { id, scope })
                     })
                     .collect::<Result<Vec<_>, ProtoError>>()?;
                 Ok(Frame::Want(WantFrame { wants }))

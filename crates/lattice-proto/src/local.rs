@@ -75,6 +75,49 @@ pub const MSG_STATUS_DELIVERED: u64 = 3;
 pub const MSG_STATUS_FAILED: u64 = 4;
 pub const MSG_STATUS_EXPIRED: u64 = 5;
 
+/// Message status as stored by the daemon and returned by the local API:
+/// the status code and an optional detail (e.g. an error code on failure).
+///
+/// Serialized as a two-element array `[status, detail]`; the on-disk STATUS
+/// table depends on that exact shape, so the serde impls below round-trip
+/// through `(u64, Option<u64>)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(from = "(u64, Option<u64>)", into = "(u64, Option<u64>)")]
+pub struct MessageStatus {
+    pub status: u64,
+    pub detail: Option<u64>,
+}
+
+impl From<(u64, Option<u64>)> for MessageStatus {
+    fn from((status, detail): (u64, Option<u64>)) -> Self {
+        Self { status, detail }
+    }
+}
+
+impl From<MessageStatus> for (u64, Option<u64>) {
+    fn from(s: MessageStatus) -> Self {
+        (s.status, s.detail)
+    }
+}
+
+/// Drain state as reported by the daemon: whether it is draining and how
+/// many bytes of custody it holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DrainState {
+    pub draining: bool,
+    pub custody_bytes: u64,
+}
+
+/// Result of a record lookup: whether a valid record is held, its mode
+/// (0 = public, 1 = private; absent when unknown), and whether a path
+/// exists right now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Lookup {
+    pub have: bool,
+    pub mode: Option<u64>,
+    pub path: bool,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Request {
     pub id: u64,
@@ -266,8 +309,15 @@ pub fn frame_local(payload: &[u8]) -> Result<Vec<u8>, ProtoError> {
     Ok(out)
 }
 
-/// Split one frame off the front of `buf`; returns (payload, bytes consumed).
-pub fn deframe_local(buf: &[u8]) -> Result<Option<(&[u8], usize)>, ProtoError> {
+/// One frame split off the front of a receive buffer.
+pub struct LocalFrame<'a> {
+    pub payload: &'a [u8],
+    /// Bytes consumed from the front of the buffer, including the prefix.
+    pub consumed: usize,
+}
+
+/// Split one frame off the front of `buf`.
+pub fn deframe_local(buf: &[u8]) -> Result<Option<LocalFrame<'_>>, ProtoError> {
     if buf.len() < LOCAL_PREFIX_LEN {
         return Ok(None);
     }
@@ -278,10 +328,10 @@ pub fn deframe_local(buf: &[u8]) -> Result<Option<(&[u8], usize)>, ProtoError> {
     if buf.len() < LOCAL_PREFIX_LEN + len {
         return Ok(None);
     }
-    Ok(Some((
-        &buf[LOCAL_PREFIX_LEN..LOCAL_PREFIX_LEN + len],
-        LOCAL_PREFIX_LEN + len,
-    )))
+    Ok(Some(LocalFrame {
+        payload: &buf[LOCAL_PREFIX_LEN..LOCAL_PREFIX_LEN + len],
+        consumed: LOCAL_PREFIX_LEN + len,
+    }))
 }
 
 /// The public `/status` object served on the WebSocket listener.

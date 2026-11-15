@@ -287,6 +287,22 @@ impl PeerRecord {
     }
 }
 
+/// The KEL head this node already holds for an identity, passed to
+/// validation so a record whose chain is behind or divergent can be
+/// rejected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KnownHead {
+    pub seq: u64,
+    pub commitment: Commitment,
+}
+
+/// A record that passed validation, paired with its KEL head.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParsedRecord {
+    pub record: PeerRecord,
+    pub head: KelHead,
+}
+
 /// A record decoded from the wire, before any validation.
 ///
 /// Carries no trust: every field is attacker-controlled until
@@ -407,14 +423,14 @@ impl PeerRecord {
     /// Parse and fully validate a record from the wire.
     ///
     /// `now` is injected so the same code runs in the simulator and the
-    /// daemon. `known_head`, when supplied, is the (seq, commitment) this
-    /// node already holds for the record's identifier; a record whose KEL is
-    /// behind or divergent is rejected.
+    /// daemon. `known_head`, when supplied, is the head this node already
+    /// holds for the record's identifier; a record whose KEL is behind or
+    /// divergent is rejected.
     pub fn from_bytes(
         bytes: &[u8],
         now: u64,
-        known_head: Option<(u64, Commitment)>,
-    ) -> Result<(PeerRecord, KelHead), ProtoError> {
+        known_head: Option<KnownHead>,
+    ) -> Result<ParsedRecord, ProtoError> {
         Self::decode(bytes)?.validate(Some(now), known_head)
     }
 
@@ -423,8 +439,8 @@ impl PeerRecord {
     /// every other check (structure, KEL chain, signatures) is identical.
     pub fn from_bytes_unchecked_time(
         bytes: &[u8],
-        known_head: Option<(u64, Commitment)>,
-    ) -> Result<(PeerRecord, KelHead), ProtoError> {
+        known_head: Option<KnownHead>,
+    ) -> Result<ParsedRecord, ProtoError> {
         Self::decode(bytes)?.validate(None, known_head)
     }
 }
@@ -435,8 +451,8 @@ impl DecodedRecord {
     pub fn validate(
         self,
         now: Option<u64>,
-        known_head: Option<(u64, Commitment)>,
-    ) -> Result<(PeerRecord, KelHead), ProtoError> {
+        known_head: Option<KnownHead>,
+    ) -> Result<ParsedRecord, ProtoError> {
         let Self {
             id,
             scope,
@@ -500,8 +516,8 @@ impl DecodedRecord {
                 "identifier does not match inception event",
             ));
         }
-        if let Some((known_seq, known_commitment)) = known_head {
-            match classify(known_seq, &known_commitment, kel.events()) {
+        if let Some(known) = known_head {
+            match classify(known.seq, &known.commitment, kel.events()) {
                 KelRelation::Extends | KelRelation::Same => {}
                 KelRelation::Behind => {
                     return Err(ProtoError::BadKeyLog("KEL is behind the known head"));
@@ -538,7 +554,7 @@ impl DecodedRecord {
         if !verify(&channel_key, &preimage, &record.channel_sig) {
             return Err(ProtoError::BadSignature);
         }
-        Ok((record, head))
+        Ok(ParsedRecord { record, head })
     }
 }
 

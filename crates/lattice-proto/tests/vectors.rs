@@ -48,8 +48,9 @@ fn all_vectors() {
             }
             "peer_record" => {
                 let now = v["now"].as_u64().unwrap();
-                let (rec, _) = PeerRecord::from_bytes(&bytes, now, None)
+                let parsed = PeerRecord::from_bytes(&bytes, now, None)
                     .unwrap_or_else(|e| panic!("{name}: {e}"));
+                let rec = parsed.record;
                 assert_eq!(
                     hex(rec.id.as_ref()),
                     v["expect"]["id"].as_str().unwrap(),

@@ -25,8 +25,8 @@ pub use message::{
     BuildParams, Envelope, GatewaySeal, Header, HopLayerPlain, Message, SealedLayer, WaypointSeal,
 };
 pub use record::{
-    DecodedRecord, Endpoint, Mode, PeerRecord, Scope, compare_lww, is_equivocation,
-    is_globally_routable, record_hash,
+    DecodedRecord, Endpoint, KnownHead, Mode, ParsedRecord, PeerRecord, Scope, compare_lww,
+    is_equivocation, is_globally_routable, record_hash,
 };
 
 /// Largest message on the wire (bucket 3) and the derived message buckets.

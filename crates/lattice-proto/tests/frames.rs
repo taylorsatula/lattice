@@ -51,17 +51,37 @@ fn reconcile_roundtrip_both_range_kinds() {
     let f = Frame::Reconcile(ReconcileFrame {
         ranges: vec![
             Range::Fingerprint {
-                lower: Some((Identifier::from_bytes([1; 32]), 0)),
-                upper: Some((Identifier::from_bytes([9; 32]), 1)),
+                lower: Some(RangeBound {
+                    id: Identifier::from_bytes([1; 32]),
+                    scope: 0,
+                }),
+                upper: Some(RangeBound {
+                    id: Identifier::from_bytes([9; 32]),
+                    scope: 1,
+                }),
                 count: 1234,
                 sum: Hash32::from_bytes([7; 32]),
             },
             Range::Entries {
-                lower: Some((Identifier::from_bytes([1; 32]), 0)),
-                upper: Some((Identifier::from_bytes([2; 32]), 0)),
+                lower: Some(RangeBound {
+                    id: Identifier::from_bytes([1; 32]),
+                    scope: 0,
+                }),
+                upper: Some(RangeBound {
+                    id: Identifier::from_bytes([2; 32]),
+                    scope: 0,
+                }),
                 entries: vec![
-                    (Identifier::from_bytes([8; 32]), 1, 42),
-                    (Identifier::from_bytes([9; 32]), 0, 7),
+                    RecordEntry {
+                        id: Identifier::from_bytes([8; 32]),
+                        scope: 1,
+                        seq: 42,
+                    },
+                    RecordEntry {
+                        id: Identifier::from_bytes([9; 32]),
+                        scope: 0,
+                        seq: 7,
+                    },
                 ],
             },
         ],
@@ -73,8 +93,14 @@ fn reconcile_roundtrip_both_range_kinds() {
 fn want_records_ping_dummy_roundtrip() {
     let f = Frame::Want(WantFrame {
         wants: vec![
-            (Identifier::from_bytes([1; 32]), 0),
-            (Identifier::from_bytes([2; 32]), 1),
+            RecordRef {
+                id: Identifier::from_bytes([1; 32]),
+                scope: 0,
+            },
+            RecordRef {
+                id: Identifier::from_bytes([2; 32]),
+                scope: 1,
+            },
         ],
     });
     assert_eq!(Frame::from_bytes(&f.encode()).unwrap(), f);
