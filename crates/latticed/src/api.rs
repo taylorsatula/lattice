@@ -20,7 +20,7 @@ use lattice_proto::local::{
 use lattice_proto::{Value, decode, encode};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast, mpsc, oneshot};
 
 use subtle::ConstantTimeEq;
 
@@ -29,6 +29,24 @@ use crate::runtime::{ApiCmd, LinkOutcome, ServiceEvent};
 use lattice_core::RotationKind;
 
 const MAX_FRAME: usize = LOCAL_MAX_FRAME;
+
+/// Maximum simultaneous application-socket connections.
+///
+/// Fixed cap, not configurable. At the cap a new connection is dropped at
+/// accept time without a single byte read or written (pre-auth silence,
+/// same posture as the undecodable-hello path); the accept loop keeps
+/// running. Slots are held by an owned semaphore permit for the life of
+/// the connection task, so every exit path releases exactly one slot.
+const MAX_APP_CONNECTIONS: usize = 64;
+
+/// Read-idle timeout for an authenticated application-socket connection.
+///
+/// After the hello handshake completes, a connection that delivers no
+/// inbound frame for this long is closed. Event-only subscribers (apps
+/// that send nothing after hello) will be disconnected and must send any
+/// op periodically or reconnect; there is no ping op today, and a future
+/// OP_PING would be the proper fix.
+const APP_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
 async fn write_frame(stream: &mut UnixStream, payload: &[u8]) -> std::io::Result<()> {
     let framed = frame_local(payload)
@@ -132,11 +150,15 @@ fn secret_eq(a: &[u8], b: &str) -> bool {
 }
 
 /// Application-socket connection handler.
+///
+/// `_permit` holds this connection's slot against MAX_APP_CONNECTIONS;
+/// dropping it on any exit path releases the slot.
 async fn handle_app(
     mut stream: UnixStream,
     cfg: Arc<Config>,
     api: mpsc::UnboundedSender<ApiCmd>,
     mut events: broadcast::Receiver<ServiceEvent>,
+    _permit: OwnedSemaphorePermit,
 ) {
     let mut buf = Vec::new();
 
@@ -209,6 +231,9 @@ async fn handle_app(
     ]);
     let _ = write_frame(&mut stream, &resp_ok(req.id, hello_ok)).await;
 
+    // Post-hello read-idle deadline. Only an inbound frame resets it;
+    // outbound event traffic does not, so a silent subscriber is reaped.
+    let mut idle_deadline = tokio::time::Instant::now() + APP_IDLE_TIMEOUT;
     loop {
         tokio::select! {
             ev = events.recv() => {
@@ -224,19 +249,29 @@ async fn handle_app(
                     }
                 }
             }
-            frame = read_frame(&mut stream, &mut buf) => {
+            frame = tokio::time::timeout_at(idle_deadline, read_frame(&mut stream, &mut buf)) => {
                 let frame = match frame {
-                    Ok(FrameRead::Frame(f)) => f,
-                    Ok(FrameRead::Eof) => return,
+                    Ok(Ok(FrameRead::Frame(f))) => {
+                        idle_deadline = tokio::time::Instant::now() + APP_IDLE_TIMEOUT;
+                        f
+                    }
+                    Ok(Ok(FrameRead::Eof)) => return,
                     // Authenticated peer: tell it the stream is unusable instead of
                     // dropping the connection without a word.
-                    Ok(FrameRead::BadFrame) => {
+                    Ok(Ok(FrameRead::BadFrame)) => {
                         eprintln!("lattice: app socket: undecodable frame; closing connection");
                         let _ = write_frame(&mut stream, &resp_err(0, ERR_BAD_ARGS)).await;
                         return;
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         eprintln!("lattice: app socket: read error: {e}");
+                        return;
+                    }
+                    Err(_) => {
+                        eprintln!(
+                            "lattice: app socket: no inbound frame for {}s; closing connection",
+                            APP_IDLE_TIMEOUT.as_secs()
+                        );
                         return;
                     }
                 };
@@ -721,12 +756,22 @@ pub async fn serve_app(
     api: mpsc::UnboundedSender<ApiCmd>,
     events: broadcast::Sender<ServiceEvent>,
 ) -> std::io::Result<()> {
+    let slots = Arc::new(Semaphore::new(MAX_APP_CONNECTIONS));
     loop {
         let (stream, _) = listener.accept().await?;
+        // At the cap: drop the connection without reading or writing a
+        // byte (pre-auth silence) and keep accepting.
+        let Ok(permit) = slots.clone().try_acquire_owned() else {
+            eprintln!(
+                "lattice: app socket: at {MAX_APP_CONNECTIONS} connections; dropping new connection"
+            );
+            drop(stream);
+            continue;
+        };
         let cfg = cfg.clone();
         let api = api.clone();
         let events = events.subscribe();
-        tokio::spawn(handle_app(stream, cfg, api, events));
+        tokio::spawn(handle_app(stream, cfg, api, events, permit));
     }
 }
 
