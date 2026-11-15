@@ -10,6 +10,7 @@
 mod error;
 pub mod graph;
 pub mod node;
+mod outbound;
 pub mod reconcile;
 pub mod rng;
 pub mod types;

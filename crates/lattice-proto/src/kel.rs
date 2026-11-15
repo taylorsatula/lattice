@@ -193,6 +193,10 @@ pub struct KelHead {
     pub commitment: Commitment,
     pub abandoned: bool,
     pub current_key: SigningPublicKey,
+    /// The head event's commitment to the next key, if any. `None` iff the
+    /// chain ends in an abandonment. Carried so rotation can check the
+    /// pre-committed next key without re-reading the event log.
+    pub next: Option<Commitment>,
 }
 
 impl KeyEvent {
@@ -246,6 +250,7 @@ impl KeyEvent {
             commitment: last.commitment(),
             abandoned: last.next.is_none(),
             current_key: last.key,
+            next: last.next,
         })
     }
 }

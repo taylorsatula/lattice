@@ -21,6 +21,7 @@ use lattice_types::{
 
 use crate::error::NodeError;
 use crate::graph::Graph;
+use crate::outbound::{OutboundMessageExt, OutboundStateExt};
 use crate::reconcile::{self, ReconcileSession};
 use crate::rng::Rng;
 use crate::types::*;
@@ -51,13 +52,15 @@ impl Identity {
         next_seed: &SigningSeed,
         new_next_seed: Option<SigningSeed>,
     ) -> Result<(), NodeError> {
-        let head = self.kel.events().last().ok_or(NodeError::EmptyKel)?;
-        let committed = head.next.ok_or(NodeError::Abandoned)?;
+        let committed = self.kel.head().next.ok_or(NodeError::Abandoned)?;
         if hash_next(next_seed) != committed {
             return Err(NodeError::NextKeyMismatch);
         }
         let next_hash = new_next_seed.as_ref().map(hash_next);
-        let event = KeyEvent::rotation(head, next_seed, next_hash);
+        // The rotation event chains off the last event; the log is
+        // non-empty by construction (a validated KEL holds ≥1 event).
+        let prev = self.kel.events().last().ok_or(NodeError::EmptyKel)?;
+        let event = KeyEvent::rotation(prev, next_seed, next_hash);
         self.kel.append(event)?;
         self.signing_seed = next_seed.clone();
         Ok(())
@@ -181,6 +184,17 @@ enum PendingOrigin {
     },
 }
 
+/// The parts of an inbound offer the custody-accept path needs,
+/// independent of which path (relay, waypoint, gateway) produced it.
+struct CustodyOffer {
+    leg: LegId,
+    message: Vec<u8>,
+    destination: Identifier,
+    exp: u64,
+    class: u8,
+    leg_hash: Hash32,
+}
+
 struct LinkState {
     /// `None` while the peer's identity is not safely established.
     peer: Option<Identifier>,
@@ -233,6 +247,9 @@ pub struct Node<S: Store> {
     graph_cache: Option<(u64, u64, Arc<Graph>)>,
     /// Memoized reconcile item list; same invalidation as `graph_cache`.
     items_cache: Option<(u64, u64, Vec<reconcile::Item>)>,
+    /// Memoized public-mode (id, envelope key) pairs for waypoint
+    /// selection; same invalidation as `graph_cache`.
+    waypoint_cache: Option<(u64, u64, Arc<WaypointCandidates>)>,
     /// Memoized validation of stored records, keyed by (id, scope). Same
     /// invalidation as the graph cache; bounded, cleared when full.
     record_cache: HashMap<(Identifier, u8), (u64, u64, Option<PeerRecord>)>,
@@ -294,6 +311,7 @@ impl<S: Store> Node<S> {
             records_version: 0,
             graph_cache: None,
             items_cache: None,
+            waypoint_cache: None,
             record_cache: HashMap::new(),
             diagnostics: Vec::new(),
             outbound_due_failures: 0,
@@ -326,9 +344,7 @@ impl<S: Store> Node<S> {
         match node.store.outbound_all() {
             Ok(all) => {
                 for mut msg in all {
-                    if msg.state == OutboundState::InFlight {
-                        msg.state = OutboundState::Queued;
-                        msg.next_attempt = now;
+                    if msg.state == OutboundState::InFlight && msg.requeue(now) {
                         if let Err(e) = node.store.outbound_put(&msg) {
                             node.diag("outbound_put", &e);
                         }
@@ -387,7 +403,15 @@ impl<S: Store> Node<S> {
                             2
                         }
                     }
-                    _ => 0,
+                    Frame::Init(_)
+                    | Frame::Cookie(_)
+                    | Frame::Resp(_)
+                    | Frame::Custody(_)
+                    | Frame::Reconcile(_)
+                    | Frame::Want(_)
+                    | Frame::Ping(_)
+                    | Frame::Dummy(_)
+                    | Frame::Attest(_) => 0,
                 };
                 // Snow telemetry is best-effort: a failed counter write must
                 // not stall frame handling, and a persistent store failure is
@@ -771,10 +795,7 @@ impl<S: Store> Node<S> {
         match self.store.outbound_all() {
             Ok(all) => {
                 for msg in all {
-                    let terminal = matches!(
-                        msg.state,
-                        OutboundState::Delivered | OutboundState::Failed | OutboundState::Expired
-                    );
+                    let terminal = msg.state.is_terminal();
                     if terminal && msg.exp.saturating_add(RETENTION_GRACE_SECS) < now {
                         if let Err(e) = self.store.outbound_remove(&msg.mid) {
                             self.diag("outbound_remove", &e);
@@ -987,6 +1008,9 @@ impl<S: Store> Node<S> {
 // ============================================================
 
 type BuildResult = (Vec<u8>, Identifier, Option<Identifier>);
+
+/// Public-mode (id, envelope key) pairs eligible for waypoint selection.
+type WaypointCandidates = Vec<(Identifier, XWingPublicKey)>;
 
 /// Why a message could not be built for sending.
 enum BuildError {
@@ -1244,8 +1268,36 @@ impl<S: Store> Node<S> {
         let own_links: HashSet<Identifier> = self.links.values().filter_map(|l| l.peer).collect();
         let recipient_gateways: HashSet<Identifier> =
             self.record_gateways(recipient).into_iter().collect();
-        // On store failure there is no candidate set; report and skip
-        // waypoint selection (a direct route may still work).
+        let cached = self.waypoint_candidates()?;
+        let mut candidates: Vec<(Identifier, XWingPublicKey)> = cached
+            .iter()
+            .filter(|(id, _)| {
+                id != &self.own_id
+                    && id != recipient
+                    && !exclude.contains(id)
+                    && !own_links.contains(id)
+                    && !recipient_gateways.contains(id)
+            })
+            .copied()
+            .collect();
+        if candidates.is_empty() {
+            return None;
+        }
+        let idx = (self.rng.next_u64() as usize) % candidates.len();
+        Some(candidates.swap_remove(idx))
+    }
+
+    /// Public-mode (id, envelope key) pairs from the store, memoized on
+    /// `(records_version, now)` like the graph cache. On store failure
+    /// there is no candidate set; report and skip waypoint selection (a
+    /// direct route may still work).
+    fn waypoint_candidates(&mut self) -> Option<Arc<WaypointCandidates>> {
+        let key = (self.records_version, self.now);
+        if let Some((v, t, cached)) = &self.waypoint_cache {
+            if (*v, *t) == key {
+                return Some(Arc::clone(cached));
+            }
+        }
         let stored = match self.store.record_all() {
             Ok(records) => records,
             Err(e) => {
@@ -1253,26 +1305,16 @@ impl<S: Store> Node<S> {
                 return None;
             }
         };
-        let mut candidates: Vec<(Identifier, XWingPublicKey)> = stored
+        let candidates: WaypointCandidates = stored
             .into_iter()
             .filter_map(|(id, _scope, bytes, _)| {
-                if id == self.own_id
-                    || &id == recipient
-                    || exclude.contains(&id)
-                    || own_links.contains(&id)
-                    || recipient_gateways.contains(&id)
-                {
-                    return None;
-                }
                 let (rec, _) = PeerRecord::from_bytes(&bytes, self.now, None).ok()?;
                 (rec.mode == Mode::Public).then_some((id, rec.envelope_key))
             })
             .collect();
-        if candidates.is_empty() {
-            return None;
-        }
-        let idx = (self.rng.next_u64() as usize) % candidates.len();
-        Some(candidates.swap_remove(idx))
+        let candidates = Arc::new(candidates);
+        self.waypoint_cache = Some((key.0, key.1, Arc::clone(&candidates)));
+        Some(candidates)
     }
 
     fn pump_outbound(&mut self, now: u64) -> Vec<Action> {
@@ -1311,7 +1353,7 @@ impl<S: Store> Node<S> {
                             if let Some(wp) = used_wp {
                                 msg.waypoints_tried.push(wp);
                             }
-                            msg.state = OutboundState::InFlight;
+                            msg.mark_in_flight();
                             msg.next_attempt = now + self.config.retry_base_secs;
                             // The receipt clock starts when the message
                             // actually goes on the wire, not at enqueue.
@@ -1321,8 +1363,7 @@ impl<S: Store> Node<S> {
                             }
                         }
                         DispatchResult::NoRoute => {
-                            msg.state = OutboundState::Queued;
-                            msg.next_attempt = now + self.backoff(msg.attempts);
+                            msg.requeue(now + self.backoff(msg.attempts));
                             if let Err(e) = self.store.outbound_put(&msg) {
                                 self.diag("outbound_put", &e);
                             }
@@ -1331,7 +1372,7 @@ impl<S: Store> Node<S> {
                 }
                 Err(BuildError::NoRoute) => {
                     if msg.attempts > self.config.fresh_waypoint_retries + 1 {
-                        msg.state = OutboundState::Failed;
+                        msg.mark_failed();
                         if let Err(e) = self.store.outbound_put(&msg) {
                             self.diag("outbound_put", &e);
                         }
@@ -1357,7 +1398,7 @@ impl<S: Store> Node<S> {
                 }
                 Err(BuildError::Crypto) => {
                     // Deterministic failure: retrying cannot help.
-                    msg.state = OutboundState::Failed;
+                    msg.mark_failed();
                     if let Err(e) = self.store.outbound_put(&msg) {
                         self.diag("outbound_put", &e);
                     }
@@ -1510,7 +1551,6 @@ impl<S: Store> Node<S> {
             return actions;
         }
         let dst = msg.header.dst;
-        let msg_len = offer.message.len() as u64;
 
         if dst == self.own_id {
             return self.on_offer_for_us(now, link, &msg, &leg_hash, actions);
@@ -1534,58 +1574,19 @@ impl<S: Store> Node<S> {
             d.get(&dst).copied().unwrap_or(u32::MAX) as usize
         };
         let class = dist.min(BUF_CLASSES - 1) as u8;
-        // Fair-share accounting is per (destination, upstream link): each
-        // upstream gets custody_allowance/N per destination. The spec's
-        // wording suggests a per-upstream aggregate cap; the per-destination
-        // form is strictly more permissive for single-destination floods and
-        // equivalent otherwise. If per-upstream aggregate accounting is ever
-        // wanted, add a second counter keyed by upstream alone and check both
-        // here — the store already keys shares by (dest, upstream).
-        if self.share_exceeded(&dst, link, msg_len) {
-            actions.push(self.busy(link, leg));
-            return actions;
-        }
-        // Merlin-Schweitzer buffer classes: each class gets an equal slice
-        // of the transit cap, so a flood in one class cannot starve the
-        // others and waits can't form a cycle (a class-d message only ever
-        // waits on class < d room at the next hop).
-        if self.class_full(class, msg_len) {
-            actions.push(self.busy(link, leg));
-            return actions;
-        }
-
-        let entry = CustodyEntry {
-            leg,
-            message: offer.message.clone(),
-            upstream: link,
-            destination: dst,
-            class,
-            exp: msg.header.exp,
-            excluded: Vec::new(),
-        };
-        let accept = CustodyAccept {
-            entry,
-            share_dest: dst,
-            share_upstream: link,
-            share_bytes: msg_len as i64,
-            seen_hash: leg_hash,
-            seen_exp: msg.header.exp,
-        };
-        if let Err(e) = self.store.custody_accept(accept) {
-            self.diag("custody_accept", &e);
-            actions.push(self.busy(link, leg));
-            return actions;
-        }
-        actions.push(Action::SendFrame {
-            pad_to: None,
+        self.accept_custody(
+            now,
             link,
-            frame: Frame::Custody(CustodyFrame {
+            CustodyOffer {
                 leg,
-                result: CUSTODY_ACCEPTED,
-                retry_after: None,
-            }),
-        });
-        self.forward_custody(now, leg, &mut actions);
+                message: offer.message.clone(),
+                destination: dst,
+                exp: msg.header.exp,
+                class,
+                leg_hash,
+            },
+            &mut actions,
+        );
         actions
     }
 
@@ -1630,6 +1631,86 @@ impl<S: Store> Node<S> {
         }
     }
 
+    /// The custody-accepted frame for `leg`.
+    fn custody_accepted(link: LinkId, leg: LegId) -> Action {
+        Action::SendFrame {
+            pad_to: None,
+            link,
+            frame: Frame::Custody(CustodyFrame {
+                leg,
+                result: CUSTODY_ACCEPTED,
+                retry_after: None,
+            }),
+        }
+    }
+
+    /// Shared tail of the three custody-accept paths (relay, waypoint,
+    /// gateway): fair-share and transit-cap checks, the custody-entry
+    /// write, the ACCEPTED frame, and the forwarding kick. `class` is
+    /// computed by the caller (relay: distance class; waypoint/gateway:
+    /// `class_for`). On rejection the appropriate reply (busy) is pushed
+    /// onto `actions`.
+    fn accept_custody(
+        &mut self,
+        now: u64,
+        link: LinkId,
+        offer: CustodyOffer,
+        actions: &mut Vec<Action>,
+    ) {
+        let CustodyOffer {
+            leg,
+            message,
+            destination,
+            exp,
+            class,
+            leg_hash,
+        } = offer;
+        let msg_len = message.len() as u64;
+        // Fair-share accounting is per (destination, upstream link): each
+        // upstream gets custody_allowance/N per destination. The spec's
+        // wording suggests a per-upstream aggregate cap; the per-destination
+        // form is strictly more permissive for single-destination floods and
+        // equivalent otherwise. If per-upstream aggregate accounting is ever
+        // wanted, add a second counter keyed by upstream alone and check both
+        // here — the store already keys shares by (dest, upstream).
+        if self.share_exceeded(&destination, link, msg_len) {
+            actions.push(self.busy(link, leg));
+            return;
+        }
+        // Merlin-Schweitzer buffer classes: each class gets an equal slice
+        // of the transit cap, so a flood in one class cannot starve the
+        // others and waits can't form a cycle (a class-d message only ever
+        // waits on class < d room at the next hop).
+        if self.class_full(class, msg_len) {
+            actions.push(self.busy(link, leg));
+            return;
+        }
+        let entry = CustodyEntry {
+            leg,
+            message,
+            upstream: link,
+            destination,
+            class,
+            exp,
+            excluded: Vec::new(),
+        };
+        let accept = CustodyAccept {
+            entry,
+            share_dest: destination,
+            share_upstream: link,
+            share_bytes: msg_len as i64,
+            seen_hash: leg_hash,
+            seen_exp: exp,
+        };
+        if let Err(e) = self.store.custody_accept(accept) {
+            self.diag("custody_accept", &e);
+            actions.push(self.busy(link, leg));
+            return;
+        }
+        actions.push(Self::custody_accepted(link, leg));
+        self.forward_custody(now, leg, actions);
+    }
+
     fn on_offer_for_us(
         &mut self,
         now: u64,
@@ -1667,48 +1748,20 @@ impl<S: Store> Node<S> {
                     };
                     // A waypoint accepts the first leg only if it can hold the
                     // second leg: fair-share + transit cap apply, same as relay.
-                    let msg_len = inner.len() as u64;
                     let class = self.class_for(&hdr_dst);
-                    if self.share_exceeded(&hdr_dst, link, msg_len) {
-                        actions.push(self.busy(link, leg));
-                        return actions;
-                    }
-                    if self.class_full(class, msg_len) {
-                        actions.push(self.busy(link, leg));
-                        return actions;
-                    }
-                    let entry = CustodyEntry {
-                        leg,
-                        message: inner,
-                        upstream: link,
-                        destination: hdr_dst,
-                        class,
-                        exp: hdr_exp,
-                        excluded: Vec::new(),
-                    };
-                    let accept = CustodyAccept {
-                        entry,
-                        share_dest: hdr_dst,
-                        share_upstream: link,
-                        share_bytes: msg_len as i64,
-                        seen_hash: *leg_hash,
-                        seen_exp: hdr_exp,
-                    };
-                    if let Err(e) = self.store.custody_accept(accept) {
-                        self.diag("custody_accept", &e);
-                        actions.push(self.busy(link, leg));
-                        return actions;
-                    }
-                    actions.push(Action::SendFrame {
-                        pad_to: None,
+                    self.accept_custody(
+                        now,
                         link,
-                        frame: Frame::Custody(CustodyFrame {
+                        CustodyOffer {
                             leg,
-                            result: CUSTODY_ACCEPTED,
-                            retry_after: None,
-                        }),
-                    });
-                    self.forward_custody(now, leg, &mut actions);
+                            message: inner,
+                            destination: hdr_dst,
+                            exp: hdr_exp,
+                            class,
+                            leg_hash: *leg_hash,
+                        },
+                        &mut actions,
+                    );
                     return actions;
                 }
                 Ok(HopLayerPlain::Gateway { rcpt }) => {
@@ -1723,48 +1776,20 @@ impl<S: Store> Node<S> {
                             return actions;
                         }
                     };
-                    let msg_len = stripped.len() as u64;
                     let class = self.class_for(&rcpt);
-                    if self.share_exceeded(&rcpt, link, msg_len) {
-                        actions.push(self.busy(link, leg));
-                        return actions;
-                    }
-                    if self.class_full(class, msg_len) {
-                        actions.push(self.busy(link, leg));
-                        return actions;
-                    }
-                    let entry = CustodyEntry {
-                        leg,
-                        message: stripped,
-                        upstream: link,
-                        destination: rcpt,
-                        class,
-                        exp: msg.header.exp,
-                        excluded: Vec::new(),
-                    };
-                    let accept = CustodyAccept {
-                        entry,
-                        share_dest: rcpt,
-                        share_upstream: link,
-                        share_bytes: msg_len as i64,
-                        seen_hash: *leg_hash,
-                        seen_exp: msg.header.exp,
-                    };
-                    if let Err(e) = self.store.custody_accept(accept) {
-                        self.diag("custody_accept", &e);
-                        actions.push(self.busy(link, leg));
-                        return actions;
-                    }
-                    actions.push(Action::SendFrame {
-                        pad_to: None,
+                    self.accept_custody(
+                        now,
                         link,
-                        frame: Frame::Custody(CustodyFrame {
+                        CustodyOffer {
                             leg,
-                            result: CUSTODY_ACCEPTED,
-                            retry_after: None,
-                        }),
-                    });
-                    self.forward_custody(now, leg, &mut actions);
+                            message: stripped,
+                            destination: rcpt,
+                            exp: msg.header.exp,
+                            class,
+                            leg_hash: *leg_hash,
+                        },
+                        &mut actions,
+                    );
                     return actions;
                 }
                 Err(_) => {
@@ -1830,15 +1855,7 @@ impl<S: Store> Node<S> {
                 self.diag("seen_add", &e);
             }
             actions.extend(self.on_receipt(now, &opened));
-            actions.push(Action::SendFrame {
-                pad_to: None,
-                link,
-                frame: Frame::Custody(CustodyFrame {
-                    leg,
-                    result: CUSTODY_ACCEPTED,
-                    retry_after: None,
-                }),
-            });
+            actions.push(Self::custody_accepted(link, leg));
             return actions;
         }
         let mid_bytes = opened.mid;
@@ -1936,15 +1953,7 @@ impl<S: Store> Node<S> {
             service: opened.tsvc.clone(),
             unread,
         });
-        actions.push(Action::SendFrame {
-            pad_to: None,
-            link,
-            frame: Frame::Custody(CustodyFrame {
-                leg,
-                result: CUSTODY_ACCEPTED,
-                retry_after: None,
-            }),
-        });
+        actions.push(Self::custody_accepted(link, leg));
         actions.extend(self.send_receipt(now, &opened));
         actions
     }
@@ -2041,166 +2050,158 @@ impl<S: Store> Node<S> {
         let leg = frame.leg;
         let pending = self.pending.remove(&leg);
         match frame.result {
-            CUSTODY_ACCEPTED => match pending.as_ref().map(|p| &p.origin) {
-                Some(PendingOrigin::Outbound { mid }) => {
-                    let mut service = String::new();
-                    match self.store.outbound_get(mid) {
-                        Ok(Some(mut msg)) => {
-                            msg.state = OutboundState::InFlight;
-                            service = msg.envelope.fsvc.clone();
-                            if let Err(e) = self.store.outbound_put(&msg) {
-                                self.diag("outbound_put", &e);
-                            }
-                        }
-                        Ok(None) => {}
-                        Err(e) => self.diag("outbound_get", &e),
-                    }
-                    if let Err(e) = self
-                        .store
-                        .status_set(mid, local::MSG_STATUS_IN_TRANSIT, None)
-                    {
-                        self.diag("status_set", &e);
-                    }
-                    actions.push(Action::Status {
-                        mid: *mid,
-                        status: local::MSG_STATUS_IN_TRANSIT,
-                        detail: None,
-                        service,
-                    });
-                }
-                Some(PendingOrigin::Relay { custody_leg }) => {
-                    match self.store.custody_remove(custody_leg) {
-                        Ok(Some(e)) => {
-                            if let Err(e) = self.store.share_add(
-                                &e.destination,
-                                e.upstream,
-                                -(e.message.len() as i64),
-                            ) {
-                                self.diag("share_add", &e);
-                            }
-                        }
-                        Ok(None) => {}
-                        Err(e) => self.diag("custody_remove", &e),
-                    }
-                }
-                None => {}
-            },
+            CUSTODY_ACCEPTED => self.custody_accepted_reply(pending, &mut actions),
             CUSTODY_ALREADY_HAVE | CUSTODY_BUSY => {
-                let busy = frame.result == CUSTODY_BUSY;
-                let retry = frame
-                    .retry_after
-                    .unwrap_or(self.config.retry_base_secs)
-                    .clamp(1, 3600);
-                if let Some(p) = pending {
-                    match p.origin {
-                        PendingOrigin::Outbound { mid } => {
-                            match self.store.outbound_get(&mid) {
-                                Ok(Some(mut msg)) => {
-                                    let until = if busy { now + retry } else { msg.exp };
-                                    add_exclusion(
-                                        self.outbound_exclusions.entry(mid).or_default(),
-                                        link,
-                                        until,
-                                    );
-                                    msg.state = OutboundState::Queued;
-                                    msg.next_attempt = now + if busy { retry } else { 0 };
-                                    if let Err(e) = self.store.outbound_put(&msg) {
-                                        self.diag("outbound_put", &e);
-                                    }
-                                }
-                                Ok(None) => {}
-                                Err(e) => self.diag("outbound_get", &e),
-                            }
-                            // Immediate retry against a different neighbor, if one exists now.
-                            if !busy {
-                                actions.extend(self.pump_outbound(now));
-                            }
-                        }
-                        PendingOrigin::Relay { custody_leg } => {
-                            if busy {
-                                match self.store.custody_get(&custody_leg) {
-                                    Ok(Some(mut e)) => {
-                                        add_exclusion(&mut e.excluded, link, now + retry);
-                                        if let Err(e) = self.store.custody_put(e) {
-                                            self.diag("custody_put", &e);
-                                        }
-                                    }
-                                    Ok(None) => {}
-                                    Err(e) => self.diag("custody_get", &e),
-                                }
-                                self.forward_custody(now, custody_leg, &mut actions);
-                            } else {
-                                // The downstream already holds it: drop ours and release the share.
-                                match self.store.custody_remove(&custody_leg) {
-                                    Ok(Some(done)) => {
-                                        if let Err(e) = self.store.share_add(
-                                            &done.destination,
-                                            done.upstream,
-                                            -(done.message.len() as i64),
-                                        ) {
-                                            self.diag("share_add", &e);
-                                        }
-                                    }
-                                    Ok(None) => {}
-                                    Err(e) => self.diag("custody_remove", &e),
-                                }
-                            }
-                        }
-                    }
-                }
+                self.custody_busy_reply(now, link, frame, pending, &mut actions)
             }
-            CUSTODY_REFUSED => {
-                if let Some(p) = pending {
-                    match p.origin {
-                        PendingOrigin::Outbound { mid } => {
-                            let mut service = String::new();
-                            match self.store.outbound_get(&mid) {
-                                Ok(Some(mut msg)) => {
-                                    msg.state = OutboundState::Failed;
-                                    self.outbound_exclusions.remove(&msg.mid);
-                                    service = msg.envelope.fsvc.clone();
-                                    if let Err(e) = self.store.outbound_put(&msg) {
-                                        self.diag("outbound_put", &e);
-                                    }
-                                }
-                                Ok(None) => {}
-                                Err(e) => self.diag("outbound_get", &e),
-                            }
-                            if let Err(e) = self.store.status_set(
-                                &mid,
-                                local::MSG_STATUS_FAILED,
-                                Some(ERR_REFUSED),
-                            ) {
-                                self.diag("status_set", &e);
-                            }
-                            actions.push(Action::Status {
-                                mid,
-                                status: local::MSG_STATUS_FAILED,
-                                detail: Some(ERR_REFUSED),
-                                service,
-                            });
-                        }
-                        PendingOrigin::Relay { custody_leg } => {
-                            match self.store.custody_remove(&custody_leg) {
-                                Ok(Some(e)) => {
-                                    if let Err(e) = self.store.share_add(
-                                        &e.destination,
-                                        e.upstream,
-                                        -(e.message.len() as i64),
-                                    ) {
-                                        self.diag("share_add", &e);
-                                    }
-                                }
-                                Ok(None) => {}
-                                Err(e) => self.diag("custody_remove", &e),
-                            }
-                        }
-                    }
-                }
-            }
+            CUSTODY_REFUSED => self.custody_refused_reply(pending, &mut actions),
             _ => {}
         }
         actions
+    }
+
+    /// Load an outbound message, reporting store errors. `None` means "not
+    /// found or unreadable"; callers treat both as "nothing to update".
+    fn load_outbound(&mut self, mid: &MessageId) -> Option<lattice_store::OutboundMessage> {
+        match self.store.outbound_get(mid) {
+            Ok(Some(msg)) => Some(msg),
+            Ok(None) => None,
+            Err(e) => {
+                self.diag("outbound_get", &e);
+                None
+            }
+        }
+    }
+
+    fn store_outbound(&mut self, msg: &lattice_store::OutboundMessage) {
+        if let Err(e) = self.store.outbound_put(msg) {
+            self.diag("outbound_put", &e);
+        }
+    }
+
+    /// Drop a relay custody entry and release its share of the upstream's
+    /// allowance. Used when the downstream side resolves (accepted, refused,
+    /// or already holds the message).
+    fn release_relay_custody(&mut self, custody_leg: LegId) {
+        match self.store.custody_remove(&custody_leg) {
+            Ok(Some(e)) => {
+                if let Err(e) =
+                    self.store
+                        .share_add(&e.destination, e.upstream, -(e.message.len() as i64))
+                {
+                    self.diag("share_add", &e);
+                }
+            }
+            Ok(None) => {}
+            Err(e) => self.diag("custody_remove", &e),
+        }
+    }
+
+    fn custody_accepted_reply(&mut self, pending: Option<PendingOffer>, actions: &mut Vec<Action>) {
+        match pending.map(|p| p.origin) {
+            Some(PendingOrigin::Outbound { mid }) => {
+                let mut service = String::new();
+                if let Some(mut msg) = self.load_outbound(&mid) {
+                    msg.mark_in_flight();
+                    service = msg.envelope.fsvc.clone();
+                    self.store_outbound(&msg);
+                }
+                if let Err(e) = self
+                    .store
+                    .status_set(&mid, local::MSG_STATUS_IN_TRANSIT, None)
+                {
+                    self.diag("status_set", &e);
+                }
+                actions.push(Action::Status {
+                    mid,
+                    status: local::MSG_STATUS_IN_TRANSIT,
+                    detail: None,
+                    service,
+                });
+            }
+            Some(PendingOrigin::Relay { custody_leg }) => self.release_relay_custody(custody_leg),
+            None => {}
+        }
+    }
+
+    fn custody_busy_reply(
+        &mut self,
+        now: u64,
+        link: LinkId,
+        frame: &CustodyFrame,
+        pending: Option<PendingOffer>,
+        actions: &mut Vec<Action>,
+    ) {
+        let busy = frame.result == CUSTODY_BUSY;
+        let retry = frame
+            .retry_after
+            .unwrap_or(self.config.retry_base_secs)
+            .clamp(1, 3600);
+        let Some(p) = pending else { return };
+        match p.origin {
+            PendingOrigin::Outbound { mid } => {
+                if let Some(mut msg) = self.load_outbound(&mid) {
+                    let until = if busy { now + retry } else { msg.exp };
+                    add_exclusion(
+                        self.outbound_exclusions.entry(mid).or_default(),
+                        link,
+                        until,
+                    );
+                    msg.requeue(now + if busy { retry } else { 0 });
+                    self.store_outbound(&msg);
+                }
+                // Immediate retry against a different neighbor, if one exists now.
+                if !busy {
+                    actions.extend(self.pump_outbound(now));
+                }
+            }
+            PendingOrigin::Relay { custody_leg } => {
+                if busy {
+                    match self.store.custody_get(&custody_leg) {
+                        Ok(Some(mut e)) => {
+                            add_exclusion(&mut e.excluded, link, now + retry);
+                            if let Err(e) = self.store.custody_put(e) {
+                                self.diag("custody_put", &e);
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(e) => self.diag("custody_get", &e),
+                    }
+                    self.forward_custody(now, custody_leg, actions);
+                } else {
+                    // The downstream already holds it: drop ours and release the share.
+                    self.release_relay_custody(custody_leg);
+                }
+            }
+        }
+    }
+
+    fn custody_refused_reply(&mut self, pending: Option<PendingOffer>, actions: &mut Vec<Action>) {
+        let Some(p) = pending else { return };
+        match p.origin {
+            PendingOrigin::Outbound { mid } => {
+                let mut service = String::new();
+                if let Some(mut msg) = self.load_outbound(&mid) {
+                    msg.mark_failed();
+                    self.outbound_exclusions.remove(&msg.mid);
+                    service = msg.envelope.fsvc.clone();
+                    self.store_outbound(&msg);
+                }
+                if let Err(e) =
+                    self.store
+                        .status_set(&mid, local::MSG_STATUS_FAILED, Some(ERR_REFUSED))
+                {
+                    self.diag("status_set", &e);
+                }
+                actions.push(Action::Status {
+                    mid,
+                    status: local::MSG_STATUS_FAILED,
+                    detail: Some(ERR_REFUSED),
+                    service,
+                });
+            }
+            PendingOrigin::Relay { custody_leg } => self.release_relay_custody(custody_leg),
+        }
     }
 
     fn on_receipt(&mut self, now: u64, envelope: &Envelope) -> Vec<Action> {
@@ -2240,14 +2241,13 @@ impl<S: Store> Node<S> {
                 if msg.recipient != envelope.from {
                     return actions;
                 }
-                let was_active =
-                    matches!(msg.state, OutboundState::Queued | OutboundState::InFlight);
+                let was_active = !msg.state.is_terminal();
                 if was_active {
-                    msg.state = if envelope.kind == KIND_RECEIPT {
-                        OutboundState::Delivered
+                    if envelope.kind == KIND_RECEIPT {
+                        msg.mark_delivered();
                     } else {
-                        OutboundState::Failed
-                    };
+                        msg.mark_failed();
+                    }
                     if let Err(e) = self.store.outbound_put(&msg) {
                         self.diag("outbound_put", &e);
                     }
@@ -2359,40 +2359,69 @@ impl<S: Store> Node<S> {
 
         // Snow first: never crowd out real work in the same tick.
         actions.extend(self.snow_tick(now));
+        actions.extend(self.reconcile_if_due(now));
+        self.refresh_record_if_due(now);
+        self.sweep_claims_if_due(now);
+        self.sweep_data_if_due(now);
+        actions.extend(self.expire_outbound(now));
+        actions.extend(self.sweep_receipt_deadlines(now));
+        actions.extend(self.sweep_stale_custody(now));
+        actions.extend(self.drain_custody(now));
+        self.sweep_custody_expiry(now);
+        self.sweep_store_expired(now);
+        actions.extend(self.pump_outbound(now));
+        actions
+    }
 
-        if now >= self.next_reconcile_at {
-            if let Some(link) = self.random_link() {
-                actions.extend(self.reconcile_with(now, link));
-            }
-            self.next_reconcile_at = now + self.config.reconcile_interval_secs;
+    /// Reconcile with a random link when the interval has elapsed.
+    fn reconcile_if_due(&mut self, now: u64) -> Vec<Action> {
+        if now < self.next_reconcile_at {
+            return Vec::new();
         }
-
-        if now >= self.record_refresh_at {
-            self.own_seq += 1;
-            if let Err(e) = self.publish_record(now) {
-                self.diag("publish_record", &e);
-            }
-            self.record_refresh_at = now + self.config.record_refresh_secs;
+        let mut actions = Vec::new();
+        if let Some(link) = self.random_link() {
+            actions.extend(self.reconcile_with(now, link));
         }
+        self.next_reconcile_at = now + self.config.reconcile_interval_secs;
+        actions
+    }
 
-        if now >= self.next_claim_sweep_at {
-            self.sweep_ck_claims(now);
-            self.next_claim_sweep_at = now + CLAIM_SWEEP_SECS;
+    /// Republish our record when the refresh interval has elapsed.
+    fn refresh_record_if_due(&mut self, now: u64) {
+        if now < self.record_refresh_at {
+            return;
         }
-
-        if now >= self.next_data_sweep_at {
-            self.sweep_expired_data(now);
-            self.next_data_sweep_at = now + DATA_SWEEP_SECS;
+        self.own_seq += 1;
+        if let Err(e) = self.publish_record(now) {
+            self.diag("publish_record", &e);
         }
+        self.record_refresh_at = now + self.config.record_refresh_secs;
+    }
 
-        // Expire originated messages.
+    fn sweep_claims_if_due(&mut self, now: u64) {
+        if now < self.next_claim_sweep_at {
+            return;
+        }
+        self.sweep_ck_claims(now);
+        self.next_claim_sweep_at = now + CLAIM_SWEEP_SECS;
+    }
+
+    fn sweep_data_if_due(&mut self, now: u64) {
+        if now < self.next_data_sweep_at {
+            return;
+        }
+        self.sweep_expired_data(now);
+        self.next_data_sweep_at = now + DATA_SWEEP_SECS;
+    }
+
+    /// Expire originated messages whose horizon has passed.
+    fn expire_outbound(&mut self, now: u64) -> Vec<Action> {
+        let mut actions = Vec::new();
         match self.store.outbound_all() {
             Ok(all) => {
                 for mut msg in all {
-                    if matches!(msg.state, OutboundState::Queued | OutboundState::InFlight)
-                        && msg.exp <= now
-                    {
-                        msg.state = OutboundState::Expired;
+                    if !msg.state.is_terminal() && msg.exp <= now {
+                        msg.mark_expired();
                         if let Err(e) = self.store.outbound_put(&msg) {
                             self.diag("outbound_put", &e);
                         }
@@ -2414,8 +2443,12 @@ impl<S: Store> Node<S> {
             }
             Err(e) => self.diag("outbound_all", &e),
         }
+        actions
+    }
 
-        // Receipt deadlines: retry via a fresh waypoint, else fail.
+    /// Receipt deadlines: retry via a fresh waypoint, else fail.
+    fn sweep_receipt_deadlines(&mut self, now: u64) -> Vec<Action> {
+        let mut actions = Vec::new();
         match self.store.outbound_all() {
             Ok(all) => {
                 for mut msg in all {
@@ -2429,7 +2462,7 @@ impl<S: Store> Node<S> {
                         continue;
                     }
                     if msg.attempts > self.config.fresh_waypoint_retries {
-                        msg.state = OutboundState::Failed;
+                        msg.mark_failed();
                         if let Err(e) = self.store.outbound_put(&msg) {
                             self.diag("outbound_put", &e);
                         }
@@ -2447,8 +2480,7 @@ impl<S: Store> Node<S> {
                             service: msg.envelope.fsvc.clone(),
                         });
                     } else {
-                        msg.state = OutboundState::Queued;
-                        msg.next_attempt = now;
+                        msg.requeue(now);
                         if let Err(e) = self.store.outbound_put(&msg) {
                             self.diag("outbound_put", &e);
                         }
@@ -2457,8 +2489,12 @@ impl<S: Store> Node<S> {
             }
             Err(e) => self.diag("outbound_all", &e),
         }
+        actions
+    }
 
-        // Custody offers that never got an answer: exclude the link and retry.
+    /// Custody offers that never got an answer: exclude the link and retry.
+    fn sweep_stale_custody(&mut self, now: u64) -> Vec<Action> {
+        let mut actions = Vec::new();
         let stale: Vec<LegId> = self
             .pending
             .iter()
@@ -2477,8 +2513,7 @@ impl<S: Store> Node<S> {
                         match self.store.outbound_get(&mid) {
                             Ok(Some(mut msg)) => {
                                 if msg.state == OutboundState::InFlight {
-                                    msg.state = OutboundState::Queued;
-                                    msg.next_attempt = now + self.config.retry_base_secs;
+                                    msg.requeue(now + self.config.retry_base_secs);
                                     if let Err(e) = self.store.outbound_put(&msg) {
                                         self.diag("outbound_put", &e);
                                     }
@@ -2511,10 +2546,14 @@ impl<S: Store> Node<S> {
                 }
             }
         }
+        actions
+    }
 
-        // Custody entries with nothing in flight get a forwarding attempt.
-        // Lower classes first: messages closer to their destination drain
-        // first, which is what keeps the class partition deadlock-free.
+    /// Custody entries with nothing in flight get a forwarding attempt.
+    /// Lower classes first: messages closer to their destination drain
+    /// first, which is what keeps the class partition deadlock-free.
+    fn drain_custody(&mut self, now: u64) -> Vec<Action> {
+        let mut actions = Vec::new();
         match self.store.custody_all() {
             Ok(mut all) => {
                 all.sort_by_key(|e| e.class);
@@ -2530,8 +2569,11 @@ impl<S: Store> Node<S> {
             }
             Err(e) => self.diag("custody_all", &e),
         }
+        actions
+    }
 
-        // Expire custody entries whose messages timed out.
+    /// Expire custody entries whose messages timed out.
+    fn sweep_custody_expiry(&mut self, now: u64) {
         match self.store.custody_all() {
             Ok(all) => {
                 for entry in all {
@@ -2554,12 +2596,12 @@ impl<S: Store> Node<S> {
             }
             Err(e) => self.diag("custody_all", &e),
         }
+    }
 
+    fn sweep_store_expired(&mut self, now: u64) {
         if let Err(e) = self.store.sweep_expired(now) {
             self.diag("sweep_expired", &e);
         }
-        actions.extend(self.pump_outbound(now));
-        actions
     }
 
     /// Build a dummy whose padded size lands in the given bucket class
