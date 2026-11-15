@@ -1,15 +1,16 @@
 use lattice_crypto::{generate_keypair, generate_seed};
 use lattice_proto::message::*;
 use lattice_proto::{CLOCK_SKEW, MAX_MESSAGE_HORIZON, MESSAGE_BUCKETS, MESSAGE_BUCKETS as BUCKETS};
+use lattice_types::{Identifier, LegId, MessageId, Signature, SigningSeed};
 
 const NOW: u64 = 1_800_000_000;
 const EXP: u64 = NOW + 86_400;
 
-fn envelope_for(from_seed: &[u8; 32], tmbx: &[u8]) -> Envelope {
+fn envelope_for(from_seed: &SigningSeed, tmbx: &[u8]) -> Envelope {
     Envelope {
         kind: KIND_MESSAGE,
-        mid: lattice_crypto::os_bytes::<16>(),
-        from: lattice_crypto::public_key(from_seed),
+        mid: MessageId::from_bytes(lattice_crypto::os_bytes::<16>()),
+        from: Identifier::from_bytes(lattice_crypto::public_key(from_seed).into_bytes()),
         fsvc: "mira".into(),
         fmbx: b"taylor".to_vec(),
         tsvc: "mira".into(),
@@ -18,7 +19,7 @@ fn envelope_for(from_seed: &[u8; 32], tmbx: &[u8]) -> Envelope {
         body: Some(b"hello".to_vec()),
         reference: None,
         reason: None,
-        sig: [0; 64],
+        sig: Signature::from_bytes([0; 64]),
     }
 }
 
@@ -28,13 +29,13 @@ fn direct_roundtrip_full() {
     let from_pk = lattice_crypto::public_key(&from_seed);
     let kp = generate_keypair();
     let env = envelope_for(&from_seed, b"sink");
-    let dst = lattice_crypto::hash(b"recipient");
+    let dst = Identifier::from_bytes(lattice_crypto::hash(b"recipient").into_bytes());
     let bytes = Message::build(BuildParams {
         envelope: env.clone(),
         sender_seed: &from_seed,
         recipient_ek: &kp.public,
         real_dst: dst,
-        leg: [7u8; 16],
+        leg: LegId::from_bytes([7u8; 16]),
         exp: EXP,
         gateway: None,
         waypoint: None,
@@ -43,7 +44,7 @@ fn direct_roundtrip_full() {
 
     let msg = Message::parse(&bytes, NOW).unwrap();
     let opened = msg.open_envelope(&kp.secret).unwrap();
-    assert_eq!(opened.from, from_pk);
+    assert_eq!(opened.from, Identifier::from_bytes(from_pk.into_bytes()));
     assert_eq!(opened.kind, KIND_MESSAGE);
     assert_eq!(opened.body.as_deref(), Some(b"hello".as_slice()));
     assert!(opened.verify_signature(&from_pk, msg.routing_header_bytes()));
@@ -55,8 +56,8 @@ fn waypoint_route_roundtrip() {
     let from_pk = lattice_crypto::public_key(&from_seed);
     let recipient_kp = generate_keypair();
     let wp_kp = generate_keypair();
-    let recipient_id = lattice_crypto::hash(b"recipient");
-    let waypoint_id = lattice_crypto::hash(b"waypoint");
+    let recipient_id = Identifier::from_bytes(lattice_crypto::hash(b"recipient").into_bytes());
+    let waypoint_id = Identifier::from_bytes(lattice_crypto::hash(b"waypoint").into_bytes());
 
     let env = envelope_for(&from_seed, b"sink");
     let bytes = Message::build(BuildParams {
@@ -64,13 +65,13 @@ fn waypoint_route_roundtrip() {
         sender_seed: &from_seed,
         recipient_ek: &recipient_kp.public,
         real_dst: recipient_id,
-        leg: [1u8; 16],
+        leg: LegId::from_bytes([1u8; 16]),
         exp: EXP,
         gateway: None,
         waypoint: Some(WaypointSeal {
             waypoint_id,
             waypoint_ek: wp_kp.public,
-            leg: [2u8; 16],
+            leg: LegId::from_bytes([2u8; 16]),
             exp: EXP,
         }),
     })
@@ -87,7 +88,7 @@ fn waypoint_route_roundtrip() {
     assert_eq!(msg2.header.dst, recipient_id);
     assert!(msg2.hop_layer.is_none());
     let opened = msg2.open_envelope(&recipient_kp.secret).unwrap();
-    assert_eq!(opened.from, from_pk);
+    assert_eq!(opened.from, Identifier::from_bytes(from_pk.into_bytes()));
 }
 
 #[test]
@@ -97,9 +98,10 @@ fn waypoint_gateway_route_roundtrip() {
     let recipient_kp = generate_keypair(); // private recipient
     let gateway_kp = generate_keypair();
     let wp_kp = generate_keypair();
-    let recipient_id = lattice_crypto::hash(b"private-recipient");
-    let gateway_id = lattice_crypto::hash(b"gateway");
-    let waypoint_id = lattice_crypto::hash(b"waypoint");
+    let recipient_id =
+        Identifier::from_bytes(lattice_crypto::hash(b"private-recipient").into_bytes());
+    let gateway_id = Identifier::from_bytes(lattice_crypto::hash(b"gateway").into_bytes());
+    let waypoint_id = Identifier::from_bytes(lattice_crypto::hash(b"waypoint").into_bytes());
 
     let env = envelope_for(&from_seed, b"sink");
     let bytes = Message::build(BuildParams {
@@ -107,7 +109,7 @@ fn waypoint_gateway_route_roundtrip() {
         sender_seed: &from_seed,
         recipient_ek: &recipient_kp.public,
         real_dst: gateway_id, // routing header names the gateway
-        leg: [3u8; 16],
+        leg: LegId::from_bytes([3u8; 16]),
         exp: EXP,
         gateway: Some(GatewaySeal {
             gateway_ek: gateway_kp.public,
@@ -116,7 +118,7 @@ fn waypoint_gateway_route_roundtrip() {
         waypoint: Some(WaypointSeal {
             waypoint_id,
             waypoint_ek: wp_kp.public,
-            leg: [4u8; 16],
+            leg: LegId::from_bytes([4u8; 16]),
             exp: EXP,
         }),
     })
@@ -136,7 +138,7 @@ fn waypoint_gateway_route_roundtrip() {
     }
     // Final recipient opens the envelope.
     let opened = msg2.open_envelope(&recipient_kp.secret).unwrap();
-    assert_eq!(opened.from, from_pk);
+    assert_eq!(opened.from, Identifier::from_bytes(from_pk.into_bytes()));
 }
 
 #[test]
@@ -144,8 +146,9 @@ fn gateway_route_roundtrip_no_waypoint() {
     let from_seed = generate_seed();
     let recipient_kp = generate_keypair();
     let gateway_kp = generate_keypair();
-    let recipient_id = lattice_crypto::hash(b"private-recipient");
-    let gateway_id = lattice_crypto::hash(b"gateway");
+    let recipient_id =
+        Identifier::from_bytes(lattice_crypto::hash(b"private-recipient").into_bytes());
+    let gateway_id = Identifier::from_bytes(lattice_crypto::hash(b"gateway").into_bytes());
 
     let env = envelope_for(&from_seed, b"sink");
     let bytes = Message::build(BuildParams {
@@ -153,7 +156,7 @@ fn gateway_route_roundtrip_no_waypoint() {
         sender_seed: &from_seed,
         recipient_ek: &recipient_kp.public,
         real_dst: gateway_id,
-        leg: [5u8; 16],
+        leg: LegId::from_bytes([5u8; 16]),
         exp: EXP,
         gateway: Some(GatewaySeal {
             gateway_ek: gateway_kp.public,
@@ -184,8 +187,8 @@ fn messages_land_in_exact_buckets() {
             envelope: env,
             sender_seed: &from_seed,
             recipient_ek: &kp.public,
-            real_dst: lattice_crypto::hash(b"r"),
-            leg: [9u8; 16],
+            real_dst: Identifier::from_bytes(lattice_crypto::hash(b"r").into_bytes()),
+            leg: LegId::from_bytes([9u8; 16]),
             exp: EXP,
             gateway: None,
             waypoint: None,
@@ -211,8 +214,8 @@ fn oversized_message_refused() {
         envelope: env,
         sender_seed: &from_seed,
         recipient_ek: &kp.public,
-        real_dst: lattice_crypto::hash(b"r"),
-        leg: [9u8; 16],
+        real_dst: Identifier::from_bytes(lattice_crypto::hash(b"r").into_bytes()),
+        leg: LegId::from_bytes([9u8; 16]),
         exp: EXP,
         gateway: None,
         waypoint: None,
@@ -229,8 +232,8 @@ fn expired_message_rejected_at_parse() {
             envelope: envelope_for(&from_seed, b"sink"),
             sender_seed: &from_seed,
             recipient_ek: &kp.public,
-            real_dst: lattice_crypto::hash(b"r"),
-            leg: [1u8; 16],
+            real_dst: Identifier::from_bytes(lattice_crypto::hash(b"r").into_bytes()),
+            leg: LegId::from_bytes([1u8; 16]),
             exp: NOW - 1, // already expired
             gateway: None,
             waypoint: None,
@@ -248,8 +251,8 @@ fn horizon_violation_rejected_at_parse() {
         envelope: envelope_for(&from_seed, b"sink"),
         sender_seed: &from_seed,
         recipient_ek: &kp.public,
-        real_dst: lattice_crypto::hash(b"r"),
-        leg: [1u8; 16],
+        real_dst: Identifier::from_bytes(lattice_crypto::hash(b"r").into_bytes()),
+        leg: LegId::from_bytes([1u8; 16]),
         exp: NOW + MAX_MESSAGE_HORIZON + CLOCK_SKEW + 100,
         gateway: None,
         waypoint: None,
@@ -266,8 +269,8 @@ fn tampered_padding_rejected() {
         envelope: envelope_for(&from_seed, b"sink"),
         sender_seed: &from_seed,
         recipient_ek: &kp.public,
-        real_dst: lattice_crypto::hash(b"r"),
-        leg: [1u8; 16],
+        real_dst: Identifier::from_bytes(lattice_crypto::hash(b"r").into_bytes()),
+        leg: LegId::from_bytes([1u8; 16]),
         exp: EXP,
         gateway: None,
         waypoint: None,
@@ -290,24 +293,24 @@ fn receipt_roundtrip() {
     let recipient_from = generate_seed();
     let env = Envelope {
         kind: KIND_RECEIPT,
-        mid: lattice_crypto::os_bytes::<16>(),
-        from: lattice_crypto::public_key(&recipient_from),
+        mid: MessageId::from_bytes(lattice_crypto::os_bytes::<16>()),
+        from: Identifier::from_bytes(lattice_crypto::public_key(&recipient_from).into_bytes()),
         fsvc: "mira".into(),
         fmbx: b"sink".to_vec(),
         tsvc: "mira".into(),
         tmbx: b"taylor".to_vec(),
         created: NOW,
         body: None,
-        reference: Some([0x55; 16]),
+        reference: Some(MessageId::from_bytes([0x55; 16])),
         reason: None,
-        sig: [0; 64],
+        sig: Signature::from_bytes([0; 64]),
     };
     let bytes = Message::build(BuildParams {
         envelope: env.clone(),
         sender_seed: &recipient_from,
         recipient_ek: &kp.public,
-        real_dst: lattice_crypto::hash(b"original-sender"),
-        leg: [6u8; 16],
+        real_dst: Identifier::from_bytes(lattice_crypto::hash(b"original-sender").into_bytes()),
+        leg: LegId::from_bytes([6u8; 16]),
         exp: EXP,
         gateway: None,
         waypoint: None,
@@ -316,7 +319,7 @@ fn receipt_roundtrip() {
     let msg = Message::parse(&bytes, NOW).unwrap();
     let opened = msg.open_envelope(&kp.secret).unwrap();
     assert_eq!(opened.kind, KIND_RECEIPT);
-    assert_eq!(opened.reference, Some([0x55; 16]));
+    assert_eq!(opened.reference, Some(MessageId::from_bytes([0x55; 16])));
 }
 
 #[test]
@@ -325,8 +328,8 @@ fn waypoint_repack_preserves_bucket() {
     let from_pk = lattice_crypto::public_key(&from_seed);
     let recipient_kp = generate_keypair();
     let wp_kp = generate_keypair();
-    let recipient_id = lattice_crypto::hash(b"recipient");
-    let waypoint_id = lattice_crypto::hash(b"waypoint");
+    let recipient_id = Identifier::from_bytes(lattice_crypto::hash(b"recipient").into_bytes());
+    let waypoint_id = Identifier::from_bytes(lattice_crypto::hash(b"waypoint").into_bytes());
 
     let body = vec![0u8; 4000]; // seals into the 8192 bucket
     let env = Envelope {
@@ -338,13 +341,13 @@ fn waypoint_repack_preserves_bucket() {
         sender_seed: &from_seed,
         recipient_ek: &recipient_kp.public,
         real_dst: recipient_id,
-        leg: [0x11; 16],
+        leg: LegId::from_bytes([0x11; 16]),
         exp: EXP,
         gateway: None,
         waypoint: Some(WaypointSeal {
             waypoint_id,
             waypoint_ek: wp_kp.public,
-            leg: [0x22; 16],
+            leg: LegId::from_bytes([0x22; 16]),
             exp: EXP,
         }),
     })

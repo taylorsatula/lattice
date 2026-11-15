@@ -1,5 +1,6 @@
 //! Noise handshake plumbing shared by client and server.
 
+use lattice_types::{ChannelPublicKey, ChannelSeed};
 use snow::{Builder, HandshakeState, TransportState};
 
 pub const PARAMS_IK: &str = "Noise_IK_25519_ChaChaPoly_BLAKE2s";
@@ -25,13 +26,16 @@ pub struct Pending {
 }
 
 impl Pending {
-    pub fn initiator_ik(seed: &[u8; 32], responder_static: &[u8; 32]) -> Result<Self, snow::Error> {
+    pub fn initiator_ik(
+        seed: &ChannelSeed,
+        responder_static: &ChannelPublicKey,
+    ) -> Result<Self, snow::Error> {
         let x_seed = lattice_crypto::channel_x25519_seed(seed);
         let x_pub = lattice_crypto::channel_x25519_public_from_ed25519(responder_static)
             .ok_or(snow::Error::Input)?;
         let state = Builder::new(PARAMS_IK.parse()?)
-            .local_private_key(&x_seed)?
-            .remote_public_key(&x_pub)?
+            .local_private_key(x_seed.as_ref())?
+            .remote_public_key(x_pub.as_ref())?
             .build_initiator()?;
         Ok(Self {
             state,
@@ -40,10 +44,10 @@ impl Pending {
         })
     }
 
-    pub fn initiator_xx(seed: &[u8; 32]) -> Result<Self, snow::Error> {
+    pub fn initiator_xx(seed: &ChannelSeed) -> Result<Self, snow::Error> {
         let x_seed = lattice_crypto::channel_x25519_seed(seed);
         let state = Builder::new(PARAMS_XX.parse()?)
-            .local_private_key(&x_seed)?
+            .local_private_key(x_seed.as_ref())?
             .build_initiator()?;
         Ok(Self {
             state,
@@ -52,10 +56,10 @@ impl Pending {
         })
     }
 
-    pub fn responder_ik(seed: &[u8; 32]) -> Result<Self, snow::Error> {
+    pub fn responder_ik(seed: &ChannelSeed) -> Result<Self, snow::Error> {
         let x_seed = lattice_crypto::channel_x25519_seed(seed);
         let state = Builder::new(PARAMS_IK.parse()?)
-            .local_private_key(&x_seed)?
+            .local_private_key(x_seed.as_ref())?
             .build_responder()?;
         Ok(Self {
             state,
@@ -64,10 +68,10 @@ impl Pending {
         })
     }
 
-    pub fn responder_xx(seed: &[u8; 32]) -> Result<Self, snow::Error> {
+    pub fn responder_xx(seed: &ChannelSeed) -> Result<Self, snow::Error> {
         let x_seed = lattice_crypto::channel_x25519_seed(seed);
         let state = Builder::new(PARAMS_XX.parse()?)
-            .local_private_key(&x_seed)?
+            .local_private_key(x_seed.as_ref())?
             .build_responder()?;
         Ok(Self {
             state,

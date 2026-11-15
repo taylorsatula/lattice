@@ -1,17 +1,18 @@
 use lattice_proto::CLOCK_SKEW;
 use lattice_proto::frames::*;
+use lattice_types::{Cookie, Hash32, Identifier, LegId, Mac16};
 
 #[test]
 fn custody_roundtrip() {
     let f = Frame::Custody(CustodyFrame {
-        leg: [7u8; 16],
+        leg: LegId::from_bytes([7u8; 16]),
         result: CUSTODY_ACCEPTED,
         retry_after: None,
     });
     let bytes = f.encode();
     assert_eq!(Frame::from_bytes(&bytes).unwrap(), f);
     let busy = Frame::Custody(CustodyFrame {
-        leg: [7; 16],
+        leg: LegId::from_bytes([7; 16]),
         result: CUSTODY_BUSY,
         retry_after: Some(30),
     });
@@ -29,7 +30,7 @@ fn offer_roundtrip() {
 #[test]
 fn custody_result_out_of_range_rejected() {
     let bytes = Frame::Custody(CustodyFrame {
-        leg: [7; 16],
+        leg: LegId::from_bytes([7; 16]),
         result: 0,
         retry_after: None,
     })
@@ -50,15 +51,18 @@ fn reconcile_roundtrip_both_range_kinds() {
     let f = Frame::Reconcile(ReconcileFrame {
         ranges: vec![
             Range::Fingerprint {
-                lower: Some(([1; 32], 0)),
-                upper: Some(([9; 32], 1)),
+                lower: Some((Identifier::from_bytes([1; 32]), 0)),
+                upper: Some((Identifier::from_bytes([9; 32]), 1)),
                 count: 1234,
-                sum: [7; 32],
+                sum: Hash32::from_bytes([7; 32]),
             },
             Range::Entries {
-                lower: Some(([1; 32], 0)),
-                upper: Some(([2; 32], 0)),
-                entries: vec![([8; 32], 1, 42), ([9; 32], 0, 7)],
+                lower: Some((Identifier::from_bytes([1; 32]), 0)),
+                upper: Some((Identifier::from_bytes([2; 32]), 0)),
+                entries: vec![
+                    (Identifier::from_bytes([8; 32]), 1, 42),
+                    (Identifier::from_bytes([9; 32]), 0, 7),
+                ],
             },
         ],
     });
@@ -66,18 +70,16 @@ fn reconcile_roundtrip_both_range_kinds() {
 }
 
 #[test]
-fn want_records_wary_ping_dummy_roundtrip() {
+fn want_records_ping_dummy_roundtrip() {
     let f = Frame::Want(WantFrame {
-        wants: vec![([1; 32], 0), ([2; 32], 1)],
+        wants: vec![
+            (Identifier::from_bytes([1; 32]), 0),
+            (Identifier::from_bytes([2; 32]), 1),
+        ],
     });
     assert_eq!(Frame::from_bytes(&f.encode()).unwrap(), f);
     let f = Frame::Records(RecordsFrame {
         records: vec![vec![1, 2, 3], vec![4]],
-    });
-    assert_eq!(Frame::from_bytes(&f.encode()).unwrap(), f);
-    let f = Frame::Wary(WaryFrame {
-        ids: vec![[1; 32], [2; 32]],
-        exp: 1_800_000_000,
     });
     assert_eq!(Frame::from_bytes(&f.encode()).unwrap(), f);
     let f = Frame::Ping(PingFrame { nonce: 42 });
@@ -90,20 +92,20 @@ fn want_records_wary_ping_dummy_roundtrip() {
 fn handshake_frames_roundtrip() {
     let f = Frame::Init(InitFrame {
         noise_msg: vec![1, 2, 3],
-        mac1: [9; 16],
+        mac1: Mac16::from_bytes([9; 16]),
         mac2: None,
         padding: vec![0; 100],
     });
     assert_eq!(Frame::from_bytes(&f.encode()).unwrap(), f);
     let f = Frame::Init(InitFrame {
         noise_msg: vec![1],
-        mac1: [9; 16],
-        mac2: Some([8; 16]),
+        mac1: Mac16::from_bytes([9; 16]),
+        mac2: Some(Mac16::from_bytes([8; 16])),
         padding: vec![],
     });
     assert_eq!(Frame::from_bytes(&f.encode()).unwrap(), f);
     let f = Frame::Cookie(CookieFrame {
-        cookie: [0xCD; 24],
+        cookie: Cookie::from_bytes([0xCD; 24]),
         padding: vec![0; 10],
     });
     assert_eq!(Frame::from_bytes(&f.encode()).unwrap(), f);

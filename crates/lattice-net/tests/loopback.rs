@@ -9,12 +9,15 @@ use lattice_net::{PeerContact, connect, serve};
 use lattice_proto::frames::Frame;
 use lattice_proto::frames::PingFrame;
 
-fn test_seeds() -> ([u8; 32], [u8; 32]) {
-    ([0xA1; 32], [0xB2; 32])
+fn test_seeds() -> (lattice_types::ChannelSeed, lattice_types::ChannelSeed) {
+    (
+        lattice_types::ChannelSeed::from_bytes([0xA1; 32]),
+        lattice_types::ChannelSeed::from_bytes([0xB2; 32]),
+    )
 }
 
 async fn start_server(
-    server_seed: [u8; 32],
+    server_seed: lattice_types::ChannelSeed,
     under_load: bool,
     status: bool,
 ) -> (
@@ -80,8 +83,9 @@ async fn ik_handshake_and_ping_pong() {
 #[tokio::test]
 async fn xx_handshake_works() {
     let (server_seed, client_seed) = test_seeds();
+    let client_seed_check = client_seed.clone();
     let path = lattice_net::upgrade_path(&lattice_crypto::channel_public(&server_seed));
-    let (addr, mut peers, _flag) = start_server(server_seed, false, false).await;
+    let (addr, mut peers, _flag) = start_server(server_seed.clone(), false, false).await;
 
     let client = tokio::spawn(async move {
         connect(PeerContact::Xx { addr, path }, &client_seed)
@@ -92,7 +96,7 @@ async fn xx_handshake_works() {
     let mut client_side = client.await.unwrap();
 
     // Both sides must see each other's channel static key.
-    let client_sk_pub = lattice_crypto::channel_x25519_public(&client_seed);
+    let client_sk_pub = lattice_crypto::channel_x25519_public(&client_seed_check);
     assert_eq!(server_side.remote_static, client_sk_pub);
     assert_eq!(
         client_side.remote_static,
@@ -137,7 +141,7 @@ async fn cookie_flow_enforced_under_load() {
 #[tokio::test]
 async fn status_endpoint_and_404() {
     let (server_seed, _client_seed) = test_seeds();
-    let (addr, _peers, _flag) = start_server(server_seed, false, true).await;
+    let (addr, _peers, _flag) = start_server(server_seed.clone(), false, true).await;
 
     // /status returns CBOR with keys 0..3
     let status = reqwest_get(&format!("http://{addr}/status")).await;

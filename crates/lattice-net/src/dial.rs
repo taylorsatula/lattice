@@ -23,38 +23,51 @@ pub struct EndpointUrl {
 }
 
 pub fn parse_endpoint(url: &str) -> Result<EndpointUrl, NetError> {
-    let (scheme, rest) = url.split_once("://").ok_or(NetError::Io)?;
+    let (scheme, rest) = url
+        .split_once("://")
+        .ok_or(NetError::InvalidInput("endpoint must be a ws:// URL"))?;
     match scheme {
         // Lattice speaks plain WebSocket; confidentiality comes from Noise.
         // wss is rejected rather than silently downgraded.
         "ws" => {}
-        _ => return Err(NetError::Io),
+        _ => return Err(NetError::InvalidInput("endpoint scheme must be ws")),
     }
     let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
     if authority.is_empty() || authority.contains('@') {
-        return Err(NetError::Io);
+        return Err(NetError::InvalidInput(
+            "endpoint must have a host and no userinfo",
+        ));
     }
     let (host, port) = if let Some(rest) = authority.strip_prefix('[') {
         // [v6]:port
-        let end = rest.find(']').ok_or(NetError::Io)?;
+        let end = rest
+            .find(']')
+            .ok_or(NetError::InvalidInput("unterminated [v6] host"))?;
         let h = &rest[..end];
         let after = &rest[end + 1..];
         let port = match after.strip_prefix(':') {
-            Some(p) => p.parse::<u16>().map_err(|_| NetError::Io)?,
+            Some(p) => p
+                .parse::<u16>()
+                .map_err(|_| NetError::InvalidInput("invalid port"))?,
             None => 80,
         };
+        if port == 0 {
+            return Err(NetError::InvalidInput("port must be non-zero"));
+        }
         (h.to_string(), port)
     } else if let Some((h, p)) = authority.rsplit_once(':') {
-        let port = p.parse::<u16>().map_err(|_| NetError::Io)?;
-        if p.bytes().any(|b| !b.is_ascii_digit()) {
-            return Err(NetError::Io);
+        let port = p
+            .parse::<u16>()
+            .map_err(|_| NetError::InvalidInput("invalid port"))?;
+        if p.bytes().any(|b| !b.is_ascii_digit()) || port == 0 {
+            return Err(NetError::InvalidInput("invalid port"));
         }
         (h.to_string(), port)
     } else {
         (authority.to_string(), 80)
     };
     if host.is_empty() {
-        return Err(NetError::Io);
+        return Err(NetError::InvalidInput("empty host"));
     }
     Ok(EndpointUrl { host, port })
 }
@@ -81,7 +94,7 @@ pub async fn scoped_addresses(
         // private address into a WAN dial.
         let resolved = tokio::net::lookup_host((endpoint.host.as_str(), endpoint.port))
             .await
-            .map_err(|_| NetError::Io)?;
+            .map_err(NetError::Io)?;
         candidates.extend(resolved.map(|a| a.ip()));
     }
     let allowed: Vec<IpAddr> = candidates
@@ -93,7 +106,9 @@ pub async fn scoped_addresses(
         .collect();
     if allowed.is_empty() {
         // Everything resolved to a disallowed address: do not dial anything.
-        return Err(NetError::Io);
+        return Err(NetError::InvalidInput(
+            "no address in scope for this endpoint",
+        ));
     }
     Ok(allowed
         .into_iter()
@@ -104,15 +119,15 @@ pub async fn scoped_addresses(
 /// Connect to an endpoint honoring the record's scope. `expected_ik` is the
 /// record's channel key for IK peers; `xx_path` for an XX root contact.
 pub async fn connect_scoped(
-    channel_seed: &[u8; 32],
+    channel_seed: &lattice_types::ChannelSeed,
     endpoint: &EndpointUrl,
     record_ips: &[IpAddr],
     scope: Scope,
-    ik_channel_key: Option<[u8; 32]>,
+    ik_channel_key: Option<lattice_types::ChannelPublicKey>,
     xx_path: Option<String>,
 ) -> Result<PeerIo, NetError> {
     let addrs = scoped_addresses(endpoint, record_ips, scope).await?;
-    let mut last_err = NetError::Io;
+    let mut last_err = NetError::InvalidInput("no address in scope for this endpoint");
     for addr in addrs {
         let contact = match (ik_channel_key, &xx_path) {
             (Some(ck), _) => PeerContact::Ik {
@@ -124,7 +139,9 @@ pub async fn connect_scoped(
                 path: path.clone(),
             },
             (None, None) => {
-                return Err(NetError::Io); // caller must supply either a key or a path
+                return Err(NetError::InvalidInput(
+                    "either a channel key or a path is required",
+                ));
             }
         };
         match connect(contact, channel_seed).await {

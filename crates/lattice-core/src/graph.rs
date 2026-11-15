@@ -7,28 +7,30 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
+use lattice_types::Identifier;
+
 use crate::rng::Rng;
 
 pub const MAX_LINKS_WAN: usize = 16;
 
 #[derive(Default)]
 pub struct Graph {
-    adjacency: HashMap<[u8; 32], HashSet<[u8; 32]>>,
+    adjacency: HashMap<Identifier, HashSet<Identifier>>,
 }
 
 impl Graph {
     /// `links` iterates over (node, its claimed links) for every known record,
     /// including our own.
-    pub fn build<'a, I>(own: &[u8; 32], records: I) -> Self
+    pub fn build<'a, I>(own: &Identifier, records: I) -> Self
     where
-        I: IntoIterator<Item = (&'a [u8; 32], &'a [[u8; 32]])>,
+        I: IntoIterator<Item = (&'a Identifier, &'a [Identifier])>,
     {
-        let claims: HashMap<[u8; 32], HashSet<[u8; 32]>> = records
+        let claims: HashMap<Identifier, HashSet<Identifier>> = records
             .into_iter()
             .map(|(id, links)| (*id, links.iter().copied().collect()))
             .collect();
-        let mut adjacency: HashMap<[u8; 32], HashSet<[u8; 32]>> = HashMap::new();
-        let ids: Vec<[u8; 32]> = claims
+        let mut adjacency: HashMap<Identifier, HashSet<Identifier>> = HashMap::new();
+        let ids: Vec<Identifier> = claims
             .keys()
             .copied()
             .chain(std::iter::once(*own))
@@ -49,17 +51,17 @@ impl Graph {
     /// Add an unconditional edge in both directions. Used for private
     /// instances, which publish no links but are reachable via the gateways
     /// named in their record.
-    pub fn add_edge(&mut self, a: [u8; 32], b: [u8; 32]) {
+    pub fn add_edge(&mut self, a: Identifier, b: Identifier) {
         self.adjacency.entry(a).or_default().insert(b);
         self.adjacency.entry(b).or_default().insert(a);
     }
 
-    pub fn neighbors(&self, id: &[u8; 32]) -> impl Iterator<Item = &[u8; 32]> {
+    pub fn neighbors(&self, id: &Identifier) -> impl Iterator<Item = &Identifier> {
         self.adjacency.get(id).into_iter().flatten()
     }
 
     /// BFS distances from `from`.
-    pub fn distances(&self, from: &[u8; 32]) -> HashMap<[u8; 32], u32> {
+    pub fn distances(&self, from: &Identifier) -> HashMap<Identifier, u32> {
         let mut dist = HashMap::new();
         let mut q = VecDeque::new();
         dist.insert(*from, 0u32);
@@ -87,16 +89,16 @@ impl Graph {
     /// this leg.
     pub fn next_hop(
         &self,
-        from: &[u8; 32],
-        dist: &HashMap<[u8; 32], u32>,
+        from: &Identifier,
+        dist: &HashMap<Identifier, u32>,
         sideways_prob: f64,
-        exclude: &HashSet<[u8; 32]>,
-        up: &HashSet<[u8; 32]>,
+        exclude: &HashSet<Identifier>,
+        up: &HashSet<Identifier>,
         rng: &mut Rng,
-    ) -> Option<[u8; 32]> {
+    ) -> Option<Identifier> {
         let my_dist = *dist.get(from)?;
-        let mut progress: Vec<[u8; 32]> = Vec::new();
-        let mut sideways: Vec<[u8; 32]> = Vec::new();
+        let mut progress: Vec<Identifier> = Vec::new();
+        let mut sideways: Vec<Identifier> = Vec::new();
         for n in self.neighbors(from) {
             if exclude.contains(n) || !up.contains(n) {
                 continue;

@@ -47,6 +47,7 @@ mira = { secret = "change-me-0123456789abcdef" }
 # custody_allowance = 4194304      # bytes of custody per upstream link
 # transit_cap = 268435456         # total bytes held in transit
 # inbox_max = 1024                # deliveries per service inbox
+# inbox_max_total = 4096          # deliveries across all service inboxes
 # snow_per_min = 2.0
 # sideways_prob = 0.15
 # waypoint_share = 0.0

@@ -14,6 +14,7 @@ use std::collections::HashSet;
 
 use lattice_crypto::hash;
 use lattice_proto::frames::Range;
+use lattice_types::{Hash32, Identifier};
 
 pub const LEAF_LIMIT: usize = 32;
 const SPLIT: u64 = 16;
@@ -21,25 +22,29 @@ const MAX_RANGES_PER_MSG: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Item {
-    pub id: [u8; 32],
+    pub id: Identifier,
     pub scope: u8,
     pub seq: u64,
 }
 
 impl Item {
-    pub fn key(&self) -> ([u8; 32], u8) {
+    pub fn key(&self) -> (Identifier, u8) {
         (self.id, self.scope)
     }
     fn hash(&self) -> crate::u256::U256 {
         let mut h = Vec::with_capacity(41);
-        h.extend_from_slice(&self.id);
+        h.extend_from_slice(self.id.as_ref());
         h.push(self.scope);
         h.extend_from_slice(&self.seq.to_le_bytes());
-        crate::u256::U256::from_bytes(&hash(&h))
+        crate::u256::U256::from_bytes(hash(&h).as_bytes())
     }
 }
 
-fn in_range(item: &Item, lower: &Option<([u8; 32], u8)>, upper: &Option<([u8; 32], u8)>) -> bool {
+fn in_range(
+    item: &Item,
+    lower: &Option<(Identifier, u8)>,
+    upper: &Option<(Identifier, u8)>,
+) -> bool {
     let key = (item.id, item.scope);
     if let Some(l) = lower {
         if key < *l {
@@ -54,7 +59,7 @@ fn in_range(item: &Item, lower: &Option<([u8; 32], u8)>, upper: &Option<([u8; 32
     true
 }
 
-type RangeBounds = (Option<([u8; 32], u8)>, Option<([u8; 32], u8)>);
+type RangeBounds = (Option<(Identifier, u8)>, Option<(Identifier, u8)>);
 
 fn range_parts(range: &Range) -> RangeBounds {
     match range {
@@ -71,10 +76,10 @@ fn split(range: &Range) -> Option<Vec<Range>> {
     let lo_bytes = lower.map(|(id, _)| id);
     let hi_bytes = upper.map(|(id, _)| id);
     let lo = lo_bytes
-        .map(|b| crate::u256::U256::from_bytes(&b))
+        .map(|b| crate::u256::U256::from_bytes(b.as_bytes()))
         .unwrap_or_default();
     let hi = hi_bytes
-        .map(|b| crate::u256::U256::from_bytes(&b))
+        .map(|b| crate::u256::U256::from_bytes(b.as_bytes()))
         .unwrap_or_default(); // 0 == end of space
     let width = hi.sub(lo);
     let step = if width.is_zero() {
@@ -100,24 +105,27 @@ fn split(range: &Range) -> Option<Vec<Range>> {
         let lower_b = if k == 0 {
             lower
         } else {
-            Some((sub_lo.to_bytes(), 0))
+            Some((Identifier::from_bytes(sub_lo.to_bytes()), 0))
         };
         let upper_b = if is_last {
             upper
         } else {
-            Some((lo.add(step.mul_small(k + 1)).to_bytes(), 0))
+            Some((
+                Identifier::from_bytes(lo.add(step.mul_small(k + 1)).to_bytes()),
+                0,
+            ))
         };
         out.push(Range::Fingerprint {
             lower: lower_b,
             upper: upper_b,
             count: 0,
-            sum: [0; 32],
+            sum: Hash32::from_bytes([0; 32]),
         });
     }
     Some(out)
 }
 
-pub fn fingerprint(items: &[Item], range: &Range) -> (u64, [u8; 32]) {
+pub fn fingerprint(items: &[Item], range: &Range) -> (u64, Hash32) {
     let (lower, upper) = range_parts(range);
     let mut count = 0u64;
     let mut sum = crate::u256::U256::default();
@@ -127,7 +135,7 @@ pub fn fingerprint(items: &[Item], range: &Range) -> (u64, [u8; 32]) {
             sum = sum.add(item.hash());
         }
     }
-    (count, sum.to_bytes())
+    (count, Hash32::from_bytes(sum.to_bytes()))
 }
 
 pub fn entries_in(items: &[Item], range: &Range) -> Vec<Item> {
@@ -172,7 +180,7 @@ pub fn respond(
     items: &[Item],
     msgs: &[Range],
     session: &mut ReconcileSession,
-) -> (Vec<Range>, Vec<([u8; 32], u8)>) {
+) -> (Vec<Range>, Vec<(Identifier, u8)>) {
     let mut out = Vec::new();
     let mut wants = Vec::new();
     // A peer may not make us do unbounded work: cap the ranges we process
@@ -279,7 +287,7 @@ pub fn initiate(items: &[Item]) -> Vec<Range> {
             lower: None,
             upper: None,
             count: 0,
-            sum: [0; 32],
+            sum: Hash32::from_bytes([0; 32]),
         },
     )]
 }
@@ -290,7 +298,7 @@ mod tests {
 
     fn item(n: u8) -> Item {
         Item {
-            id: [n; 32],
+            id: Identifier::from_bytes([n; 32]),
             scope: 0,
             seq: n as u64,
         }
@@ -307,12 +315,12 @@ mod tests {
             lower: None,
             upper: None,
             count: 0,
-            sum: [0; 32],
+            sum: Hash32::from_bytes([0; 32]),
         };
         let subs = split(&full).unwrap();
         assert_eq!(subs.len(), 16);
         for id in [0x00u8, 0x07, 0x10, 0x7f, 0x80, 0xfe, 0xff] {
-            let id = [id; 32];
+            let id = Identifier::from_bytes([id; 32]);
             let hits = subs
                 .iter()
                 .filter(|r| {
@@ -332,12 +340,12 @@ mod tests {
             lower: None,
             upper: None,
             count: 0,
-            sum: [0; 32],
+            sum: Hash32::from_bytes([0; 32]),
         };
         assert_ne!(fingerprint(&a, &full), fingerprint(&b, &full));
     }
 
-    type Wants = Vec<([u8; 32], u8)>;
+    type Wants = Vec<(Identifier, u8)>;
     fn reconcile_pair(a: &[Item], b: &[Item]) -> (Wants, Wants) {
         let mut a_msg = initiate(a);
         let mut a_wants = Vec::new();
@@ -362,8 +370,8 @@ mod tests {
         let a = sorted(vec![item(1), item(2), item(3)]);
         let b = sorted(vec![item(2), item(3), item(4)]);
         let (a_wants, b_wants) = reconcile_pair(&a, &b);
-        assert!(a_wants.contains(&([4u8; 32], 0)));
-        assert!(b_wants.contains(&([1u8; 32], 0)));
+        assert!(a_wants.contains(&(Identifier::from_bytes([4u8; 32]), 0)));
+        assert!(b_wants.contains(&(Identifier::from_bytes([1u8; 32]), 0)));
     }
 
     #[test]
@@ -382,7 +390,7 @@ mod tests {
                 id[0] = (i >> 8) as u8;
                 id[1] = i as u8;
                 Item {
-                    id,
+                    id: Identifier::from_bytes(id),
                     scope: 0,
                     seq: 1,
                 }
@@ -390,21 +398,21 @@ mod tests {
             .collect();
         let mut a = base.clone();
         a.push(Item {
-            id: [0xde; 32],
+            id: Identifier::from_bytes([0xde; 32]),
             scope: 0,
             seq: 1,
         });
         let mut b = base;
         b.push(Item {
-            id: [0xad; 32],
+            id: Identifier::from_bytes([0xad; 32]),
             scope: 0,
             seq: 1,
         });
         a.sort();
         b.sort();
         let (a_wants, b_wants) = reconcile_pair(&a, &b);
-        assert!(a_wants.contains(&([0xad; 32], 0)));
-        assert!(b_wants.contains(&([0xde; 32], 0)));
+        assert!(a_wants.contains(&(Identifier::from_bytes([0xad; 32]), 0)));
+        assert!(b_wants.contains(&(Identifier::from_bytes([0xde; 32]), 0)));
     }
 }
 
@@ -414,7 +422,7 @@ mod adversarial_tests {
 
     fn item(n: u8) -> Item {
         Item {
-            id: [n; 32],
+            id: Identifier::from_bytes([n; 32]),
             scope: 0,
             seq: n as u64,
         }
@@ -429,7 +437,7 @@ mod adversarial_tests {
                 lower: None,
                 upper: None,
                 count: 0,
-                sum: [0; 32],
+                sum: Hash32::from_bytes([0; 32]),
             })
             .collect();
         let mut session = ReconcileSession::new();
@@ -443,7 +451,7 @@ mod adversarial_tests {
         // Peer sends an Entries range covering 100 of our items; we must
         // echo at most LEAF_LIMIT of them.
         let items: Vec<Item> = (0..100u8).map(item).collect();
-        let entries: Vec<([u8; 32], u8, u64)> =
+        let entries: Vec<(Identifier, u8, u64)> =
             items.iter().map(|i| (i.id, i.scope, i.seq)).collect();
         let msgs = vec![Range::Entries {
             lower: None,
@@ -465,11 +473,11 @@ mod adversarial_tests {
     #[test]
     fn wants_are_capped() {
         let items: Vec<Item> = vec![];
-        let entries: Vec<([u8; 32], u8, u64)> = (0..200u16)
+        let entries: Vec<(Identifier, u8, u64)> = (0..200u16)
             .map(|i| {
                 let mut id = [0u8; 32];
                 id[..2].copy_from_slice(&i.to_be_bytes());
-                (id, 0u8, 1u64)
+                (Identifier::from_bytes(id), 0u8, 1u64)
             })
             .collect();
         let msgs = vec![Range::Entries {

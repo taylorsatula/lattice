@@ -53,7 +53,10 @@ fn cmd_init(args: &[String]) -> std::process::ExitCode {
             {
                 println!(
                     "node id: {}",
-                    id.iter().map(|b| format!("{b:02x}")).collect::<String>()
+                    id.as_ref()
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect::<String>()
                 );
             }
             println!("next: create a config, e.g. /etc/lattice/lattice.toml");
@@ -92,7 +95,7 @@ fn record_self_test(cfg: &config::Config, identity: &lattice_core::Identity) -> 
     let gateways = if private {
         cfg.gateways
             .iter()
-            .map(|h| config::decode_hex32(h))
+            .map(|h| config::decode_hex32(h).map(lattice_types::Identifier::from_bytes))
             .collect::<Result<Vec<_>, _>>()?
     } else {
         Vec::new()
@@ -102,7 +105,7 @@ fn record_self_test(cfg: &config::Config, identity: &lattice_core::Identity) -> 
         seq: 1,
         exp: now + 3600,
         channel_key: lattice_crypto::channel_public(&identity.channel_seed),
-        channel_seed: identity.channel_seed,
+        channel_seed: identity.channel_seed.clone(),
         envelope_key: identity.xwing_public,
         mode,
         scope: lattice_proto::record::Scope::Wan,
@@ -177,10 +180,22 @@ async fn cmd_run(args: &[String]) -> std::process::ExitCode {
     // transient one: an operator who drained a node for maintenance expects
     // it to stay drained across a restart (e.g. after a crash or a package
     // upgrade), not to silently resume accepting custody. Clearing it is an
-    // explicit operator action (`latticectl drain off`).
-    let draining = Arc::new(std::sync::atomic::AtomicBool::new(
-        store.drain_get().unwrap_or(false),
-    ));
+    // explicit operator action (`latticectl drain off`). If the flag cannot
+    // be read, refuse to start: a node that cannot tell whether the operator
+    // drained it must not take custody, and a store that cannot serve this
+    // read is not one to run on.
+    let drain_flag = match store.drain_get() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!(
+                "store: reading the drain flag failed: {e}. Refusing to start: \
+                 the drain flag is the maintenance safety hatch and must not fail open. \
+                 Inspect or restore the store, then retry."
+            );
+            return std::process::ExitCode::from(1);
+        }
+    };
+    let draining = Arc::new(std::sync::atomic::AtomicBool::new(drain_flag));
     let cfg = Arc::new(cfg);
 
     // Install signal handlers before binding any socket, so SIGTERM/SIGINT
@@ -188,27 +203,40 @@ async fn cmd_run(args: &[String]) -> std::process::ExitCode {
     // tokio registers the OS handler eagerly in `signal()`, so these must be
     // created here, not inside the future passed to run().
     #[cfg(unix)]
-    let shutdown = {
+    let shutdown: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> = {
         use tokio::signal::unix::{SignalKind, signal};
-        let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
-        let mut int = signal(SignalKind::interrupt()).expect("install SIGINT handler");
-        async move {
-            tokio::select! {
-                _ = term.recv() => {},
-                _ = int.recv() => {},
+        match (
+            signal(SignalKind::terminate()),
+            signal(SignalKind::interrupt()),
+        ) {
+            (Ok(mut term), Ok(mut int)) => Box::pin(async move {
+                tokio::select! {
+                    _ = term.recv() => {},
+                    _ = int.recv() => {},
+                }
+            }),
+            (term, int) => {
+                if term.is_err() {
+                    eprintln!("lattice: failed to install SIGTERM handler");
+                }
+                if int.is_err() {
+                    eprintln!("lattice: failed to install SIGINT handler");
+                }
+                return std::process::ExitCode::FAILURE;
             }
         }
     };
     #[cfg(not(unix))]
-    let shutdown = async {
-        let _ = tokio::signal::ctrl_c().await;
-    };
+    let shutdown: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> =
+        Box::pin(async {
+            let _ = tokio::signal::ctrl_c().await;
+        });
 
     // Inbound listener: accept connections, hand peers to the runtime.
     let (peer_tx, peer_rx) = tokio::sync::mpsc::unbounded_channel::<lattice_net::PeerIo>();
     for addr in &cfg.listen {
         let listener_cfg = lattice_net::ListenerConfig {
-            channel_seed: identity.channel_seed,
+            channel_seed: identity.channel_seed.clone(),
             status_enabled: cfg.status,
             draining: draining.clone(),
             force_under_load: false,
@@ -223,32 +251,40 @@ async fn cmd_run(args: &[String]) -> std::process::ExitCode {
         }
     }
 
-    let runtime = runtime::Runtime::new(&cfg, identity, store, now, peer_rx, draining.clone());
+    let mut runtime = runtime::Runtime::new(&cfg, identity, store, now, peer_rx, draining.clone());
 
-    // Dial configured roots at startup.
-    for root in &cfg.roots {
-        let addr: std::net::SocketAddr = match root.addr.parse() {
-            Ok(a) => a,
-            Err(_) => {
-                eprintln!("root {:?}: invalid socket address", root.addr);
-                continue;
-            }
-        };
-        let ik_key = root
-            .channel_key
-            .as_deref()
-            .and_then(|h| config::decode_hex32(h).ok());
-        let peer_id = root
-            .id
-            .as_deref()
-            .and_then(|h| config::decode_hex32(h).ok());
-        let path = root.path.clone();
-        if ik_key.is_some() {
-            runtime.spawn_dial(addr.to_string(), ik_key, None, peer_id);
-        } else {
-            runtime.spawn_dial(addr.to_string(), None, path, peer_id);
-        }
-    }
+    // Register configured roots; the runtime dials them now and redials
+    // with backoff until a link is up (and again if it drops later).
+    let roots: Vec<runtime::RootSpec> = cfg
+        .roots
+        .iter()
+        .filter_map(|root| {
+            let addr: std::net::SocketAddr = match root.addr.parse() {
+                Ok(a) => a,
+                Err(_) => {
+                    eprintln!("root {:?}: invalid socket address", root.addr);
+                    return None;
+                }
+            };
+            let ik_key = root
+                .channel_key
+                .as_deref()
+                .and_then(|h| config::decode_hex32(h).ok())
+                .map(lattice_types::ChannelPublicKey::from_bytes);
+            let peer_id = root
+                .id
+                .as_deref()
+                .and_then(|h| config::decode_hex32(h).ok())
+                .map(lattice_types::Identifier::from_bytes);
+            Some(runtime::RootSpec {
+                addr,
+                ik_key,
+                path: root.path.clone(),
+                peer_id,
+            })
+        })
+        .collect();
+    runtime.set_roots(roots);
 
     // Bind both sockets before doing anything else; if either fails, exit
     // nonzero rather than run without a local API.

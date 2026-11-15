@@ -9,6 +9,9 @@ use lattice_core::{Action, Event, Node};
 use lattice_crypto::os_bytes;
 use lattice_proto::frames::Frame;
 use lattice_store::{RedbStore, Store};
+use lattice_types::{
+    ChannelPublicKey, ChannelSeed, DeliveryId, Identifier, MessageId, X25519PublicKey,
+};
 use tokio::sync::{broadcast, mpsc};
 
 use crate::config::Config;
@@ -22,9 +25,9 @@ pub enum LinkEvent {
 pub enum Cmd {
     Dial {
         addr: String,
-        ik_key: Option<[u8; 32]>,
+        ik_key: Option<ChannelPublicKey>,
         path: Option<String>,
-        peer_id: Option<[u8; 32]>,
+        peer_id: Option<Identifier>,
     },
 }
 
@@ -34,10 +37,10 @@ pub enum Cmd {
 pub enum ApiCmd {
     AppSend {
         send: lattice_core::AppSend,
-        respond: tokio::sync::oneshot::Sender<[u8; 16]>,
+        respond: tokio::sync::oneshot::Sender<MessageId>,
     },
     Status {
-        mid: [u8; 16],
+        mid: MessageId,
         respond: tokio::sync::oneshot::Sender<Option<(u64, Option<u64>)>>,
     },
     Fetch {
@@ -47,11 +50,11 @@ pub enum ApiCmd {
     },
     Ack {
         service: String,
-        ids: Vec<[u8; 16]>,
+        ids: Vec<DeliveryId>,
         respond: tokio::sync::oneshot::Sender<usize>,
     },
     Lookup {
-        id: [u8; 32],
+        id: Identifier,
         respond: tokio::sync::oneshot::Sender<(bool, Option<u64>, bool)>,
     },
     NodeInfo {
@@ -73,21 +76,21 @@ pub enum ApiCmd {
         respond: tokio::sync::oneshot::Sender<Result<String, String>>,
     },
     UnlinkByPeer {
-        peer: [u8; 32],
+        peer: Identifier,
         respond: tokio::sync::oneshot::Sender<bool>,
     },
     Link {
         addr: String,
-        ik_key: Option<[u8; 32]>,
+        ik_key: Option<ChannelPublicKey>,
         path: Option<String>,
-        peer_id: Option<[u8; 32]>,
+        peer_id: Option<Identifier>,
         respond: tokio::sync::oneshot::Sender<bool>,
     },
 }
 
 #[derive(Clone, Debug)]
 pub struct NodeInfo {
-    pub id: [u8; 32],
+    pub id: Identifier,
     pub mode: &'static str,
     pub links: usize,
     pub records: usize,
@@ -101,8 +104,29 @@ pub(crate) struct OutFrame {
     pad_to: Option<usize>,
 }
 
+/// A configured root to dial, with redial backoff state. The daemon keeps
+/// trying roots that are unreachable at startup (or that drop later) instead
+/// of giving up after one attempt.
+pub struct RootSpec {
+    pub addr: std::net::SocketAddr,
+    pub ik_key: Option<ChannelPublicKey>,
+    pub path: Option<String>,
+    pub peer_id: Option<Identifier>,
+}
+
+struct RootDial {
+    addr: std::net::SocketAddr,
+    ik_key: Option<ChannelPublicKey>,
+    path: Option<String>,
+    peer_id: Option<Identifier>,
+    next_attempt: u64,
+    attempts: u32,
+    in_flight: bool,
+}
+
 struct LinkHandle {
-    peer: Option<[u8; 32]>,
+    peer: Option<Identifier>,
+    addr: Option<std::net::SocketAddr>,
     tx: mpsc::UnboundedSender<OutFrame>,
     task: tokio::task::AbortHandle,
 }
@@ -112,13 +136,14 @@ pub struct Runtime {
     pub draining: Arc<AtomicBool>,
     mode: &'static str,
     identity_dir: std::path::PathBuf,
-    channel_seed: [u8; 32],
+    channel_seed: ChannelSeed,
     links: HashMap<u64, LinkHandle>,
     peer_rx: Option<mpsc::UnboundedReceiver<lattice_net::PeerIo>>,
     link_rx: Option<mpsc::UnboundedReceiver<LinkEvent>>,
     link_tx: mpsc::UnboundedSender<LinkEvent>,
     cmd_rx: mpsc::UnboundedReceiver<Cmd>,
     cmd_tx: mpsc::UnboundedSender<Cmd>,
+    roots: Vec<RootDial>,
     api_rx: Option<mpsc::UnboundedReceiver<ApiCmd>>,
     api_tx: mpsc::UnboundedSender<ApiCmd>,
     pub app_broadcast: broadcast::Sender<(String, Vec<u8>)>,
@@ -174,16 +199,20 @@ impl Runtime {
         peer_rx: mpsc::UnboundedReceiver<lattice_net::PeerIo>,
         draining: Arc<AtomicBool>,
     ) -> Self {
-        let channel_seed = identity.channel_seed;
+        let channel_seed = identity.channel_seed.clone();
         let mode = if cfg.mode == "private" {
             lattice_proto::record::Mode::Private
         } else {
             lattice_proto::record::Mode::Public
         };
-        let gateways: Vec<[u8; 32]> = cfg
+        let gateways: Vec<Identifier> = cfg
             .gateways
             .iter()
-            .map(|h| crate::config::decode_hex32(h).expect("config validation checked gateway hex"))
+            .map(|h| {
+                Identifier::from_bytes(
+                    crate::config::decode_hex32(h).expect("config validation checked gateway hex"),
+                )
+            })
             .collect();
         let core_cfg = lattice_core::Config {
             snow_per_min: cfg.limits.snow_per_min,
@@ -193,6 +222,7 @@ impl Runtime {
             custody_allowance: cfg.limits.custody_allowance,
             transit_cap: cfg.limits.transit_cap,
             inbox_max_deliveries: cfg.limits.inbox_max,
+            inbox_max_total: cfg.limits.inbox_max_total,
             rng_seed: u64::from_le_bytes(os_bytes::<8>()),
             advertise: cfg.advertise.clone(),
             gateways,
@@ -223,6 +253,7 @@ impl Runtime {
             peer_rx: Some(peer_rx),
             cmd_rx,
             cmd_tx,
+            roots: Vec::new(),
             api_rx: Some(api_rx),
             api_tx,
             app_broadcast,
@@ -237,9 +268,10 @@ impl Runtime {
     /// Register an established peer connection.
     pub fn attach_link(
         &mut self,
-        peer: Option<[u8; 32]>,
-        remote_ck: [u8; 32],
+        peer: Option<Identifier>,
+        remote_ck: X25519PublicKey,
         io: lattice_net::PeerIo,
+        addr: Option<std::net::SocketAddr>,
     ) -> u64 {
         let id = self.next_link;
         self.next_link += 1;
@@ -250,6 +282,7 @@ impl Runtime {
             id,
             LinkHandle {
                 peer,
+                addr,
                 tx: outbound_tx,
                 task: task.abort_handle(),
             },
@@ -257,7 +290,7 @@ impl Runtime {
         // The link is registered, so the actions returned by LinkUp (the
         // attestation frame) can be routed to it.
         let actions = {
-            let mut node = self.node.lock().unwrap();
+            let mut node = self.node.lock().unwrap_or_else(|e| e.into_inner());
             node.handle(Event::LinkUp {
                 at: now_secs(),
                 link: id,
@@ -270,30 +303,56 @@ impl Runtime {
         id
     }
 
-    /// Wire up the dial side: queue an outbound connection attempt.
-    pub fn spawn_dial(
-        &self,
-        addr: String,
-        ik_key: Option<[u8; 32]>,
-        path: Option<String>,
-        peer_id: Option<[u8; 32]>,
-    ) {
-        let cmd = self.cmd_tx.clone();
-        tokio::spawn(async move {
-            let _ = cmd.send(Cmd::Dial {
-                addr,
-                ik_key,
-                path,
-                peer_id,
+    /// Register the configured roots. Each is dialed immediately and then
+    /// retried with exponential backoff (capped at 60s) until a link to it
+    /// is established; if the link later drops, dialing resumes.
+    pub fn set_roots(&mut self, roots: Vec<RootSpec>) {
+        self.roots = roots
+            .into_iter()
+            .map(|r| RootDial {
+                addr: r.addr,
+                ik_key: r.ik_key,
+                path: r.path,
+                peer_id: r.peer_id,
+                next_attempt: 0,
+                attempts: 0,
+                in_flight: false,
+            })
+            .collect();
+        self.redial_roots();
+    }
+
+    /// Queue a dial for every root that is due and not currently connected.
+    fn redial_roots(&mut self) {
+        let now = now_secs();
+        for root in &mut self.roots {
+            let connected = self.links.values().any(|l| l.addr == Some(root.addr));
+            if connected {
+                root.attempts = 0;
+                root.next_attempt = now + 5;
+                continue;
+            }
+            if root.in_flight || now < root.next_attempt {
+                continue;
+            }
+            root.in_flight = true;
+            let backoff = (1u64 << root.attempts.min(6)).min(60);
+            root.attempts += 1;
+            root.next_attempt = now + backoff;
+            let _ = self.cmd_tx.send(Cmd::Dial {
+                addr: root.addr.to_string(),
+                ik_key: root.ik_key,
+                path: root.path.clone(),
+                peer_id: root.peer_id,
             });
-        });
+        }
     }
 
     /// Enter drain: refuse new custody, persist the flag, and report.
     /// Called on SIGTERM/SIGINT before the process exits.
     fn begin_drain(&mut self) {
         self.draining.store(true, Ordering::Relaxed);
-        let mut node = self.node.lock().unwrap();
+        let mut node = self.node.lock().unwrap_or_else(|e| e.into_inner());
         node.set_draining(true);
         if let Err(e) = node.store_mut().drain_set(true) {
             eprintln!("lattice: failed to persist drain flag: {e}");
@@ -316,7 +375,7 @@ impl Runtime {
                 }
                 Some(peer) = peer_rx.recv() => {
                     let ck = peer.remote_static;
-                    self.attach_link(None, ck, peer);
+                    self.attach_link(None, ck, peer, None);
                 }
                 Some(api) = api_rx.recv() => self.handle_api(api),
                 Some(cmd) = self.cmd_rx.recv() => match cmd {
@@ -325,7 +384,7 @@ impl Runtime {
                 Some(ev) = link_rx.recv() => match ev {
                     LinkEvent::Frame { link, frame } => {
                         let peer = self.links.get(&link).and_then(|l| l.peer);
-                        self.apply(Event::Frame { at: now_secs(), link, from: peer.unwrap_or([0u8; 32]), frame });
+                        self.apply(Event::Frame { at: now_secs(), link, from: peer.unwrap_or(Identifier::from_bytes([0u8; 32])), frame });
                     }
                     LinkEvent::Down { link } => {
                         if self.links.remove(&link).is_some() {
@@ -334,6 +393,7 @@ impl Runtime {
                     }
                 },
                 _ = tick.tick() => {
+                    self.redial_roots();
                     self.apply(Event::Tick { at: now_secs() });
                 }
             }
@@ -342,7 +402,7 @@ impl Runtime {
 
     fn apply(&mut self, event: Event) {
         let actions = {
-            let mut node = self.node.lock().unwrap();
+            let mut node = self.node.lock().unwrap_or_else(|e| e.into_inner());
             node.handle(event)
         };
         self.apply_actions(actions);
@@ -385,20 +445,22 @@ impl Runtime {
     fn handle_api(&mut self, api: ApiCmd) {
         match api {
             ApiCmd::AppSend { send, respond } => {
-                let mid = send.mid_hint.unwrap_or_else(lattice_crypto::os_bytes::<16>);
+                let mid = send
+                    .mid_hint
+                    .unwrap_or_else(|| MessageId::from_bytes(lattice_crypto::os_bytes::<16>()));
                 let send = lattice_core::AppSend {
                     mid_hint: Some(mid),
                     ..send
                 };
                 let actions = {
-                    let mut node = self.node.lock().unwrap();
+                    let mut node = self.node.lock().unwrap_or_else(|e| e.into_inner());
                     node.handle(Event::AppSend(send))
                 };
                 self.apply_actions(actions);
                 let _ = respond.send(mid);
             }
             ApiCmd::Status { mid, respond } => {
-                let node = self.node.lock().unwrap();
+                let node = self.node.lock().unwrap_or_else(|e| e.into_inner());
                 let value = node.store_ref().status_get(&mid).ok().flatten();
                 let _ = respond.send(value);
             }
@@ -407,7 +469,7 @@ impl Runtime {
                 max,
                 respond,
             } => {
-                let node = self.node.lock().unwrap();
+                let node = self.node.lock().unwrap_or_else(|e| e.into_inner());
                 let rows = node
                     .store_ref()
                     .inbox_fetch(&service, max)
@@ -419,18 +481,18 @@ impl Runtime {
                 ids,
                 respond,
             } => {
-                let mut node = self.node.lock().unwrap();
+                let mut node = self.node.lock().unwrap_or_else(|e| e.into_inner());
                 let n = node.store_mut().inbox_ack(&service, &ids).unwrap_or(0);
                 let _ = respond.send(n);
             }
             ApiCmd::Lookup { id, respond } => {
-                let mut node = self.node.lock().unwrap();
+                let mut node = self.node.lock().unwrap_or_else(|e| e.into_inner());
                 let (have, mode) = node.lookup(&id);
                 let path = node.has_path(&id);
                 let _ = respond.send((have, mode, path));
             }
             ApiCmd::NodeInfo { respond } => {
-                let node = self.node.lock().unwrap();
+                let node = self.node.lock().unwrap_or_else(|e| e.into_inner());
                 let info = NodeInfo {
                     id: node.own_id,
                     mode: self.mode,
@@ -442,7 +504,7 @@ impl Runtime {
                 let _ = respond.send(info);
             }
             ApiCmd::Drain { draining, respond } => {
-                let mut node = self.node.lock().unwrap();
+                let mut node = self.node.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(d) = draining {
                     node.set_draining(d);
                     self.draining.store(d, Ordering::Relaxed);
@@ -485,7 +547,7 @@ impl Runtime {
                     )
                     .map_err(|e| e.to_string())?;
                     let now = now_secs();
-                    let mut node = self.node.lock().unwrap();
+                    let mut node = self.node.lock().unwrap_or_else(|e| e.into_inner());
                     node.reload_identity(rotation.identity, now, !abandon)
                         .map_err(|e| e.to_string())?;
                     if abandon {
@@ -513,7 +575,7 @@ impl Runtime {
                     let identity = crate::keys::rotate_envelope_key(&dir, 2 * 24 * 3600)
                         .map_err(|e| e.to_string())?;
                     let now = now_secs();
-                    let mut node = self.node.lock().unwrap();
+                    let mut node = self.node.lock().unwrap_or_else(|e| e.into_inner());
                     node.reload_identity(identity, now, true)
                         .map_err(|e| e.to_string())?;
                     Ok("envelope key rotated; old key kept decrypt-only for 2 days".to_string())
@@ -531,9 +593,9 @@ impl Runtime {
     async fn handle_dial(
         &mut self,
         addr: String,
-        ik_key: Option<[u8; 32]>,
+        ik_key: Option<ChannelPublicKey>,
         path: Option<String>,
-        peer_id: Option<[u8; 32]>,
+        peer_id: Option<Identifier>,
     ) {
         let addr: std::net::SocketAddr = match addr.parse() {
             Ok(a) => a,
@@ -554,19 +616,25 @@ impl Runtime {
             (None, Some(p)) => lattice_net::PeerContact::Xx { addr, path: p },
             (None, None) => return,
         };
-        let seed = self.channel_seed;
-        match lattice_net::connect(contact, &seed).await {
+        match lattice_net::connect(contact, &self.channel_seed).await {
             Ok(io) => {
                 let remote_ck = io.remote_static;
-                self.attach_link(pinned, remote_ck, io);
+                self.attach_link(pinned, remote_ck, io, Some(addr));
+                if let Some(root) = self.roots.iter_mut().find(|r| r.addr == addr) {
+                    root.attempts = 0;
+                    root.next_attempt = now_secs() + 60;
+                }
             }
             Err(e) => {
                 eprintln!("lattice: dial {addr} failed: {e}");
             }
         }
+        if let Some(root) = self.roots.iter_mut().find(|r| r.addr == addr) {
+            root.in_flight = false;
+        }
     }
 
-    fn unlink(&mut self, peer: [u8; 32]) {
+    fn unlink(&mut self, peer: Identifier) {
         let dead: Vec<u64> = self
             .links
             .iter()
@@ -606,7 +674,7 @@ fn encode_event(event: u64, data: &lattice_proto::Value) -> Vec<u8> {
     lattice_proto::encode(&v)
 }
 
-fn encode_status_event(mid: [u8; 16], status: u64) -> Vec<u8> {
+fn encode_status_event(mid: MessageId, status: u64) -> Vec<u8> {
     encode_event(
         2,
         &lattice_proto::Value::map(vec![
@@ -625,24 +693,25 @@ fn encode_status_event(mid: [u8; 16], status: u64) -> Vec<u8> {
 /// Pin the configured peer id only for IK-authenticated dials. An XX dial
 /// proves nothing about who is on the other end; pinning then would bind the
 /// link to an unverified id. Record-based attribution binds it later.
-fn pinned_peer(ik: bool, peer_id: Option<[u8; 32]>) -> Option<[u8; 32]> {
+fn pinned_peer(ik: bool, peer_id: Option<Identifier>) -> Option<Identifier> {
     if ik { peer_id } else { None }
 }
 
 #[cfg(test)]
 mod tests {
     use super::pinned_peer;
+    use lattice_types::Identifier;
 
     #[test]
     fn ik_dial_pins_configured_id() {
-        let id = [7u8; 32];
+        let id = Identifier::from_bytes([7u8; 32]);
         assert_eq!(pinned_peer(true, Some(id)), Some(id));
         assert_eq!(pinned_peer(true, None), None);
     }
 
     #[test]
     fn xx_dial_never_pins() {
-        let id = [7u8; 32];
+        let id = Identifier::from_bytes([7u8; 32]);
         assert_eq!(pinned_peer(false, Some(id)), None);
         assert_eq!(pinned_peer(false, None), None);
     }

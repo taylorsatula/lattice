@@ -92,6 +92,8 @@ pub struct Limits {
     pub transit_cap: u64,
     #[serde(default = "default_inbox_max")]
     pub inbox_max: u64,
+    #[serde(default = "default_inbox_max_total")]
+    pub inbox_max_total: u64,
     #[serde(default = "default_snow_per_min")]
     pub snow_per_min: f64,
     #[serde(default = "default_sideways_prob")]
@@ -109,6 +111,7 @@ impl Default for Limits {
             custody_allowance: default_custody_allowance(),
             transit_cap: default_transit_cap(),
             inbox_max: default_inbox_max(),
+            inbox_max_total: default_inbox_max_total(),
             snow_per_min: default_snow_per_min(),
             sideways_prob: default_sideways_prob(),
             waypoint_share: 0.0,
@@ -126,6 +129,9 @@ fn default_transit_cap() -> u64 {
 fn default_inbox_max() -> u64 {
     1024
 }
+fn default_inbox_max_total() -> u64 {
+    4096
+}
 fn default_snow_per_min() -> f64 {
     2.0
 }
@@ -135,6 +141,23 @@ fn default_sideways_prob() -> f64 {
 fn default_reconcile_interval_secs() -> u64 {
     60
 }
+
+// Validation ceilings. The defaults are far below these; they exist to catch
+// unit mistakes and typos (e.g. 1000000000000 for bytes), not to constrain
+// legitimate deployments.
+/// Per-upstream-link custody allowance ceiling: 1 GiB (default 4 MiB).
+const MAX_CUSTODY_ALLOWANCE: u64 = 1 << 30;
+/// Total bytes held in transit ceiling: 64 GiB (default 256 MiB).
+const MAX_TRANSIT_CAP: u64 = 64 << 30;
+/// Deliveries per service inbox ceiling (default 1024).
+const MAX_INBOX_MAX: u64 = 100_000;
+/// Deliveries across all service inboxes ceiling (default 4096).
+const MAX_INBOX_MAX_TOTAL: u64 = 1_000_000;
+/// Dummy-traffic rate ceiling: 1000/minute, ~16 per second (default 2.0).
+const MAX_SNOW_PER_MIN: f64 = 1000.0;
+/// Anti-entropy interval ceiling: 1 day. Also keeps `now + interval` far
+/// from u64 overflow.
+const MAX_RECONCILE_INTERVAL_SECS: u64 = 86_400;
 
 pub fn load(path: &Path) -> Result<Config, String> {
     let text =
@@ -156,8 +179,10 @@ pub fn validate(cfg: &Config) -> Result<(), String> {
         return Err("at least one service must be configured".into());
     }
     for (name, svc) in &cfg.services {
-        if name.is_empty() || name.len() > 64 {
-            return Err(format!("service name {name:?} is invalid"));
+        if !valid_service_name(name) {
+            return Err(format!(
+                "service name {name:?} is invalid: use 1-64 chars of [A-Za-z0-9._-] (no whitespace or control characters)"
+            ));
         }
         if svc.secret.len() < 16 {
             return Err(format!(
@@ -190,6 +215,9 @@ pub fn validate(cfg: &Config) -> Result<(), String> {
         }
         // Full validation (host syntax, port) happens by building the record at startup.
     }
+    for (i, cidr) in cfg.hive.iter().enumerate() {
+        parse_cidr(cidr).map_err(|e| format!("hive[{i}] {cidr:?}: {e}"))?;
+    }
     for (i, root) in cfg.roots.iter().enumerate() {
         root.addr.parse::<std::net::SocketAddr>().map_err(|e| {
             format!(
@@ -208,6 +236,10 @@ pub fn validate(cfg: &Config) -> Result<(), String> {
         if let Some(id) = &root.id {
             decode_hex32(id).map_err(|e| format!("roots[{i}].id: {e}"))?;
         }
+        if let Some(p) = &root.path {
+            lattice_net::validate_upgrade_path(p)
+                .map_err(|_| format!("roots[{i}].path {p:?} is not a valid upgrade path"))?;
+        }
     }
     for (name, v) in [
         ("snow_per_min", cfg.limits.snow_per_min),
@@ -218,8 +250,44 @@ pub fn validate(cfg: &Config) -> Result<(), String> {
             return Err(format!("limits.{name} must be finite, got {v}"));
         }
     }
-    if cfg.limits.snow_per_min < 0.0 {
-        return Err("limits.snow_per_min must be >= 0".into());
+    if !(0.0..=MAX_SNOW_PER_MIN).contains(&cfg.limits.snow_per_min) {
+        return Err(format!(
+            "limits.snow_per_min must be in [0, {MAX_SNOW_PER_MIN}] (dummy messages per minute), got {}",
+            cfg.limits.snow_per_min
+        ));
+    }
+    if cfg.limits.custody_allowance > MAX_CUSTODY_ALLOWANCE {
+        return Err(format!(
+            "limits.custody_allowance must be <= {MAX_CUSTODY_ALLOWANCE} bytes (1 GiB), got {}",
+            cfg.limits.custody_allowance
+        ));
+    }
+    if cfg.limits.transit_cap > MAX_TRANSIT_CAP {
+        return Err(format!(
+            "limits.transit_cap must be <= {MAX_TRANSIT_CAP} bytes (64 GiB), got {}",
+            cfg.limits.transit_cap
+        ));
+    }
+    if cfg.limits.inbox_max > MAX_INBOX_MAX {
+        return Err(format!(
+            "limits.inbox_max must be <= {MAX_INBOX_MAX} deliveries, got {}",
+            cfg.limits.inbox_max
+        ));
+    }
+    if cfg.limits.inbox_max_total > MAX_INBOX_MAX_TOTAL {
+        return Err(format!(
+            "limits.inbox_max_total must be <= {MAX_INBOX_MAX_TOTAL} deliveries, got {}",
+            cfg.limits.inbox_max_total
+        ));
+    }
+    if cfg.limits.reconcile_interval_secs == 0 {
+        return Err("limits.reconcile_interval_secs must be >= 1 second".into());
+    }
+    if cfg.limits.reconcile_interval_secs > MAX_RECONCILE_INTERVAL_SECS {
+        return Err(format!(
+            "limits.reconcile_interval_secs must be <= {MAX_RECONCILE_INTERVAL_SECS} (1 day), got {}",
+            cfg.limits.reconcile_interval_secs
+        ));
     }
     for (name, v) in [
         ("sideways_prob", cfg.limits.sideways_prob),
@@ -228,6 +296,35 @@ pub fn validate(cfg: &Config) -> Result<(), String> {
         if !(0.0..=1.0).contains(&v) {
             return Err(format!("limits.{name} must be in [0, 1], got {v}"));
         }
+    }
+    Ok(())
+}
+
+/// Service names flow into event tags and logs; keep them to a conservative
+/// ASCII set so they are safe to print and match on.
+fn valid_service_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+}
+
+/// Parse `addr/prefix` CIDR notation. The address may be v4 or v6; the
+/// prefix must fit the address family. Host bits need not be zero.
+fn parse_cidr(s: &str) -> Result<(), String> {
+    let (addr, prefix) = s
+        .split_once('/')
+        .ok_or_else(|| "expected CIDR notation `<ip>/<prefix>`".to_string())?;
+    let ip: std::net::IpAddr = addr
+        .parse()
+        .map_err(|_| format!("{addr:?} is not an IP address"))?;
+    let prefix: u8 = prefix
+        .parse()
+        .map_err(|_| format!("{prefix:?} is not a valid prefix length"))?;
+    let max = if ip.is_ipv4() { 32 } else { 128 };
+    if prefix > max {
+        return Err(format!("prefix length {prefix} exceeds {max} for {ip}"));
     }
     Ok(())
 }
@@ -243,4 +340,145 @@ pub fn decode_hex32(s: &str) -> Result<[u8; 32], String> {
         .collect::<Result<Vec<u8>, _>>()?;
     <[u8; 32]>::try_from(bytes.as_slice())
         .map_err(|_| format!("expected 32 bytes, got {}", bytes.len()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BASE: &str = r#"
+[services]
+mira = { secret = "change-me-0123456789abcdef" }
+"#;
+
+    fn validate_str(toml_str: &str) -> Result<Config, String> {
+        let cfg: Config = toml::from_str(toml_str).map_err(|e| format!("parse: {e}"))?;
+        validate(&cfg)?;
+        Ok(cfg)
+    }
+
+    fn with_limits(limits: &str) -> String {
+        format!("{BASE}\n[limits]\n{limits}\n")
+    }
+
+    fn with_hive(hive: &str) -> String {
+        format!("hive = [{hive}]\n{BASE}")
+    }
+
+    #[test]
+    fn example_config_is_accepted() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../deploy/lattice.example.toml"
+        );
+        load(Path::new(path)).expect("shipped example config must validate");
+    }
+
+    #[test]
+    fn minimal_config_is_accepted() {
+        validate_str(BASE).expect("minimal config must validate");
+    }
+
+    #[test]
+    fn rejects_absurd_custody_allowance() {
+        let err = validate_str(&with_limits("custody_allowance = 1000000000000")).unwrap_err();
+        assert!(err.contains("custody_allowance"), "{err}");
+    }
+
+    #[test]
+    fn rejects_absurd_transit_cap() {
+        let err = validate_str(&with_limits("transit_cap = 1000000000000")).unwrap_err();
+        assert!(err.contains("transit_cap"), "{err}");
+    }
+
+    #[test]
+    fn rejects_absurd_inbox_max() {
+        let err = validate_str(&with_limits("inbox_max = 1000000000")).unwrap_err();
+        assert!(err.contains("inbox_max"), "{err}");
+    }
+
+    #[test]
+    fn rejects_absurd_inbox_max_total() {
+        let err = validate_str(&with_limits("inbox_max_total = 1000000000")).unwrap_err();
+        assert!(err.contains("inbox_max_total"), "{err}");
+    }
+
+    #[test]
+    fn rejects_zero_reconcile_interval() {
+        let err = validate_str(&with_limits("reconcile_interval_secs = 0")).unwrap_err();
+        assert!(err.contains("reconcile_interval_secs"), "{err}");
+    }
+
+    #[test]
+    fn rejects_unbounded_snow_per_min() {
+        let err = validate_str(&with_limits("snow_per_min = 1000000.0")).unwrap_err();
+        assert!(err.contains("snow_per_min"), "{err}");
+    }
+
+    #[test]
+    fn accepts_boundary_limits() {
+        validate_str(&with_limits(
+            "custody_allowance = 1073741824\n\
+             transit_cap = 68719476736\n\
+             inbox_max = 100000\n\
+             inbox_max_total = 1000000\n\
+             snow_per_min = 1000.0\n\
+             reconcile_interval_secs = 86400",
+        ))
+        .expect("boundary values must validate");
+    }
+
+    #[test]
+    fn rejects_garbage_hive_cidr() {
+        for bad in [
+            "garbage",
+            "10.0.0.0",
+            "10.0.0.0/33",
+            "::1/129",
+            "10.0.0.0/8/9",
+            "/8",
+            "10.0.0.0/",
+        ] {
+            let err = validate_str(&with_hive(&format!("\"{bad}\""))).unwrap_err();
+            assert!(err.contains("hive[0]"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn accepts_valid_hive_cidrs() {
+        let toml_str =
+            with_hive("\"10.0.0.0/8\", \"192.168.0.0/16\", \"fd00::/8\", \"2001:db8::/32\"");
+        validate_str(&toml_str).expect("valid CIDRs must validate");
+    }
+
+    #[test]
+    fn rejects_service_names_with_whitespace_or_control_chars() {
+        // TOML strings may contain spaces and tabs, so these reach validation.
+        for bad in ["my service", "svc\tname", " leading", "trailing "] {
+            let toml_str =
+                format!("[services]\n\"{bad}\" = {{ secret = \"change-me-0123456789abcdef\" }}\n");
+            let err = validate_str(&toml_str).unwrap_err();
+            assert!(err.contains("service name"), "{bad:?}: {err}");
+        }
+        // Other control characters are not TOML-representable; test the predicate.
+        for bad in [
+            "svc\nname",
+            "svc\u{7}name",
+            "svc\u{7f}name",
+            "",
+            "na/me",
+            "na:me",
+        ] {
+            assert!(!valid_service_name(bad), "{bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn accepts_conservative_service_names() {
+        for good in ["mira", "my-service", "my_service", "my.service", "Svc123"] {
+            let toml_str =
+                format!("[services]\n\"{good}\" = {{ secret = \"change-me-0123456789abcdef\" }}\n");
+            validate_str(&toml_str).unwrap_or_else(|e| panic!("{good}: {e}"));
+        }
+    }
 }

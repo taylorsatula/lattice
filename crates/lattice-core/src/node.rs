@@ -2,9 +2,10 @@
 //! randomness and persistence are injected.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use lattice_proto::frames::*;
-use lattice_proto::kel::{self, KeyEvent};
+use lattice_proto::kel::{KeyEvent, ValidatedKel};
 use lattice_proto::local;
 use lattice_proto::message::{
     BuildParams, Envelope, GatewaySeal, HopLayerPlain, KIND_MESSAGE, KIND_NEGATIVE_RECEIPT,
@@ -13,44 +14,32 @@ use lattice_proto::message::{
 use lattice_proto::record::{Mode, PeerRecord, Scope, compare_lww};
 use lattice_store::{CustodyAccept, CustodyEntry, InboxEntry, OutboundState, Store};
 
+use lattice_types::{
+    ChannelPublicKey, ChannelSeed, Commitment, DeliveryId, Hash32, Identifier, LegId, MessageId,
+    Signature, SigningPublicKey, SigningSeed, X25519PublicKey, XWingPublicKey, XWingSecretKey,
+};
+
 use crate::graph::Graph;
 use crate::reconcile::{self, ReconcileSession};
 use crate::rng::Rng;
 use crate::types::*;
 
 pub struct Identity {
-    pub signing_seed: [u8; 32],
-    pub kel: Vec<KeyEvent>,
-    pub channel_seed: [u8; 32],
-    pub xwing_secret: [u8; 32],
-    pub xwing_public: [u8; 1216],
+    pub signing_seed: SigningSeed,
+    /// The validated key event log. Validated at construction; rotation
+    /// re-validates on every append.
+    pub kel: ValidatedKel,
+    pub channel_seed: ChannelSeed,
+    pub xwing_secret: XWingSecretKey,
+    pub xwing_public: XWingPublicKey,
     /// Retired envelope (X-Wing) private keys kept for decryption only,
     /// each with the unix time after which it must be deleted. Rotation
     /// replaces the active key; retired keys decrypt envelopes that were
     /// in flight when the rotation happened.
-    pub retired_xwing: Vec<([u8; 32], u64)>,
+    pub retired_xwing: Vec<(XWingSecretKey, u64)>,
 }
 
 impl Identity {
-    pub fn generate() -> Self {
-        let signing_seed = lattice_crypto::generate_seed();
-        let next_seed = lattice_crypto::generate_seed();
-        let inception = KeyEvent::inception(&signing_seed, hash_next(&next_seed));
-        // Keep the next seed only if the caller wants pre-rotation; for now the
-        // daemon stores it separately (see lattice-crypto). The inception
-        // commits to it; losing it strands rotation, which is the intended UX.
-        let _ = next_seed;
-        let kp = lattice_crypto::generate_keypair();
-        Identity {
-            signing_seed,
-            kel: vec![inception],
-            channel_seed: lattice_crypto::os_bytes::<32>(),
-            xwing_secret: kp.secret,
-            xwing_public: kp.public,
-            retired_xwing: Vec::new(),
-        }
-    }
-
     /// Rotate the signing key using the pre-committed next key.
     ///
     /// `next_seed` must hash to the current head's `next` commitment.
@@ -58,10 +47,10 @@ impl Identity {
     /// the identity permanently (a rotation with no next-key commitment).
     pub fn rotate(
         &mut self,
-        next_seed: &[u8; 32],
-        new_next_seed: Option<[u8; 32]>,
+        next_seed: &SigningSeed,
+        new_next_seed: Option<SigningSeed>,
     ) -> Result<(), String> {
-        let head = self.kel.last().ok_or("empty key event log")?;
+        let head = self.kel.events().last().ok_or("empty key event log")?;
         let committed = head
             .next
             .ok_or("identity is abandoned; it cannot rotate further")?;
@@ -70,27 +59,24 @@ impl Identity {
         }
         let next_hash = new_next_seed.as_ref().map(hash_next);
         let event = KeyEvent::rotation(head, next_seed, next_hash);
-        self.kel.push(event);
-        self.signing_seed = *next_seed;
+        self.kel.append(event).map_err(|e| e.to_string())?;
+        self.signing_seed = next_seed.clone();
         Ok(())
     }
 
     /// True if the KEL ends in an abandonment (a rotation with no next-key
     /// commitment). An abandoned identity must not sign or publish.
     pub fn is_abandoned(&self) -> bool {
-        match self.kel.last() {
-            Some(e) => e.kind == kel::KeyEventKind::Rotation && e.next.is_none(),
-            None => true,
-        }
+        self.kel.is_abandoned()
     }
 
     /// Rotate the envelope key: generate a fresh X-Wing keypair, move the
     /// current private key into the retired set (decrypt-only) until
     /// `retire_at`, and return the new public key.
-    pub fn rotate_envelope(&mut self, retire_at: u64) -> [u8; 1216] {
+    pub fn rotate_envelope(&mut self, retire_at: u64) -> XWingPublicKey {
         let kp = lattice_crypto::generate_keypair();
-        self.retired_xwing.push((self.xwing_secret, retire_at));
-        self.xwing_secret = kp.secret;
+        let old = std::mem::replace(&mut self.xwing_secret, kp.secret);
+        self.retired_xwing.push((old, retire_at));
         self.xwing_public = kp.public;
         self.xwing_public
     }
@@ -120,7 +106,12 @@ impl Identity {
     }
 
     /// Build an identity deterministically from a 32-byte seed. Used by the
-    /// simulator so runs are reproducible; production uses `generate`.
+    /// simulator so runs are reproducible.
+    ///
+    /// The caller must retain `seed` to rotate later: the next signing key
+    /// is derived from it (`seed || "next"`), and the daemon never stores
+    /// it. Dropping the seed strands the identity's rotation capability,
+    /// though the identity itself remains valid.
     pub fn from_seed(seed: &[u8; 32]) -> Self {
         let derive = |tag: &[u8]| {
             let mut v = Vec::with_capacity(32 + tag.len());
@@ -128,41 +119,47 @@ impl Identity {
             v.extend_from_slice(tag);
             lattice_crypto::hash(&v)
         };
-        let signing_seed = derive(b"signing");
-        let next_seed = derive(b"next");
+        let signing_seed = SigningSeed::from_bytes(derive(b"signing").into_bytes());
+        let next_seed = SigningSeed::from_bytes(derive(b"next").into_bytes());
         let inception = KeyEvent::inception(&signing_seed, hash_next(&next_seed));
-        let channel_seed = derive(b"channel");
-        let xwing_seed = derive(b"xwing");
-        let xwing_secret = lattice_crypto::XWingSecretKey::from_bytes(xwing_seed);
-        let xwing_public = xwing_secret.public_key();
+        let kel = ValidatedKel::validate(vec![inception])
+            .expect("a freshly built inception event is valid by construction");
+        let channel_seed = ChannelSeed::from_bytes(derive(b"channel").into_bytes());
+        let xwing_secret = XWingSecretKey::from_bytes(derive(b"xwing").into_bytes());
+        let xwing_public = lattice_crypto::xwing_public_key(&xwing_secret);
         Identity {
             signing_seed,
-            kel: vec![inception],
+            kel,
             channel_seed,
-            xwing_secret: xwing_seed,
+            xwing_secret,
             xwing_public,
             retired_xwing: Vec::new(),
         }
     }
 
-    pub fn id(&self) -> [u8; 32] {
-        kel::identifier(&self.kel).expect("inception validates")
+    pub fn id(&self) -> Identifier {
+        self.kel.identifier()
     }
 }
 
-fn hash_next(seed: &[u8; 32]) -> [u8; 32] {
-    lattice_crypto::hash(&lattice_crypto::public_key(seed))
+fn hash_next(seed: &SigningSeed) -> Commitment {
+    Commitment::from_bytes(
+        lattice_crypto::hash(lattice_crypto::public_key(seed).as_ref()).into_bytes(),
+    )
 }
 
 /// Preimage for a channel attestation: binds the signer's Ed25519 channel
 /// key and the verifier's X25519 channel key. Both sides can compute it:
 /// the signer knows both keys, the verifier knows the signer's (from the
 /// record) and its own (from its seed).
-fn attestation_preimage(signer_ed_ck: &[u8; 32], verifier_x_ck: &[u8; 32]) -> [u8; 32] {
+fn attestation_preimage(
+    signer_ed_ck: &ChannelPublicKey,
+    verifier_x_ck: &X25519PublicKey,
+) -> Hash32 {
     let mut h = Vec::with_capacity(22 + 64);
     h.extend_from_slice(b"lattice attestation v1");
-    h.extend_from_slice(signer_ed_ck);
-    h.extend_from_slice(verifier_x_ck);
+    h.extend_from_slice(signer_ed_ck.as_ref());
+    h.extend_from_slice(verifier_x_ck.as_ref());
     lattice_crypto::hash(&h)
 }
 
@@ -177,38 +174,38 @@ struct PendingOffer {
 
 enum PendingOrigin {
     Outbound {
-        mid: [u8; 16],
+        mid: MessageId,
     },
     /// Custody-entry key of the relay entry this offer belongs to.
     Relay {
-        custody_leg: [u8; 16],
+        custody_leg: LegId,
     },
 }
 
 struct LinkState {
     /// `None` while the peer's identity is not safely established.
-    peer: Option<[u8; 32]>,
-    remote_ck: [u8; 32],
+    peer: Option<Identifier>,
+    remote_ck: X25519PublicKey,
     /// True when the peer id was pinned by operator config (root `id`); pinned
     /// bindings are never re-derived from records or revoked by contest.
     pinned: bool,
     /// The peer's attestation (id, signature), received on this link.
     /// Verified against our records in `reevaluate_link_bindings`.
-    attestation: Option<([u8; 32], [u8; 64])>,
+    attestation: Option<(Identifier, Signature)>,
 }
 
 pub struct Node<S: Store> {
     pub config: Config,
     identity: Identity,
     store: S,
-    pub own_id: [u8; 32],
+    pub own_id: Identifier,
     scope: Scope,
     own_seq: u64,
     links: HashMap<LinkId, LinkState>,
     next_link_order: Vec<LinkId>,
     reconcile_sessions: HashMap<LinkId, ReconcileSession>,
-    pending: HashMap<[u8; 16], PendingOffer>,
-    outbound_exclusions: HashMap<[u8; 16], Vec<(LinkId, u64)>>,
+    pending: HashMap<LegId, PendingOffer>,
+    outbound_exclusions: HashMap<MessageId, Vec<(LinkId, u64)>>,
     snow_next: u64,
     frames_since_snow_tick: u32,
     snow_history: [u64; 3],
@@ -222,10 +219,24 @@ pub struct Node<S: Store> {
     /// channel_key -> set of node ids whose records claim that key.
     /// Attribution of a link to a peer is allowed only when exactly one id
     /// claims the link's channel key; more than one fails closed.
-    ck_claims: HashMap<[u8; 32], std::collections::HashSet<[u8; 32]>>,
+    ck_claims: HashMap<X25519PublicKey, std::collections::HashSet<Identifier>>,
     next_claim_sweep_at: u64,
     next_data_sweep_at: u64,
     contested: u64,
+    /// Bumped on every record-set mutation (admit, sweep, publish, or any
+    /// `store_mut`). Keys the derived-data caches below.
+    records_version: u64,
+    /// Memoized routing graph. Stored bytes are untrusted and are
+    /// re-validated whenever the record set changes (see `records_version`);
+    /// within a stable record set the graph is a pure function of the
+    /// records, so re-validating on every routing decision would be a
+    /// remote-triggerable CPU amplifier.
+    graph_cache: Option<(u64, u64, Arc<Graph>)>,
+    /// Memoized reconcile item list; same invalidation as `graph_cache`.
+    items_cache: Option<(u64, u64, Vec<reconcile::Item>)>,
+    /// Memoized validation of stored records, keyed by (id, scope). Same
+    /// invalidation as the graph cache; bounded, cleared when full.
+    record_cache: HashMap<(Identifier, u8), (u64, u64, Option<PeerRecord>)>,
 }
 
 impl<S: Store> Node<S> {
@@ -273,6 +284,10 @@ impl<S: Store> Node<S> {
             next_claim_sweep_at: now + CLAIM_SWEEP_SECS,
             next_data_sweep_at: now + DATA_SWEEP_SECS,
             contested: 0,
+            records_version: 0,
+            graph_cache: None,
+            items_cache: None,
+            record_cache: HashMap::new(),
         };
         // Seed the claim set from records already in the store so links can be
         // attributed immediately after a restart.
@@ -388,7 +403,7 @@ impl<S: Store> Node<S> {
     fn build_own_record(&self, seq: u64, now: u64) -> Result<(PeerRecord, Vec<u8>), String> {
         let exp = now + 7 * 24 * 3600;
         let private = self.config.mode == Mode::Private;
-        let links: Vec<[u8; 32]> = if private {
+        let links: Vec<Identifier> = if private {
             vec![]
         } else {
             self.links.values().filter_map(|l| l.peer).collect()
@@ -416,7 +431,7 @@ impl<S: Store> Node<S> {
                 seq,
                 exp,
                 channel_key: lattice_crypto::channel_public(&self.identity.channel_seed),
-                channel_seed: self.identity.channel_seed,
+                channel_seed: self.identity.channel_seed.clone(),
                 envelope_key: self.identity.xwing_public,
                 mode: self.config.mode,
                 scope: self.scope,
@@ -438,6 +453,7 @@ impl<S: Store> Node<S> {
         self.store
             .record_put(&id, self.scope, &bytes, now)
             .map_err(|e| e.to_string())?;
+        self.records_version += 1;
         Ok(())
     }
 
@@ -445,8 +461,8 @@ impl<S: Store> Node<S> {
         &mut self,
         at: u64,
         link: LinkId,
-        peer: Option<[u8; 32]>,
-        remote_ck: [u8; 32],
+        peer: Option<Identifier>,
+        remote_ck: X25519PublicKey,
         wan: bool,
     ) -> Vec<Action> {
         self.touch(at);
@@ -473,15 +489,15 @@ impl<S: Store> Node<S> {
         // Prove possession of our KEL key to the peer, bound to this
         // channel. The peer folds this into its link binding; without it
         // the link is attributed only from record claims.
-        vec![self.attestation_frame(link, remote_ck)]
+        vec![self.attestation_frame(link, &remote_ck)]
     }
 
     /// Build the attestation frame for a link: proof that we hold the KEL
     /// signing key for our id, bound to this channel.
-    fn attestation_frame(&self, link: LinkId, remote_ck: [u8; 32]) -> Action {
+    fn attestation_frame(&self, link: LinkId, remote_ck: &X25519PublicKey) -> Action {
         let own_ck = lattice_crypto::channel_public(&self.identity.channel_seed);
-        let preimage = attestation_preimage(&own_ck, &remote_ck);
-        let sig = lattice_crypto::sign(&self.identity.signing_seed, &preimage);
+        let preimage = attestation_preimage(&own_ck, remote_ck);
+        let sig = lattice_crypto::sign(&self.identity.signing_seed, preimage.as_ref());
         Action::SendFrame {
             pad_to: None,
             link,
@@ -502,8 +518,21 @@ impl<S: Store> Node<S> {
         Vec::new()
     }
 
-    fn build_graph(&self) -> Graph {
-        type RecordParts = ([u8; 32], Vec<[u8; 32]>, Vec<[u8; 32]>);
+    /// Build the routing graph from the stored records.
+    ///
+    /// Stored bytes are untrusted and re-validated on read; the result is
+    /// memoized on `(records_version, now)` so repeated calls within one
+    /// operation (relay path, `class_for`, `pick_next_hop`) validate the
+    /// store once instead of once per call. Any record-set mutation or the
+    /// passage of time invalidates the memo.
+    fn build_graph(&mut self) -> Arc<Graph> {
+        let key = (self.records_version, self.now);
+        if let Some((v, t, g)) = &self.graph_cache {
+            if (*v, *t) == key {
+                return Arc::clone(g);
+            }
+        }
+        type RecordParts = (Identifier, Vec<Identifier>, Vec<Identifier>);
         let records: Vec<RecordParts> = self
             .store
             .record_all()
@@ -527,10 +556,20 @@ impl<S: Store> Node<S> {
                 graph.add_edge(*id, *gw);
             }
         }
+        let graph = Arc::new(graph);
+        self.graph_cache = Some((key.0, key.1, Arc::clone(&graph)));
         graph
     }
 
-    fn record_items(&self) -> Vec<reconcile::Item> {
+    /// Reconcile item list for the stored records. Memoized on the same
+    /// key as [`Self::build_graph`].
+    fn record_items(&mut self) -> Vec<reconcile::Item> {
+        let key = (self.records_version, self.now);
+        if let Some((v, t, items)) = &self.items_cache {
+            if (*v, *t) == key {
+                return items.clone();
+            }
+        }
         let mut items: Vec<reconcile::Item> = self
             .store
             .record_all()
@@ -548,6 +587,7 @@ impl<S: Store> Node<S> {
             .collect();
         items.sort();
         items.dedup();
+        self.items_cache = Some((key.0, key.1, items.clone()));
         items
     }
 
@@ -619,7 +659,8 @@ impl<S: Store> Node<S> {
     /// lifecycle is a separate decision), so this keys off validity at
     /// `now`; when a record-expiry sweep lands it will plug in here.
     fn sweep_ck_claims(&mut self, now: u64) {
-        let mut fresh: HashMap<[u8; 32], std::collections::HashSet<[u8; 32]>> = HashMap::new();
+        let mut fresh: HashMap<X25519PublicKey, std::collections::HashSet<Identifier>> =
+            HashMap::new();
         if let Ok(records) = self.store.record_all() {
             for (_, _, bytes, _) in records {
                 if let Ok((rec, _)) = PeerRecord::from_bytes(&bytes, now, None) {
@@ -638,24 +679,25 @@ impl<S: Store> Node<S> {
     /// Retention sweep: drop records and terminal outbound messages past
     /// expiry + grace, and KEL heads not seen for a year. Records are the
     /// only unbounded growth left in the store; everything else already
-    /// expires (seen/delivered/wary) or is capped (inbox, custody).
+    /// expires (seen/delivered) or is capped (inbox, custody).
     fn sweep_expired_data(&mut self, now: u64) {
         if let Ok(records) = self.store.record_all() {
             for (id, scope, bytes, _) in records {
                 if id == self.own_id {
                     continue;
                 }
-                // Parse with now = 0 so expired-but-present records still
-                // decode; anything undecodable is useless and goes too.
-                let expired = match PeerRecord::from_bytes(&bytes, 0, None) {
+                // Skip the time check: expired records must still decode so
+                // the grace period can elapse; undecodable records are dropped.
+                let expired = match PeerRecord::from_bytes_unchecked_time(&bytes, None) {
                     Ok((rec, _)) => rec.exp.saturating_add(RETENTION_GRACE_SECS) < now,
                     Err(_) => true,
                 };
-                if expired {
-                    let _ = self.store.record_remove(&id, scope);
+                if expired && self.store.record_remove(&id, scope).is_ok() {
+                    self.records_version += 1;
                 }
             }
         }
+        let _ = self.store.inbox_sweep_expired(INBOX_TTL_SECS, now);
         if let Ok(all) = self.store.outbound_all() {
             for msg in all {
                 let terminal = matches!(
@@ -675,7 +717,7 @@ impl<S: Store> Node<S> {
 
     /// The claim key for a record's channel key: the X25519 form, matching
     /// what the Noise handshake reports as the peer's static key.
-    fn claim_key(rec: &PeerRecord) -> Option<[u8; 32]> {
+    fn claim_key(rec: &PeerRecord) -> Option<X25519PublicKey> {
         lattice_crypto::channel_x25519_public_from_ed25519(&rec.channel_key)
     }
 
@@ -699,13 +741,15 @@ impl<S: Store> Node<S> {
     /// Verify a peer's attestation against our records. The record for
     /// `id` must claim this link's channel key, and the signature must
     /// verify under that record's KEL key.
-    fn attestation_valid(&self, remote_ck: &[u8; 32], id: &[u8; 32], sig: &[u8; 64]) -> bool {
+    fn attestation_valid(
+        &mut self,
+        remote_ck: &X25519PublicKey,
+        id: &Identifier,
+        sig: &Signature,
+    ) -> bool {
         let own_x = lattice_crypto::channel_x25519_public(&self.identity.channel_seed);
         for scope in [Scope::Wan, Scope::Hive] {
-            let Ok(Some((bytes, _))) = self.store.record_get(id, scope) else {
-                continue;
-            };
-            let Ok((rec, _)) = PeerRecord::from_bytes(&bytes, self.now, None) else {
+            let Some(rec) = self.validated_record(id, scope) else {
                 continue;
             };
             let Some(x) = lattice_crypto::channel_x25519_public_from_ed25519(&rec.channel_key)
@@ -716,7 +760,7 @@ impl<S: Store> Node<S> {
                 continue;
             }
             let preimage = attestation_preimage(&rec.channel_key, &own_x);
-            if lattice_crypto::verify(&rec.current_signing_key(), &preimage, sig) {
+            if lattice_crypto::verify(&rec.current_signing_key(), preimage.as_ref(), sig) {
                 return true;
             }
         }
@@ -726,15 +770,20 @@ impl<S: Store> Node<S> {
     fn reevaluate_link_bindings(&mut self, at: u64) {
         // Pass 1: attestation wins over record claims — it is direct proof
         // of KEL possession, not a third-party claim about a channel key.
-        let mut attested: HashMap<LinkId, [u8; 32]> = HashMap::new();
-        for (link_id, link) in &self.links {
-            if link.pinned {
-                continue;
-            }
-            if let Some((id, sig)) = &link.attestation {
-                if self.attestation_valid(&link.remote_ck, id, sig) {
-                    attested.insert(*link_id, *id);
-                }
+        let pending: Vec<(LinkId, X25519PublicKey, Identifier, Signature)> = self
+            .links
+            .iter()
+            .filter(|(_, link)| !link.pinned)
+            .filter_map(|(link_id, link)| {
+                link.attestation
+                    .as_ref()
+                    .map(|(id, sig)| (*link_id, link.remote_ck, *id, *sig))
+            })
+            .collect();
+        let mut attested: HashMap<LinkId, Identifier> = HashMap::new();
+        for (link_id, remote_ck, id, sig) in pending {
+            if self.attestation_valid(&remote_ck, &id, &sig) {
+                attested.insert(link_id, id);
             }
         }
         let mut changed = false;
@@ -782,19 +831,28 @@ impl<S: Store> Node<S> {
         }
     }
     fn admit_record(&mut self, at: u64, bytes: &[u8]) -> bool {
-        let known = match PeerRecord::from_bytes(bytes, at, None) {
-            Ok((rec, _)) => self
-                .store
-                .kel_head(&rec.id)
-                .ok()
-                .flatten()
-                .map(|(seq, commitment, _)| (seq, commitment)),
+        // Decode once to learn the claimed id, look up the known head,
+        // then validate exactly once. Validating the bytes twice (the old
+        // behavior) doubled the KEL signature checks on every admission.
+        let decoded = match lattice_proto::record::PeerRecord::decode(bytes) {
+            Ok(d) => d,
             Err(_) => return false,
         };
-        match PeerRecord::from_bytes(bytes, at, known) {
+        let known = match self.store.kel_head(&decoded.id()) {
+            Ok(k) => k.map(|(seq, commitment, _)| (seq, commitment)),
+            // Fail closed: without the known head we cannot rule out
+            // equivocation, so refuse the record.
+            Err(_) => return false,
+        };
+        match decoded.validate(Some(at), known) {
             Ok((rec, head)) => {
                 let scope = rec.scope;
-                let existing = self.store.record_get(&rec.id, scope).ok().flatten();
+                let existing = match self.store.record_get(&rec.id, scope) {
+                    Ok(e) => e,
+                    // Fail closed: without the current row we cannot apply
+                    // last-writer-wins, so keep what we have.
+                    Err(_) => return false,
+                };
                 if let Some((old_bytes, _)) = existing {
                     // Lower-hash wins at equal seq (equivocation rule);
                     // otherwise normal last-writer-wins by seq.
@@ -810,9 +868,13 @@ impl<S: Store> Node<S> {
                         return false; // keep ours
                     }
                 }
-                let _ = self.store.record_put(&rec.id, scope, bytes, at);
+                if self.store.record_put(&rec.id, scope, bytes, at).is_ok() {
+                    self.records_version += 1;
+                }
                 let known = self.store.kel_head(&rec.id).ok().flatten();
-                if known.map(|(seq, _, _)| head.seq > seq).unwrap_or(true) {
+                // Only advance the stored head when we could read it; on a
+                // read error, leave it alone rather than overwrite blindly.
+                if known.map(|(seq, _, _)| head.seq > seq).unwrap_or(false) {
                     let _ = self
                         .store
                         .kel_head_put(&rec.id, head.seq, head.commitment, at);
@@ -830,7 +892,24 @@ impl<S: Store> Node<S> {
 // Messaging engine
 // ============================================================
 
-type BuildResult = (Vec<u8>, [u8; 32], Option<[u8; 32]>);
+type BuildResult = (Vec<u8>, Identifier, Option<Identifier>);
+
+/// Why a message could not be built for sending.
+enum BuildError {
+    /// No route to the destination (no record, no gateway, no waypoint).
+    /// Retryable: the network may learn a route later.
+    NoRoute,
+    /// Cryptographic or encoding failure. Deterministic for the same inputs,
+    /// so retrying is pointless; surfaces as ERR_INTERNAL. The underlying
+    /// error is dropped: the sans-IO core has no diagnostic channel yet.
+    Crypto,
+}
+
+impl From<lattice_proto::ProtoError> for BuildError {
+    fn from(_: lattice_proto::ProtoError) -> Self {
+        BuildError::Crypto
+    }
+}
 
 enum DispatchResult {
     Sent,
@@ -844,6 +923,8 @@ const MAX_PENDING_ECHOES: usize = 256;
 const DATA_SWEEP_SECS: u64 = 3600;
 /// Grace period past a record's/message's expiry before it is purged.
 const RETENTION_GRACE_SECS: u64 = 7 * 24 * 3600;
+/// Undelivered inbox entries older than this are dropped by the sweep.
+const INBOX_TTL_SECS: u64 = 30 * 24 * 3600;
 /// KEL heads not seen for this long are dropped (spec: one year).
 const KEL_HEAD_MAX_AGE_SECS: u64 = 365 * 24 * 3600;
 const BUF_CLASSES: usize = 16;
@@ -851,8 +932,10 @@ const BUF_CLASSES: usize = 16;
 impl<S: Store> Node<S> {
     fn on_app_send(&mut self, send: AppSend) -> Vec<Action> {
         let now = self.now;
-        let mid: [u8; 16] = send.mid_hint.unwrap_or_else(lattice_crypto::os_bytes::<16>);
-        if self.lookup_record(&send.to).is_none() {
+        let mid: MessageId = send
+            .mid_hint
+            .unwrap_or_else(|| MessageId::from_bytes(lattice_crypto::os_bytes::<16>()));
+        if !self.has_record(&send.to) {
             return vec![Action::Status {
                 mid,
                 status: local::MSG_STATUS_FAILED,
@@ -878,7 +961,7 @@ impl<S: Store> Node<S> {
             body: Some(send.body.clone()),
             reference: None,
             reason: None,
-            sig: [0; 64],
+            sig: Signature::from_bytes([0; 64]),
         };
 
         let receipt_timeout = if self.record_mode(&send.to) == Some(Mode::Private) {
@@ -918,31 +1001,68 @@ impl<S: Store> Node<S> {
         actions
     }
 
-    fn lookup_record(&self, id: &[u8; 32]) -> Option<Vec<u8>> {
+    /// Presence check only; does not validate. Used where a missing record
+    /// is the error condition and validation happens (and is memoized)
+    /// downstream.
+    fn has_record(&self, id: &Identifier) -> bool {
         for scope in [Scope::Wan, Scope::Hive] {
-            if let Ok(Some((bytes, _))) = self.store.record_get(id, scope) {
-                return Some(bytes);
+            if let Ok(Some(_)) = self.store.record_get(id, scope) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Validate a stored record, memoized on `(records_version, now)`.
+    /// Stored bytes are untrusted; the memo is keyed on the record-set
+    /// version and the current time, so it never serves a result that a
+    /// fresh read would not produce. Bounded; cleared when full.
+    fn validated_record(&mut self, id: &Identifier, scope: Scope) -> Option<PeerRecord> {
+        let key = (*id, scope_as_u8(scope));
+        let tag = (self.records_version, self.now);
+        if let Some((v, t, rec)) = self.record_cache.get(&key) {
+            if (*v, *t) == tag {
+                return rec.clone();
+            }
+        }
+        let rec = self
+            .store
+            .record_get(id, scope)
+            .ok()
+            .flatten()
+            .and_then(|(bytes, _)| {
+                PeerRecord::from_bytes(&bytes, self.now, None)
+                    .ok()
+                    .map(|(r, _)| r)
+            });
+        if self.record_cache.len() >= 256 {
+            self.record_cache.clear();
+        }
+        self.record_cache.insert(key, (tag.0, tag.1, rec.clone()));
+        rec
+    }
+
+    /// Look up and validate a record in either scope (WAN first, then hive).
+    fn lookup_validated(&mut self, id: &Identifier) -> Option<PeerRecord> {
+        for scope in [Scope::Wan, Scope::Hive] {
+            if let Some(rec) = self.validated_record(id, scope) {
+                return Some(rec);
             }
         }
         None
     }
 
-    fn record_mode(&self, id: &[u8; 32]) -> Option<Mode> {
-        PeerRecord::from_bytes(&self.lookup_record(id)?, self.now, None)
-            .ok()
-            .map(|(r, _)| r.mode)
+    fn record_mode(&mut self, id: &Identifier) -> Option<Mode> {
+        self.lookup_validated(id).map(|r| r.mode)
     }
 
-    fn record_envelope_key(&self, id: &[u8; 32]) -> Option<[u8; 1216]> {
-        PeerRecord::from_bytes(&self.lookup_record(id)?, self.now, None)
-            .ok()
-            .map(|(r, _)| r.envelope_key)
+    fn record_envelope_key(&mut self, id: &Identifier) -> Option<XWingPublicKey> {
+        self.lookup_validated(id).map(|r| r.envelope_key)
     }
 
-    fn record_gateways(&self, id: &[u8; 32]) -> Vec<[u8; 32]> {
-        self.lookup_record(id)
-            .and_then(|b| PeerRecord::from_bytes(&b, self.now, None).ok())
-            .map(|(r, _)| r.gateways)
+    fn record_gateways(&mut self, id: &Identifier) -> Vec<Identifier> {
+        self.lookup_validated(id)
+            .map(|r| r.gateways)
             .unwrap_or_default()
     }
 
@@ -951,17 +1071,23 @@ impl<S: Store> Node<S> {
         &mut self,
         msg: &lattice_store::OutboundMessage,
         force_waypoint: bool,
-    ) -> Result<BuildResult, ()> {
-        let recipient_private = self.record_mode(&msg.recipient) == Some(Mode::Private);
+    ) -> Result<BuildResult, BuildError> {
+        let recipient_rec = self.lookup_validated(&msg.recipient);
+        let recipient_private = recipient_rec
+            .as_ref()
+            .is_some_and(|r| r.mode == Mode::Private);
         let gateway_choice = if recipient_private {
-            self.record_gateways(&msg.recipient)
+            recipient_rec
+                .as_ref()
+                .map(|r| r.gateways.clone())
+                .unwrap_or_default()
                 .into_iter()
-                .find(|g| self.record_envelope_key(g).is_some())
+                .find_map(|g| self.record_envelope_key(&g).map(|ek| (g, ek)))
         } else {
             None
         };
         if recipient_private && gateway_choice.is_none() {
-            return Err(());
+            return Err(BuildError::NoRoute);
         }
 
         let want_waypoint = force_waypoint
@@ -978,16 +1104,21 @@ impl<S: Store> Node<S> {
             None
         };
 
-        let recipient_ek = self.record_envelope_key(&msg.recipient).ok_or(())?;
-        let real_dst = gateway_choice.unwrap_or(msg.recipient);
-        let gateway = gateway_choice.map(|g| GatewaySeal {
-            gateway_ek: self.record_envelope_key(&g).expect("checked above"),
+        let recipient_ek = recipient_rec
+            .map(|r| r.envelope_key)
+            .ok_or(BuildError::NoRoute)?;
+        let real_dst = gateway_choice
+            .as_ref()
+            .map(|(g, _)| *g)
+            .unwrap_or(msg.recipient);
+        let gateway = gateway_choice.map(|(_g, gateway_ek)| GatewaySeal {
+            gateway_ek,
             rcpt: msg.recipient,
         });
         let waypoint = waypoint_choice.map(|(id, ek)| WaypointSeal {
             waypoint_id: id,
             waypoint_ek: ek,
-            leg: lattice_crypto::os_bytes::<16>(),
+            leg: LegId::from_bytes(lattice_crypto::os_bytes::<16>()),
             exp: msg.exp,
         });
         let used_waypoint_id = waypoint.as_ref().map(|w| w.waypoint_id);
@@ -996,26 +1127,26 @@ impl<S: Store> Node<S> {
             sender_seed: &self.identity.signing_seed,
             recipient_ek: &recipient_ek,
             real_dst,
-            leg: lattice_crypto::os_bytes::<16>(),
+            leg: LegId::from_bytes(lattice_crypto::os_bytes::<16>()),
             exp: msg.exp,
             gateway,
             waypoint,
         })
-        .map_err(|_| ())?;
+        .map_err(|_| BuildError::Crypto)?;
         Ok((wire, real_dst, used_waypoint_id))
     }
 
     fn pick_waypoint(
         &mut self,
-        recipient: &[u8; 32],
-        exclude: &[[u8; 32]],
-    ) -> Option<([u8; 32], [u8; 1216])> {
+        recipient: &Identifier,
+        exclude: &[Identifier],
+    ) -> Option<(Identifier, XWingPublicKey)> {
         // Spec: exclude the sender's own links and the recipient's gateways
         // (a gateway is already the entry point; it is not a waypoint).
-        let own_links: HashSet<[u8; 32]> = self.links.values().filter_map(|l| l.peer).collect();
-        let recipient_gateways: HashSet<[u8; 32]> =
+        let own_links: HashSet<Identifier> = self.links.values().filter_map(|l| l.peer).collect();
+        let recipient_gateways: HashSet<Identifier> =
             self.record_gateways(recipient).into_iter().collect();
-        let mut candidates: Vec<([u8; 32], [u8; 1216])> = self
+        let mut candidates: Vec<(Identifier, XWingPublicKey)> = self
             .store
             .record_all()
             .unwrap_or_default()
@@ -1075,7 +1206,7 @@ impl<S: Store> Node<S> {
                         }
                     }
                 }
-                Err(()) => {
+                Err(BuildError::NoRoute) => {
                     if msg.attempts > self.config.fresh_waypoint_retries + 1 {
                         msg.state = OutboundState::Failed;
                         let _ = self.store.outbound_put(&msg);
@@ -1095,12 +1226,28 @@ impl<S: Store> Node<S> {
                         let _ = self.store.outbound_put(&msg);
                     }
                 }
+                Err(BuildError::Crypto) => {
+                    // Deterministic failure: retrying cannot help.
+                    msg.state = OutboundState::Failed;
+                    let _ = self.store.outbound_put(&msg);
+                    let _ = self.store.status_set(
+                        &msg.mid,
+                        local::MSG_STATUS_FAILED,
+                        Some(ERR_INTERNAL),
+                    );
+                    actions.push(Action::Status {
+                        mid: msg.mid,
+                        status: local::MSG_STATUS_FAILED,
+                        detail: Some(ERR_INTERNAL),
+                        service: msg.envelope.fsvc.clone(),
+                    });
+                }
             }
         }
         actions
     }
 
-    fn receipt_timeout_for(&self, msg: &lattice_store::OutboundMessage) -> u64 {
+    fn receipt_timeout_for(&mut self, msg: &lattice_store::OutboundMessage) -> u64 {
         if self.record_mode(&msg.recipient) == Some(Mode::Private) {
             self.config.receipt_timeout_private
         } else {
@@ -1116,10 +1263,10 @@ impl<S: Store> Node<S> {
 
     fn pick_next_hop(
         &mut self,
-        dst: &[u8; 32],
+        dst: &Identifier,
         exclude: &[(LinkId, u64)],
         now: u64,
-    ) -> Option<(LinkId, [u8; 32])> {
+    ) -> Option<(LinkId, Identifier)> {
         // A directly connected peer is always one hop away, even when the
         // record graph has no path to it (a private instance publishes no
         // links). Honor exclusions like any other hop.
@@ -1132,12 +1279,12 @@ impl<S: Store> Node<S> {
         // so BFS from dst gives each node's distance to the destination.
         let graph = self.build_graph();
         let dist = graph.distances(dst);
-        let excluded_peers: HashSet<[u8; 32]> = exclude
+        let excluded_peers: HashSet<Identifier> = exclude
             .iter()
             .filter(|(_, until)| *until > now)
             .filter_map(|(l, _)| self.links.get(l).and_then(|s| s.peer))
             .collect();
-        let up: HashSet<[u8; 32]> = self.links.values().filter_map(|l| l.peer).collect();
+        let up: HashSet<Identifier> = self.links.values().filter_map(|l| l.peer).collect();
         let peer = graph.next_hop(
             &self.own_id,
             &dist,
@@ -1207,8 +1354,8 @@ impl<S: Store> Node<S> {
             actions.push(self.busy(link, leg));
             return actions;
         }
-        let leg_hash = lattice_crypto::hash(&leg);
-        if self.store.seen_contains(&leg_hash, now).unwrap_or(false) {
+        let leg_hash = lattice_crypto::hash(leg.as_ref());
+        if self.store.seen_contains(&leg_hash, now).unwrap_or(true) {
             actions.push(Action::SendFrame {
                 pad_to: None,
                 link,
@@ -1254,7 +1401,13 @@ impl<S: Store> Node<S> {
         // wanted, add a second counter keyed by upstream alone and check both
         // here — the store already keys shares by (dest, upstream).
         let share_limit = self.config.custody_allowance / upstream_count;
-        if self.store.share_get(&dst, link).unwrap_or(0) + msg_len > share_limit {
+        if self
+            .store
+            .share_get(&dst, link)
+            .unwrap_or(u64::MAX)
+            .saturating_add(msg_len)
+            > share_limit
+        {
             actions.push(self.busy(link, leg));
             return actions;
         }
@@ -1262,8 +1415,10 @@ impl<S: Store> Node<S> {
         // of the transit cap, so a flood in one class cannot starve the
         // others and waits can't form a cycle (a class-d message only ever
         // waits on class < d room at the next hop).
-        let class_bytes = self.store.custody_class_bytes().unwrap_or([0; 16]);
-        if class_bytes[class as usize] + msg_len > self.config.transit_cap / BUF_CLASSES as u64 {
+        let class_bytes = self.store.custody_class_bytes().unwrap_or([u64::MAX; 16]);
+        if class_bytes[class as usize].saturating_add(msg_len)
+            > self.config.transit_cap / BUF_CLASSES as u64
+        {
             actions.push(self.busy(link, leg));
             return actions;
         }
@@ -1302,7 +1457,7 @@ impl<S: Store> Node<S> {
         actions
     }
 
-    fn busy(&self, link: LinkId, leg: [u8; 16]) -> Action {
+    fn busy(&self, link: LinkId, leg: LegId) -> Action {
         Action::SendFrame {
             pad_to: None,
             link,
@@ -1319,7 +1474,7 @@ impl<S: Store> Node<S> {
         now: u64,
         link: LinkId,
         msg: &Message,
-        leg_hash: &[u8; 32],
+        leg_hash: &Hash32,
         mut actions: Vec<Action>,
     ) -> Vec<Action> {
         let leg = msg.header.leg;
@@ -1327,6 +1482,16 @@ impl<S: Store> Node<S> {
         if msg.hop_layer.is_some() {
             match msg.open_hop_layer(&self.identity.xwing_secret) {
                 Ok(HopLayerPlain::Waypoint { hdr, inner }) => {
+                    // The outer header's expiry is checked in Message::parse;
+                    // the inner header's is not, so enforce the same horizon
+                    // here before the expiry is used for custody accounting.
+                    if hdr.exp <= now
+                        || hdr.exp
+                            > now + lattice_proto::MAX_MESSAGE_HORIZON + lattice_proto::CLOCK_SKEW
+                    {
+                        actions.push(self.refuse(link, leg));
+                        return actions;
+                    }
                     let hdr_dst = hdr.dst;
                     let hdr_exp = hdr.exp;
                     let inner = match msg
@@ -1342,15 +1507,21 @@ impl<S: Store> Node<S> {
                     // A waypoint accepts the first leg only if it can hold the
                     // second leg: fair-share + transit cap apply, same as relay.
                     let msg_len = inner.len() as u64;
-                    let class = self.class_for(hdr_dst);
+                    let class = self.class_for(&hdr_dst);
                     let upstream_count = self.links.len().max(1) as u64;
                     let share_limit = self.config.custody_allowance / upstream_count;
-                    if self.store.share_get(&hdr_dst, link).unwrap_or(0) + msg_len > share_limit {
+                    if self
+                        .store
+                        .share_get(&hdr_dst, link)
+                        .unwrap_or(u64::MAX)
+                        .saturating_add(msg_len)
+                        > share_limit
+                    {
                         actions.push(self.busy(link, leg));
                         return actions;
                     }
-                    let class_bytes = self.store.custody_class_bytes().unwrap_or([0; 16]);
-                    if class_bytes[class as usize] + msg_len
+                    let class_bytes = self.store.custody_class_bytes().unwrap_or([u64::MAX; 16]);
+                    if class_bytes[class as usize].saturating_add(msg_len)
                         > self.config.transit_cap / BUF_CLASSES as u64
                     {
                         actions.push(self.busy(link, leg));
@@ -1402,15 +1573,21 @@ impl<S: Store> Node<S> {
                         }
                     };
                     let msg_len = stripped.len() as u64;
-                    let class = self.class_for(rcpt);
+                    let class = self.class_for(&rcpt);
                     let upstream_count = self.links.len().max(1) as u64;
                     let share_limit = self.config.custody_allowance / upstream_count;
-                    if self.store.share_get(&rcpt, link).unwrap_or(0) + msg_len > share_limit {
+                    if self
+                        .store
+                        .share_get(&rcpt, link)
+                        .unwrap_or(u64::MAX)
+                        .saturating_add(msg_len)
+                        > share_limit
+                    {
                         actions.push(self.busy(link, leg));
                         return actions;
                     }
-                    let class_bytes = self.store.custody_class_bytes().unwrap_or([0; 16]);
-                    if class_bytes[class as usize] + msg_len
+                    let class_bytes = self.store.custody_class_bytes().unwrap_or([u64::MAX; 16]);
+                    if class_bytes[class as usize].saturating_add(msg_len)
                         > self.config.transit_cap / BUF_CLASSES as u64
                     {
                         actions.push(self.busy(link, leg));
@@ -1514,11 +1691,11 @@ impl<S: Store> Node<S> {
             return actions;
         }
         let mid_bytes = opened.mid;
-        let mid_hash = lattice_crypto::hash(&mid_bytes);
+        let mid_hash = lattice_crypto::hash(mid_bytes.as_ref());
         if self
             .store
             .delivered_contains(&mid_hash, now)
-            .unwrap_or(false)
+            .unwrap_or(true)
         {
             let _ = self.store.seen_add(*leg_hash, msg.header.exp);
             actions.extend(self.send_receipt(now, &opened));
@@ -1533,13 +1710,16 @@ impl<S: Store> Node<S> {
             });
             return actions;
         }
-        let inbox_len = self.store.inbox_len(&opened.tsvc).unwrap_or(0);
-        if inbox_len >= self.config.inbox_max_deliveries {
+        let inbox_len = self.store.inbox_len(&opened.tsvc).unwrap_or(u64::MAX);
+        let inbox_total = self.store.inbox_len_total().unwrap_or(u64::MAX);
+        if inbox_len >= self.config.inbox_max_deliveries
+            || inbox_total >= self.config.inbox_max_total
+        {
             actions.push(self.busy(link, leg));
             return actions;
         }
         let entry = InboxEntry {
-            delivery_id: lattice_crypto::os_bytes::<16>(),
+            delivery_id: DeliveryId::from_bytes(lattice_crypto::os_bytes::<16>()),
             mid: mid_bytes,
             from: opened.from,
             fsvc: opened.fsvc.clone(),
@@ -1584,7 +1764,7 @@ impl<S: Store> Node<S> {
         actions
     }
 
-    fn refuse(&self, link: LinkId, leg: [u8; 16]) -> Action {
+    fn refuse(&self, link: LinkId, leg: LegId) -> Action {
         Action::SendFrame {
             pad_to: None,
             link,
@@ -1596,27 +1776,20 @@ impl<S: Store> Node<S> {
         }
     }
 
-    fn signing_key_for(&self, id: &[u8; 32]) -> Option<[u8; 32]> {
-        for scope in [Scope::Wan, Scope::Hive] {
-            if let Ok(Some((bytes, _))) = self.store.record_get(id, scope) {
-                if let Ok((rec, _)) = PeerRecord::from_bytes(&bytes, self.now, None) {
-                    return Some(rec.current_signing_key());
-                }
-            }
-        }
-        None
+    fn signing_key_for(&mut self, id: &Identifier) -> Option<SigningPublicKey> {
+        self.lookup_validated(id).map(|r| r.current_signing_key())
     }
 
-    fn class_for(&self, dst: [u8; 32]) -> u8 {
+    fn class_for(&mut self, dst: &Identifier) -> u8 {
         let g = self.build_graph();
         let d = g.distances(&self.own_id);
-        d.get(&dst)
+        d.get(dst)
             .copied()
             .unwrap_or(u32::MAX)
             .min((BUF_CLASSES - 1) as u32) as u8
     }
 
-    fn forward_custody(&mut self, now: u64, leg: [u8; 16], actions: &mut Vec<Action>) {
+    fn forward_custody(&mut self, now: u64, leg: LegId, actions: &mut Vec<Action>) {
         let entry = match self.store.custody_get(&leg) {
             Ok(Some(e)) => e,
             _ => return,
@@ -1800,13 +1973,12 @@ impl<S: Store> Node<S> {
                 local::MSG_STATUS_DELIVERED | local::MSG_STATUS_FAILED | local::MSG_STATUS_EXPIRED
             )
         };
-        let already_terminal = self
-            .store
-            .status_get(&reference)
-            .ok()
-            .flatten()
-            .map(|(s, _)| terminal_status(s))
-            .unwrap_or(false);
+        let already_terminal = match self.store.status_get(&reference) {
+            Ok(Some((s, _))) => terminal_status(s),
+            Ok(None) => false,
+            // Store error: fail closed and ignore the receipt.
+            Err(_) => true,
+        };
         match envelope.kind {
             KIND_RECEIPT | KIND_NEGATIVE_RECEIPT => {
                 let Ok(Some(mut msg)) = self.store.outbound_get(&reference) else {
@@ -1857,7 +2029,7 @@ impl<S: Store> Node<S> {
     fn send_receipt(&mut self, now: u64, delivered: &Envelope) -> Vec<Action> {
         let envelope = Envelope {
             kind: KIND_RECEIPT,
-            mid: lattice_crypto::os_bytes::<16>(),
+            mid: MessageId::from_bytes(lattice_crypto::os_bytes::<16>()),
             from: self.own_id,
             fsvc: delivered.tsvc.clone(),
             fmbx: delivered.tmbx.clone(),
@@ -1867,23 +2039,22 @@ impl<S: Store> Node<S> {
             body: None,
             reference: Some(delivered.mid),
             reason: None,
-            sig: [0; 64],
+            sig: Signature::from_bytes([0; 64]),
         };
         self.enqueue_control(now, delivered.from, envelope)
     }
 
-    #[allow(dead_code)]
     fn send_negative_receipt(
         &mut self,
         now: u64,
-        original_from: [u8; 32],
+        original_from: Identifier,
         original: &Envelope,
         reason: u64,
         my_service: &str,
     ) -> Vec<Action> {
         let envelope = Envelope {
             kind: KIND_NEGATIVE_RECEIPT,
-            mid: lattice_crypto::os_bytes::<16>(),
+            mid: MessageId::from_bytes(lattice_crypto::os_bytes::<16>()),
             from: self.own_id,
             fsvc: my_service.to_string(),
             fmbx: Vec::new(),
@@ -1893,7 +2064,7 @@ impl<S: Store> Node<S> {
             body: None,
             reference: Some(original.mid),
             reason: Some(reason),
-            sig: [0; 64],
+            sig: Signature::from_bytes([0; 64]),
         };
         self.enqueue_control(now, original_from, envelope)
     }
@@ -1901,7 +2072,7 @@ impl<S: Store> Node<S> {
     fn enqueue_control(
         &mut self,
         now: u64,
-        recipient: [u8; 32],
+        recipient: Identifier,
         envelope: Envelope,
     ) -> Vec<Action> {
         let mid = envelope.mid;
@@ -2016,7 +2187,7 @@ impl<S: Store> Node<S> {
         }
 
         // Custody offers that never got an answer: exclude the link and retry.
-        let stale: Vec<[u8; 16]> = self
+        let stale: Vec<LegId> = self
             .pending
             .iter()
             .filter(|(_, p)| now.saturating_sub(p.sent_at) > CUSTODY_TIMEOUT_SECS)
@@ -2196,7 +2367,7 @@ impl<S: Store> Node<S> {
         self.rng.next_u64() as f64 / u64::MAX as f64
     }
 
-    fn on_frame(&mut self, at: u64, link: LinkId, from: [u8; 32], frame: Frame) -> Vec<Action> {
+    fn on_frame(&mut self, at: u64, link: LinkId, from: Identifier, frame: Frame) -> Vec<Action> {
         self.now = at;
         let _ = from;
         match frame {
@@ -2221,7 +2392,6 @@ impl<S: Store> Node<S> {
                 }
                 Vec::new()
             }
-            Frame::Wary(w) => self.on_wary(at, &w),
             Frame::Attest(a) => self.on_attest(at, link, &a),
             Frame::Init(_) | Frame::Cookie(_) | Frame::Resp(_) => Vec::new(),
         }
@@ -2247,14 +2417,6 @@ impl<S: Store> Node<S> {
             }
         }
         self.reevaluate_link_bindings(now);
-        Vec::new()
-    }
-
-    fn on_wary(&mut self, now: u64, w: &WaryFrame) -> Vec<Action> {
-        for id in &w.ids {
-            let _ = self.store.wary_add(id, 0, w.exp);
-        }
-        let _ = now;
         Vec::new()
     }
 
@@ -2305,18 +2467,9 @@ impl<S: Store> Node<S> {
     }
 
     /// Is there currently a path to `dst` over the known record graph?
-    pub fn has_path(&mut self, dst: &[u8; 32]) -> bool {
+    pub fn has_path(&mut self, dst: &Identifier) -> bool {
         let g = self.build_graph();
         g.distances(&self.own_id).contains_key(dst)
-    }
-
-    pub fn uptime_links(&self) -> usize {
-        self.links.len()
-    }
-
-    #[doc(hidden)]
-    pub fn debug_equivocations(&self) -> u64 {
-        self.equivocations
     }
 
     #[doc(hidden)]
@@ -2324,9 +2477,14 @@ impl<S: Store> Node<S> {
         self.contested
     }
 
+    #[doc(hidden)]
+    pub fn debug_equivocations(&self) -> u64 {
+        self.equivocations
+    }
+
     /// Peer id a link is currently bound to, if any. Test/diagnostic only.
     #[doc(hidden)]
-    pub fn debug_link_peer(&self, link: u64) -> Option<Option<[u8; 32]>> {
+    pub fn debug_link_peer(&self, link: u64) -> Option<Option<Identifier>> {
         self.links.get(&link).map(|l| l.peer)
     }
 
@@ -2353,20 +2511,12 @@ impl<S: Store> Node<S> {
     }
 
     #[doc(hidden)]
-    pub fn debug_custody_destinations(&self) -> Vec<[u8; 32]> {
-        self.store
-            .custody_all()
-            .map(|v| v.into_iter().map(|e| e.destination).collect())
-            .unwrap_or_default()
-    }
-
-    #[doc(hidden)]
     pub fn debug_record_count(&self) -> usize {
         self.store.record_count().unwrap_or(0)
     }
 
     #[doc(hidden)]
-    pub fn debug_record_ids(&self) -> Vec<[u8; 32]> {
+    pub fn debug_record_ids(&self) -> Vec<Identifier> {
         self.store
             .record_all()
             .unwrap_or_default()
@@ -2376,21 +2526,21 @@ impl<S: Store> Node<S> {
     }
 
     #[doc(hidden)]
-    pub fn debug_inbox_len(&self, service: &str) -> u64 {
-        self.store.inbox_len(service).unwrap_or(0)
-    }
-
-    #[doc(hidden)]
     pub fn store_ref(&self) -> &S {
         &self.store
     }
 
+    /// Mutable access to the store. Bumps the record-set version so the
+    /// memoized graph and reconcile items are rebuilt on next use; callers
+    /// must not use this to mutate records behind the node's back without
+    /// accepting that cost.
     pub fn store_mut(&mut self) -> &mut S {
+        self.records_version += 1;
         &mut self.store
     }
 
     /// (have record, mode as 0=public/1=private)
-    pub fn lookup(&self, id: &[u8; 32]) -> (bool, Option<u64>) {
+    pub fn lookup(&self, id: &Identifier) -> (bool, Option<u64>) {
         for scope in [
             lattice_proto::record::Scope::Wan,
             lattice_proto::record::Scope::Hive,
@@ -2408,7 +2558,7 @@ impl<S: Store> Node<S> {
         (false, None)
     }
 
-    fn on_app_ack(&mut self, now: u64, service: &str, delivery_ids: &[[u8; 16]]) -> Vec<Action> {
+    fn on_app_ack(&mut self, now: u64, service: &str, delivery_ids: &[DeliveryId]) -> Vec<Action> {
         let _ = now;
         let _ = self.store.inbox_ack(service, delivery_ids);
         let unread = self.store.inbox_len(service).unwrap_or(0);
@@ -2456,17 +2606,23 @@ mod tests {
             snow_per_min: 0.0,
             ..Config::default()
         };
-        Node::new(cfg, Identity::generate(), MemStore::new(), 1_000).expect("node construction")
+        Node::new(
+            cfg,
+            Identity::from_seed(&lattice_crypto::os_bytes::<32>()),
+            MemStore::new(),
+            1_000,
+        )
+        .expect("node construction")
     }
 
-    fn outbound(mid: [u8; 16], recipient: [u8; 32], state: OutboundState) -> OutboundMessage {
+    fn outbound(mid: MessageId, recipient: Identifier, state: OutboundState) -> OutboundMessage {
         OutboundMessage {
             mid,
             recipient,
             envelope: lattice_proto::message::Envelope {
                 kind: KIND_MESSAGE,
                 mid,
-                from: [0xF1; 32],
+                from: Identifier::from_bytes([0xF1; 32]),
                 fsvc: "svc".into(),
                 fmbx: b"out".to_vec(),
                 tsvc: "svc".into(),
@@ -2475,7 +2631,7 @@ mod tests {
                 body: Some(b"hi".to_vec()),
                 reference: None,
                 reason: None,
-                sig: [0; 64],
+                sig: Signature::from_bytes([0; 64]),
             },
             priority: 1,
             exp: u64::MAX / 2,
@@ -2488,10 +2644,10 @@ mod tests {
         }
     }
 
-    fn receipt(kind: u64, reference: [u8; 16], from: [u8; 32]) -> Envelope {
+    fn receipt(kind: u64, reference: MessageId, from: Identifier) -> Envelope {
         Envelope {
             kind,
-            mid: [0xEE; 16],
+            mid: MessageId::from_bytes([0xEE; 16]),
             from,
             fsvc: "svc".into(),
             fmbx: b"in".to_vec(),
@@ -2501,15 +2657,15 @@ mod tests {
             body: None,
             reference: Some(reference),
             reason: None,
-            sig: [0; 64],
+            sig: Signature::from_bytes([0; 64]),
         }
     }
 
     #[test]
     fn receipt_from_recipient_marks_delivered() {
         let mut node = test_node();
-        let recipient = [0xA1; 32];
-        let mid = [0x11; 16];
+        let recipient = Identifier::from_bytes([0xA1; 32]);
+        let mid = MessageId::from_bytes([0x11; 16]);
         node.store
             .outbound_push(&outbound(mid, recipient, OutboundState::InFlight))
             .unwrap();
@@ -2526,9 +2682,9 @@ mod tests {
     #[test]
     fn receipt_from_non_recipient_is_ignored() {
         let mut node = test_node();
-        let recipient = [0xA1; 32];
-        let attacker = [0xB2; 32];
-        let mid = [0x22; 16];
+        let recipient = Identifier::from_bytes([0xA1; 32]);
+        let attacker = Identifier::from_bytes([0xB2; 32]);
+        let mid = MessageId::from_bytes([0x22; 16]);
         node.store
             .outbound_push(&outbound(mid, recipient, OutboundState::InFlight))
             .unwrap();
@@ -2547,10 +2703,10 @@ mod tests {
     #[test]
     fn late_receipt_does_not_flip_terminal_states() {
         let mut node = test_node();
-        let recipient = [0xA1; 32];
+        let recipient = Identifier::from_bytes([0xA1; 32]);
 
         // Expired message stays Expired when a receipt arrives late.
-        let mid1 = [0x33; 16];
+        let mid1 = MessageId::from_bytes([0x33; 16]);
         node.store
             .outbound_push(&outbound(mid1, recipient, OutboundState::Expired))
             .unwrap();
@@ -2569,7 +2725,7 @@ mod tests {
         );
 
         // Delivered message stays Delivered when a negative receipt arrives late.
-        let mid2 = [0x44; 16];
+        let mid2 = MessageId::from_bytes([0x44; 16]);
         node.store
             .outbound_push(&outbound(mid2, recipient, OutboundState::Delivered))
             .unwrap();
@@ -2588,16 +2744,17 @@ mod tests {
         );
     }
 
-    fn test_identity() -> (Identity, [u8; 32], [u8; 32]) {
-        let signing_seed = [1u8; 32];
-        let next_seed = [2u8; 32];
-        let next_next_seed = [3u8; 32];
+    fn test_identity() -> (Identity, SigningSeed, SigningSeed) {
+        let signing_seed = SigningSeed::from_bytes([1u8; 32]);
+        let next_seed = SigningSeed::from_bytes([2u8; 32]);
+        let next_next_seed = SigningSeed::from_bytes([3u8; 32]);
         let inception = KeyEvent::inception(&signing_seed, hash_next(&next_seed));
+        let kel = ValidatedKel::validate(vec![inception]).expect("fresh inception validates");
         let kp = lattice_crypto::generate_keypair();
         let id = Identity {
             signing_seed,
-            kel: vec![inception],
-            channel_seed: [4u8; 32],
+            kel,
+            channel_seed: ChannelSeed::from_bytes([4u8; 32]),
             xwing_secret: kp.secret,
             xwing_public: kp.public,
             retired_xwing: Vec::new(),
@@ -2622,7 +2779,9 @@ mod tests {
     #[test]
     fn rotate_rejects_wrong_next_key() {
         let (mut id, _next_seed, next_next) = test_identity();
-        let err = id.rotate(&[9u8; 32], Some(next_next)).unwrap_err();
+        let err = id
+            .rotate(&SigningSeed::from_bytes([9u8; 32]), Some(next_next))
+            .unwrap_err();
         assert!(err.contains("pre-rotation"), "unexpected error: {err}");
     }
 
@@ -2631,7 +2790,9 @@ mod tests {
         let (mut id, next_seed, _) = test_identity();
         id.rotate(&next_seed, None).unwrap();
         assert!(id.is_abandoned());
-        let err = id.rotate(&[7u8; 32], None).unwrap_err();
+        let err = id
+            .rotate(&SigningSeed::from_bytes([7u8; 32]), None)
+            .unwrap_err();
         assert!(err.contains("abandoned"), "unexpected error: {err}");
         let head = KeyEvent::validate_chain(&id.kel).unwrap();
         assert!(head.abandoned);
@@ -2641,8 +2802,8 @@ mod tests {
         use lattice_proto::message::{BuildParams, Envelope, KIND_MESSAGE, Message};
         let envelope = Envelope {
             kind: KIND_MESSAGE,
-            mid: [0x42; 16],
-            from: [0xAA; 32],
+            mid: MessageId::from_bytes([0x42; 16]),
+            from: Identifier::from_bytes([0xAA; 32]),
             fsvc: "svc".into(),
             fmbx: b"out".to_vec(),
             tsvc: "svc".into(),
@@ -2651,14 +2812,14 @@ mod tests {
             body: Some(body.to_vec()),
             reference: None,
             reason: None,
-            sig: [0; 64],
+            sig: Signature::from_bytes([0; 64]),
         };
         let bytes = Message::build(BuildParams {
             envelope,
-            sender_seed: &[0xBB; 32],
+            sender_seed: &SigningSeed::from_bytes([0xBB; 32]),
             recipient_ek: &id.xwing_public,
-            real_dst: [0xCC; 32],
-            leg: [0xDD; 16],
+            real_dst: Identifier::from_bytes([0xCC; 32]),
+            leg: LegId::from_bytes([0xDD; 16]),
             exp: 2_000_000,
             gateway: None,
             waypoint: None,
@@ -2674,7 +2835,7 @@ mod tests {
         // Rotate; old key moves to the retired set with a 2-day grace.
         let now = 1_000_000u64;
         let retire_at = now + 2 * 24 * 3600;
-        let old_secret = id.xwing_secret;
+        let old_secret = id.xwing_secret.clone();
         id.rotate_envelope(retire_at);
         assert_ne!(id.xwing_secret, old_secret);
         assert_eq!(id.retired_xwing.len(), 1);
@@ -2693,5 +2854,70 @@ mod tests {
         id.sweep_retired_envelope_keys(retire_at + 1);
         assert!(id.retired_xwing.is_empty());
         assert!(id.open_envelope_any(&msg).is_err());
+    }
+
+    #[test]
+    fn sweep_expired_data_keeps_records_within_grace_and_drops_garbage() {
+        use lattice_proto::kel::KeyEvent;
+        use lattice_proto::record::{Endpoint, Mode, PeerRecord, RecordParams, Scope};
+
+        let mut node = test_node();
+        let seed = lattice_crypto::generate_seed();
+        let next_seed = lattice_crypto::generate_seed();
+        let kel = vec![KeyEvent::inception(
+            &seed,
+            Commitment::from_bytes(
+                lattice_crypto::hash(lattice_crypto::public_key(&next_seed).as_ref()).into_bytes(),
+            ),
+        )];
+        let channel_seed = ChannelSeed::from_bytes(lattice_crypto::os_bytes::<32>());
+        let exp = 10_000u64;
+        let rec = PeerRecord::build(
+            RecordParams {
+                kel,
+                seq: 1,
+                exp,
+                channel_key: lattice_crypto::channel_public(&channel_seed),
+                channel_seed,
+                envelope_key: XWingPublicKey::from_bytes([7u8; 1216]),
+                mode: Mode::Public,
+                scope: Scope::Wan,
+                endpoints: vec![Endpoint {
+                    url: "ws://mesh.example.com/".into(),
+                    ips: vec![],
+                }],
+                links: vec![],
+                gateways: vec![],
+                capabilities: 0,
+            },
+            &seed,
+        )
+        .unwrap();
+        let id = rec.id;
+        node.store
+            .record_put(&id, Scope::Wan, &rec.encode(), 0)
+            .unwrap();
+        node.store
+            .record_put(
+                &Identifier::from_bytes([0xAB; 32]),
+                Scope::Wan,
+                b"garbage",
+                0,
+            )
+            .unwrap();
+
+        // Within the grace window the record must survive; garbage is dropped.
+        node.sweep_expired_data(exp + RETENTION_GRACE_SECS - 1);
+        assert!(node.store.record_get(&id, Scope::Wan).unwrap().is_some());
+        assert!(
+            node.store
+                .record_get(&Identifier::from_bytes([0xAB; 32]), Scope::Wan)
+                .unwrap()
+                .is_none()
+        );
+
+        // Past the grace window the expired record is dropped.
+        node.sweep_expired_data(exp + RETENTION_GRACE_SECS + 1);
+        assert!(node.store.record_get(&id, Scope::Wan).unwrap().is_none());
     }
 }

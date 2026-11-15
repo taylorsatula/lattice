@@ -15,6 +15,8 @@ use blake2::Blake2sMac256;
 use blake2::digest::{KeyInit, Mac};
 use subtle::ConstantTimeEq;
 
+use lattice_types::{ChannelPublicKey, Cookie, Mac16};
+
 pub const COOKIE_BYTES: usize = 24;
 const CONTEXT: &[u8] = b"lattice v1 cookie";
 const ROTATION_SECS: u64 = 7200; // two hours
@@ -27,13 +29,15 @@ pub struct CookieState {
 }
 
 fn mac(key: &[u8], msg: &[u8]) -> [u8; 32] {
-    let mut m = <Blake2sMac256 as KeyInit>::new_from_slice(key).expect("32-byte key");
+    debug_assert!(key.len() <= 32, "Blake2s accepts at most 32-byte keys");
+    let mut m = <Blake2sMac256 as KeyInit>::new_from_slice(key)
+        .expect("Blake2s accepts keys of 0..=32 bytes");
     m.update(msg);
     m.finalize().into_bytes().into()
 }
 
-fn mac16(key: &[u8], msg: &[u8]) -> [u8; 16] {
-    mac(key, msg)[..16].try_into().unwrap()
+fn mac16(key: &[u8], msg: &[u8]) -> Mac16 {
+    Mac16::from_bytes(mac(key, msg)[..16].try_into().unwrap())
 }
 
 impl CookieState {
@@ -69,19 +73,19 @@ impl CookieState {
         self.advance(now);
     }
 
-    fn cookie_for_key(key: &[u8; 32], addr: &[u8]) -> [u8; COOKIE_BYTES] {
+    fn cookie_for_key(key: &[u8; 32], addr: &[u8]) -> Cookie {
         let mut h = Vec::with_capacity(CONTEXT.len() + addr.len());
         h.extend_from_slice(CONTEXT);
         h.extend_from_slice(addr);
         let full = mac(key, &h);
-        full[..COOKIE_BYTES].try_into().unwrap()
+        Cookie::from_bytes(full[..COOKIE_BYTES].try_into().unwrap())
     }
 
-    pub fn issue(&self, addr: &[u8]) -> [u8; COOKIE_BYTES] {
+    pub fn issue(&self, addr: &[u8]) -> Cookie {
         Self::cookie_for_key(&self.key, addr)
     }
 
-    fn cookie_candidates(&self, addr: &[u8]) -> Vec<[u8; COOKIE_BYTES]> {
+    fn cookie_candidates(&self, addr: &[u8]) -> Vec<Cookie> {
         let mut out = vec![Self::cookie_for_key(&self.key, addr)];
         if let Some(prev) = &self.prev_key {
             out.push(Self::cookie_for_key(prev, addr));
@@ -90,11 +94,11 @@ impl CookieState {
     }
 
     /// Verify `mac2` for the given client address and init message.
-    pub fn verify_mac2(&self, addr: &[u8], init_msg: &[u8], mac2: &[u8; 16]) -> bool {
+    pub fn verify_mac2(&self, addr: &[u8], init_msg: &[u8], mac2: &Mac16) -> bool {
         self.cookie_candidates(addr).iter().any(|cookie| {
-            mac16(cookie, init_msg)
-                .as_slice()
-                .ct_eq(mac2.as_slice())
+            mac16(cookie.as_ref(), init_msg)
+                .as_ref()
+                .ct_eq(mac2.as_ref())
                 .unwrap_u8()
                 == 1
         })
@@ -102,13 +106,13 @@ impl CookieState {
 }
 
 /// mac1 over the init message, keyed by the responder's channel key.
-pub fn mac1(channel_key: &[u8; 32], init_msg: &[u8]) -> [u8; 16] {
-    mac16(channel_key, init_msg)
+pub fn mac1(channel_key: &ChannelPublicKey, init_msg: &[u8]) -> Mac16 {
+    mac16(channel_key.as_ref(), init_msg)
 }
 
 /// mac2 over the init message, keyed by the cookie the client received.
-pub fn mac2(cookie: &[u8; COOKIE_BYTES], init_msg: &[u8]) -> [u8; 16] {
-    mac16(cookie, init_msg)
+pub fn mac2(cookie: &Cookie, init_msg: &[u8]) -> Mac16 {
+    mac16(cookie.as_ref(), init_msg)
 }
 
 #[cfg(test)]
@@ -131,10 +135,11 @@ mod tests {
 
     #[test]
     fn mac1_depends_on_channel_key_and_msg() {
-        let a = mac1(&[1u8; 32], b"hello");
-        assert_ne!(a, mac1(&[2u8; 32], b"hello"));
-        assert_ne!(a, mac1(&[1u8; 32], b"hellp"));
-        assert_eq!(a, mac1(&[1u8; 32], b"hello"));
+        let k = |b: u8| ChannelPublicKey::from_bytes([b; 32]);
+        let a = mac1(&k(1), b"hello");
+        assert_ne!(a, mac1(&k(2), b"hello"));
+        assert_ne!(a, mac1(&k(1), b"hellp"));
+        assert_eq!(a, mac1(&k(1), b"hello"));
     }
 
     #[test]

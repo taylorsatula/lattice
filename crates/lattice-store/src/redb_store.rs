@@ -11,6 +11,61 @@ use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
 
 use crate::*;
 use lattice_proto::record::Scope;
+use lattice_types::{Commitment, DeliveryId, Hash32, Identifier, LegId, MessageId};
+
+// redb error types convert mechanically into `StoreError::Backend` with an
+// empty op; the `read`/`write`/`open` boundaries fill in the operation name
+// via `StoreError::at`. Serde errors are converted at the site with a
+// `Codec` context instead.
+impl From<redb::StorageError> for StoreError {
+    fn from(e: redb::StorageError) -> Self {
+        StoreError::Backend {
+            op: "",
+            source: Box::new(e),
+        }
+    }
+}
+
+impl From<redb::TableError> for StoreError {
+    fn from(e: redb::TableError) -> Self {
+        StoreError::Backend {
+            op: "",
+            source: Box::new(e),
+        }
+    }
+}
+
+impl From<redb::DatabaseError> for StoreError {
+    fn from(e: redb::DatabaseError) -> Self {
+        StoreError::Backend {
+            op: "",
+            source: Box::new(e),
+        }
+    }
+}
+
+impl From<redb::TransactionError> for StoreError {
+    fn from(e: redb::TransactionError) -> Self {
+        StoreError::Backend {
+            op: "",
+            source: Box::new(e),
+        }
+    }
+}
+
+impl From<redb::CommitError> for StoreError {
+    fn from(e: redb::CommitError) -> Self {
+        StoreError::Backend {
+            op: "",
+            source: Box::new(e),
+        }
+    }
+}
+
+/// Attach operation context to a backend error conversion.
+fn ctx<E: Into<StoreError>>(op: &'static str) -> impl FnOnce(E) -> StoreError {
+    move |e| e.into().at(op)
+}
 
 const SCHEMA_VERSION: u64 = 1;
 
@@ -26,7 +81,6 @@ const SEEN: TableDefinition<[u8; 32], u64> = TableDefinition::new("seen");
 const DELIVERED: TableDefinition<[u8; 32], u64> = TableDefinition::new("delivered");
 const INBOX: TableDefinition<[u8; 16], Vec<u8>> = TableDefinition::new("inbox");
 const STATUS: TableDefinition<[u8; 16], Vec<u8>> = TableDefinition::new("status");
-const WARY: TableDefinition<[u8; 32], Vec<u8>> = TableDefinition::new("wary");
 
 fn scope_byte(s: Scope) -> u8 {
     match s {
@@ -35,16 +89,16 @@ fn scope_byte(s: Scope) -> u8 {
     }
 }
 
-fn record_key(id: &[u8; 32], scope: Scope) -> [u8; 33] {
+fn record_key(id: &Identifier, scope: Scope) -> [u8; 33] {
     let mut k = [0u8; 33];
-    k[..32].copy_from_slice(id);
+    k[..32].copy_from_slice(id.as_bytes());
     k[32] = scope_byte(scope);
     k
 }
 
-fn share_key(dest: &[u8; 32], upstream: u64) -> [u8; 40] {
+fn share_key(dest: &Identifier, upstream: u64) -> [u8; 40] {
     let mut k = [0u8; 40];
-    k[..32].copy_from_slice(dest);
+    k[..32].copy_from_slice(dest.as_bytes());
     k[32..].copy_from_slice(&upstream.to_be_bytes());
     k
 }
@@ -58,28 +112,17 @@ fn migrate(txn: &redb::WriteTransaction, from: u64) -> Result<(), StoreError> {
     // v1 is the initial schema, so there is nothing to do yet; any other
     // older version has no path and must fail loudly.
     if from != 1 {
-        return Err(StoreError::Backend(format!(
-            "no migration path from schema version {from}"
-        )));
+        return Err(StoreError::NoMigration { from });
     }
-    let mut meta = txn
-        .open_table(META)
-        .map_err(|e| StoreError::Backend(e.to_string()))?;
-    meta.insert("schema_version", SCHEMA_VERSION)
-        .map_err(|e| StoreError::Backend(e.to_string()))?;
+    let mut meta = txn.open_table(META)?;
+    meta.insert("schema_version", SCHEMA_VERSION)?;
     Ok(())
 }
 
 /// Read a u64 counter from the meta table inside a write transaction.
 fn meta_u64(txn: &redb::WriteTransaction, key: &str) -> Result<u64, StoreError> {
-    let meta = txn
-        .open_table(META)
-        .map_err(|e| StoreError::Backend(e.to_string()))?;
-    Ok(meta
-        .get(key)
-        .map_err(|e| StoreError::Backend(e.to_string()))?
-        .map(|v| v.value())
-        .unwrap_or(0))
+    let meta = txn.open_table(META)?;
+    Ok(meta.get(key)?.map(|v| v.value()).unwrap_or(0))
 }
 
 /// Add `delta` (signed) to a u64 counter in the meta table.
@@ -87,15 +130,12 @@ fn meta_add(txn: &redb::WriteTransaction, key: &str, delta: i64) -> Result<u64, 
     let cur = meta_u64(txn, key)?;
     let next = (cur as i64)
         .checked_add(delta)
-        .ok_or_else(|| StoreError::Backend(format!("meta counter {key} overflow")))?;
+        .ok_or_else(|| StoreError::CounterOverflow(format!("meta counter {key}")))?;
     if next < 0 {
-        return Err(StoreError::Backend(format!("meta counter {key} underflow")));
+        return Err(StoreError::CounterUnderflow(format!("meta counter {key}")));
     }
-    let mut meta = txn
-        .open_table(META)
-        .map_err(|e| StoreError::Backend(e.to_string()))?;
-    meta.insert(key, next as u64)
-        .map_err(|e| StoreError::Backend(e.to_string()))?;
+    let mut meta = txn.open_table(META)?;
+    meta.insert(key, next as u64)?;
     Ok(next as u64)
 }
 
@@ -107,183 +147,146 @@ impl RedbStore {
     /// Open (or create) a store at `path`. Refuses to open a database whose
     /// schema version is newer than this build understands.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
-        let db = Database::create(path).map_err(|e| StoreError::Backend(e.to_string()))?;
-        let txn = db
-            .begin_write()
-            .map_err(|e| StoreError::Backend(e.to_string()))?;
+        const OP: &str = "open";
+        let db = Database::create(path).map_err(ctx(OP))?;
+        let txn = db.begin_write().map_err(ctx(OP))?;
         {
-            let mut meta = txn
-                .open_table(META)
-                .map_err(|e| StoreError::Backend(e.to_string()))?;
+            let mut meta = txn.open_table(META).map_err(ctx(OP))?;
             let existing = meta
                 .get("schema_version")
-                .map_err(|e| StoreError::Backend(e.to_string()))?
+                .map_err(ctx(OP))?
                 .map(|v| v.value());
             match existing {
                 None => {
                     meta.insert("schema_version", SCHEMA_VERSION)
-                        .map_err(|e| StoreError::Backend(e.to_string()))?;
+                        .map_err(ctx(OP))?;
                 }
                 Some(v) if v > SCHEMA_VERSION => {
-                    return Err(StoreError::Backend(format!(
-                        "schema version {v} is newer than this build understands ({SCHEMA_VERSION})"
-                    )));
+                    return Err(StoreError::SchemaTooNew {
+                        found: v,
+                        supported: SCHEMA_VERSION,
+                    });
                 }
                 Some(v) if v < SCHEMA_VERSION => {
                     drop(meta);
-                    migrate(&txn, v)?;
+                    migrate(&txn, v).map_err(|e| e.at(OP))?;
                 }
                 Some(_) => {}
             }
         }
         // Initialize empty tables so reads never fail on a fresh database.
-        txn.open_table(RECORDS)
-            .map_err(|e| StoreError::Backend(e.to_string()))?;
-        txn.open_table(RECORD_RECV)
-            .map_err(|e| StoreError::Backend(e.to_string()))?;
-        txn.open_table(KEL_HEADS)
-            .map_err(|e| StoreError::Backend(e.to_string()))?;
-        txn.open_table(PEERS)
-            .map_err(|e| StoreError::Backend(e.to_string()))?;
-        txn.open_table(OUTBOUND)
-            .map_err(|e| StoreError::Backend(e.to_string()))?;
-        txn.open_table(CUSTODY)
-            .map_err(|e| StoreError::Backend(e.to_string()))?;
-        txn.open_table(SHARES)
-            .map_err(|e| StoreError::Backend(e.to_string()))?;
-        txn.open_table(SEEN)
-            .map_err(|e| StoreError::Backend(e.to_string()))?;
-        txn.open_table(DELIVERED)
-            .map_err(|e| StoreError::Backend(e.to_string()))?;
-        txn.open_table(INBOX)
-            .map_err(|e| StoreError::Backend(e.to_string()))?;
-        txn.open_table(STATUS)
-            .map_err(|e| StoreError::Backend(e.to_string()))?;
-        txn.open_table(WARY)
-            .map_err(|e| StoreError::Backend(e.to_string()))?;
+        txn.open_table(RECORDS).map_err(ctx(OP))?;
+        txn.open_table(RECORD_RECV).map_err(ctx(OP))?;
+        txn.open_table(KEL_HEADS).map_err(ctx(OP))?;
+        txn.open_table(PEERS).map_err(ctx(OP))?;
+        txn.open_table(OUTBOUND).map_err(ctx(OP))?;
+        txn.open_table(CUSTODY).map_err(ctx(OP))?;
+        txn.open_table(SHARES).map_err(ctx(OP))?;
+        txn.open_table(SEEN).map_err(ctx(OP))?;
+        txn.open_table(DELIVERED).map_err(ctx(OP))?;
+        txn.open_table(INBOX).map_err(ctx(OP))?;
+        txn.open_table(STATUS).map_err(ctx(OP))?;
         // Rebuild the custody byte counters from the table so they can never
         // drift from the rows actually present.
         let mut custody_bytes: u64 = 0;
         let mut class_bytes = [0u64; 16];
         {
-            let t = txn
-                .open_table(CUSTODY)
-                .map_err(|e| StoreError::Backend(e.to_string()))?;
-            for entry in t.iter().map_err(|e| StoreError::Backend(e.to_string()))? {
-                let (_, v) = entry.map_err(|e| StoreError::Backend(e.to_string()))?;
-                let e: CustodyEntry = serde_json::from_slice(&v.value())
-                    .map_err(|e| StoreError::Backend(e.to_string()))?;
+            let t = txn.open_table(CUSTODY).map_err(ctx(OP))?;
+            for entry in t.iter().map_err(ctx(OP))? {
+                let (_, v) = entry.map_err(ctx(OP))?;
+                let e: CustodyEntry =
+                    serde_json::from_slice(&v.value()).map_err(|e| StoreError::Codec {
+                        context: "decode custody entry",
+                        source: e,
+                    })?;
                 custody_bytes += e.message.len() as u64;
                 class_bytes[(e.class as usize).min(15)] += e.message.len() as u64;
             }
         }
         {
-            let mut meta = txn
-                .open_table(META)
-                .map_err(|e| StoreError::Backend(e.to_string()))?;
+            let mut meta = txn.open_table(META).map_err(ctx(OP))?;
             meta.insert("custody_bytes", custody_bytes)
-                .map_err(|e| StoreError::Backend(e.to_string()))?;
+                .map_err(ctx(OP))?;
             for (i, b) in class_bytes.iter().enumerate() {
                 meta.insert(format!("custody_class_{i}").as_str(), *b)
-                    .map_err(|e| StoreError::Backend(e.to_string()))?;
+                    .map_err(ctx(OP))?;
             }
         }
-        txn.commit()
-            .map_err(|e| StoreError::Backend(e.to_string()))?;
+        txn.commit().map_err(ctx(OP))?;
         Ok(Self { db })
     }
 
     fn read<R>(
         &self,
+        op: &'static str,
         f: impl FnOnce(&redb::ReadTransaction) -> Result<R, StoreError>,
     ) -> Result<R, StoreError> {
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| StoreError::Backend(e.to_string()))?;
-        f(&txn)
+        let txn = self.db.begin_read().map_err(ctx(op))?;
+        f(&txn).map_err(|e| e.at(op))
     }
 
     fn write<R>(
         &self,
+        op: &'static str,
         f: impl FnOnce(&redb::WriteTransaction) -> Result<R, StoreError>,
     ) -> Result<R, StoreError> {
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| StoreError::Backend(e.to_string()))?;
+        let txn = self.db.begin_write().map_err(ctx(op))?;
         let mut txn = txn;
         txn.set_durability(redb::Durability::Immediate);
-        let out = f(&txn)?;
-        txn.commit()
-            .map_err(|e| StoreError::Backend(e.to_string()))?;
+        let out = f(&txn).map_err(|e| e.at(op))?;
+        txn.commit().map_err(ctx(op))?;
         Ok(out)
     }
 
     fn bucket_counts(&self) -> Result<[u64; 3], StoreError> {
-        self.read(|txn| {
-            let table = txn
-                .open_table(META)
-                .map_err(|e| StoreError::Backend(e.to_string()))?;
+        self.read("bucket_counts", |txn| {
+            let table = txn.open_table(META)?;
             let mut out = [0u64; 3];
             for (i, key) in ["bucket_0", "bucket_1", "bucket_2"].iter().enumerate() {
-                out[i] = table
-                    .get(*key)
-                    .map_err(|e| StoreError::Backend(e.to_string()))?
-                    .map(|v| v.value())
-                    .unwrap_or(0);
+                out[i] = table.get(*key)?.map(|v| v.value()).unwrap_or(0);
             }
             Ok(out)
         })
     }
 
     fn bucket_bump(&self, bucket: u8) -> Result<(), StoreError> {
-        self.write(|txn| {
-            let mut table = txn
-                .open_table(META)
-                .map_err(|e| StoreError::Backend(e.to_string()))?;
+        self.write("bucket_bump", |txn| {
+            let mut table = txn.open_table(META)?;
             let key = format!("bucket_{}", bucket.min(2));
-            let cur = table
-                .get(key.as_str())
-                .map_err(|e| StoreError::Backend(e.to_string()))?
-                .map(|v| v.value())
-                .unwrap_or(0);
-            table
-                .insert(key.as_str(), cur + 1)
-                .map_err(|e| StoreError::Backend(e.to_string()))?;
+            let cur = table.get(key.as_str())?.map(|v| v.value()).unwrap_or(0);
+            table.insert(key.as_str(), cur + 1)?;
             Ok(())
         })
     }
 }
 
-fn class_of_bytes(bytes: &[u8]) -> usize {
-    serde_json::from_slice::<CustodyEntry>(bytes)
-        .map(|e| e.class.min(15) as usize)
-        .unwrap_or(0)
-}
-
 /// Insert a custody row and bump the byte counter, in the caller's txn.
+/// `bytes` must be the serialization of `entry`; the counters are updated
+/// from `entry` directly rather than by re-decoding `bytes`.
 fn custody_put_txn(
     txn: &redb::WriteTransaction,
-    leg: [u8; 16],
+    entry: &CustodyEntry,
     bytes: Vec<u8>,
-    msg_len: i64,
 ) -> Result<(), StoreError> {
-    let mut t = txn
-        .open_table(CUSTODY)
-        .map_err(|e| StoreError::Backend(e.to_string()))?;
+    let leg = entry.leg;
+    let msg_len = entry.message.len() as i64;
+    let new_class = entry.class.min(15) as usize;
+    let mut t = txn.open_table(CUSTODY)?;
     // The byte counters track message bytes, so recover the old entry's
     // message length and class from the stored row if this leg is overwritten.
-    let (old_msg_len, old_class) =
-        match t.get(leg).map_err(|e| StoreError::Backend(e.to_string()))? {
-            Some(v) => serde_json::from_slice::<CustodyEntry>(&v.value())
-                .map(|e| (e.message.len() as i64, e.class.min(15) as usize))
-                .unwrap_or((0, 0)),
-            None => (0, 0),
-        };
-    let new_class = class_of_bytes(&bytes);
-    t.insert(leg, bytes)
-        .map_err(|e| StoreError::Backend(e.to_string()))?;
+    let (old_msg_len, old_class) = match t.get(leg.as_bytes())? {
+        Some(v) => match serde_json::from_slice::<CustodyEntry>(&v.value()) {
+            Ok(e) => (e.message.len() as i64, e.class.min(15) as usize),
+            Err(e) => {
+                return Err(StoreError::Codec {
+                    context: "decode custody entry",
+                    source: e,
+                });
+            }
+        },
+        None => (0, 0),
+    };
+    t.insert(*leg.as_bytes(), bytes)?;
     meta_add(txn, "custody_bytes", msg_len - old_msg_len)?;
     if old_msg_len > 0 {
         meta_add(txn, &format!("custody_class_{old_class}"), -old_msg_len)?;
@@ -295,137 +298,95 @@ fn custody_put_txn(
 /// Fair-share accounting with checked arithmetic; no silent clamping.
 fn share_add_txn(
     txn: &redb::WriteTransaction,
-    dest: &[u8; 32],
+    dest: &Identifier,
     upstream: u64,
     bytes: i64,
 ) -> Result<u64, StoreError> {
     let key = share_key(dest, upstream);
-    let mut t = txn
-        .open_table(SHARES)
-        .map_err(|e| StoreError::Backend(e.to_string()))?;
-    let cur = t
-        .get(key)
-        .map_err(|e| StoreError::Backend(e.to_string()))?
-        .map(|v| v.value())
-        .unwrap_or(0);
+    let mut t = txn.open_table(SHARES)?;
+    let cur = t.get(key)?.map(|v| v.value()).unwrap_or(0);
     let next = (cur as i64)
         .checked_add(bytes)
-        .ok_or_else(|| StoreError::Backend("share counter overflow".into()))?;
+        .ok_or_else(|| StoreError::CounterOverflow("share".into()))?;
     if next < 0 {
-        return Err(StoreError::Backend("share counter underflow".into()));
+        return Err(StoreError::CounterUnderflow("share".into()));
     }
     if next == 0 {
-        t.remove(key)
-            .map_err(|e| StoreError::Backend(e.to_string()))?;
+        t.remove(key)?;
     } else {
-        t.insert(key, next as u64)
-            .map_err(|e| StoreError::Backend(e.to_string()))?;
+        t.insert(key, next as u64)?;
     }
     Ok(next as u64)
 }
 
-fn seen_add_txn(txn: &redb::WriteTransaction, hash: [u8; 32], exp: u64) -> Result<(), StoreError> {
-    let mut t = txn
-        .open_table(SEEN)
-        .map_err(|e| StoreError::Backend(e.to_string()))?;
-    t.insert(hash, exp)
-        .map_err(|e| StoreError::Backend(e.to_string()))?;
+fn seen_add_txn(txn: &redb::WriteTransaction, hash: Hash32, exp: u64) -> Result<(), StoreError> {
+    let mut t = txn.open_table(SEEN)?;
+    t.insert(*hash.as_bytes(), exp)?;
     Ok(())
 }
 
 impl Store for RedbStore {
     fn record_get(
         &self,
-        id: &[u8; 32],
+        id: &Identifier,
         scope: Scope,
     ) -> Result<Option<(Vec<u8>, u64)>, StoreError> {
         let key = record_key(id, scope);
-        self.read(|txn| {
-            let t = txn
-                .open_table(RECORDS)
-                .map_err(|e| StoreError::Backend(e.to_string()))?;
-            let Some(bytes) = t
-                .get(key)
-                .map_err(|e| StoreError::Backend(e.to_string()))?
-                .map(|v| v.value())
-            else {
+        self.read("record_get", |txn| {
+            let t = txn.open_table(RECORDS)?;
+            let Some(bytes) = t.get(key)?.map(|v| v.value()) else {
                 return Ok(None);
             };
-            let recv = txn
-                .open_table(RECORD_RECV)
-                .map_err(|e| StoreError::Backend(e.to_string()))?;
-            let at = recv
-                .get(key)
-                .map_err(|e| StoreError::Backend(e.to_string()))?
-                .map(|v| v.value())
-                .unwrap_or(0);
+            let recv = txn.open_table(RECORD_RECV)?;
+            let at = recv.get(key)?.map(|v| v.value()).unwrap_or(0);
             Ok(Some((bytes, at)))
         })
     }
 
     fn record_put(
         &mut self,
-        id: &[u8; 32],
+        id: &Identifier,
         scope: Scope,
         bytes: &[u8],
         received: u64,
     ) -> Result<(), StoreError> {
         let key = record_key(id, scope);
-        self.write(|txn| {
-            let mut t = txn
-                .open_table(RECORDS)
-                .map_err(|e| StoreError::Backend(e.to_string()))?;
-            t.insert(key, bytes.to_vec())
-                .map_err(|e| StoreError::Backend(e.to_string()))?;
-            let mut r = txn
-                .open_table(RECORD_RECV)
-                .map_err(|e| StoreError::Backend(e.to_string()))?;
-            r.insert(key, received)
-                .map_err(|e| StoreError::Backend(e.to_string()))?;
+        self.write("record_put", |txn| {
+            let mut t = txn.open_table(RECORDS)?;
+            t.insert(key, bytes.to_vec())?;
+            let mut r = txn.open_table(RECORD_RECV)?;
+            r.insert(key, received)?;
             Ok(())
         })
     }
 
-    fn record_remove(&mut self, id: &[u8; 32], scope: Scope) -> Result<(), StoreError> {
+    fn record_remove(&mut self, id: &Identifier, scope: Scope) -> Result<(), StoreError> {
         let key = record_key(id, scope);
-        self.write(|txn| {
-            let mut t = txn
-                .open_table(RECORDS)
-                .map_err(|e| StoreError::Backend(e.to_string()))?;
-            t.remove(key)
-                .map_err(|e| StoreError::Backend(e.to_string()))?;
-            let mut r = txn
-                .open_table(RECORD_RECV)
-                .map_err(|e| StoreError::Backend(e.to_string()))?;
-            r.remove(key)
-                .map_err(|e| StoreError::Backend(e.to_string()))?;
+        self.write("record_remove", |txn| {
+            let mut t = txn.open_table(RECORDS)?;
+            t.remove(key)?;
+            let mut r = txn.open_table(RECORD_RECV)?;
+            r.remove(key)?;
             Ok(())
         })
     }
 
     fn record_all(&self) -> Result<Vec<StoredRecord>, StoreError> {
-        self.read(|txn| {
-            let t = txn
-                .open_table(RECORDS)
-                .map_err(|e| StoreError::Backend(e.to_string()))?;
-            let r = txn
-                .open_table(RECORD_RECV)
-                .map_err(|e| StoreError::Backend(e.to_string()))?;
+        self.read("record_all", |txn| {
+            let t = txn.open_table(RECORDS)?;
+            let r = txn.open_table(RECORD_RECV)?;
             let mut out = Vec::new();
-            for entry in t.iter().map_err(|e| StoreError::Backend(e.to_string()))? {
-                let (k, v) = entry.map_err(|e| StoreError::Backend(e.to_string()))?;
+            for entry in t.iter()? {
+                let (k, v) = entry?;
                 let key = k.value();
-                let id: [u8; 32] = key[..32].try_into().unwrap();
+                let id =
+                    Identifier::from_bytes(key[..32].try_into().expect("RECORDS key is 33 bytes"));
                 let scope = if key[32] == 0 {
                     Scope::Wan
                 } else {
                     Scope::Hive
                 };
-                let recv = r
-                    .get(key)
-                    .map_err(|e| StoreError::Backend(e.to_string()))?
-                    .map(|v| v.value())
-                    .unwrap_or(0);
+                let recv = r.get(key)?.map(|v| v.value()).unwrap_or(0);
                 out.push((id, scope, v.value(), recv));
             }
             Ok(out)
@@ -433,26 +394,28 @@ impl Store for RedbStore {
     }
 
     fn record_count(&self) -> Result<usize, StoreError> {
-        self.read(|txn| {
-            let t = txn
-                .open_table(RECORDS)
-                .map_err(|e| StoreError::Backend(e.to_string()))?;
-            Ok(t.len().map_err(|e| StoreError::Backend(e.to_string()))? as usize)
+        self.read("record_count", |txn| {
+            let t = txn.open_table(RECORDS)?;
+            Ok(t.len()? as usize)
         })
     }
 
-    fn kel_head(&self, id: &[u8; 32]) -> Result<Option<(u64, [u8; 32], u64)>, StoreError> {
-        self.read(|txn| {
-            let t = txn
-                .open_table(KEL_HEADS)
-                .map_err(|e| StoreError::Backend(e.to_string()))?;
-            match t.get(id).map_err(|e| StoreError::Backend(e.to_string()))? {
+    fn kel_head(&self, id: &Identifier) -> Result<Option<(u64, Commitment, u64)>, StoreError> {
+        self.read("kel_head", |txn| {
+            let t = txn.open_table(KEL_HEADS)?;
+            match t.get(id.as_bytes())? {
                 None => Ok(None),
                 Some(v) => {
                     let raw = v.value();
-                    let seq = u64::from_le_bytes(raw[..8].try_into().unwrap());
-                    let commitment: [u8; 32] = raw[8..40].try_into().unwrap();
-                    let seen = u64::from_le_bytes(raw[40..].try_into().unwrap());
+                    let seq = u64::from_le_bytes(
+                        raw[..8].try_into().expect("KEL_HEADS value is 48 bytes"),
+                    );
+                    let commitment = Commitment::from_bytes(
+                        raw[8..40].try_into().expect("KEL_HEADS value is 48 bytes"),
+                    );
+                    let seen = u64::from_le_bytes(
+                        raw[40..].try_into().expect("KEL_HEADS value is 48 bytes"),
+                    );
                     Ok(Some((seq, commitment, seen)))
                 }
             }
@@ -460,16 +423,16 @@ impl Store for RedbStore {
     }
 
     fn kel_head_sweep(&mut self, older_than: u64) -> Result<usize, StoreError> {
-        self.write(|txn| {
-            let mut t = txn
-                .open_table(KEL_HEADS)
-                .map_err(|e| StoreError::Backend(e.to_string()))?;
+        self.write("kel_head_sweep", |txn| {
+            let mut t = txn.open_table(KEL_HEADS)?;
             let stale: Vec<[u8; 32]> = {
                 let mut out = Vec::new();
-                for entry in t.iter().map_err(|e| StoreError::Backend(e.to_string()))? {
-                    let (k, v) = entry.map_err(|e| StoreError::Backend(e.to_string()))?;
+                for entry in t.iter()? {
+                    let (k, v) = entry?;
                     let raw = v.value();
-                    let seen = u64::from_le_bytes(raw[40..48].try_into().unwrap());
+                    let seen = u64::from_le_bytes(
+                        raw[40..48].try_into().expect("KEL_HEADS value is 48 bytes"),
+                    );
                     if seen < older_than {
                         out.push(k.value());
                     }
@@ -478,8 +441,7 @@ impl Store for RedbStore {
             };
             let n = stale.len();
             for k in stale {
-                t.remove(k)
-                    .map_err(|e| StoreError::Backend(e.to_string()))?;
+                t.remove(k)?;
             }
             Ok(n)
         })
@@ -487,83 +449,75 @@ impl Store for RedbStore {
 
     fn kel_head_put(
         &mut self,
-        id: &[u8; 32],
+        id: &Identifier,
         seq: u64,
-        commitment: [u8; 32],
+        commitment: Commitment,
         seen: u64,
     ) -> Result<(), StoreError> {
         let mut raw = [0u8; 48];
         raw[..8].copy_from_slice(&seq.to_le_bytes());
-        raw[8..40].copy_from_slice(&commitment);
+        raw[8..40].copy_from_slice(commitment.as_ref());
         raw[40..].copy_from_slice(&seen.to_le_bytes());
-        self.write(|txn| {
-            let mut t = txn
-                .open_table(KEL_HEADS)
-                .map_err(|e| StoreError::Backend(e.to_string()))?;
-            t.insert(*id, raw)
-                .map_err(|e| StoreError::Backend(e.to_string()))?;
+        self.write("kel_head_put", |txn| {
+            let mut t = txn.open_table(KEL_HEADS)?;
+            t.insert(*id.as_bytes(), raw)?;
             Ok(())
         })
     }
 
-    fn peer_save(&mut self, id: &[u8; 32], address: &str) -> Result<(), StoreError> {
-        self.write(|txn| {
-            let mut t = txn
-                .open_table(PEERS)
-                .map_err(|e| StoreError::Backend(e.to_string()))?;
-            t.insert(*id, address)
-                .map_err(|e| StoreError::Backend(e.to_string()))?;
+    fn peer_save(&mut self, id: &Identifier, address: &str) -> Result<(), StoreError> {
+        self.write("peer_save", |txn| {
+            let mut t = txn.open_table(PEERS)?;
+            t.insert(*id.as_bytes(), address)?;
             Ok(())
         })
     }
 
-    fn peer_saved(&self) -> Result<Vec<([u8; 32], String)>, StoreError> {
-        self.read(|txn| {
-            let t = txn
-                .open_table(PEERS)
-                .map_err(|e| StoreError::Backend(e.to_string()))?;
+    fn peer_saved(&self) -> Result<Vec<(Identifier, String)>, StoreError> {
+        self.read("peer_saved", |txn| {
+            let t = txn.open_table(PEERS)?;
             let mut out = Vec::new();
-            for entry in t.iter().map_err(|e| StoreError::Backend(e.to_string()))? {
-                let (k, v) = entry.map_err(|e| StoreError::Backend(e.to_string()))?;
-                out.push((k.value(), v.value().to_string()));
+            for entry in t.iter()? {
+                let (k, v) = entry?;
+                out.push((Identifier::from_bytes(k.value()), v.value().to_string()));
             }
             Ok(out)
         })
     }
 
-    fn outbound_remove(&mut self, mid: &[u8; 16]) -> Result<(), StoreError> {
-        self.write(|txn| {
-            let mut t = txn
-                .open_table(OUTBOUND)
-                .map_err(|e| StoreError::Backend(e.to_string()))?;
-            t.remove(mid)
-                .map_err(|e| StoreError::Backend(e.to_string()))?;
+    fn outbound_remove(&mut self, mid: &MessageId) -> Result<(), StoreError> {
+        self.write("outbound_remove", |txn| {
+            let mut t = txn.open_table(OUTBOUND)?;
+            t.remove(mid.as_bytes())?;
             Ok(())
         })
     }
 
     fn outbound_push(&mut self, msg: &OutboundMessage) -> Result<(), StoreError> {
-        let bytes = serde_json::to_vec(msg).map_err(|e| StoreError::Backend(e.to_string()))?;
-        self.write(|txn| {
-            let mut t = txn
-                .open_table(OUTBOUND)
-                .map_err(|e| StoreError::Backend(e.to_string()))?;
-            t.insert(msg.mid, bytes)
-                .map_err(|e| StoreError::Backend(e.to_string()))?;
+        let bytes = serde_json::to_vec(msg).map_err(|e| StoreError::Codec {
+            context: "encode outbound message",
+            source: e,
+        })?;
+        self.write("outbound_push", |txn| {
+            let mut t = txn.open_table(OUTBOUND)?;
+            t.insert(*msg.mid.as_bytes(), bytes)?;
             Ok(())
         })
     }
 
-    fn outbound_get(&self, mid: &[u8; 16]) -> Result<Option<OutboundMessage>, StoreError> {
-        self.read(|txn| {
-            let t = txn
-                .open_table(OUTBOUND)
-                .map_err(|e| StoreError::Backend(e.to_string()))?;
-            match t.get(mid).map_err(|e| StoreError::Backend(e.to_string()))? {
+    fn outbound_get(&self, mid: &MessageId) -> Result<Option<OutboundMessage>, StoreError> {
+        self.read("outbound_get", |txn| {
+            let t = txn.open_table(OUTBOUND)?;
+            match t.get(mid.as_bytes())? {
                 None => Ok(None),
-                Some(v) => serde_json::from_slice(&v.value())
-                    .map(Some)
-                    .map_err(|e| StoreError::Backend(e.to_string())),
+                Some(v) => {
+                    serde_json::from_slice(&v.value())
+                        .map(Some)
+                        .map_err(|e| StoreError::Codec {
+                            context: "decode outbound message",
+                            source: e,
+                        })
+                }
             }
         })
     }
@@ -587,15 +541,16 @@ impl Store for RedbStore {
     }
 
     fn outbound_all(&self) -> Result<Vec<OutboundMessage>, StoreError> {
-        self.read(|txn| {
-            let t = txn
-                .open_table(OUTBOUND)
-                .map_err(|e| StoreError::Backend(e.to_string()))?;
+        self.read("outbound_all", |txn| {
+            let t = txn.open_table(OUTBOUND)?;
             let mut out = Vec::new();
-            for entry in t.iter().map_err(|e| StoreError::Backend(e.to_string()))? {
-                let (_, v) = entry.map_err(|e| StoreError::Backend(e.to_string()))?;
-                let msg: OutboundMessage = serde_json::from_slice(&v.value())
-                    .map_err(|e| StoreError::Backend(e.to_string()))?;
+            for entry in t.iter()? {
+                let (_, v) = entry?;
+                let msg: OutboundMessage =
+                    serde_json::from_slice(&v.value()).map_err(|e| StoreError::Codec {
+                        context: "decode outbound message",
+                        source: e,
+                    })?;
                 out.push(msg);
             }
             Ok(out)
@@ -611,11 +566,12 @@ impl Store for RedbStore {
             seen_hash,
             seen_exp,
         } = accept;
-        let bytes = serde_json::to_vec(&entry).map_err(|e| StoreError::Backend(e.to_string()))?;
-        let msg_len = entry.message.len() as i64;
-        let leg = entry.leg;
-        self.write(|txn| {
-            custody_put_txn(txn, leg, bytes, msg_len)?;
+        let bytes = serde_json::to_vec(&entry).map_err(|e| StoreError::Codec {
+            context: "encode custody entry",
+            source: e,
+        })?;
+        self.write("custody_accept", |txn| {
+            custody_put_txn(txn, &entry, bytes)?;
             share_add_txn(txn, &share_dest, share_upstream, share_bytes)?;
             seen_add_txn(txn, seen_hash, seen_exp)?;
             Ok(())
@@ -623,37 +579,38 @@ impl Store for RedbStore {
     }
 
     fn custody_put(&mut self, entry: CustodyEntry) -> Result<(), StoreError> {
-        let bytes = serde_json::to_vec(&entry).map_err(|e| StoreError::Backend(e.to_string()))?;
-        let leg = entry.leg;
-        let msg_len = entry.message.len() as i64;
-        self.write(|txn| custody_put_txn(txn, leg, bytes, msg_len))
+        let bytes = serde_json::to_vec(&entry).map_err(|e| StoreError::Codec {
+            context: "encode custody entry",
+            source: e,
+        })?;
+        self.write("custody_put", |txn| custody_put_txn(txn, &entry, bytes))
     }
 
-    fn custody_get(&self, leg: &[u8; 16]) -> Result<Option<CustodyEntry>, StoreError> {
-        self.read(|txn| {
-            let t = txn
-                .open_table(CUSTODY)
-                .map_err(|e| StoreError::Backend(e.to_string()))?;
-            match t.get(leg).map_err(|e| StoreError::Backend(e.to_string()))? {
+    fn custody_get(&self, leg: &LegId) -> Result<Option<CustodyEntry>, StoreError> {
+        self.read("custody_get", |txn| {
+            let t = txn.open_table(CUSTODY)?;
+            match t.get(leg.as_bytes())? {
                 None => Ok(None),
-                Some(v) => serde_json::from_slice(&v.value())
-                    .map(Some)
-                    .map_err(|e| StoreError::Backend(e.to_string())),
+                Some(v) => {
+                    serde_json::from_slice(&v.value())
+                        .map(Some)
+                        .map_err(|e| StoreError::Codec {
+                            context: "decode custody entry",
+                            source: e,
+                        })
+                }
             }
         })
     }
 
-    fn custody_remove(&mut self, leg: &[u8; 16]) -> Result<Option<CustodyEntry>, StoreError> {
+    fn custody_remove(&mut self, leg: &LegId) -> Result<Option<CustodyEntry>, StoreError> {
         let existing = self.custody_get(leg)?;
         if let Some(e) = &existing {
             let msg_len = e.message.len() as i64;
             let class = e.class.min(15) as usize;
-            self.write(|txn| {
-                let mut t = txn
-                    .open_table(CUSTODY)
-                    .map_err(|e| StoreError::Backend(e.to_string()))?;
-                t.remove(leg)
-                    .map_err(|e| StoreError::Backend(e.to_string()))?;
+            self.write("custody_remove", |txn| {
+                let mut t = txn.open_table(CUSTODY)?;
+                t.remove(leg.as_bytes())?;
                 meta_add(txn, "custody_bytes", -msg_len)?;
                 meta_add(txn, &format!("custody_class_{class}"), -msg_len)?;
                 Ok(())
@@ -663,16 +620,16 @@ impl Store for RedbStore {
     }
 
     fn custody_all(&self) -> Result<Vec<CustodyEntry>, StoreError> {
-        self.read(|txn| {
-            let t = txn
-                .open_table(CUSTODY)
-                .map_err(|e| StoreError::Backend(e.to_string()))?;
+        self.read("custody_all", |txn| {
+            let t = txn.open_table(CUSTODY)?;
             let mut out = Vec::new();
-            for entry in t.iter().map_err(|e| StoreError::Backend(e.to_string()))? {
-                let (_, v) = entry.map_err(|e| StoreError::Backend(e.to_string()))?;
+            for entry in t.iter()? {
+                let (_, v) = entry?;
                 out.push(
-                    serde_json::from_slice(&v.value())
-                        .map_err(|e| StoreError::Backend(e.to_string()))?,
+                    serde_json::from_slice(&v.value()).map_err(|e| StoreError::Codec {
+                        context: "decode custody entry",
+                        source: e,
+                    })?,
                 );
             }
             Ok(out)
@@ -680,28 +637,19 @@ impl Store for RedbStore {
     }
 
     fn custody_bytes(&self) -> Result<u64, StoreError> {
-        self.read(|txn| {
-            let meta = txn
-                .open_table(META)
-                .map_err(|e| StoreError::Backend(e.to_string()))?;
-            Ok(meta
-                .get("custody_bytes")
-                .map_err(|e| StoreError::Backend(e.to_string()))?
-                .map(|v| v.value())
-                .unwrap_or(0))
+        self.read("custody_bytes", |txn| {
+            let meta = txn.open_table(META)?;
+            Ok(meta.get("custody_bytes")?.map(|v| v.value()).unwrap_or(0))
         })
     }
 
     fn custody_class_bytes(&self) -> Result<[u64; 16], StoreError> {
-        self.read(|txn| {
-            let meta = txn
-                .open_table(META)
-                .map_err(|e| StoreError::Backend(e.to_string()))?;
+        self.read("custody_class_bytes", |txn| {
+            let meta = txn.open_table(META)?;
             let mut out = [0u64; 16];
             for (i, slot) in out.iter_mut().enumerate() {
                 *slot = meta
-                    .get(format!("custody_class_{i}").as_str())
-                    .map_err(|e| StoreError::Backend(e.to_string()))?
+                    .get(format!("custody_class_{i}").as_str())?
                     .map(|v| v.value())
                     .unwrap_or(0);
             }
@@ -709,112 +657,67 @@ impl Store for RedbStore {
         })
     }
 
-    fn share_add(&mut self, dest: &[u8; 32], upstream: u64, bytes: i64) -> Result<u64, StoreError> {
-        self.write(|txn| share_add_txn(txn, dest, upstream, bytes))
+    fn share_add(
+        &mut self,
+        dest: &Identifier,
+        upstream: u64,
+        bytes: i64,
+    ) -> Result<u64, StoreError> {
+        self.write("share_add", |txn| share_add_txn(txn, dest, upstream, bytes))
     }
 
-    fn share_get(&self, dest: &[u8; 32], upstream: u64) -> Result<u64, StoreError> {
+    fn share_get(&self, dest: &Identifier, upstream: u64) -> Result<u64, StoreError> {
         let key = share_key(dest, upstream);
-        self.read(|txn| {
-            let t = txn
-                .open_table(SHARES)
-                .map_err(|e| StoreError::Backend(e.to_string()))?;
-            Ok(t.get(key)
-                .map_err(|e| StoreError::Backend(e.to_string()))?
-                .map(|v| v.value())
-                .unwrap_or(0))
+        self.read("share_get", |txn| {
+            let t = txn.open_table(SHARES)?;
+            Ok(t.get(key)?.map(|v| v.value()).unwrap_or(0))
         })
     }
 
-    fn seen_contains(&self, hash: &[u8; 32], now: u64) -> Result<bool, StoreError> {
-        self.read(|txn| {
-            let t = txn
-                .open_table(SEEN)
-                .map_err(|e| StoreError::Backend(e.to_string()))?;
-            Ok(t.get(hash)
-                .map_err(|e| StoreError::Backend(e.to_string()))?
+    fn seen_contains(&self, hash: &Hash32, now: u64) -> Result<bool, StoreError> {
+        self.read("seen_contains", |txn| {
+            let t = txn.open_table(SEEN)?;
+            Ok(t.get(hash.as_bytes())?
                 .map(|v| v.value() > now)
                 .unwrap_or(false))
         })
     }
 
-    fn seen_add(&mut self, hash: [u8; 32], exp: u64) -> Result<(), StoreError> {
-        self.write(|txn| seen_add_txn(txn, hash, exp))
+    fn seen_add(&mut self, hash: Hash32, exp: u64) -> Result<(), StoreError> {
+        self.write("seen_add", |txn| seen_add_txn(txn, hash, exp))
     }
 
-    fn delivered_contains(&self, hash: &[u8; 32], now: u64) -> Result<bool, StoreError> {
-        self.read(|txn| {
-            let t = txn
-                .open_table(DELIVERED)
-                .map_err(|e| StoreError::Backend(e.to_string()))?;
-            Ok(t.get(hash)
-                .map_err(|e| StoreError::Backend(e.to_string()))?
+    fn delivered_contains(&self, hash: &Hash32, now: u64) -> Result<bool, StoreError> {
+        self.read("delivered_contains", |txn| {
+            let t = txn.open_table(DELIVERED)?;
+            Ok(t.get(hash.as_bytes())?
                 .map(|v| v.value() > now)
                 .unwrap_or(false))
         })
     }
 
-    fn delivered_add(&mut self, hash: [u8; 32], exp: u64) -> Result<(), StoreError> {
-        self.write(|txn| {
-            let mut t = txn
-                .open_table(DELIVERED)
-                .map_err(|e| StoreError::Backend(e.to_string()))?;
-            t.insert(hash, exp)
-                .map_err(|e| StoreError::Backend(e.to_string()))?;
+    fn delivered_add(&mut self, hash: Hash32, exp: u64) -> Result<(), StoreError> {
+        self.write("delivered_add", |txn| {
+            let mut t = txn.open_table(DELIVERED)?;
+            t.insert(*hash.as_bytes(), exp)?;
             Ok(())
         })
     }
 
     fn sweep_expired(&mut self, now: u64) -> Result<(), StoreError> {
-        self.write(|txn| {
+        self.write("sweep_expired", |txn| {
             for table_def in [SEEN, DELIVERED] {
-                let mut t = txn
-                    .open_table(table_def)
-                    .map_err(|e| StoreError::Backend(e.to_string()))?;
+                let mut t = txn.open_table(table_def)?;
                 let expired: Vec<[u8; 32]> = t
-                    .iter()
-                    .map_err(|e| StoreError::Backend(e.to_string()))?
-                    .filter_map(|e| e.ok())
-                    .filter(|(_, v)| v.value() <= now)
-                    .map(|(k, _)| k.value())
+                    .iter()?
+                    .map(|e| e.map(|(k, v)| (k.value(), v.value())))
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_iter()
+                    .filter(|(_, v)| *v <= now)
+                    .map(|(k, _)| k)
                     .collect();
                 for k in expired {
-                    t.remove(k)
-                        .map_err(|e| StoreError::Backend(e.to_string()))?;
-                }
-            }
-            // Wary entries carry JSON rows of (range, exp); drop expired ones.
-            let mut t = txn
-                .open_table(WARY)
-                .map_err(|e| StoreError::Backend(e.to_string()))?;
-            let keys: Vec<[u8; 32]> = t
-                .iter()
-                .map_err(|e| StoreError::Backend(e.to_string()))?
-                .filter_map(|e| e.ok())
-                .map(|(k, _)| k.value())
-                .collect();
-            for id in keys {
-                let Some(v) = t
-                    .get(id)
-                    .map_err(|e| StoreError::Backend(e.to_string()))?
-                    .map(|v| v.value())
-                else {
-                    continue;
-                };
-                let mut rows: Vec<(u64, u64)> =
-                    serde_json::from_slice(&v).map_err(|e| StoreError::Backend(e.to_string()))?;
-                let before = rows.len();
-                rows.retain(|(_, exp)| *exp > now);
-                if rows.len() != before {
-                    if rows.is_empty() {
-                        t.remove(id)
-                            .map_err(|e| StoreError::Backend(e.to_string()))?;
-                    } else {
-                        let bytes = serde_json::to_vec(&rows)
-                            .map_err(|e| StoreError::Backend(e.to_string()))?;
-                        t.insert(id, bytes)
-                            .map_err(|e| StoreError::Backend(e.to_string()))?;
-                    }
+                    t.remove(k)?;
                 }
             }
             Ok(())
@@ -824,14 +727,14 @@ impl Store for RedbStore {
     fn inbox_push(&mut self, service: &str, entry: InboxEntry) -> Result<(), StoreError> {
         let mut e = entry;
         let _ = service; // service is carried inside the entry
-        let bytes = serde_json::to_vec(&e).map_err(|e| StoreError::Backend(e.to_string()))?;
+        let bytes = serde_json::to_vec(&e).map_err(|e| StoreError::Codec {
+            context: "encode inbox entry",
+            source: e,
+        })?;
         let id = e.delivery_id;
-        self.write(|txn| {
-            let mut t = txn
-                .open_table(INBOX)
-                .map_err(|e| StoreError::Backend(e.to_string()))?;
-            t.insert(id, bytes)
-                .map_err(|e| StoreError::Backend(e.to_string()))?;
+        self.write("inbox_push", |txn| {
+            let mut t = txn.open_table(INBOX)?;
+            t.insert(*id.as_bytes(), bytes)?;
             Ok(())
         })?;
         let _ = &mut e;
@@ -839,18 +742,19 @@ impl Store for RedbStore {
     }
 
     fn inbox_fetch(&self, service: &str, max: usize) -> Result<Vec<InboxEntry>, StoreError> {
-        self.read(|txn| {
-            let t = txn
-                .open_table(INBOX)
-                .map_err(|e| StoreError::Backend(e.to_string()))?;
+        self.read("inbox_fetch", |txn| {
+            let t = txn.open_table(INBOX)?;
             let mut out = Vec::new();
-            for entry in t.iter().map_err(|e| StoreError::Backend(e.to_string()))? {
+            for entry in t.iter()? {
                 if out.len() >= max {
                     break;
                 }
-                let (_, v) = entry.map_err(|e| StoreError::Backend(e.to_string()))?;
-                let e: InboxEntry = serde_json::from_slice(&v.value())
-                    .map_err(|e| StoreError::Backend(e.to_string()))?;
+                let (_, v) = entry?;
+                let e: InboxEntry =
+                    serde_json::from_slice(&v.value()).map_err(|e| StoreError::Codec {
+                        context: "decode inbox entry",
+                        source: e,
+                    })?;
                 if e.tsvc == service {
                     out.push(e);
                 }
@@ -859,26 +763,30 @@ impl Store for RedbStore {
         })
     }
 
-    fn inbox_ack(&mut self, service: &str, delivery_ids: &[[u8; 16]]) -> Result<usize, StoreError> {
-        self.write(|txn| {
-            let mut t = txn
-                .open_table(INBOX)
-                .map_err(|e| StoreError::Backend(e.to_string()))?;
+    fn inbox_ack(
+        &mut self,
+        service: &str,
+        delivery_ids: &[DeliveryId],
+    ) -> Result<usize, StoreError> {
+        self.write("inbox_ack", |txn| {
+            let mut t = txn.open_table(INBOX)?;
             let mut removed = 0;
             for id in delivery_ids {
-                let entry = t
-                    .get(*id)
-                    .map_err(|e| StoreError::Backend(e.to_string()))?
-                    .map(|v| v.value());
+                let entry = t.get(id.as_bytes())?.map(|v| v.value());
                 let belongs = match &entry {
-                    Some(bytes) => serde_json::from_slice::<InboxEntry>(bytes)
-                        .map(|e| e.tsvc == service)
-                        .unwrap_or(false),
+                    Some(bytes) => match serde_json::from_slice::<InboxEntry>(bytes) {
+                        Ok(e) => e.tsvc == service,
+                        Err(e) => {
+                            return Err(StoreError::Codec {
+                                context: "decode inbox entry",
+                                source: e,
+                            });
+                        }
+                    },
                     None => false,
                 };
                 if belongs {
-                    t.remove(id)
-                        .map_err(|e| StoreError::Backend(e.to_string()))?;
+                    t.remove(id.as_bytes())?;
                     removed += 1;
                 }
             }
@@ -887,15 +795,16 @@ impl Store for RedbStore {
     }
 
     fn inbox_len(&self, service: &str) -> Result<u64, StoreError> {
-        self.read(|txn| {
-            let t = txn
-                .open_table(INBOX)
-                .map_err(|e| StoreError::Backend(e.to_string()))?;
+        self.read("inbox_len", |txn| {
+            let t = txn.open_table(INBOX)?;
             let mut count = 0u64;
-            for entry in t.iter().map_err(|e| StoreError::Backend(e.to_string()))? {
-                let (_, v) = entry.map_err(|e| StoreError::Backend(e.to_string()))?;
-                let e: InboxEntry = serde_json::from_slice(&v.value())
-                    .map_err(|e| StoreError::Backend(e.to_string()))?;
+            for entry in t.iter()? {
+                let (_, v) = entry?;
+                let e: InboxEntry =
+                    serde_json::from_slice(&v.value()).map_err(|e| StoreError::Codec {
+                        context: "decode inbox entry",
+                        source: e,
+                    })?;
                 if e.tsvc == service {
                     count += 1;
                 }
@@ -904,81 +813,73 @@ impl Store for RedbStore {
         })
     }
 
+    fn inbox_len_total(&self) -> Result<u64, StoreError> {
+        self.read("inbox_len_total", |txn| {
+            let t = txn.open_table(INBOX)?;
+            let mut count = 0u64;
+            for entry in t.iter()? {
+                entry?;
+                count += 1;
+            }
+            Ok(count)
+        })
+    }
+
+    fn inbox_sweep_expired(&mut self, max_age_secs: u64, now: u64) -> Result<u64, StoreError> {
+        self.write("inbox_sweep_expired", |txn| {
+            let mut t = txn.open_table(INBOX)?;
+            let mut stale = Vec::new();
+            for entry in t.iter()? {
+                let (k, v) = entry?;
+                let e: InboxEntry =
+                    serde_json::from_slice(&v.value()).map_err(|e| StoreError::Codec {
+                        context: "decode inbox entry",
+                        source: e,
+                    })?;
+                if e.received.saturating_add(max_age_secs) <= now {
+                    stale.push(k.value());
+                }
+            }
+            let dropped = stale.len() as u64;
+            for id in stale {
+                t.remove(id)?;
+            }
+            Ok(dropped)
+        })
+    }
+
     fn status_set(
         &mut self,
-        mid: &[u8; 16],
+        mid: &MessageId,
         status: u64,
         detail: Option<u64>,
     ) -> Result<(), StoreError> {
-        let bytes = serde_json::to_vec(&(status, detail))
-            .map_err(|e| StoreError::Backend(e.to_string()))?;
-        self.write(|txn| {
-            let mut t = txn
-                .open_table(STATUS)
-                .map_err(|e| StoreError::Backend(e.to_string()))?;
-            t.insert(*mid, bytes)
-                .map_err(|e| StoreError::Backend(e.to_string()))?;
+        let bytes = serde_json::to_vec(&(status, detail)).map_err(|e| StoreError::Codec {
+            context: "encode status",
+            source: e,
+        })?;
+        self.write("status_set", |txn| {
+            let mut t = txn.open_table(STATUS)?;
+            t.insert(*mid.as_bytes(), bytes)?;
             Ok(())
         })
     }
 
-    fn status_get(&self, mid: &[u8; 16]) -> Result<Option<(u64, Option<u64>)>, StoreError> {
-        self.read(|txn| {
-            let t = txn
-                .open_table(STATUS)
-                .map_err(|e| StoreError::Backend(e.to_string()))?;
-            match t.get(mid).map_err(|e| StoreError::Backend(e.to_string()))? {
+    fn status_get(&self, mid: &MessageId) -> Result<Option<(u64, Option<u64>)>, StoreError> {
+        self.read("status_get", |txn| {
+            let t = txn.open_table(STATUS)?;
+            match t.get(mid.as_bytes())? {
                 None => Ok(None),
-                Some(v) => serde_json::from_slice(&v.value())
-                    .map(Some)
-                    .map_err(|e| StoreError::Backend(e.to_string())),
-            }
-        })
-    }
-
-    fn wary_add(&mut self, id: &[u8; 32], source_range: u64, exp: u64) -> Result<(), StoreError> {
-        self.write(|txn| {
-            let mut t = txn
-                .open_table(WARY)
-                .map_err(|e| StoreError::Backend(e.to_string()))?;
-            let mut rows: Vec<(u64, u64)> =
-                match t.get(id).map_err(|e| StoreError::Backend(e.to_string()))? {
-                    Some(v) => serde_json::from_slice(&v.value())
-                        .map_err(|e| StoreError::Backend(e.to_string()))?,
-                    None => Vec::new(),
-                };
-            rows.retain(|(r, _)| *r != source_range);
-            rows.push((source_range, exp));
-            let bytes =
-                serde_json::to_vec(&rows).map_err(|e| StoreError::Backend(e.to_string()))?;
-            t.insert(*id, bytes)
-                .map_err(|e| StoreError::Backend(e.to_string()))?;
-            Ok(())
-        })
-    }
-
-    fn wary_ranges(&self, id: &[u8; 32], now: u64) -> Result<Vec<u64>, StoreError> {
-        self.read(|txn| {
-            let t = txn
-                .open_table(WARY)
-                .map_err(|e| StoreError::Backend(e.to_string()))?;
-            match t.get(id).map_err(|e| StoreError::Backend(e.to_string()))? {
-                None => Ok(Vec::new()),
                 Some(v) => {
-                    let rows: Vec<(u64, u64)> = serde_json::from_slice(&v.value())
-                        .map_err(|e| StoreError::Backend(e.to_string()))?;
-                    Ok(rows
-                        .into_iter()
-                        .filter(|(_, e)| *e > now)
-                        .map(|(r, _)| r)
-                        .collect())
+                    serde_json::from_slice(&v.value())
+                        .map(Some)
+                        .map_err(|e| StoreError::Codec {
+                            context: "decode status",
+                            source: e,
+                        })
                 }
             }
         })
-    }
-
-    fn wary_sweep(&mut self, now: u64) -> Result<(), StoreError> {
-        self.sweep_expired(now)
     }
 
     fn size_bucket_sample(&mut self, bucket: u8) {
@@ -990,25 +891,16 @@ impl Store for RedbStore {
     }
 
     fn drain_get(&self) -> Result<bool, StoreError> {
-        self.read(|txn| {
-            let meta = txn
-                .open_table(META)
-                .map_err(|e| StoreError::Backend(e.to_string()))?;
-            Ok(meta
-                .get("drain")
-                .map_err(|e| StoreError::Backend(e.to_string()))?
-                .map(|v| v.value() != 0)
-                .unwrap_or(false))
+        self.read("drain_get", |txn| {
+            let meta = txn.open_table(META)?;
+            Ok(meta.get("drain")?.map(|v| v.value() != 0).unwrap_or(false))
         })
     }
 
     fn drain_set(&mut self, draining: bool) -> Result<(), StoreError> {
-        self.write(|txn| {
-            let mut meta = txn
-                .open_table(META)
-                .map_err(|e| StoreError::Backend(e.to_string()))?;
-            meta.insert("drain", if draining { 1 } else { 0 })
-                .map_err(|e| StoreError::Backend(e.to_string()))?;
+        self.write("drain_set", |txn| {
+            let mut meta = txn.open_table(META)?;
+            meta.insert("drain", if draining { 1 } else { 0 })?;
             Ok(())
         })
     }
@@ -1019,12 +911,13 @@ impl RedbStore {
     /// batch becomes durable with a single fsync — the group-commit pattern
     /// the custody path needs for custody throughput.
     pub fn custody_put_batch(&self, entries: &[CustodyEntry]) -> Result<(), StoreError> {
-        self.write(|txn| {
+        self.write("custody_put_batch", |txn| {
             for entry in entries {
-                let bytes =
-                    serde_json::to_vec(entry).map_err(|e| StoreError::Backend(e.to_string()))?;
-                let msg_len = entry.message.len() as i64;
-                custody_put_txn(txn, entry.leg, bytes, msg_len)?;
+                let bytes = serde_json::to_vec(entry).map_err(|e| StoreError::Codec {
+                    context: "encode custody entry",
+                    source: e,
+                })?;
+                custody_put_txn(txn, entry, bytes)?;
             }
             Ok(())
         })

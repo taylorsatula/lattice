@@ -10,9 +10,13 @@ fn sign_verify_roundtrip() {
     let sig = sign(&seed, msg);
     assert!(verify(&pk, msg, &sig));
     assert!(!verify(&pk, b"exact bytes being signedf", &sig));
-    let mut bad = sig;
+    let mut bad = sig.into_bytes();
     bad[10] ^= 1;
-    assert!(!verify(&pk, msg, &bad));
+    assert!(!verify(
+        &pk,
+        msg,
+        &lattice_types::Signature::from_bytes(bad)
+    ));
 }
 
 #[test]
@@ -20,9 +24,13 @@ fn tampered_public_key_fails() {
     let seed = generate_seed();
     let pk = public_key(&seed);
     let sig = sign(&seed, b"m");
-    let mut wrong = pk;
+    let mut wrong = pk.into_bytes();
     wrong[0] ^= 1;
-    assert!(!verify(&wrong, b"m", &sig));
+    assert!(!verify(
+        &lattice_types::SigningPublicKey::from_bytes(wrong),
+        b"m",
+        &sig
+    ));
 }
 
 #[test]

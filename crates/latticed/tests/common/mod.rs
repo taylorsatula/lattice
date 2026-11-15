@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use lattice_types::{ChannelPublicKey, Identifier};
+
 pub fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -30,7 +32,7 @@ pub fn latticed() -> &'static str {
     env!("CARGO_BIN_EXE_latticed")
 }
 
-pub fn init_node(dir: &Path) -> ([u8; 32], [u8; 32]) {
+pub fn init_node(dir: &Path) -> (Identifier, ChannelPublicKey) {
     let out = Command::new(latticed())
         .args(["init", "--dir", dir.to_str().unwrap()])
         .output()
@@ -47,11 +49,13 @@ pub fn init_node(dir: &Path) -> ([u8; 32], [u8; 32]) {
         .expect("init prints node id")
         .trim()
         .to_string();
-    let id: [u8; 32] = hex_decode(&id_hex).try_into().unwrap();
-    let channel_key: [u8; 32] = std::fs::read(dir.join("channel_key.pub"))
-        .unwrap()
-        .try_into()
-        .unwrap();
+    let id = Identifier::from_bytes(hex_decode(&id_hex).try_into().unwrap());
+    let channel_key = ChannelPublicKey::from_bytes(
+        std::fs::read(dir.join("channel_key.pub"))
+            .unwrap()
+            .try_into()
+            .unwrap(),
+    );
     (id, channel_key)
 }
 
@@ -61,17 +65,17 @@ pub struct NodeSpec<'a> {
     pub port: u16,
     pub app: &'a Path,
     pub admin: &'a Path,
-    pub peer: Option<(&'a str, [u8; 32], [u8; 32])>,
+    pub peer: Option<(&'a str, ChannelPublicKey, Identifier)>,
     pub services: &'a [(&'a str, &'a str)],
-    pub private_gateways: Option<Vec<[u8; 32]>>,
+    pub private_gateways: Option<Vec<Identifier>>,
 }
 
 pub fn write_config(dir: &Path, spec: &NodeSpec) {
     let roots = match spec.peer {
         Some((addr, key, id)) => format!(
             "[[roots]]\naddr = \"{addr}\"\nchannel_key = \"{}\"\nid = \"{}\"\n",
-            hex_encode(&key),
-            hex_encode(&id),
+            hex_encode(key.as_ref()),
+            hex_encode(id.as_ref()),
         ),
         None => String::new(),
     };
@@ -87,7 +91,7 @@ pub fn write_config(dir: &Path, spec: &NodeSpec) {
             format!(
                 "gateways = [{}]\n",
                 gws.iter()
-                    .map(|g| format!("\"{}\"", hex_encode(g)))
+                    .map(|g| format!("\"{}\"", hex_encode(g.as_ref())))
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
@@ -134,15 +138,15 @@ pub struct TestNode {
     pub port: u16,
     pub app: PathBuf,
     pub admin: PathBuf,
-    pub id: [u8; 32],
-    pub channel_key: [u8; 32],
+    pub id: Identifier,
+    pub channel_key: ChannelPublicKey,
     pub child: Option<Child>,
 }
 
 pub fn boot_node(
     tmp: &Path,
     name: &str,
-    peer: Option<(&str, [u8; 32], [u8; 32])>,
+    peer: Option<(&str, ChannelPublicKey, Identifier)>,
     services: &[(&str, &str)],
 ) -> TestNode {
     boot_node_full(tmp, name, peer, services, None)
@@ -151,33 +155,72 @@ pub fn boot_node(
 pub fn boot_node_full(
     tmp: &Path,
     name: &str,
-    peer: Option<(&str, [u8; 32], [u8; 32])>,
+    peer: Option<(&str, ChannelPublicKey, Identifier)>,
     services: &[(&str, &str)],
-    private_gateways: Option<Vec<[u8; 32]>>,
+    private_gateways: Option<Vec<Identifier>>,
 ) -> TestNode {
     let dir = tmp.join(name);
     let (id, channel_key) = init_node(&dir);
-    let port = free_port();
     let app = tmp.join(format!("{name}.app.sock"));
     let admin = tmp.join(format!("{name}.admin.sock"));
-    let spec = NodeSpec {
-        port,
-        app: &app,
-        admin: &admin,
-        peer,
-        services,
-        private_gateways,
-    };
-    write_config(&dir, &spec);
-    let child = start_node(&dir);
-    TestNode {
-        dir,
-        port,
-        app,
-        admin,
-        id,
-        channel_key,
-        child: Some(child),
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        let port = free_port();
+        let spec = NodeSpec {
+            port,
+            app: &app,
+            admin: &admin,
+            peer,
+            services,
+            private_gateways: private_gateways.clone(),
+        };
+        write_config(&dir, &spec);
+        let mut child = start_node(&dir);
+        // Give the daemon a brief window to fail on bind (the port we just
+        // probed can be taken between probe and bind). If it exits during
+        // startup, retry with a fresh port instead of waiting 30s for
+        // sockets that will never appear.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut early_exit = None;
+        while Instant::now() < deadline {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    early_exit = Some(status);
+                    break;
+                }
+                Ok(None) => {}
+                Err(e) => panic!("wait failed: {e}"),
+            }
+            if std::os::unix::net::UnixStream::connect(&app).is_ok()
+                && std::os::unix::net::UnixStream::connect(&admin).is_ok()
+            {
+                break; // daemon is up
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        match early_exit {
+            Some(status) => {
+                eprintln!(
+                    "latticed exited during startup ({status}); retrying with a fresh port (attempt {attempt})"
+                );
+                if attempt >= 5 {
+                    panic!("latticed failed to start after {attempt} attempts");
+                }
+                continue;
+            }
+            None => {
+                return TestNode {
+                    dir,
+                    port,
+                    app,
+                    admin,
+                    id,
+                    channel_key,
+                    child: Some(child),
+                };
+            }
+        }
     }
 }
 
@@ -220,7 +263,7 @@ impl Drop for TestNode {
     }
 }
 
-pub async fn wait_for_path(client: &mut lattice_client::Client, id: &[u8; 32], secs: u64) {
+pub async fn wait_for_path(client: &mut lattice_client::Client, id: &Identifier, secs: u64) {
     let deadline = Instant::now() + Duration::from_secs(secs);
     loop {
         match client.lookup(id).await {
@@ -238,7 +281,7 @@ pub async fn wait_for_path(client: &mut lattice_client::Client, id: &[u8; 32], s
 pub async fn send_and_fetch(
     sender: &mut lattice_client::Client,
     recipient: &mut lattice_client::Client,
-    to: [u8; 32],
+    to: Identifier,
     body: &[u8],
     route: Option<u64>,
     timeout: Duration,

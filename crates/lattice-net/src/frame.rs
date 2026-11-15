@@ -6,12 +6,38 @@ use lattice_proto::cbor::{self, Value};
 
 pub const FRAME_BUCKETS: [usize; 3] = [2048, 8192, 32768];
 
+/// Why a wire frame failed to encode or decode.
 #[derive(Debug)]
 pub enum FrameError {
+    /// The frame does not fit any bucket (encode) or the input is not a
+    /// bucket size (decode).
     TooLarge,
+    /// The decoded value is not a `[frame, padding]` pair of byte strings.
     BadShape,
+    /// The padding bytes were not all zero.
     BadPadding,
-    BadFrame(String),
+    /// The frame bytes did not decode as CBOR.
+    BadFrame(lattice_proto::ProtoError),
+}
+
+impl std::fmt::Display for FrameError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FrameError::TooLarge => write!(f, "frame too large"),
+            FrameError::BadShape => write!(f, "frame is not a [frame, padding] pair"),
+            FrameError::BadPadding => write!(f, "non-zero padding"),
+            FrameError::BadFrame(e) => write!(f, "undecodable frame: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for FrameError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            FrameError::BadFrame(e) => Some(e),
+            _ => None,
+        }
+    }
 }
 
 fn cbor_head_len(n: usize) -> usize {
@@ -79,7 +105,7 @@ pub fn decode_wire(bytes: &[u8]) -> Result<Vec<u8>, FrameError> {
     if !FRAME_BUCKETS.contains(&bytes.len()) {
         return Err(FrameError::TooLarge);
     }
-    let v = cbor::decode(bytes).map_err(|e| FrameError::BadFrame(e.to_string()))?;
+    let v = cbor::decode(bytes).map_err(|e| FrameError::BadFrame(e.into()))?;
     let arr = v.as_array().ok_or(FrameError::BadShape)?;
     if arr.len() != 2 {
         return Err(FrameError::BadShape);

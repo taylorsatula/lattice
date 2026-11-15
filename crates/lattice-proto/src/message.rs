@@ -8,6 +8,10 @@
 //! needs to be secret.
 
 use lattice_crypto::{ENVELOPE_CONTEXT, HOP_CONTEXT, open, seal};
+use lattice_types::{
+    Identifier, KemCiphertext, LegId, MessageId, Signature, SigningPublicKey, SigningSeed,
+    XWingPublicKey, XWingSecretKey,
+};
 
 use crate::cbor::{Value, decode, encode};
 use crate::error::ProtoError;
@@ -31,8 +35,8 @@ const SEALED_KEYS: [u64; 2] = [0, 1];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Header {
-    pub leg: [u8; 16],
-    pub dst: [u8; 32],
+    pub leg: LegId,
+    pub dst: Identifier,
     pub exp: u64,
 }
 
@@ -58,8 +62,8 @@ impl Header {
             return Err(ProtoError::Invalid("not a header"));
         }
         Ok(Self {
-            leg: fixed_bytes(v, 2)?,
-            dst: fixed_bytes(v, 3)?,
+            leg: LegId::from_bytes(fixed_bytes(v, 2)?),
+            dst: Identifier::from_bytes(fixed_bytes(v, 3)?),
             exp: v.req_uint(4)?,
         })
     }
@@ -68,7 +72,7 @@ impl Header {
 /// A sealed layer as it rides on the wire: `{0: kem, 1: ct}`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SealedLayer {
-    pub kem: [u8; 1120],
+    pub kem: KemCiphertext,
     pub ct: Vec<u8>,
 }
 
@@ -82,13 +86,13 @@ impl SealedLayer {
     pub fn from_value(v: &Value) -> Result<Self, ProtoError> {
         v.deny_unknown_keys(&SEALED_KEYS)?;
         Ok(Self {
-            kem: fixed_bytes(v, 0)?,
+            kem: KemCiphertext::from_bytes(fixed_bytes(v, 0)?),
             ct: v.req_bytes(1)?.to_vec(),
         })
     }
     fn seal_to(
         context: &str,
-        public: &[u8; 1216],
+        public: &XWingPublicKey,
         aad: &[u8],
         plaintext: &[u8],
     ) -> Result<Self, ProtoError> {
@@ -102,7 +106,7 @@ impl SealedLayer {
     fn open_with(
         &self,
         context: &str,
-        secret: &[u8; 32],
+        secret: &XWingSecretKey,
         aad: &[u8],
     ) -> Result<Vec<u8>, ProtoError> {
         open(context, secret, aad, &self.kem, &self.ct)
@@ -118,7 +122,7 @@ pub enum HopLayerPlain {
         inner: Option<Box<SealedLayer>>,
     },
     Gateway {
-        rcpt: [u8; 32],
+        rcpt: Identifier,
     },
 }
 
@@ -153,7 +157,7 @@ impl HopLayerPlain {
                 Ok(HopLayerPlain::Waypoint { hdr, inner })
             }
             HOP_KIND_GATEWAY => Ok(HopLayerPlain::Gateway {
-                rcpt: fixed_bytes(v, 3)?,
+                rcpt: Identifier::from_bytes(fixed_bytes(v, 3)?),
             }),
             _ => Err(ProtoError::Invalid("unknown hop layer kind")),
         }
@@ -164,18 +168,17 @@ impl HopLayerPlain {
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Envelope {
     pub kind: u64,
-    pub mid: [u8; 16],
-    pub from: [u8; 32],
+    pub mid: MessageId,
+    pub from: Identifier,
     pub fsvc: String,
     pub fmbx: Vec<u8>,
     pub tsvc: String,
     pub tmbx: Vec<u8>,
     pub created: u64,
     pub body: Option<Vec<u8>>,
-    pub reference: Option<[u8; 16]>,
+    pub reference: Option<MessageId>,
     pub reason: Option<u64>,
-    #[serde(with = "crate::serde_arrays::sig64")]
-    pub sig: [u8; 64],
+    pub sig: Signature,
 }
 
 impl Envelope {
@@ -206,13 +209,17 @@ impl Envelope {
     }
 
     /// Sign this envelope against `routing_header_bytes`.
-    pub fn sign(&mut self, signing_seed: &[u8; 32], routing_header_bytes: &[u8]) {
+    pub fn sign(&mut self, signing_seed: &SigningSeed, routing_header_bytes: &[u8]) {
         let mut preimage = routing_header_bytes.to_vec();
         preimage.extend_from_slice(&encode(&self.unsigned_value()));
         self.sig = lattice_crypto::sign(signing_seed, &preimage);
     }
 
-    pub fn verify_signature(&self, from_key: &[u8; 32], routing_header_bytes: &[u8]) -> bool {
+    pub fn verify_signature(
+        &self,
+        from_key: &SigningPublicKey,
+        routing_header_bytes: &[u8],
+    ) -> bool {
         let mut preimage = routing_header_bytes.to_vec();
         preimage.extend_from_slice(&encode(&self.unsigned_value()));
         lattice_crypto::verify(from_key, &preimage, &self.sig)
@@ -243,6 +250,7 @@ impl Envelope {
             Some(b) => Some(
                 b.as_bytes()
                     .and_then(|b| <[u8; 16]>::try_from(b).ok())
+                    .map(MessageId::from_bytes)
                     .ok_or(ProtoError::WrongType(8, "16-byte id"))?,
             ),
         };
@@ -273,8 +281,8 @@ impl Envelope {
         }
         Ok(Self {
             kind,
-            mid: fixed_bytes(v, 11)?,
-            from: fixed_bytes(v, 1)?,
+            mid: MessageId::from_bytes(fixed_bytes(v, 11)?),
+            from: Identifier::from_bytes(fixed_bytes(v, 1)?),
             fsvc: v.req_text(2)?.to_string(),
             fmbx: v.req_bytes(3)?.to_vec(),
             tsvc: v.req_text(4)?.to_string(),
@@ -283,7 +291,7 @@ impl Envelope {
             body,
             reference,
             reason,
-            sig: fixed_bytes(v, 10)?,
+            sig: Signature::from_bytes(fixed_bytes(v, 10)?),
         })
     }
 }
@@ -303,29 +311,29 @@ pub struct Message {
 #[derive(Clone)]
 pub struct GatewaySeal {
     /// The gateway's X-Wing encapsulation (public) key.
-    pub gateway_ek: [u8; 1216],
+    pub gateway_ek: XWingPublicKey,
     /// The private recipient's identifier, placed in the gateway layer.
-    pub rcpt: [u8; 32],
+    pub rcpt: Identifier,
 }
 
 #[derive(Clone)]
 pub struct WaypointSeal {
-    pub waypoint_id: [u8; 32],
-    pub waypoint_ek: [u8; 1216],
-    pub leg: [u8; 16],
+    pub waypoint_id: Identifier,
+    pub waypoint_ek: XWingPublicKey,
+    pub leg: LegId,
     pub exp: u64,
 }
 
 pub struct BuildParams<'a> {
     pub envelope: Envelope,
-    pub sender_seed: &'a [u8; 32],
+    pub sender_seed: &'a SigningSeed,
     /// Envelope key of the final recipient.
-    pub recipient_ek: &'a [u8; 1216],
+    pub recipient_ek: &'a XWingPublicKey,
     /// Routing destination of the real header: the recipient for a direct
     /// public route, or the gateway for a private one.
-    pub real_dst: [u8; 32],
+    pub real_dst: Identifier,
     /// Leg id and expiry of the real header.
-    pub leg: [u8; 16],
+    pub leg: LegId,
     pub exp: u64,
     pub gateway: Option<GatewaySeal>,
     pub waypoint: Option<WaypointSeal>,
@@ -482,7 +490,7 @@ impl Message {
 
     /// Open the outer hop layer with the given hop secret key. Returns the
     /// plaintext for the node's role: Waypoint or Gateway.
-    pub fn open_hop_layer(&self, hop_secret: &[u8; 32]) -> Result<HopLayerPlain, ProtoError> {
+    pub fn open_hop_layer(&self, hop_secret: &XWingSecretKey) -> Result<HopLayerPlain, ProtoError> {
         let layer = self
             .hop_layer
             .as_ref()
@@ -522,7 +530,7 @@ impl Message {
 
     /// Decrypt the envelope with the recipient's key. The AAD is the routing
     /// header — the header in the same array slot the recipient received.
-    pub fn open_envelope(&self, recipient_secret: &[u8; 32]) -> Result<Envelope, ProtoError> {
+    pub fn open_envelope(&self, recipient_secret: &XWingSecretKey) -> Result<Envelope, ProtoError> {
         let pt = self
             .envelope
             .open_with(ENVELOPE_CONTEXT, recipient_secret, &self.raw_header)?;

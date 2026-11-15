@@ -14,25 +14,67 @@ pub use mem::MemStore;
 pub use redb_store::RedbStore;
 
 use lattice_proto::record::Scope;
+use lattice_types::{Commitment, DeliveryId, Hash32, Identifier, LegId, MessageId};
 
+/// Error returned by every store operation.
+///
+/// `Backend` preserves the underlying backend error as `source` and names the
+/// store operation (`op`, e.g. `"record_get"`) that failed, so an operator can
+/// tell which operation against which backend failed and why.
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
-    #[error("store full")]
-    Full,
-    #[error("not found")]
-    NotFound,
-    #[error("backend: {0}")]
-    Backend(String),
+    /// The storage backend rejected an operation. `op` names the store
+    /// operation; `source` is the underlying error.
+    #[error("{op}: {source}")]
+    Backend {
+        op: &'static str,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+    /// A value failed to (de)serialize. `context` names the value being
+    /// encoded or decoded (e.g. `"decode custody entry"`).
+    #[error("{context}: {source}")]
+    Codec {
+        context: &'static str,
+        #[source]
+        source: serde_json::Error,
+    },
+    /// An internal counter would overflow.
+    #[error("counter {0} overflow")]
+    CounterOverflow(String),
+    /// An internal counter would underflow.
+    #[error("counter {0} underflow")]
+    CounterUnderflow(String),
+    /// The database schema version is newer than this build understands.
+    #[error("schema version {found} is newer than this build understands ({supported})")]
+    SchemaTooNew { found: u64, supported: u64 },
+    /// No migration path from the on-disk schema version to this build's.
+    #[error("no migration path from schema version {from}")]
+    NoMigration { from: u64 },
+}
+
+impl StoreError {
+    /// Fill in the operation context if the error does not already carry one.
+    /// Backends call this at the transaction boundary so errors created deep
+    /// inside a closure are named after the store operation that ran them.
+    pub(crate) fn at(mut self, op: &'static str) -> Self {
+        if let StoreError::Backend { op: slot, .. } = &mut self {
+            if slot.is_empty() {
+                *slot = op;
+            }
+        }
+        self
+    }
 }
 
 /// Stored record as returned by `record_all`: (id, scope, bytes, received_at).
-pub type StoredRecord = ([u8; 32], Scope, Vec<u8>, u64);
+pub type StoredRecord = (Identifier, Scope, Vec<u8>, u64);
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct OutboundMessage {
-    pub mid: [u8; 16],
+    pub mid: MessageId,
     /// Final recipient (never the gateway).
-    pub recipient: [u8; 32],
+    pub recipient: Identifier,
     /// The sealed envelope, kept so retries can rebuild the message with
     /// fresh leg ids and waypoints without re-encrypting.
     pub envelope: lattice_proto::message::Envelope,
@@ -42,7 +84,7 @@ pub struct OutboundMessage {
     pub exp: u64,
     pub state: OutboundState,
     /// Waypoints already used, so retries can avoid them.
-    pub waypoints_tried: Vec<[u8; 32]>,
+    pub waypoints_tried: Vec<Identifier>,
     /// Receipt deadline; on expiry the message is retried via a fresh waypoint or failed.
     pub receipt_deadline: Option<u64>,
     pub attempts: u32,
@@ -64,10 +106,10 @@ pub enum OutboundState {
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct CustodyEntry {
-    pub leg: [u8; 16],
+    pub leg: LegId,
     pub message: Vec<u8>,
     pub upstream: u64, // link id of the neighbor we accepted from; 0 = locally originated
-    pub destination: [u8; 32],
+    pub destination: Identifier,
     pub class: u8,
     pub exp: u64,
     /// Neighbors that already answered busy/already-have for this leg.
@@ -78,9 +120,9 @@ pub struct CustodyEntry {
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct InboxEntry {
-    pub delivery_id: [u8; 16],
-    pub mid: [u8; 16],
-    pub from: [u8; 32],
+    pub delivery_id: DeliveryId,
+    pub mid: MessageId,
+    pub from: Identifier,
     pub fsvc: String,
     pub fmbx: Vec<u8>,
     pub tsvc: String,
@@ -101,48 +143,51 @@ pub struct ShareCounters {
 /// without a dedup marker) or leak share accounting on crash.
 pub struct CustodyAccept {
     pub entry: CustodyEntry,
-    pub share_dest: [u8; 32],
+    pub share_dest: Identifier,
     pub share_upstream: u64,
     pub share_bytes: i64,
-    pub seen_hash: [u8; 32],
+    pub seen_hash: Hash32,
     pub seen_exp: u64,
 }
 
 pub trait Store {
     // peer records (raw bytes + received time), keyed by (id, scope)
-    fn record_get(&self, id: &[u8; 32], scope: Scope)
-    -> Result<Option<(Vec<u8>, u64)>, StoreError>;
+    fn record_get(
+        &self,
+        id: &Identifier,
+        scope: Scope,
+    ) -> Result<Option<(Vec<u8>, u64)>, StoreError>;
     fn record_put(
         &mut self,
-        id: &[u8; 32],
+        id: &Identifier,
         scope: Scope,
         bytes: &[u8],
         received: u64,
     ) -> Result<(), StoreError>;
-    fn record_remove(&mut self, id: &[u8; 32], scope: Scope) -> Result<(), StoreError>;
+    fn record_remove(&mut self, id: &Identifier, scope: Scope) -> Result<(), StoreError>;
     fn record_all(&self) -> Result<Vec<StoredRecord>, StoreError>;
     fn record_count(&self) -> Result<usize, StoreError>;
 
     // KEL heads (kept one year beyond last sighting by the caller)
-    fn kel_head(&self, id: &[u8; 32]) -> Result<Option<(u64, [u8; 32], u64)>, StoreError>; // seq, commitment, seen
+    fn kel_head(&self, id: &Identifier) -> Result<Option<(u64, Commitment, u64)>, StoreError>; // seq, commitment, seen
     fn kel_head_put(
         &mut self,
-        id: &[u8; 32],
+        id: &Identifier,
         seq: u64,
-        commitment: [u8; 32],
+        commitment: Commitment,
         seen: u64,
     ) -> Result<(), StoreError>;
     /// Drop KEL heads last seen before `older_than`. Returns how many were removed.
     fn kel_head_sweep(&mut self, older_than: u64) -> Result<usize, StoreError>;
 
     // saved peer addresses, kept beyond record expiry
-    fn peer_save(&mut self, id: &[u8; 32], address: &str) -> Result<(), StoreError>;
-    fn peer_saved(&self) -> Result<Vec<([u8; 32], String)>, StoreError>;
+    fn peer_save(&mut self, id: &Identifier, address: &str) -> Result<(), StoreError>;
+    fn peer_saved(&self) -> Result<Vec<(Identifier, String)>, StoreError>;
 
     // outbound queue
     fn outbound_push(&mut self, msg: &OutboundMessage) -> Result<(), StoreError>;
-    fn outbound_remove(&mut self, mid: &[u8; 16]) -> Result<(), StoreError>;
-    fn outbound_get(&self, mid: &[u8; 16]) -> Result<Option<OutboundMessage>, StoreError>;
+    fn outbound_remove(&mut self, mid: &MessageId) -> Result<(), StoreError>;
+    fn outbound_get(&self, mid: &MessageId) -> Result<Option<OutboundMessage>, StoreError>;
     fn outbound_put(&mut self, msg: &OutboundMessage) -> Result<(), StoreError>;
     fn outbound_due(&self, now: u64) -> Result<Vec<OutboundMessage>, StoreError>;
     fn outbound_all(&self) -> Result<Vec<OutboundMessage>, StoreError>;
@@ -150,43 +195,51 @@ pub trait Store {
     // custody
     fn custody_accept(&mut self, accept: CustodyAccept) -> Result<(), StoreError>;
     fn custody_put(&mut self, entry: CustodyEntry) -> Result<(), StoreError>;
-    fn custody_get(&self, leg: &[u8; 16]) -> Result<Option<CustodyEntry>, StoreError>;
-    fn custody_remove(&mut self, leg: &[u8; 16]) -> Result<Option<CustodyEntry>, StoreError>;
+    fn custody_get(&self, leg: &LegId) -> Result<Option<CustodyEntry>, StoreError>;
+    fn custody_remove(&mut self, leg: &LegId) -> Result<Option<CustodyEntry>, StoreError>;
     fn custody_all(&self) -> Result<Vec<CustodyEntry>, StoreError>;
     fn custody_bytes(&self) -> Result<u64, StoreError>;
     /// Bytes held per buffer class (index = class, 0 = closest to destination).
     fn custody_class_bytes(&self) -> Result<[u64; 16], StoreError>;
 
     // fair-share accounting per (destination, upstream link)
-    fn share_add(&mut self, dest: &[u8; 32], upstream: u64, bytes: i64) -> Result<u64, StoreError>;
-    fn share_get(&self, dest: &[u8; 32], upstream: u64) -> Result<u64, StoreError>;
+    fn share_add(
+        &mut self,
+        dest: &Identifier,
+        upstream: u64,
+        bytes: i64,
+    ) -> Result<u64, StoreError>;
+    fn share_get(&self, dest: &Identifier, upstream: u64) -> Result<u64, StoreError>;
 
     // dedup
-    fn seen_contains(&self, hash: &[u8; 32], now: u64) -> Result<bool, StoreError>;
-    fn seen_add(&mut self, hash: [u8; 32], exp: u64) -> Result<(), StoreError>;
-    fn delivered_contains(&self, hash: &[u8; 32], now: u64) -> Result<bool, StoreError>;
-    fn delivered_add(&mut self, hash: [u8; 32], exp: u64) -> Result<(), StoreError>;
+    fn seen_contains(&self, hash: &Hash32, now: u64) -> Result<bool, StoreError>;
+    fn seen_add(&mut self, hash: Hash32, exp: u64) -> Result<(), StoreError>;
+    fn delivered_contains(&self, hash: &Hash32, now: u64) -> Result<bool, StoreError>;
+    fn delivered_add(&mut self, hash: Hash32, exp: u64) -> Result<(), StoreError>;
     fn sweep_expired(&mut self, now: u64) -> Result<(), StoreError>;
 
     // inbox (per service)
     fn inbox_push(&mut self, service: &str, entry: InboxEntry) -> Result<(), StoreError>;
     fn inbox_fetch(&self, service: &str, max: usize) -> Result<Vec<InboxEntry>, StoreError>;
-    fn inbox_ack(&mut self, service: &str, delivery_ids: &[[u8; 16]]) -> Result<usize, StoreError>;
+    fn inbox_ack(
+        &mut self,
+        service: &str,
+        delivery_ids: &[DeliveryId],
+    ) -> Result<usize, StoreError>;
     fn inbox_len(&self, service: &str) -> Result<u64, StoreError>;
+    /// Total undelivered entries across all services.
+    fn inbox_len_total(&self) -> Result<u64, StoreError>;
+    /// Drop inbox entries older than `max_age_secs` (by `received`). Returns the count dropped.
+    fn inbox_sweep_expired(&mut self, max_age_secs: u64, now: u64) -> Result<u64, StoreError>;
 
     // per-service delivery status, for the local API
     fn status_set(
         &mut self,
-        mid: &[u8; 16],
+        mid: &MessageId,
         status: u64,
         detail: Option<u64>,
     ) -> Result<(), StoreError>;
-    fn status_get(&self, mid: &[u8; 16]) -> Result<Option<(u64, Option<u64>)>, StoreError>;
-
-    // wary list observations: (identifier, source range tag) with expiry
-    fn wary_add(&mut self, id: &[u8; 32], source_range: u64, exp: u64) -> Result<(), StoreError>;
-    fn wary_ranges(&self, id: &[u8; 32], now: u64) -> Result<Vec<u64>, StoreError>;
-    fn wary_sweep(&mut self, now: u64) -> Result<(), StoreError>;
+    fn status_get(&self, mid: &MessageId) -> Result<Option<(u64, Option<u64>)>, StoreError>;
 
     // transmission counters used for snow sizing
     fn size_bucket_sample(&mut self, bucket: u8);

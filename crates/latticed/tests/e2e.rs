@@ -30,7 +30,7 @@ fn latticed() -> &'static str {
     env!("CARGO_BIN_EXE_latticed")
 }
 
-fn init_node(dir: &Path) -> ([u8; 32], [u8; 32]) {
+fn init_node(dir: &Path) -> (lattice_types::Identifier, lattice_types::ChannelPublicKey) {
     let out = Command::new(latticed())
         .args(["init", "--dir", dir.to_str().unwrap()])
         .output()
@@ -47,11 +47,13 @@ fn init_node(dir: &Path) -> ([u8; 32], [u8; 32]) {
         .expect("init prints node id")
         .trim()
         .to_string();
-    let id: [u8; 32] = hex_decode(&id_hex).try_into().unwrap();
-    let channel_key: [u8; 32] = std::fs::read(dir.join("channel_key.pub"))
-        .unwrap()
-        .try_into()
-        .unwrap();
+    let id = lattice_types::Identifier::from_bytes(hex_decode(&id_hex).try_into().unwrap());
+    let channel_key = lattice_types::ChannelPublicKey::from_bytes(
+        std::fs::read(dir.join("channel_key.pub"))
+            .unwrap()
+            .try_into()
+            .unwrap(),
+    );
     (id, channel_key)
 }
 
@@ -60,13 +62,17 @@ fn write_config(
     port: u16,
     app_sock: &Path,
     admin_sock: &Path,
-    peer: Option<(&str, [u8; 32], [u8; 32])>,
+    peer: Option<(
+        &str,
+        lattice_types::ChannelPublicKey,
+        lattice_types::Identifier,
+    )>,
 ) {
     let roots = match peer {
         Some((addr, key, id)) => format!(
             "[[roots]]\naddr = \"{addr}\"\nchannel_key = \"{}\"\nid = \"{}\"\n",
-            hex_encode(&key),
-            hex_encode(&id),
+            hex_encode(key.as_ref()),
+            hex_encode(id.as_ref()),
         ),
         None => String::new(),
     };
@@ -286,8 +292,8 @@ struct TestNode {
     port: u16,
     app: std::path::PathBuf,
     admin: std::path::PathBuf,
-    id: [u8; 32],
-    channel_key: [u8; 32],
+    id: lattice_types::Identifier,
+    channel_key: lattice_types::ChannelPublicKey,
     child: Option<Child>,
 }
 
@@ -296,14 +302,18 @@ fn write_config_multi(
     port: u16,
     app: &Path,
     admin: &Path,
-    peer: Option<(&str, [u8; 32], [u8; 32])>,
+    peer: Option<(
+        &str,
+        lattice_types::ChannelPublicKey,
+        lattice_types::Identifier,
+    )>,
     services: &[(&str, &str)],
 ) {
     let roots = match peer {
         Some((addr, key, id)) => format!(
             "[[roots]]\naddr = \"{addr}\"\nchannel_key = \"{}\"\nid = \"{}\"\n",
-            hex_encode(&key),
-            hex_encode(&id),
+            hex_encode(key.as_ref()),
+            hex_encode(id.as_ref()),
         ),
         None => String::new(),
     };
@@ -333,24 +343,67 @@ admin_socket = "{admin}"
 fn boot_node(
     tmp: &Path,
     name: &str,
-    peer: Option<(&str, [u8; 32], [u8; 32])>,
+    peer: Option<(
+        &str,
+        lattice_types::ChannelPublicKey,
+        lattice_types::Identifier,
+    )>,
     services: &[(&str, &str)],
 ) -> TestNode {
     let dir = tmp.join(name);
     let (id, channel_key) = init_node(&dir);
-    let port = free_port();
     let app = tmp.join(format!("{name}.app.sock"));
     let admin = tmp.join(format!("{name}.admin.sock"));
-    write_config_multi(&dir, port, &app, &admin, peer, services);
-    let child = start_node(&dir);
-    TestNode {
-        dir,
-        port,
-        app,
-        admin,
-        id,
-        channel_key,
-        child: Some(child),
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        let port = free_port();
+        write_config_multi(&dir, port, &app, &admin, peer, services);
+        let mut child = start_node(&dir);
+        // Give the daemon a brief window to fail on bind (the port we just
+        // probed can be taken between probe and bind). If it exits during
+        // startup, retry with a fresh port instead of waiting 30s for
+        // sockets that will never appear.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut early_exit = None;
+        while Instant::now() < deadline {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    early_exit = Some(status);
+                    break;
+                }
+                Ok(None) => {}
+                Err(e) => panic!("wait failed: {e}"),
+            }
+            if std::os::unix::net::UnixStream::connect(&app).is_ok()
+                && std::os::unix::net::UnixStream::connect(&admin).is_ok()
+            {
+                break; // daemon is up
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        match early_exit {
+            Some(status) => {
+                eprintln!(
+                    "latticed exited during startup ({status}); retrying with a fresh port (attempt {attempt})"
+                );
+                if attempt >= 5 {
+                    panic!("latticed failed to start after {attempt} attempts");
+                }
+                continue;
+            }
+            None => {
+                return TestNode {
+                    dir,
+                    port,
+                    app,
+                    admin,
+                    id,
+                    channel_key,
+                    child: Some(child),
+                };
+            }
+        }
     }
 }
 
@@ -393,7 +446,7 @@ impl Drop for TestNode {
     }
 }
 
-async fn wait_for_path(client: &mut Client, id: &[u8; 32], secs: u64) {
+async fn wait_for_path(client: &mut Client, id: &lattice_types::Identifier, secs: u64) {
     let deadline = Instant::now() + Duration::from_secs(secs);
     loop {
         match client.lookup(id).await {

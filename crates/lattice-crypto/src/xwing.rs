@@ -7,69 +7,56 @@
 //! draft-06), not a published RFC; the wire format may change if the draft
 //! is revised.
 
+use lattice_types::{KemCiphertext, SharedSecret, XWingPublicKey, XWingSecretKey};
 use x_wing::{
     DecapsulationKeyRejectNonContrib, Decapsulator, Encapsulate, EncapsulationKey, Kem, KeyExport,
     TryDecapsulate, XWingKem, kem,
 };
 
-pub const XWING_PUBLIC_KEY_LEN: usize = 1216;
-pub const XWING_SECRET_KEY_LEN: usize = 32;
-pub const KEM_CIPHERTEXT_LEN: usize = 1120;
-
-/// A generated keypair. `secret` is the 32-byte decapsulation seed.
+/// A generated keypair.
 pub struct XWingKeypair {
-    pub secret: [u8; XWING_SECRET_KEY_LEN],
-    pub public: [u8; XWING_PUBLIC_KEY_LEN],
+    pub secret: XWingSecretKey,
+    pub public: XWingPublicKey,
 }
 
-pub struct XWingSecretKey([u8; XWING_SECRET_KEY_LEN]);
-
-impl XWingSecretKey {
-    pub fn from_bytes(bytes: [u8; XWING_SECRET_KEY_LEN]) -> Self {
-        Self(bytes)
-    }
-    pub fn public_key(&self) -> [u8; XWING_PUBLIC_KEY_LEN] {
-        DecapsulationKeyRejectNonContrib::from(self.0)
+/// Derive the encapsulation key for a decapsulation seed.
+pub fn public_key(secret: &XWingSecretKey) -> XWingPublicKey {
+    XWingPublicKey::from_bytes(
+        DecapsulationKeyRejectNonContrib::from(*secret.as_bytes())
             .encapsulation_key()
             .to_bytes()
-            .into()
-    }
-    pub fn expose(&self) -> &[u8; XWING_SECRET_KEY_LEN] {
-        &self.0
-    }
-}
-
-impl Drop for XWingSecretKey {
-    fn drop(&mut self) {
-        use zeroize::Zeroize;
-        self.0.zeroize();
-    }
+            .into(),
+    )
 }
 
 pub fn generate_keypair() -> XWingKeypair {
     let (dk, ek) = XWingKem::generate_keypair();
     XWingKeypair {
-        secret: dk.to_bytes().into(),
-        public: ek.to_bytes().into(),
+        secret: XWingSecretKey::from_bytes(dk.to_bytes().into()),
+        public: XWingPublicKey::from_bytes(ek.to_bytes().into()),
     }
 }
 
 pub(crate) fn encapsulate(
-    public: &[u8; XWING_PUBLIC_KEY_LEN],
-) -> Result<([u8; KEM_CIPHERTEXT_LEN], [u8; 32]), SealError> {
-    let ek = EncapsulationKey::try_from(public.as_slice()).map_err(|_| SealError::BadPublicKey)?;
+    public: &XWingPublicKey,
+) -> Result<(KemCiphertext, SharedSecret), SealError> {
+    let ek = EncapsulationKey::try_from(public.as_bytes().as_slice())
+        .map_err(|_| SealError::BadPublicKey)?;
     let (ct, ss) = ek.encapsulate();
-    Ok((ct.into(), ss.into()))
+    Ok((
+        KemCiphertext::from_bytes(ct.into()),
+        SharedSecret::from_bytes(ss.into()),
+    ))
 }
 
 pub(crate) fn decapsulate(
-    secret: &[u8; XWING_SECRET_KEY_LEN],
-    ciphertext: &[u8; KEM_CIPHERTEXT_LEN],
-) -> Result<[u8; 32], SealError> {
-    let dk = DecapsulationKeyRejectNonContrib::from(*secret);
-    let ct: kem::Ciphertext<XWingKem> = (*ciphertext).into();
+    secret: &XWingSecretKey,
+    ciphertext: &KemCiphertext,
+) -> Result<SharedSecret, SealError> {
+    let dk = DecapsulationKeyRejectNonContrib::from(*secret.as_bytes());
+    let ct: kem::Ciphertext<XWingKem> = (*ciphertext.as_bytes()).into();
     dk.try_decapsulate(&ct)
-        .map(Into::into)
+        .map(|ss| SharedSecret::from_bytes(ss.into()))
         .map_err(|_| SealError::Decapsulation)
 }
 

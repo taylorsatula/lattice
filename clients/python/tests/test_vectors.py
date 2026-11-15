@@ -22,7 +22,6 @@ FRAME_TYPES = {
     20: "reconcile",
     21: "want",
     22: "records",
-    23: "wary",
     60: "ping",
     61: "dummy",
     62: "attest",

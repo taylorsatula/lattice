@@ -3,20 +3,20 @@
 use std::collections::HashMap;
 
 use crate::*;
+use lattice_types::{Commitment, DeliveryId, Hash32, Identifier, LegId, MessageId};
 
 #[derive(Default)]
 pub struct MemStore {
-    records: HashMap<([u8; 32], u8), (Vec<u8>, u64)>,
-    kel_heads: HashMap<[u8; 32], (u64, [u8; 32], u64)>,
-    saved_peers: HashMap<[u8; 32], String>,
-    outbound: HashMap<[u8; 16], OutboundMessage>,
-    custody: HashMap<[u8; 16], CustodyEntry>,
-    shares: HashMap<([u8; 32], u64), u64>,
-    seen: HashMap<[u8; 32], u64>,
-    delivered: HashMap<[u8; 32], u64>,
+    records: HashMap<(Identifier, u8), (Vec<u8>, u64)>,
+    kel_heads: HashMap<Identifier, (u64, Commitment, u64)>,
+    saved_peers: HashMap<Identifier, String>,
+    outbound: HashMap<MessageId, OutboundMessage>,
+    custody: HashMap<LegId, CustodyEntry>,
+    shares: HashMap<(Identifier, u64), u64>,
+    seen: HashMap<Hash32, u64>,
+    delivered: HashMap<Hash32, u64>,
     inbox: HashMap<String, Vec<InboxEntry>>,
-    status: HashMap<[u8; 16], (u64, Option<u64>)>,
-    wary: HashMap<[u8; 32], Vec<(u64, u64)>>, // id -> [(source_range, exp)]
+    status: HashMap<MessageId, (u64, Option<u64>)>,
     buckets: [u64; 3],
     custody_bytes: u64,
     custody_class_bytes: [u64; 16],
@@ -43,14 +43,14 @@ fn scope_of(b: u8) -> Scope {
 impl Store for MemStore {
     fn record_get(
         &self,
-        id: &[u8; 32],
+        id: &Identifier,
         scope: Scope,
     ) -> Result<Option<(Vec<u8>, u64)>, StoreError> {
         Ok(self.records.get(&(*id, scope_key(scope))).cloned())
     }
     fn record_put(
         &mut self,
-        id: &[u8; 32],
+        id: &Identifier,
         scope: Scope,
         bytes: &[u8],
         received: u64,
@@ -59,11 +59,11 @@ impl Store for MemStore {
             .insert((*id, scope_key(scope)), (bytes.to_vec(), received));
         Ok(())
     }
-    fn record_remove(&mut self, id: &[u8; 32], scope: Scope) -> Result<(), StoreError> {
+    fn record_remove(&mut self, id: &Identifier, scope: Scope) -> Result<(), StoreError> {
         self.records.remove(&(*id, scope_key(scope)));
         Ok(())
     }
-    fn record_all(&self) -> Result<Vec<([u8; 32], Scope, Vec<u8>, u64)>, StoreError> {
+    fn record_all(&self) -> Result<Vec<StoredRecord>, StoreError> {
         Ok(self
             .records
             .iter()
@@ -74,14 +74,14 @@ impl Store for MemStore {
         Ok(self.records.len())
     }
 
-    fn kel_head(&self, id: &[u8; 32]) -> Result<Option<(u64, [u8; 32], u64)>, StoreError> {
+    fn kel_head(&self, id: &Identifier) -> Result<Option<(u64, Commitment, u64)>, StoreError> {
         Ok(self.kel_heads.get(id).copied())
     }
     fn kel_head_put(
         &mut self,
-        id: &[u8; 32],
+        id: &Identifier,
         seq: u64,
-        commitment: [u8; 32],
+        commitment: Commitment,
         seen: u64,
     ) -> Result<(), StoreError> {
         self.kel_heads.insert(*id, (seq, commitment, seen));
@@ -93,11 +93,11 @@ impl Store for MemStore {
         Ok(before - self.kel_heads.len())
     }
 
-    fn peer_save(&mut self, id: &[u8; 32], address: &str) -> Result<(), StoreError> {
+    fn peer_save(&mut self, id: &Identifier, address: &str) -> Result<(), StoreError> {
         self.saved_peers.insert(*id, address.to_string());
         Ok(())
     }
-    fn peer_saved(&self) -> Result<Vec<([u8; 32], String)>, StoreError> {
+    fn peer_saved(&self) -> Result<Vec<(Identifier, String)>, StoreError> {
         Ok(self
             .saved_peers
             .iter()
@@ -109,11 +109,11 @@ impl Store for MemStore {
         self.outbound.insert(msg.mid, msg.clone());
         Ok(())
     }
-    fn outbound_remove(&mut self, mid: &[u8; 16]) -> Result<(), StoreError> {
+    fn outbound_remove(&mut self, mid: &MessageId) -> Result<(), StoreError> {
         self.outbound.remove(mid);
         Ok(())
     }
-    fn outbound_get(&self, mid: &[u8; 16]) -> Result<Option<OutboundMessage>, StoreError> {
+    fn outbound_get(&self, mid: &MessageId) -> Result<Option<OutboundMessage>, StoreError> {
         Ok(self.outbound.get(mid).cloned())
     }
     fn outbound_put(&mut self, msg: &OutboundMessage) -> Result<(), StoreError> {
@@ -165,10 +165,10 @@ impl Store for MemStore {
         self.custody_class_bytes[new_class] += new_len;
         Ok(())
     }
-    fn custody_get(&self, leg: &[u8; 16]) -> Result<Option<CustodyEntry>, StoreError> {
+    fn custody_get(&self, leg: &LegId) -> Result<Option<CustodyEntry>, StoreError> {
         Ok(self.custody.get(leg).cloned())
     }
-    fn custody_remove(&mut self, leg: &[u8; 16]) -> Result<Option<CustodyEntry>, StoreError> {
+    fn custody_remove(&mut self, leg: &LegId) -> Result<Option<CustodyEntry>, StoreError> {
         let removed = self.custody.remove(leg);
         if let Some(e) = &removed {
             self.custody_bytes = self.custody_bytes.saturating_sub(e.message.len() as u64);
@@ -188,42 +188,43 @@ impl Store for MemStore {
         Ok(self.custody_class_bytes)
     }
 
-    fn share_add(&mut self, dest: &[u8; 32], upstream: u64, bytes: i64) -> Result<u64, StoreError> {
+    fn share_add(
+        &mut self,
+        dest: &Identifier,
+        upstream: u64,
+        bytes: i64,
+    ) -> Result<u64, StoreError> {
         let e = self.shares.entry((*dest, upstream)).or_insert(0);
         let next = (*e as i64)
             .checked_add(bytes)
-            .ok_or(StoreError::Backend("share counter overflow".into()))?;
+            .ok_or_else(|| StoreError::CounterOverflow("share".into()))?;
         if next < 0 {
-            return Err(StoreError::Backend("share counter underflow".into()));
+            return Err(StoreError::CounterUnderflow("share".into()));
         }
         *e = next as u64;
         Ok(*e)
     }
-    fn share_get(&self, dest: &[u8; 32], upstream: u64) -> Result<u64, StoreError> {
+    fn share_get(&self, dest: &Identifier, upstream: u64) -> Result<u64, StoreError> {
         Ok(*self.shares.get(&(*dest, upstream)).unwrap_or(&0))
     }
 
-    fn seen_contains(&self, hash: &[u8; 32], now: u64) -> Result<bool, StoreError> {
+    fn seen_contains(&self, hash: &Hash32, now: u64) -> Result<bool, StoreError> {
         Ok(self.seen.get(hash).is_some_and(|exp| *exp > now))
     }
-    fn seen_add(&mut self, hash: [u8; 32], exp: u64) -> Result<(), StoreError> {
+    fn seen_add(&mut self, hash: Hash32, exp: u64) -> Result<(), StoreError> {
         self.seen.insert(hash, exp);
         Ok(())
     }
-    fn delivered_contains(&self, hash: &[u8; 32], now: u64) -> Result<bool, StoreError> {
+    fn delivered_contains(&self, hash: &Hash32, now: u64) -> Result<bool, StoreError> {
         Ok(self.delivered.get(hash).is_some_and(|exp| *exp > now))
     }
-    fn delivered_add(&mut self, hash: [u8; 32], exp: u64) -> Result<(), StoreError> {
+    fn delivered_add(&mut self, hash: Hash32, exp: u64) -> Result<(), StoreError> {
         self.delivered.insert(hash, exp);
         Ok(())
     }
     fn sweep_expired(&mut self, now: u64) -> Result<(), StoreError> {
         self.seen.retain(|_, exp| *exp > now);
         self.delivered.retain(|_, exp| *exp > now);
-        self.wary
-            .values_mut()
-            .for_each(|v| v.retain(|(_, exp)| *exp > now));
-        self.wary.retain(|_, v| !v.is_empty());
         Ok(())
     }
 
@@ -244,7 +245,11 @@ impl Store for MemStore {
             .cloned()
             .collect())
     }
-    fn inbox_ack(&mut self, service: &str, delivery_ids: &[[u8; 16]]) -> Result<usize, StoreError> {
+    fn inbox_ack(
+        &mut self,
+        service: &str,
+        delivery_ids: &[DeliveryId],
+    ) -> Result<usize, StoreError> {
         let Some(entries) = self.inbox.get_mut(service) else {
             return Ok(0);
         };
@@ -255,41 +260,31 @@ impl Store for MemStore {
     fn inbox_len(&self, service: &str) -> Result<u64, StoreError> {
         Ok(self.inbox.get(service).map(|v| v.len() as u64).unwrap_or(0))
     }
+    fn inbox_len_total(&self) -> Result<u64, StoreError> {
+        Ok(self.inbox.values().map(|v| v.len() as u64).sum())
+    }
+    fn inbox_sweep_expired(&mut self, max_age_secs: u64, now: u64) -> Result<u64, StoreError> {
+        let mut dropped = 0u64;
+        for entries in self.inbox.values_mut() {
+            let before = entries.len();
+            entries.retain(|e| e.received.saturating_add(max_age_secs) > now);
+            dropped += (before - entries.len()) as u64;
+        }
+        self.inbox.retain(|_, v| !v.is_empty());
+        Ok(dropped)
+    }
 
     fn status_set(
         &mut self,
-        mid: &[u8; 16],
+        mid: &MessageId,
         status: u64,
         detail: Option<u64>,
     ) -> Result<(), StoreError> {
         self.status.insert(*mid, (status, detail));
         Ok(())
     }
-    fn status_get(&self, mid: &[u8; 16]) -> Result<Option<(u64, Option<u64>)>, StoreError> {
+    fn status_get(&self, mid: &MessageId) -> Result<Option<(u64, Option<u64>)>, StoreError> {
         Ok(self.status.get(mid).copied())
-    }
-
-    fn wary_add(&mut self, id: &[u8; 32], source_range: u64, exp: u64) -> Result<(), StoreError> {
-        let entry = self.wary.entry(*id).or_default();
-        // keep at most one entry per source range, latest wins
-        entry.retain(|(r, _)| *r != source_range);
-        entry.push((source_range, exp));
-        Ok(())
-    }
-    fn wary_ranges(&self, id: &[u8; 32], now: u64) -> Result<Vec<u64>, StoreError> {
-        Ok(self
-            .wary
-            .get(id)
-            .map(|v| {
-                v.iter()
-                    .filter(|(_, e)| *e > now)
-                    .map(|(r, _)| *r)
-                    .collect()
-            })
-            .unwrap_or_default())
-    }
-    fn wary_sweep(&mut self, now: u64) -> Result<(), StoreError> {
-        self.sweep_expired(now)
     }
 
     fn size_bucket_sample(&mut self, bucket: u8) {

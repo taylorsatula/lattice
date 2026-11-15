@@ -9,9 +9,9 @@ use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use zeroize::Zeroizing;
 
-use crate::xwing::{
-    self, KEM_CIPHERTEXT_LEN, SealError, XWING_PUBLIC_KEY_LEN, XWING_SECRET_KEY_LEN,
-};
+use lattice_types::{AeadKey, KemCiphertext, SharedSecret, XWingPublicKey, XWingSecretKey};
+
+use crate::xwing::{self, SealError};
 
 /// BLAKE3 KDF context for the envelope layer (recipient only).
 pub const ENVELOPE_CONTEXT: &str = "lattice v1 envelope";
@@ -22,18 +22,18 @@ const ZERO_NONCE: [u8; 12] = [0u8; 12];
 const TAG_LEN: usize = 16;
 
 pub struct Sealed {
-    pub kem_ciphertext: [u8; KEM_CIPHERTEXT_LEN],
+    pub kem_ciphertext: KemCiphertext,
     pub ciphertext: Vec<u8>,
 }
 
-fn aead_key(context: &str, shared_secret: &[u8; 32]) -> [u8; 32] {
-    blake3::derive_key(context, shared_secret)
+fn aead_key(context: &str, shared_secret: &SharedSecret) -> AeadKey {
+    AeadKey::from_bytes(blake3::derive_key(context, shared_secret.as_bytes()))
 }
 
 /// Seal `plaintext` to `public` under `context`, binding `aad`.
 pub fn seal(
     context: &str,
-    public: &[u8; XWING_PUBLIC_KEY_LEN],
+    public: &XWingPublicKey,
     aad: &[u8],
     plaintext: &[u8],
 ) -> Result<Sealed, SealError> {
@@ -58,9 +58,9 @@ pub fn seal(
 /// Open a layer sealed by [`seal`].
 pub fn open(
     context: &str,
-    secret: &[u8; XWING_SECRET_KEY_LEN],
+    secret: &XWingSecretKey,
     aad: &[u8],
-    kem_ciphertext: &[u8; KEM_CIPHERTEXT_LEN],
+    kem_ciphertext: &KemCiphertext,
     ciphertext: &[u8],
 ) -> Result<Vec<u8>, SealError> {
     if ciphertext.len() < TAG_LEN {

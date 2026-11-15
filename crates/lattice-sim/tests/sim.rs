@@ -1,5 +1,6 @@
 use lattice_core::Config;
 use lattice_sim::Sim;
+use lattice_types::{ChannelSeed, Identifier, LegId, MessageId, Signature, XWingPublicKey};
 
 fn fast_config() -> Config {
     Config {
@@ -36,7 +37,7 @@ fn wait_for_path(sim: &mut Sim, from: usize, to: usize) {
 
 /// Run the sim until `node`'s link is bound to `id` (attestation or record
 /// claims, whichever lands first), or panic.
-fn wait_for_binding(sim: &mut Sim, node: usize, link: u64, id: [u8; 32]) {
+fn wait_for_binding(sim: &mut Sim, node: usize, link: u64, id: Identifier) {
     for _ in 0..30 {
         if sim.nodes[node].debug_link_peer(link) == Some(Some(id)) {
             return;
@@ -145,7 +146,7 @@ fn waypoint_route_delivers() {
     }
     full_mesh(&mut sim, 4);
     sim.run_for(6);
-    let mid = [7u8; 16];
+    let mid = MessageId::from_bytes([7u8; 16]);
     let to = sim.ids[3];
     let send = lattice_core::AppSend {
         service: "test".into(),
@@ -179,7 +180,7 @@ fn expired_message_is_not_delivered() {
     let start = 7; // after the 6s convergence below
     let send = lattice_core::AppSend {
         service: "test".into(),
-        mid_hint: Some([9u8; 16]),
+        mid_hint: Some(MessageId::from_bytes([9u8; 16])),
         to: sim.ids[2],
         tsvc: "test".into(),
         tmbx: b"inbox".to_vec(),
@@ -286,7 +287,7 @@ fn duplicate_mid_is_not_delivered_twice() {
     }
     sim.connect(0, 1);
     sim.run_for(4);
-    let mid = [0xABu8; 16];
+    let mid = MessageId::from_bytes([0xABu8; 16]);
     let to_id = sim.ids[1];
     let make = || lattice_core::AppSend {
         service: "test".into(),
@@ -327,8 +328,8 @@ fn equivocating_records_converge_to_lower_hash() {
     let attacker = lattice_core::Identity::from_seed(&[0xA7; 32]);
     let kel = attacker.kel.clone();
     let id = lattice_proto::kel::identifier(&kel).unwrap();
-    let attacker_channel_seed = lattice_crypto::generate_seed();
-    let attacker_channel = lattice_crypto::public_key(&attacker_channel_seed);
+    let attacker_channel_seed = ChannelSeed::from_bytes(lattice_crypto::os_bytes::<32>());
+    let attacker_channel = lattice_crypto::channel_public(&attacker_channel_seed);
     let mk = |caps: u64| {
         PeerRecord::build(
             RecordParams {
@@ -336,8 +337,8 @@ fn equivocating_records_converge_to_lower_hash() {
                 seq: 7,
                 exp: 1_000_000,
                 channel_key: attacker_channel,
-                channel_seed: attacker_channel_seed,
-                envelope_key: [2u8; 1216],
+                channel_seed: attacker_channel_seed.clone(),
+                envelope_key: XWingPublicKey::from_bytes([2u8; 1216]),
                 mode: Mode::Public,
                 scope: Scope::Wan,
                 endpoints: vec![],
@@ -447,7 +448,7 @@ fn forged_envelope_is_not_delivered() {
 
     let envelope = Envelope {
         kind: KIND_MESSAGE,
-        mid: [0xEE; 16],
+        mid: MessageId::from_bytes([0xEE; 16]),
         from: victim_id,
         fsvc: "test".into(),
         fmbx: b"outbox".to_vec(),
@@ -457,14 +458,14 @@ fn forged_envelope_is_not_delivered() {
         body: Some(b"forged".to_vec()),
         reference: None,
         reason: None,
-        sig: [0; 64],
+        sig: Signature::from_bytes([0; 64]),
     };
     let msg = Message::build(BuildParams {
         envelope,
         sender_seed: &attacker_seed,
         recipient_ek: &target_rec.envelope_key,
         real_dst: target_id,
-        leg: [0x42; 16],
+        leg: LegId::from_bytes([0x42; 16]),
         exp: 1_900_000_000,
         gateway: None,
         waypoint: None,
@@ -475,7 +476,9 @@ fn forged_envelope_is_not_delivered() {
     sim.inject_offer(1, link_01, msg);
     sim.run_for(10);
     assert!(
-        sim.deliveries.iter().all(|d| d.mid != [0xEE; 16]),
+        sim.deliveries
+            .iter()
+            .all(|d| d.mid != MessageId::from_bytes([0xEE; 16])),
         "forged envelope must not be delivered"
     );
     assert_eq!(
@@ -498,7 +501,7 @@ fn custody_drains_after_delivery() {
     let to = sim.ids[3];
     let send = lattice_core::AppSend {
         service: "test".into(),
-        mid_hint: Some([0x77; 16]),
+        mid_hint: Some(MessageId::from_bytes([0x77; 16])),
         to,
         tsvc: "test".into(),
         tmbx: b"inbox".to_vec(),
@@ -551,15 +554,15 @@ fn contested_channel_key_claim_unbinds_link() {
     let _att_id = sim.ids[att];
     let b_ck = sim.channel_key_of(b);
     let attacker = lattice_core::Identity::from_seed(&[0xA7; 32]);
-    let attacker_channel_seed = lattice_crypto::generate_seed();
+    let attacker_channel_seed = ChannelSeed::from_bytes(lattice_crypto::os_bytes::<32>());
     let forged = PeerRecord::build(
         RecordParams {
             kel: attacker.kel.clone(),
             seq: 1,
             exp: 1_000_000,
             channel_key: b_ck, // the theft: b's channel key under a foreign id
-            channel_seed: attacker_channel_seed, // ...but not b's channel key
-            envelope_key: [9u8; 1216],
+            channel_seed: attacker_channel_seed.clone(), // ...but not b's channel key
+            envelope_key: XWingPublicKey::from_bytes([9u8; 1216]),
             mode: Mode::Public,
             scope: Scope::Wan,
             endpoints: vec![],
@@ -668,7 +671,7 @@ fn buffer_class_isolates_full_classes() {
             a,
             lattice_core::AppSend {
                 service: "test".into(),
-                mid_hint: Some([tag; 16]),
+                mid_hint: Some(MessageId::from_bytes([tag; 16])),
                 to: to_id,
                 tsvc: "test".into(),
                 tmbx: b"inbox".to_vec(),
@@ -746,13 +749,13 @@ fn forged_attestation_does_not_bind() {
     let b = sim.add_node();
     let link = sim.connect_unpinned(a, b);
     let id_b = sim.ids[b];
-    let forged_id = [0xEE; 32];
+    let forged_id = Identifier::from_bytes([0xEE; 32]);
     sim.inject_frame(
         a,
         link,
         lattice_proto::frames::Frame::Attest(lattice_proto::frames::AttestFrame {
             id: forged_id,
-            sig: [0u8; 64],
+            sig: Signature::from_bytes([0u8; 64]),
         }),
     );
     wait_for_binding(&mut sim, a, link, id_b);

@@ -13,6 +13,7 @@ use std::collections::VecDeque;
 use lattice_core::{Action, AppSend, Config, Event, Node};
 use lattice_proto::frames::Frame;
 use lattice_store::{MemStore, Store};
+use lattice_types::{Identifier, MessageId, X25519PublicKey};
 
 pub type NodeIndex = usize;
 
@@ -40,22 +41,22 @@ pub enum SimEvent {
 pub struct Delivery {
     pub node: NodeIndex,
     pub service: String,
-    pub mid: [u8; 16],
-    pub from: [u8; 32],
+    pub mid: MessageId,
+    pub from: Identifier,
     pub body: Vec<u8>,
 }
 
 pub struct Sim<S: Store = MemStore> {
     pub nodes: Vec<Node<S>>,
-    pub ids: Vec<[u8; 32]>,
-    pub channel_keys: std::collections::HashMap<[u8; 32], [u8; 32]>,
+    pub ids: Vec<Identifier>,
+    pub channel_keys: std::collections::HashMap<Identifier, X25519PublicKey>,
     links: Vec<Link>,
     next_link: u64,
     now: u64,
     queue: VecDeque<(u64, u64, SimEvent)>,
     seq: u64,
     pub deliveries: Vec<Delivery>,
-    pub statuses: Vec<([u8; 16], u64)>,
+    pub statuses: Vec<(MessageId, u64)>,
     pub frame_counts: std::collections::HashMap<&'static str, u64>,
     configs: Vec<Config>,
     prototype: Config,
@@ -168,7 +169,13 @@ impl<S: Store> Sim<S> {
     /// Fire a LinkUp at a node and apply the actions it returns (the
     /// attestation frame, in particular). LinkUp's return value carries the
     /// attestation; dropping it would leave the link unattested.
-    fn link_up(&mut self, node: NodeIndex, link: u64, peer: Option<[u8; 32]>, remote_ck: [u8; 32]) {
+    fn link_up(
+        &mut self,
+        node: NodeIndex,
+        link: u64,
+        peer: Option<Identifier>,
+        remote_ck: X25519PublicKey,
+    ) {
         let actions = self.nodes[node].handle(Event::LinkUp {
             at: self.now,
             link,
@@ -273,7 +280,7 @@ impl<S: Store> Sim<S> {
     }
 
     /// Send a message from node `from` to the *identity* of node `to`.
-    pub fn app_send(&mut self, from: NodeIndex, to: NodeIndex, body: &[u8]) -> [u8; 16] {
+    pub fn app_send(&mut self, from: NodeIndex, to: NodeIndex, body: &[u8]) -> MessageId {
         let to_id = self.ids[to];
         let send = AppSend {
             service: "test".to_string(),
@@ -366,7 +373,6 @@ impl<S: Store> Sim<S> {
                         Frame::Records(_) => "records",
                         Frame::Ping(_) => "ping",
                         Frame::Dummy(_) => "dummy",
-                        Frame::Wary(_) => "wary",
                         Frame::Init(_) | Frame::Cookie(_) | Frame::Resp(_) => "handshake",
                         Frame::Attest(_) => "attest",
                     };
@@ -460,7 +466,7 @@ impl<S: Store> Sim<S> {
 
     /// The Ed25519 channel key in a node's own record (what a forger would
     /// claim). Read from the node's store.
-    pub fn channel_key_of(&self, node: NodeIndex) -> [u8; 32] {
+    pub fn channel_key_of(&self, node: NodeIndex) -> lattice_types::ChannelPublicKey {
         let id = self.ids[node];
         let (bytes, _) = self.nodes[node]
             .store_ref()
@@ -478,17 +484,17 @@ impl<S: Store> Sim<S> {
         self.nodes[node].debug_custody_count()
     }
 
-    pub fn node_ids(&self) -> &[[u8; 32]] {
+    pub fn node_ids(&self) -> &[Identifier] {
         &self.ids
     }
 }
 
-fn test_mid() -> [u8; 16] {
+fn test_mid() -> MessageId {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0x9e3779b97f4a7c15);
     let mut mid = [0u8; 16];
     let v = COUNTER.fetch_add(0x9E3779B97F4A7C15, Ordering::Relaxed);
     mid[..8].copy_from_slice(&v.to_le_bytes());
     mid[8..].copy_from_slice(&v.rotate_left(32).to_le_bytes());
-    mid
+    MessageId::from_bytes(mid)
 }

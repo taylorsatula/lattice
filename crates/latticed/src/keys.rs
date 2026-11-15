@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 
 use lattice_core::Identity;
 use lattice_crypto::{channel_public, generate_seed, hash, public_key, sign, verify};
+use lattice_types::{ChannelSeed, Commitment, SigningSeed, XWingSecretKey};
 
 fn credentials_dir() -> Option<PathBuf> {
     std::env::var_os("CREDENTIALS_DIRECTORY").map(PathBuf::from)
@@ -45,7 +46,7 @@ fn read_seed(dir: &Path, name: &str) -> io::Result<[u8; 32]> {
     })
 }
 
-fn write_seed(dir: &Path, name: &str, seed: &[u8; 32]) -> io::Result<()> {
+fn write_seed(dir: &Path, name: &str, seed: &impl AsRef<[u8]>) -> io::Result<()> {
     let path = dir.join(name);
     #[cfg(unix)]
     {
@@ -54,11 +55,11 @@ fn write_seed(dir: &Path, name: &str, seed: &[u8; 32]) -> io::Result<()> {
         opts.write(true).create(true).truncate(true).mode(0o600);
         let mut f = opts.open(&path)?;
         use std::io::Write;
-        f.write_all(seed)?;
+        f.write_all(seed.as_ref())?;
     }
     #[cfg(not(unix))]
     {
-        fs::write(&path, seed)?;
+        fs::write(&path, seed.as_ref())?;
     }
     Ok(())
 }
@@ -74,7 +75,7 @@ pub fn init_identity(dir: &Path) -> io::Result<()> {
         ));
     }
     let signing_seed = generate_seed();
-    let channel_seed = generate_seed();
+    let channel_seed = ChannelSeed::from_bytes(lattice_crypto::os_bytes::<32>());
     let kp = lattice_crypto::generate_keypair();
     write_seed(dir, "signing_seed", &signing_seed)?;
     write_seed(dir, "channel_seed", &channel_seed)?;
@@ -82,14 +83,20 @@ pub fn init_identity(dir: &Path) -> io::Result<()> {
     // The next signing key: store the seed (operator should move it offline).
     let next_seed = generate_seed();
     write_seed(dir, "next_signing_seed", &next_seed)?;
-    fs::write(dir.join("channel_key.pub"), channel_public(&channel_seed))?;
-    fs::write(dir.join("signing_seed.pub"), public_key(&signing_seed))?;
+    fs::write(
+        dir.join("channel_key.pub"),
+        channel_public(&channel_seed).as_ref(),
+    )?;
+    fs::write(
+        dir.join("signing_seed.pub"),
+        public_key(&signing_seed).as_ref(),
+    )?;
     // Persist the key event log itself: the node's identity is the hash of
     // this, and it must survive restarts even if next_signing_seed is later
     // moved offline.
     let kel = vec![lattice_proto::kel::KeyEvent::inception(
         &signing_seed,
-        hash(&public_key(&next_seed)),
+        Commitment::from_bytes(hash(public_key(&next_seed).as_ref()).into_bytes()),
     )];
     let kel_bytes = lattice_proto::kel::encode_kel(&kel);
     fs::write(dir.join("kel.bin"), kel_bytes)?;
@@ -97,9 +104,9 @@ pub fn init_identity(dir: &Path) -> io::Result<()> {
 }
 
 pub fn load_identity(dir: &Path) -> io::Result<Identity> {
-    let signing_seed = read_seed(dir, "signing_seed")?;
-    let channel_seed = read_seed(dir, "channel_seed")?;
-    let envelope_seed = read_seed(dir, "envelope_seed")?;
+    let signing_seed = SigningSeed::from_bytes(read_seed(dir, "signing_seed")?);
+    let channel_seed = ChannelSeed::from_bytes(read_seed(dir, "channel_seed")?);
+    let envelope_seed = XWingSecretKey::from_bytes(read_seed(dir, "envelope_seed")?);
 
     let kel = {
         let bytes = fs::read(dir.join("kel.bin")).map_err(|e| {
@@ -115,12 +122,11 @@ pub fn load_identity(dir: &Path) -> io::Result<Identity> {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
     };
     let retired_xwing = load_retired_envelope_keys(dir)?;
-    // The signing seed must match the KEL's current head key. (Before
+    // The signing seed must match the KEL's current head key. `decode_kel`
+    // already validated the chain; no second pass is needed. (Before
     // rotation support this checked the inception key, which broke on the
     // first rotation.)
-    let head = lattice_proto::kel::KeyEvent::validate_chain(&kel)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    if head.current_key != public_key(&signing_seed) {
+    if kel.current_key() != public_key(&signing_seed) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "signing_seed does not match the KEL head",
@@ -130,8 +136,8 @@ pub fn load_identity(dir: &Path) -> io::Result<Identity> {
         signing_seed,
         kel,
         channel_seed,
-        xwing_secret: envelope_seed,
-        xwing_public: lattice_crypto::XWingSecretKey::from_bytes(envelope_seed).public_key(),
+        xwing_secret: envelope_seed.clone(),
+        xwing_public: lattice_crypto::xwing_public_key(&envelope_seed),
         retired_xwing,
     })
 }
@@ -147,8 +153,7 @@ pub fn self_test(identity: &Identity) -> io::Result<()> {
             "signing key failed self-test",
         ));
     }
-    let kp = lattice_crypto::XWingSecretKey::from_bytes(identity.xwing_secret);
-    let derived = kp.public_key();
+    let derived = lattice_crypto::xwing_public_key(&identity.xwing_secret);
     if derived != identity.xwing_public {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -162,7 +167,7 @@ const RETIRED_ENVELOPE_PREFIX: &str = "envelope_seed.retired.";
 
 /// Load retired envelope keys whose grace period has not elapsed; delete the
 /// rest. Files are named `envelope_seed.retired.<unix-expiry>`.
-fn load_retired_envelope_keys(dir: &Path) -> io::Result<Vec<([u8; 32], u64)>> {
+fn load_retired_envelope_keys(dir: &Path) -> io::Result<Vec<(XWingSecretKey, u64)>> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -189,7 +194,7 @@ fn load_retired_envelope_keys(dir: &Path) -> io::Result<Vec<([u8; 32], u64)>> {
                 format!("{name}: expected 32 bytes"),
             )
         })?;
-        out.push((seed, exp));
+        out.push((XWingSecretKey::from_bytes(seed), exp));
     }
     Ok(out)
 }
@@ -210,9 +215,30 @@ pub fn rotate_signing_key(
     abandon: bool,
 ) -> io::Result<Rotation> {
     let mut identity = load_identity(dir)?;
-    let next_path = next_key_file
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| dir.join("next_signing_seed"));
+    let next_path = match next_key_file {
+        Some(p) => {
+            // The admin socket is owner-only, but confine the override to the
+            // identity directory anyway: the path is used as key material, so
+            // it must not become an arbitrary-file-read primitive.
+            let canon_dir = dir.canonicalize().map_err(|e| {
+                io::Error::new(e.kind(), format!("identity dir {}: {e}", dir.display()))
+            })?;
+            let canon = p.canonicalize().map_err(|e| {
+                io::Error::new(e.kind(), format!("next key file {}: {e}", p.display()))
+            })?;
+            if !canon.starts_with(&canon_dir) {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "next key file {} is outside the identity directory",
+                        p.display()
+                    ),
+                ));
+            }
+            canon
+        }
+        None => dir.join("next_signing_seed"),
+    };
     let next_seed_bytes = fs::read(&next_path).map_err(|e| {
         io::Error::new(
             e.kind(),
@@ -222,12 +248,13 @@ pub fn rotate_signing_key(
             ),
         )
     })?;
-    let next_seed: [u8; 32] = next_seed_bytes.as_slice().try_into().map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "next signing key must be 32 bytes",
-        )
-    })?;
+    let next_seed =
+        SigningSeed::from_bytes(next_seed_bytes.as_slice().try_into().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "next signing key must be 32 bytes",
+            )
+        })?);
 
     let new_next = if abandon {
         None
@@ -235,7 +262,7 @@ pub fn rotate_signing_key(
         Some(lattice_crypto::generate_seed())
     };
     identity
-        .rotate(&next_seed, new_next)
+        .rotate(&next_seed, new_next.clone())
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
     // Persist: new KEL, new current signing seed, new next seed (or none).

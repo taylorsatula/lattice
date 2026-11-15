@@ -2,6 +2,8 @@
 //! Noise transport message, itself a CBOR array `[frame, padding]`.
 //! lattice-net owns padding and the Noise layer; this module owns shapes.
 
+use lattice_types::{Cookie, Hash32, Identifier, LegId, Mac16, Signature};
+
 use crate::cbor::{Value, encode};
 use crate::error::ProtoError;
 use crate::obj::fixed_bytes;
@@ -14,7 +16,6 @@ pub const T_CUSTODY: u64 = 51;
 pub const T_RECONCILE: u64 = 20;
 pub const T_WANT: u64 = 21;
 pub const T_RECORDS: u64 = 22;
-pub const T_WARY: u64 = 23;
 pub const T_PING: u64 = 60;
 pub const T_DUMMY: u64 = 61;
 pub const T_ATTEST: u64 = 62;
@@ -31,22 +32,22 @@ pub const CUSTODY_ALREADY_HAVE: u64 = 1;
 pub const CUSTODY_BUSY: u64 = 2;
 pub const CUSTODY_REFUSED: u64 = 3;
 
-fn mac_bytes(v: &Value, key: u64) -> Result<[u8; 16], ProtoError> {
-    fixed_bytes(v, key)
+fn mac_bytes(v: &Value, key: u64) -> Result<Mac16, ProtoError> {
+    Ok(Mac16::from_bytes(fixed_bytes(v, key)?))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InitFrame {
     pub noise_msg: Vec<u8>,
-    pub mac1: [u8; 16],
-    pub mac2: Option<[u8; 16]>,
+    pub mac1: Mac16,
+    pub mac2: Option<Mac16>,
     pub padding: Vec<u8>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CookieFrame {
     /// Opaque 24-byte cookie issued by the server; echoed back in mac2.
-    pub cookie: [u8; 24],
+    pub cookie: Cookie,
     pub padding: Vec<u8>,
 }
 
@@ -63,7 +64,7 @@ pub struct OfferFrame {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CustodyFrame {
-    pub leg: [u8; 16],
+    pub leg: LegId,
     pub result: u64,
     pub retry_after: Option<u64>,
 }
@@ -72,20 +73,20 @@ pub struct CustodyFrame {
 /// [lower, upper); `None` is unbounded on that side. Bounds have scope 0 at
 /// split points so both scopes of an id interval stay inside one range.
 /// A bound of a reconciliation range: `(id, scope)`.
-pub type RangeBound = ([u8; 32], u8);
+pub type RangeBound = (Identifier, u8);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Range {
     Fingerprint {
-        lower: Option<([u8; 32], u8)>,
-        upper: Option<([u8; 32], u8)>,
+        lower: Option<(Identifier, u8)>,
+        upper: Option<(Identifier, u8)>,
         count: u64,
-        sum: [u8; 32],
+        sum: Hash32,
     },
     Entries {
-        lower: Option<([u8; 32], u8)>,
-        upper: Option<([u8; 32], u8)>,
-        entries: Vec<([u8; 32], u8, u64)>,
+        lower: Option<(Identifier, u8)>,
+        upper: Option<(Identifier, u8)>,
+        entries: Vec<(Identifier, u8, u64)>,
     },
 }
 
@@ -97,19 +98,13 @@ pub struct ReconcileFrame {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WantFrame {
     /// (identifier, scope) pairs to fetch.
-    pub wants: Vec<([u8; 32], u8)>,
+    pub wants: Vec<(Identifier, u8)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecordsFrame {
     /// Raw record encodings, exactly as received (needed for hashing).
     pub records: Vec<Vec<u8>>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct WaryFrame {
-    pub ids: Vec<[u8; 32]>,
-    pub exp: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -129,8 +124,8 @@ pub struct DummyFrame {
 /// handshake. Lets a peer attribute a link without trusting record claims.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AttestFrame {
-    pub id: [u8; 32],
-    pub sig: [u8; 64],
+    pub id: Identifier,
+    pub sig: Signature,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -143,22 +138,21 @@ pub enum Frame {
     Reconcile(ReconcileFrame),
     Want(WantFrame),
     Records(RecordsFrame),
-    Wary(WaryFrame),
     Ping(PingFrame),
     Dummy(DummyFrame),
     Attest(AttestFrame),
 }
 
-fn bound_value(b: &([u8; 32], u8)) -> Value {
+fn bound_value(b: &(Identifier, u8)) -> Value {
     Value::map(vec![
         (Value::UInt(0), Value::Bytes(b.0.to_vec())),
         (Value::UInt(1), Value::UInt(b.1 as u64)),
     ])
 }
 
-fn parse_bound(v: &Value) -> Result<([u8; 32], u8), ProtoError> {
+fn parse_bound(v: &Value) -> Result<(Identifier, u8), ProtoError> {
     v.deny_unknown_keys(&[0, 1])?;
-    let id: [u8; 32] = fixed_bytes(v, 0)?;
+    let id = Identifier::from_bytes(fixed_bytes(v, 0)?);
     let scope = v.req_uint(1)?;
     if scope > 1 {
         return Err(ProtoError::Invalid("scope out of range"));
@@ -167,7 +161,7 @@ fn parse_bound(v: &Value) -> Result<([u8; 32], u8), ProtoError> {
 }
 
 impl Range {
-    fn bound_value(b: &Option<([u8; 32], u8)>) -> Option<Value> {
+    fn bound_value(b: &Option<(Identifier, u8)>) -> Option<Value> {
         b.map(|(id, scope)| bound_value(&(id, scope)))
     }
 
@@ -248,10 +242,12 @@ impl Range {
             let count = arr[0]
                 .as_uint()
                 .ok_or(ProtoError::WrongType(2, "uint count"))?;
-            let sum: [u8; 32] = arr[1]
-                .as_bytes()
-                .and_then(|b| b.try_into().ok())
-                .ok_or(ProtoError::WrongType(2, "32-byte sum"))?;
+            let sum = Hash32::from_bytes(
+                arr[1]
+                    .as_bytes()
+                    .and_then(|b| <[u8; 32]>::try_from(b).ok())
+                    .ok_or(ProtoError::WrongType(2, "32-byte sum"))?,
+            );
             return Ok(Range::Fingerprint {
                 lower,
                 upper,
@@ -271,10 +267,11 @@ impl Range {
                     if a.len() != 3 {
                         return Err(ProtoError::Invalid("entry must be [id, scope, seq]"));
                     }
-                    let id: [u8; 32] = a[0]
-                        .as_bytes()
-                        .and_then(|b| b.try_into().ok())
-                        .ok_or(ProtoError::WrongType(3, "32-byte id"))?;
+                    let id = Identifier::from_bytes(
+                        a[0].as_bytes()
+                            .and_then(|b| <[u8; 32]>::try_from(b).ok())
+                            .ok_or(ProtoError::WrongType(3, "32-byte id"))?,
+                    );
                     let scope = u8::try_from(
                         a[1].as_uint()
                             .ok_or(ProtoError::WrongType(3, "uint scope"))?,
@@ -310,7 +307,6 @@ impl Frame {
             Frame::Reconcile(_) => T_RECONCILE,
             Frame::Want(_) => T_WANT,
             Frame::Records(_) => T_RECORDS,
-            Frame::Wary(_) => T_WARY,
             Frame::Ping(_) => T_PING,
             Frame::Dummy(_) => T_DUMMY,
             Frame::Attest(_) => T_ATTEST,
@@ -387,14 +383,6 @@ impl Frame {
                     Value::Array(f.records.iter().map(|r| Value::Bytes(r.clone())).collect()),
                 ),
             ]),
-            Frame::Wary(f) => Value::map(vec![
-                (Value::UInt(0), Value::UInt(T_WARY)),
-                (
-                    Value::UInt(2),
-                    Value::Array(f.ids.iter().map(|i| Value::Bytes(i.to_vec())).collect()),
-                ),
-                (Value::UInt(3), Value::UInt(f.exp)),
-            ]),
             Frame::Ping(f) => Value::map(vec![
                 (Value::UInt(0), Value::UInt(T_PING)),
                 (Value::UInt(2), Value::UInt(f.nonce)),
@@ -425,7 +413,7 @@ impl Frame {
                     mac1: mac_bytes(v, 3)?,
                     mac2: match v.get_key(4)? {
                         None => None,
-                        Some(_) => Some(fixed_bytes(v, 4)?),
+                        Some(_) => Some(Mac16::from_bytes(fixed_bytes(v, 4)?)),
                     },
                     padding: v.req_bytes(5)?.to_vec(),
                 }))
@@ -433,7 +421,7 @@ impl Frame {
             T_COOKIE => {
                 v.deny_unknown_keys(&[0, 2, 5])?;
                 Ok(Frame::Cookie(CookieFrame {
-                    cookie: fixed_bytes(v, 2)?,
+                    cookie: Cookie::from_bytes(fixed_bytes(v, 2)?),
                     padding: v.req_bytes(5)?.to_vec(),
                 }))
             }
@@ -457,7 +445,7 @@ impl Frame {
                     return Err(ProtoError::Invalid("unknown custody result"));
                 }
                 Ok(Frame::Custody(CustodyFrame {
-                    leg: fixed_bytes(v, 2)?,
+                    leg: LegId::from_bytes(fixed_bytes(v, 2)?),
                     result,
                     retry_after: match v.get_key(4)? {
                         None => None,
@@ -487,15 +475,19 @@ impl Frame {
                         if a.len() != 2 {
                             return Err(ProtoError::Invalid("want entry must be [id, scope]"));
                         }
-                        let id: [u8; 32] = a[0]
-                            .as_bytes()
-                            .and_then(|b| b.try_into().ok())
-                            .ok_or(ProtoError::WrongType(2, "32-byte id"))?;
+                        let id = Identifier::from_bytes(
+                            a[0].as_bytes()
+                                .and_then(|b| <[u8; 32]>::try_from(b).ok())
+                                .ok_or(ProtoError::WrongType(2, "32-byte id"))?,
+                        );
                         let scope = u8::try_from(
                             a[1].as_uint()
                                 .ok_or(ProtoError::WrongType(2, "uint scope"))?,
                         )
                         .map_err(|_| ProtoError::Invalid("scope out of range"))?;
+                        if scope > 1 {
+                            return Err(ProtoError::Invalid("scope out of range"));
+                        }
                         Ok((id, scope))
                     })
                     .collect::<Result<Vec<_>, ProtoError>>()?;
@@ -514,22 +506,6 @@ impl Frame {
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(Frame::Records(RecordsFrame { records }))
             }
-            T_WARY => {
-                v.deny_unknown_keys(&[0, 2, 3])?;
-                let ids = v
-                    .req_array(2)?
-                    .iter()
-                    .map(|e| {
-                        e.as_bytes()
-                            .and_then(|b| <[u8; 32]>::try_from(b).ok())
-                            .ok_or(ProtoError::WrongType(2, "32-byte id"))
-                    })
-                    .collect::<Result<Vec<_>, ProtoError>>()?;
-                Ok(Frame::Wary(WaryFrame {
-                    ids,
-                    exp: v.req_uint(3)?,
-                }))
-            }
             T_PING => {
                 v.deny_unknown_keys(&[0, 2])?;
                 Ok(Frame::Ping(PingFrame {
@@ -545,8 +521,8 @@ impl Frame {
             T_ATTEST => {
                 v.deny_unknown_keys(&[0, 2, 3])?;
                 Ok(Frame::Attest(AttestFrame {
-                    id: fixed_bytes(v, 2)?,
-                    sig: fixed_bytes(v, 3)?,
+                    id: Identifier::from_bytes(fixed_bytes(v, 2)?),
+                    sig: Signature::from_bytes(fixed_bytes(v, 3)?),
                 }))
             }
             _ => Err(ProtoError::Invalid("unknown frame type")),

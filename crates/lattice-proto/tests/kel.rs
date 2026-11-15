@@ -1,20 +1,21 @@
 use lattice_crypto::{generate_seed, hash, sign};
 use lattice_proto::cbor::encode;
 use lattice_proto::kel::{KelRelation, KeyEvent, classify, identifier};
+use lattice_types::{Commitment, Identifier, SigningSeed};
 
-fn public_of(seed: &[u8; 32]) -> [u8; 32] {
-    lattice_crypto::public_key(seed)
+fn commitment_of(seed: &SigningSeed) -> Commitment {
+    Commitment::from_bytes(hash(lattice_crypto::public_key(seed).as_ref()).into_bytes())
 }
 
 fn chain(n: usize) -> Vec<KeyEvent> {
     let seed0 = generate_seed();
     let seed1 = generate_seed();
-    let mut events = vec![KeyEvent::inception(&seed0, hash(&public_of(&seed1)))];
+    let mut events = vec![KeyEvent::inception(&seed0, commitment_of(&seed1))];
     let mut current = seed1;
     for i in 1..n {
         let next_seed = generate_seed();
         let abandon = i == n - 1;
-        let next_hash = (!abandon).then(|| hash(&public_of(&next_seed)));
+        let next_hash = (!abandon).then(|| commitment_of(&next_seed));
         events.push(KeyEvent::rotation(
             events.last().unwrap(),
             &current,
@@ -32,7 +33,10 @@ fn inception_validates_and_id_stable() {
     assert_eq!(head.seq, 0);
     assert!(!head.abandoned);
     assert_eq!(identifier(&events).unwrap(), identifier(&events).unwrap());
-    assert_ne!(identifier(&events).unwrap(), [0u8; 32]);
+    assert_ne!(
+        identifier(&events).unwrap(),
+        Identifier::from_bytes([0u8; 32])
+    );
 }
 
 #[test]
@@ -63,10 +67,10 @@ fn rotation_by_uncommitted_key_fails() {
 fn tampered_prev_fails() {
     let seed0 = generate_seed();
     let seed1 = generate_seed();
-    let e0 = KeyEvent::inception(&seed0, hash(&public_of(&seed1)));
+    let e0 = KeyEvent::inception(&seed0, commitment_of(&seed1));
     let mut e1 = KeyEvent::rotation(&e0, &seed1, None);
     // Re-sign with the correct key but a doctored prev commitment.
-    e1.prev = Some([7u8; 32]);
+    e1.prev = Some(Commitment::from_bytes([7u8; 32]));
     e1.sig = sign(&seed1, &encode(&e1.unsigned_value()));
     assert!(KeyEvent::validate_chain(&[e0, e1]).is_err());
 }
@@ -75,7 +79,9 @@ fn tampered_prev_fails() {
 fn tampered_signature_fails() {
     let events = chain(2);
     let mut bad = events.clone();
-    bad[1].sig[10] ^= 1;
+    let mut sig = bad[1].sig.into_bytes();
+    sig[10] ^= 1;
+    bad[1].sig = lattice_types::Signature::from_bytes(sig);
     assert!(KeyEvent::validate_chain(&bad).is_err());
 }
 

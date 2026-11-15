@@ -9,6 +9,7 @@
 //! same rule used for the identifier — and it is what `prev` refers to.
 
 use lattice_crypto::{hash, sign, verify};
+use lattice_types::{Commitment, Identifier, Signature, SigningPublicKey, SigningSeed};
 
 use crate::cbor::{Value, encode};
 use crate::error::ProtoError;
@@ -45,12 +46,12 @@ pub struct KeyEvent {
     pub kind: KeyEventKind,
     pub seq: u64,
     /// Hash (commitment) of the previous event. Absent in inception.
-    pub prev: Option<[u8; 32]>,
+    pub prev: Option<Commitment>,
     /// The signing key this event establishes.
-    pub key: [u8; 32],
+    pub key: SigningPublicKey,
     /// BLAKE3 of the next signing key. Absent means abandonment (rotation only).
-    pub next: Option<[u8; 32]>,
-    pub sig: [u8; 64],
+    pub next: Option<Commitment>,
+    pub sig: Signature,
 }
 
 const KEY_EVENT_KEYS: [u64; 7] = [0, 1, 2, 3, 4, 5, 6];
@@ -83,8 +84,8 @@ impl KeyEvent {
     }
 
     /// BLAKE3 of the unsigned encoding; what `prev` refers to.
-    pub fn commitment(&self) -> [u8; 32] {
-        hash(&encode(&self.unsigned_value()))
+    pub fn commitment(&self) -> Commitment {
+        Commitment::from_bytes(hash(&encode(&self.unsigned_value())).into_bytes())
     }
 
     pub fn encode(&self) -> Vec<u8> {
@@ -100,14 +101,14 @@ impl KeyEvent {
         let seq = v.req_uint(2)?;
         let prev = match v.get_key(3)? {
             None => None,
-            Some(_) => Some(fixed_bytes(v, 3)?),
+            Some(_) => Some(Commitment::from_bytes(fixed_bytes(v, 3)?)),
         };
-        let key = fixed_bytes(v, 4)?;
+        let key = SigningPublicKey::from_bytes(fixed_bytes(v, 4)?);
         let next = match v.get_key(5)? {
             None => None,
-            Some(_) => Some(fixed_bytes(v, 5)?),
+            Some(_) => Some(Commitment::from_bytes(fixed_bytes(v, 5)?)),
         };
-        let sig = fixed_bytes(v, 6)?;
+        let sig = Signature::from_bytes(fixed_bytes(v, 6)?);
         Ok(Self {
             kind,
             seq,
@@ -128,7 +129,7 @@ impl KeyEvent {
     }
 
     /// Create and sign an inception event.
-    pub fn inception(signing_seed: &[u8; 32], next_key_hash: [u8; 32]) -> Self {
+    pub fn inception(signing_seed: &SigningSeed, next_key_hash: Commitment) -> Self {
         Self::build(
             KeyEventKind::Inception,
             0,
@@ -142,8 +143,8 @@ impl KeyEvent {
     /// Create and sign a rotation event against `prev`.
     pub fn rotation(
         prev: &KeyEvent,
-        new_signing_seed: &[u8; 32],
-        next_key_hash: Option<[u8; 32]>,
+        new_signing_seed: &SigningSeed,
+        next_key_hash: Option<Commitment>,
     ) -> Self {
         Self::build(
             KeyEventKind::Rotation,
@@ -158,10 +159,10 @@ impl KeyEvent {
     fn build(
         kind: KeyEventKind,
         seq: u64,
-        prev: Option<[u8; 32]>,
-        key: [u8; 32],
-        next: Option<[u8; 32]>,
-        signing_seed: &[u8; 32],
+        prev: Option<Commitment>,
+        key: SigningPublicKey,
+        next: Option<Commitment>,
+        signing_seed: &SigningSeed,
     ) -> Self {
         let mut ev = KeyEvent {
             kind,
@@ -169,33 +170,28 @@ impl KeyEvent {
             prev,
             key,
             next,
-            sig: [0u8; 64],
+            sig: Signature::from_bytes([0u8; 64]),
         };
         ev.sig = sign(signing_seed, &encode(&ev.unsigned_value()));
         ev
     }
 }
 
-fn signing_seed_public(seed: &[u8; 32]) -> [u8; 32] {
+fn signing_seed_public(seed: &SigningSeed) -> SigningPublicKey {
     public_key_of(seed)
 }
 
-fn public_key_of(seed: &[u8; 32]) -> [u8; 32] {
+fn public_key_of(seed: &SigningSeed) -> SigningPublicKey {
     lattice_crypto::public_key(seed)
-}
-
-/// A validated key event log.
-pub struct Kel {
-    pub events: Vec<KeyEvent>,
 }
 
 /// The point a KEL comparison converges on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KelHead {
     pub seq: u64,
-    pub commitment: [u8; 32],
+    pub commitment: Commitment,
     pub abandoned: bool,
-    pub current_key: [u8; 32],
+    pub current_key: SigningPublicKey,
 }
 
 impl KeyEvent {
@@ -232,7 +228,7 @@ impl KeyEvent {
             if ev.prev != Some(prev.commitment()) {
                 return Err(ProtoError::BadKeyLog("prev does not match predecessor"));
             }
-            if Some(hash(&ev.key)) != prev.next {
+            if Some(Commitment::from_bytes(hash(ev.key.as_ref()).into_bytes())) != prev.next {
                 return Err(ProtoError::BadKeyLog(
                     "rotated key does not match the committed next-key hash",
                 ));
@@ -241,13 +237,103 @@ impl KeyEvent {
                 return Err(ProtoError::BadSignature);
             }
         }
-        let last = events.last().expect("non-empty checked");
+        let Some(last) = events.last() else {
+            return Err(ProtoError::BadKeyLog("empty log"));
+        };
         Ok(KelHead {
             seq: last.seq,
             commitment: last.commitment(),
             abandoned: last.next.is_none(),
             current_key: last.key,
         })
+    }
+}
+
+/// A key event log that has passed full chain validation.
+///
+/// Constructed only by [`ValidatedKel::validate`] (or [`decode_kel`]); the
+/// events are private, so the "this chain was verified" fact travels with
+/// the value instead of being a convention enforced by callers. Cloning is
+/// cheap enough for the records that embed a KEL.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ValidatedKel {
+    events: Vec<KeyEvent>,
+    head: KelHead,
+    id: Identifier,
+}
+
+impl ValidatedKel {
+    /// Validate a complete KEL (inception through the last event) and
+    /// return it in its validated form.
+    pub fn validate(events: Vec<KeyEvent>) -> Result<Self, ProtoError> {
+        let head = KeyEvent::validate_chain(&events)?;
+        let id = identifier(&events)?;
+        Ok(Self { events, head, id })
+    }
+
+    /// The validated events, in order.
+    pub fn events(&self) -> &[KeyEvent] {
+        &self.events
+    }
+
+    /// Number of events in the chain. Always at least one.
+    pub fn len(&self) -> usize {
+        self.events.len()
+    }
+
+    /// Always false: a validated KEL holds at least the inception event.
+    pub fn is_empty(&self) -> bool {
+        false
+    }
+
+    /// The head of the validated chain.
+    pub fn head(&self) -> KelHead {
+        self.head
+    }
+
+    /// The identifier of this chain (hash of the inception event).
+    pub fn identifier(&self) -> Identifier {
+        self.id
+    }
+
+    /// The current signing key: the key established by the head event.
+    pub fn current_key(&self) -> SigningPublicKey {
+        self.head.current_key
+    }
+
+    /// True if the chain ends in an abandonment (a rotation with no
+    /// next-key commitment).
+    pub fn is_abandoned(&self) -> bool {
+        self.head.abandoned
+    }
+
+    /// Append `event`, re-validating the whole chain. Used by rotation;
+    /// rotations are rare, so re-validating is simpler and safer than
+    /// maintaining a second, incremental check that could drift from
+    /// [`KeyEvent::validate_chain`].
+    pub fn append(&mut self, event: KeyEvent) -> Result<(), ProtoError> {
+        let mut events = self.events.clone();
+        events.push(event);
+        *self = Self::validate(events)?;
+        Ok(())
+    }
+
+    /// Consume the validated log and return the raw events.
+    pub fn into_events(self) -> Vec<KeyEvent> {
+        self.events
+    }
+}
+
+impl std::ops::Deref for ValidatedKel {
+    type Target = [KeyEvent];
+    fn deref(&self) -> &[KeyEvent] {
+        &self.events
+    }
+}
+
+impl From<ValidatedKel> for Vec<KeyEvent> {
+    fn from(kel: ValidatedKel) -> Self {
+        kel.events
     }
 }
 
@@ -275,10 +361,10 @@ pub enum KelRelation {
 /// `commitments` is the per-event commitment list of the candidate chain.
 pub fn classify(
     known_seq: u64,
-    known_commitment: &[u8; 32],
+    known_commitment: &Commitment,
     candidate: &[KeyEvent],
 ) -> KelRelation {
-    let commitments: Vec<[u8; 32]> = candidate.iter().map(|e| e.commitment()).collect();
+    let commitments: Vec<Commitment> = candidate.iter().map(|e| e.commitment()).collect();
     // We only hold the head commitment, not the full known chain: only the
     // boundary position can be compared directly. A candidate that at least
     // reaches our known seq must commit to the same event there.
@@ -298,12 +384,14 @@ pub fn classify(
 }
 
 /// The identifier a KEL belongs to: hash of the inception event's unsigned encoding.
-pub fn identifier(events: &[KeyEvent]) -> Result<[u8; 32], ProtoError> {
+pub fn identifier(events: &[KeyEvent]) -> Result<Identifier, ProtoError> {
     let first = events.first().ok_or(ProtoError::BadKeyLog("empty log"))?;
     if first.kind != KeyEventKind::Inception {
         return Err(ProtoError::BadKeyLog("first event is not an inception"));
     }
-    Ok(hash(&encode(&first.unsigned_value())))
+    Ok(Identifier::from_bytes(
+        hash(&encode(&first.unsigned_value())).into_bytes(),
+    ))
 }
 
 /// Encode a KEL as the concatenated event encodings preceded by a u32 count.
@@ -320,7 +408,10 @@ pub fn encode_kel(events: &[KeyEvent]) -> Vec<u8> {
 }
 
 /// Decode a KEL written by [`encode_kel`].
-pub fn decode_kel(bytes: &[u8]) -> Result<Vec<KeyEvent>, ProtoError> {
+///
+/// The returned log has passed full chain validation; there is no way to
+/// obtain an unvalidated `ValidatedKel` from the wire.
+pub fn decode_kel(bytes: &[u8]) -> Result<ValidatedKel, ProtoError> {
     fn take<'a>(buf: &'a [u8], at: &mut usize, n: usize) -> Result<&'a [u8], ProtoError> {
         if *at + n > buf.len() {
             return Err(ProtoError::BadKeyLog("truncated KEL file"));
@@ -330,13 +421,20 @@ pub fn decode_kel(bytes: &[u8]) -> Result<Vec<KeyEvent>, ProtoError> {
         Ok(out)
     }
     let mut at = 0usize;
-    let count = u32::from_le_bytes(take(bytes, &mut at, 4)?.try_into().unwrap()) as usize;
+    let count = u32::from_le_bytes(
+        take(bytes, &mut at, 4)?
+            .try_into()
+            .map_err(|_| ProtoError::BadKeyLog("truncated KEL file"))?,
+    ) as usize;
     let mut events = Vec::with_capacity(count.min(1024));
     for _ in 0..count {
-        let len = u32::from_le_bytes(take(bytes, &mut at, 4)?.try_into().unwrap()) as usize;
+        let len = u32::from_le_bytes(
+            take(bytes, &mut at, 4)?
+                .try_into()
+                .map_err(|_| ProtoError::BadKeyLog("truncated KEL file"))?,
+        ) as usize;
         let raw = take(bytes, &mut at, len)?;
         events.push(KeyEvent::from_bytes(raw)?);
     }
-    KeyEvent::validate_chain(&events)?;
-    Ok(events)
+    ValidatedKel::validate(events)
 }

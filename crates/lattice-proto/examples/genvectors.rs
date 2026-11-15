@@ -9,6 +9,10 @@ use lattice_proto::kel::KeyEvent;
 use lattice_proto::message::*;
 use lattice_proto::record::*;
 use lattice_proto::{Value, encode};
+use lattice_types::{
+    ChannelSeed, Commitment, Cookie, Hash32, Identifier, LegId, Mac16, MessageId, SigningSeed,
+    XWingPublicKey, XWingSecretKey,
+};
 use std::fs;
 
 const NOW: u64 = 1_800_000_000;
@@ -17,9 +21,11 @@ fn main() {
     let mut vectors = Vec::new();
 
     // --- key events ---
-    let seed0 = [1u8; 32];
-    let seed1 = [2u8; 32];
-    let inception = KeyEvent::inception(&seed0, hash(&public_key(&seed1)));
+    let seed0 = SigningSeed::from_bytes([1u8; 32]);
+    let seed1 = SigningSeed::from_bytes([2u8; 32]);
+    let commitment =
+        |seed: &SigningSeed| Commitment::from_bytes(hash(public_key(seed).as_ref()).into_bytes());
+    let inception = KeyEvent::inception(&seed0, commitment(&seed1));
     let rotation = KeyEvent::rotation(&inception, &seed1, None);
     vectors.push(serde_json::json!({
         "name": "key_event_inception",
@@ -35,9 +41,9 @@ fn main() {
     }));
 
     // --- peer record (public, WAN) ---
-    let envelope_ek = [7u8; 1216];
-    let channel_seed = [9u8; 32];
-    let channel = lattice_crypto::public_key(&channel_seed);
+    let envelope_ek = XWingPublicKey::from_bytes([7u8; 1216]);
+    let channel_seed = ChannelSeed::from_bytes([9u8; 32]);
+    let channel = lattice_crypto::channel_public(&channel_seed);
     let kel = vec![inception.clone()];
     let id = lattice_proto::kel::identifier(&kel).unwrap();
     let rec = PeerRecord::build(
@@ -71,7 +77,7 @@ fn main() {
 
     // --- frames ---
     let custody = Frame::Custody(CustodyFrame {
-        leg: [0xAB; 16],
+        leg: LegId::from_bytes([0xAB; 16]),
         result: CUSTODY_ACCEPTED,
         retry_after: None,
     });
@@ -97,7 +103,7 @@ fn main() {
     }));
     let init = Frame::Init(InitFrame {
         noise_msg: vec![0xE1; 32],
-        mac1: [0x11; 16],
+        mac1: Mac16::from_bytes([0x11; 16]),
         mac2: None,
         padding: vec![0u8; 64],
     });
@@ -109,8 +115,8 @@ fn main() {
     }));
     let init2 = Frame::Init(InitFrame {
         noise_msg: vec![0xE1; 32],
-        mac1: [0x11; 16],
-        mac2: Some([0x22; 16]),
+        mac1: Mac16::from_bytes([0x11; 16]),
+        mac2: Some(Mac16::from_bytes([0x22; 16])),
         padding: vec![0u8; 0],
     });
     vectors.push(serde_json::json!({
@@ -120,7 +126,7 @@ fn main() {
         "expect": { "type": "init" },
     }));
     let cookie = Frame::Cookie(CookieFrame {
-        cookie: [0x44; 24],
+        cookie: Cookie::from_bytes([0x44; 24]),
         padding: vec![0u8; 8],
     });
     vectors.push(serde_json::json!({
@@ -142,15 +148,15 @@ fn main() {
     let reconcile = Frame::Reconcile(ReconcileFrame {
         ranges: vec![
             Range::Fingerprint {
-                lower: Some(([0x01; 32], 0)),
-                upper: Some(([0x7f; 32], 0)),
+                lower: Some((Identifier::from_bytes([0x01; 32]), 0)),
+                upper: Some((Identifier::from_bytes([0x7f; 32]), 0)),
                 count: 42,
-                sum: [0x55; 32],
+                sum: Hash32::from_bytes([0x55; 32]),
             },
             Range::Entries {
-                lower: Some(([0x80; 32], 1)),
-                upper: Some(([0xfe; 32], 1)),
-                entries: vec![([0x90; 32], 0, 7)],
+                lower: Some((Identifier::from_bytes([0x80; 32]), 1)),
+                upper: Some((Identifier::from_bytes([0xfe; 32]), 1)),
+                entries: vec![(Identifier::from_bytes([0x90; 32]), 0, 7)],
             },
         ],
     });
@@ -161,7 +167,10 @@ fn main() {
         "expect": { "type": "reconcile" },
     }));
     let want = Frame::Want(WantFrame {
-        wants: vec![([0x21; 32], 0), ([0x22; 32], 1)],
+        wants: vec![
+            (Identifier::from_bytes([0x21; 32]), 0),
+            (Identifier::from_bytes([0x22; 32]), 1),
+        ],
     });
     vectors.push(serde_json::json!({
         "name": "want",
@@ -178,26 +187,16 @@ fn main() {
         "hex": hex_of(records.encode()),
         "expect": { "type": "records" },
     }));
-    let wary = Frame::Wary(WaryFrame {
-        ids: vec![[0x51; 32]],
-        exp: 1_800_100_000,
-    });
-    vectors.push(serde_json::json!({
-        "name": "wary",
-        "kind": "frame",
-        "hex": hex_of(wary.encode()),
-        "expect": { "type": "wary" },
-    }));
 
     // --- end-to-end message (sealed; KEM randomness captured here) ---
     let recipient_seed = [3u8; 32];
-    let recipient_sk = lattice_crypto::XWingSecretKey::from_bytes(recipient_seed);
-    let recipient_ek = recipient_sk.public_key();
-    let from_seed = [2u8; 32];
+    let recipient_sk = XWingSecretKey::from_bytes(recipient_seed);
+    let recipient_ek = lattice_crypto::xwing_public_key(&recipient_sk);
+    let from_seed = SigningSeed::from_bytes([2u8; 32]);
     let env = Envelope {
         kind: KIND_MESSAGE,
-        mid: [0x42; 16],
-        from: public_key(&from_seed),
+        mid: MessageId::from_bytes([0x42; 16]),
+        from: Identifier::from_bytes(public_key(&from_seed).into_bytes()),
         fsvc: "mira".into(),
         fmbx: b"taylor".to_vec(),
         tsvc: "mira".into(),
@@ -206,14 +205,14 @@ fn main() {
         body: Some(b"vector payload".to_vec()),
         reference: None,
         reason: None,
-        sig: [0u8; 64],
+        sig: lattice_types::Signature::from_bytes([0u8; 64]),
     };
     let msg_bytes = Message::build(BuildParams {
         envelope: env,
         sender_seed: &from_seed,
         recipient_ek: &recipient_ek,
-        real_dst: [0x77; 32],
-        leg: [0x11; 16],
+        real_dst: Identifier::from_bytes([0x77; 32]),
+        leg: LegId::from_bytes([0x11; 16]),
         exp: NOW + 86_400,
         gateway: None,
         waypoint: None,
@@ -229,7 +228,7 @@ fn main() {
             "leg": hex(&[0x11u8; 16]),
             "dst": hex(&[0x77u8; 32]),
             "recipient_seed": hex(&recipient_seed),
-            "sender": hex(&public_key(&from_seed)),
+            "sender": hex(public_key(&from_seed).as_ref()),
             "body_utf8": "vector payload",
         },
     }));

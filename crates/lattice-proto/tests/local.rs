@@ -49,7 +49,7 @@ fn send_args_roundtrip_and_limits() {
     let parsed = SendArgs::from_value(&args).unwrap();
     assert_eq!(parsed.priority, Some(2));
     assert_eq!(parsed.route, Some(ROUTE_WAYPOINT));
-    assert_eq!(parsed.to, [1u8; 32]);
+    assert_eq!(parsed.to, lattice_types::Identifier::from_bytes([1u8; 32]));
 
     let bad = Value::map(vec![
         (Value::UInt(0), Value::Bytes(vec![1; 32])),

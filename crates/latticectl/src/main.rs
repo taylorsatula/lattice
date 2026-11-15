@@ -70,7 +70,7 @@ async fn run(socket: &Path, args: &[String]) -> ExitCode {
     match args.first().map(String::as_str) {
         Some("node") => match client.node().await {
             Ok(n) => {
-                println!("id:            {}", hex(&n.id));
+                println!("id:            {}", hex(n.id.as_ref()));
                 println!("mode:          {}", n.mode);
                 println!("links:         {}", n.links);
                 println!("records:       {}", n.records);
@@ -101,9 +101,9 @@ async fn run(socket: &Path, args: &[String]) -> ExitCode {
         }
         Some("link") => {
             let mut addr: Option<String> = None;
-            let mut key: Option<[u8; 32]> = None;
+            let mut key: Option<lattice_types::ChannelPublicKey> = None;
             let mut path: Option<String> = None;
-            let mut id: Option<[u8; 32]> = None;
+            let mut id: Option<lattice_types::Identifier> = None;
             let mut i = 1;
             while i < args.len() {
                 match args[i].as_str() {
@@ -114,7 +114,7 @@ async fn run(socket: &Path, args: &[String]) -> ExitCode {
                         };
                         match args[i].as_str() {
                             "--key" => match decode_hex32(v) {
-                                Ok(k) => key = Some(k),
+                                Ok(k) => key = Some(lattice_types::ChannelPublicKey::from_bytes(k)),
                                 Err(e) => {
                                     eprintln!("--key: {e}");
                                     return ExitCode::from(2);
@@ -122,7 +122,7 @@ async fn run(socket: &Path, args: &[String]) -> ExitCode {
                             },
                             "--path" => path = Some(v.clone()),
                             "--id" => match decode_hex32(v) {
-                                Ok(k) => id = Some(k),
+                                Ok(k) => id = Some(lattice_types::Identifier::from_bytes(k)),
                                 Err(e) => {
                                     eprintln!("--id: {e}");
                                     return ExitCode::from(2);
@@ -166,7 +166,7 @@ async fn run(socket: &Path, args: &[String]) -> ExitCode {
                 eprintln!("usage: latticectl unlink <id-hex>");
                 return ExitCode::from(2);
             };
-            match decode_hex32(hex) {
+            match decode_hex32(hex).map(lattice_types::Identifier::from_bytes) {
                 Ok(id) => match client.unlink(&id).await {
                     Ok(true) => {
                         println!("unlinked");

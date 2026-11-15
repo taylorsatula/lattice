@@ -7,6 +7,8 @@ use snow::TransportState;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 
+use lattice_types::X25519PublicKey;
+
 use crate::frame::{decode_wire, encode_wire, encode_wire_to_bucket};
 use crate::{MAX_WIRE_BYTES, errors::NetError};
 
@@ -19,14 +21,14 @@ pub type BoxedStream = std::pin::Pin<Box<dyn AsyncReadWrite + Send>>;
 pub struct PeerIo {
     ws: WebSocketStream<BoxedStream>,
     transport: TransportState,
-    pub remote_static: [u8; 32],
+    pub remote_static: X25519PublicKey,
 }
 
 impl PeerIo {
     pub(crate) fn new(
         ws: WebSocketStream<BoxedStream>,
         transport: TransportState,
-        remote_static: [u8; 32],
+        remote_static: X25519PublicKey,
     ) -> Self {
         Self {
             ws,
@@ -50,13 +52,13 @@ impl PeerIo {
         let n = self
             .transport
             .write_message(&plaintext, &mut buf)
-            .map_err(|_| NetError::Crypto)?;
+            .map_err(NetError::Crypto)?;
         buf.truncate(n);
         debug_assert!(buf.len() <= MAX_WIRE_BYTES);
         self.ws
             .send(Message::Binary(Bytes::from(buf)))
             .await
-            .map_err(|_| NetError::Io)?;
+            .map_err(NetError::WebSocket)?;
         Ok(())
     }
 
@@ -64,7 +66,7 @@ impl PeerIo {
         {
             let msg = match self.ws.next().await {
                 None => return Ok(None),
-                Some(Err(_)) => return Err(NetError::Io),
+                Some(Err(e)) => return Err(NetError::WebSocket(e)),
                 Some(Ok(m)) => m,
             };
             let Message::Binary(bytes) = msg else {
@@ -78,10 +80,10 @@ impl PeerIo {
             let n = self
                 .transport
                 .read_message(&bytes, &mut plaintext)
-                .map_err(|_| NetError::Crypto)?;
+                .map_err(NetError::Crypto)?;
             plaintext.truncate(n);
-            let inner = decode_wire(&plaintext).map_err(|_| NetError::BadWire)?;
-            let frame = Frame::from_bytes(&inner).map_err(|_| NetError::BadFrame)?;
+            let inner = decode_wire(&plaintext).map_err(NetError::BadWire)?;
+            let frame = Frame::from_bytes(&inner).map_err(NetError::BadFrame)?;
             Ok(Some(frame))
         }
     }

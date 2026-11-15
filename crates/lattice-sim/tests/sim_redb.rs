@@ -6,6 +6,7 @@
 use lattice_core::Config;
 use lattice_sim::Sim;
 use lattice_store::RedbStore;
+use lattice_types::{ChannelSeed, MessageId, XWingPublicKey};
 
 fn fast_config() -> Config {
     Config {
@@ -149,7 +150,7 @@ fn redb_duplicate_mid_is_not_delivered_twice() {
     }
     sim.connect(0, 1);
     wait_for_path(&mut sim, 0, 1);
-    let mid = [0xABu8; 16];
+    let mid = MessageId::from_bytes([0xABu8; 16]);
     let to_id = sim.ids[1];
     let make = || lattice_core::AppSend {
         service: "test".into(),
@@ -194,15 +195,15 @@ fn redb_contested_channel_key_claim_unbinds_link() {
 
     let b_ck = sim.channel_key_of(b);
     let attacker = lattice_core::Identity::from_seed(&[0xA7; 32]);
-    let attacker_channel_seed = lattice_crypto::generate_seed();
+    let attacker_channel_seed = ChannelSeed::from_bytes(lattice_crypto::os_bytes::<32>());
     let forged = PeerRecord::build(
         RecordParams {
             kel: attacker.kel.clone(),
             seq: 1,
             exp: 1_000_000,
             channel_key: b_ck,
-            channel_seed: attacker_channel_seed,
-            envelope_key: [9u8; 1216],
+            channel_seed: attacker_channel_seed.clone(),
+            envelope_key: XWingPublicKey::from_bytes([9u8; 1216]),
             mode: Mode::Public,
             scope: Scope::Wan,
             endpoints: vec![],

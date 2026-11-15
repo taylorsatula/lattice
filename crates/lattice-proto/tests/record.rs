@@ -2,30 +2,37 @@ use lattice_crypto::generate_seed;
 use lattice_proto::kel::KeyEvent;
 use lattice_proto::record::*;
 use lattice_proto::{CLOCK_SKEW, MAX_RECORD_HORIZON};
+use lattice_types::{
+    ChannelPublicKey, ChannelSeed, Commitment, Identifier, SigningSeed, XWingPublicKey,
+};
+
+fn commitment(bytes: &[u8]) -> Commitment {
+    Commitment::from_bytes(lattice_crypto::hash(bytes).into_bytes())
+}
 
 const NOW: u64 = 1_800_000_000;
 
 struct Fixture {
-    seed: [u8; 32],
+    seed: SigningSeed,
     kel: Vec<KeyEvent>,
-    envelope: [u8; 1216],
-    channel: [u8; 32],
-    channel_seed: [u8; 32],
+    envelope: XWingPublicKey,
+    channel: ChannelPublicKey,
+    channel_seed: ChannelSeed,
 }
 
 fn fixture() -> Fixture {
     let seed = generate_seed();
     let next_seed = generate_seed();
+    let channel_seed = ChannelSeed::from_bytes(lattice_crypto::os_bytes::<32>());
     let kel = vec![KeyEvent::inception(
         &seed,
-        lattice_crypto::hash(&lattice_crypto::public_key(&next_seed)),
+        commitment(lattice_crypto::public_key(&next_seed).as_ref()),
     )];
-    let channel_seed = generate_seed();
-    let channel = lattice_crypto::public_key(&channel_seed);
+    let channel = lattice_crypto::channel_public(&channel_seed);
     Fixture {
         seed,
         kel,
-        envelope: [7u8; 1216],
+        envelope: XWingPublicKey::from_bytes([7u8; 1216]),
         channel,
         channel_seed,
     }
@@ -38,7 +45,7 @@ fn public_record(f: &Fixture) -> PeerRecord {
             seq: 1,
             exp: NOW + 86_400,
             channel_key: f.channel,
-            channel_seed: f.channel_seed,
+            channel_seed: f.channel_seed.clone(),
             envelope_key: f.envelope,
             mode: Mode::Public,
             scope: Scope::Wan,
@@ -97,7 +104,7 @@ fn private_record_with_private_endpoints_rejected() {
                 seq: 1,
                 exp: NOW + 86_400,
                 channel_key: f.channel,
-                channel_seed: f.channel_seed,
+                channel_seed: f.channel_seed.clone(),
                 envelope_key: f.envelope,
                 mode: Mode::Private,
                 scope: Scope::Wan,
@@ -106,7 +113,7 @@ fn private_record_with_private_endpoints_rejected() {
                     ips: vec![]
                 }],
                 links: vec![],
-                gateways: vec![[1u8; 32]],
+                gateways: vec![Identifier::from_bytes([1u8; 32])],
                 capabilities: 0,
             },
             &f.seed
@@ -122,13 +129,13 @@ fn private_record_with_private_endpoints_rejected() {
             seq: 1,
             exp: NOW + 86_400,
             channel_key: f.channel,
-            channel_seed: f.channel_seed,
+            channel_seed: f.channel_seed.clone(),
             envelope_key: f.envelope,
             mode: Mode::Private,
             scope: Scope::Wan,
             endpoints: vec![],
             links: vec![],
-            gateways: vec![[1u8; 32]],
+            gateways: vec![Identifier::from_bytes([1u8; 32])],
             capabilities: 0,
         },
         &f.seed,
@@ -147,7 +154,7 @@ fn wan_record_rejects_private_endpoint_ip() {
             seq: 1,
             exp: NOW + 86_400,
             channel_key: f.channel,
-            channel_seed: f.channel_seed,
+            channel_seed: f.channel_seed.clone(),
             envelope_key: f.envelope,
             mode: Mode::Public,
             scope: Scope::Wan,
@@ -173,7 +180,7 @@ fn hive_record_allows_private_endpoint_ip() {
             seq: 1,
             exp: NOW + 86_400,
             channel_key: f.channel,
-            channel_seed: f.channel_seed,
+            channel_seed: f.channel_seed.clone(),
             envelope_key: f.envelope,
             mode: Mode::Public,
             scope: Scope::Hive,
@@ -214,7 +221,7 @@ fn equivocation_detection() {
             seq: b.seq,
             exp: b.exp,
             channel_key: b.channel_key,
-            channel_seed: f.channel_seed,
+            channel_seed: f.channel_seed.clone(),
             envelope_key: b.envelope_key,
             mode: b.mode,
             scope: b.scope,
@@ -249,7 +256,9 @@ fn known_head_divergence_rejected() {
     let f = fixture();
     let rec = public_record(&f);
     let bytes = rec.encode();
-    assert!(PeerRecord::from_bytes(&bytes, NOW, Some((0, [0xAA; 32]))).is_err());
+    assert!(
+        PeerRecord::from_bytes(&bytes, NOW, Some((0, Commitment::from_bytes([0xAA; 32])))).is_err()
+    );
     let real_commitment = lattice_proto::kel::KeyEvent::validate_chain(&f.kel)
         .unwrap()
         .commitment;

@@ -3,10 +3,14 @@
 use std::net::{IpAddr, Ipv4Addr};
 
 use lattice_crypto::{hash, sign, verify};
+use lattice_types::{
+    ChannelPublicKey, ChannelSeed, Commitment, Hash32, Identifier, Signature, SigningPublicKey,
+    SigningSeed, XWingPublicKey,
+};
 
 use crate::cbor::{Value, encode};
 use crate::error::ProtoError;
-use crate::kel::{KelHead, KelRelation, KeyEvent, classify, identifier};
+use crate::kel::{KelHead, KelRelation, KeyEvent, ValidatedKel, classify};
 use crate::obj::{decode_limited, fixed_bytes};
 use crate::{CLOCK_SKEW, MAX_RECORD_HORIZON, RECORD_MAX};
 
@@ -111,39 +115,44 @@ impl Endpoint {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PeerRecord {
-    pub id: [u8; 32],
+    pub id: Identifier,
     pub scope: Scope,
     pub seq: u64,
     pub exp: u64,
-    pub kel: Vec<KeyEvent>,
-    pub channel_key: [u8; 32],
-    pub envelope_key: [u8; 1216],
+    /// The record's key event log, validated at decode (or build) time.
+    pub kel: ValidatedKel,
+    pub channel_key: ChannelPublicKey,
+    pub envelope_key: XWingPublicKey,
     pub mode: Mode,
     pub endpoints: Vec<Endpoint>,
-    pub links: Vec<[u8; 32]>,
-    pub gateways: Vec<[u8; 32]>,
+    pub links: Vec<Identifier>,
+    pub gateways: Vec<Identifier>,
     pub capabilities: u64,
-    pub sig: [u8; 64],
+    pub sig: Signature,
     /// Signature by the channel key over the same preimage as `sig`.
     /// Proves the channel-key holder endorsed this record; a record claiming
     /// someone else's channel key cannot be produced without that key.
-    pub channel_sig: [u8; 64],
+    pub channel_sig: Signature,
 }
 
 /// Parameters for [`PeerRecord::build`].
-pub struct RecordParams {
-    pub kel: Vec<KeyEvent>,
+///
+/// `kel` accepts anything that converts into the chain's events: a
+/// `Vec<KeyEvent>` (validated here before signing) or an already-validated
+/// [`ValidatedKel`].
+pub struct RecordParams<K = Vec<KeyEvent>> {
+    pub kel: K,
     pub seq: u64,
     pub exp: u64,
-    pub channel_key: [u8; 32],
+    pub channel_key: ChannelPublicKey,
     /// The channel private key, used to sign the record (cross-signature).
-    pub channel_seed: [u8; 32],
-    pub envelope_key: [u8; 1216],
+    pub channel_seed: ChannelSeed,
+    pub envelope_key: XWingPublicKey,
     pub mode: Mode,
     pub scope: Scope,
     pub endpoints: Vec<Endpoint>,
-    pub links: Vec<[u8; 32]>,
-    pub gateways: Vec<[u8; 32]>,
+    pub links: Vec<Identifier>,
+    pub gateways: Vec<Identifier>,
     pub capabilities: u64,
 }
 
@@ -211,7 +220,13 @@ impl PeerRecord {
     }
 
     /// Build and sign a record. Caller supplies fresh seq and expiry.
-    pub fn build(params: RecordParams, signing_seed: &[u8; 32]) -> Result<PeerRecord, ProtoError> {
+    ///
+    /// The KEL is validated before anything is signed; a record is never
+    /// produced from an unverifiable chain.
+    pub fn build<K: Into<Vec<KeyEvent>>>(
+        params: RecordParams<K>,
+        signing_seed: &SigningSeed,
+    ) -> Result<PeerRecord, ProtoError> {
         let RecordParams {
             kel,
             seq,
@@ -247,7 +262,8 @@ impl PeerRecord {
         for ep in &endpoints {
             validate_endpoint(ep, scope)?;
         }
-        let id = identifier(&kel)?;
+        let kel = ValidatedKel::validate(kel.into())?;
+        let id = kel.identifier();
         let mut rec = PeerRecord {
             id,
             scope,
@@ -261,8 +277,8 @@ impl PeerRecord {
             links,
             gateways,
             capabilities,
-            sig: [0; 64],
-            channel_sig: [0; 64],
+            sig: Signature::from_bytes([0; 64]),
+            channel_sig: Signature::from_bytes([0; 64]),
         };
         let preimage = encode(&rec.unsigned_value());
         rec.sig = sign(signing_seed, &preimage);
@@ -271,18 +287,43 @@ impl PeerRecord {
     }
 }
 
+/// A record decoded from the wire, before any validation.
+///
+/// Carries no trust: every field is attacker-controlled until
+/// [`DecodedRecord::validate`] succeeds. Exists so callers can learn the
+/// record's claimed id (e.g. to look up a known KEL head) without paying
+/// for full validation, then validate exactly once.
+pub struct DecodedRecord {
+    id: Identifier,
+    scope: Scope,
+    seq: u64,
+    exp: u64,
+    kel: Vec<KeyEvent>,
+    channel_key: ChannelPublicKey,
+    envelope_key: XWingPublicKey,
+    mode: Mode,
+    endpoints: Vec<Endpoint>,
+    links: Vec<Identifier>,
+    gateways: Vec<Identifier>,
+    capabilities: u64,
+    sig: Signature,
+    channel_sig: Signature,
+}
+
+impl DecodedRecord {
+    /// The record's claimed identifier. Not yet verified against the KEL;
+    /// only meaningful for lookups, never for trust decisions.
+    pub fn id(&self) -> Identifier {
+        self.id
+    }
+}
+
 impl PeerRecord {
-    /// Parse and fully validate a record from the wire.
+    /// Decode a record from the wire without validating it.
     ///
-    /// `now` is injected so the same code runs in the simulator and the
-    /// daemon. `known_head`, when supplied, is the (seq, commitment) this
-    /// node already holds for the record's identifier; a record whose KEL is
-    /// behind or divergent is rejected.
-    pub fn from_bytes(
-        bytes: &[u8],
-        now: u64,
-        known_head: Option<(u64, [u8; 32])>,
-    ) -> Result<(PeerRecord, KelHead), ProtoError> {
+    /// The result proves nothing about the bytes; call
+    /// [`DecodedRecord::validate`] before trusting any field.
+    pub fn decode(bytes: &[u8]) -> Result<DecodedRecord, ProtoError> {
         let value = decode_limited(bytes, RECORD_MAX)?;
         value.deny_unknown_keys(&RECORD_KEYS)?;
         if value.req_uint(0)? != crate::kel::PROTOCOL_VERSION {
@@ -291,7 +332,7 @@ impl PeerRecord {
         if value.req_uint(1)? != KIND_RECORD {
             return Err(ProtoError::Invalid("not a peer record"));
         }
-        let id = fixed_bytes::<32>(&value, 2)?;
+        let id = Identifier::from_bytes(fixed_bytes::<32>(&value, 2)?);
         let scope = Scope::from_u64(value.req_uint(3)?)?;
         let seq = value.req_uint(4)?;
         let exp = value.req_uint(5)?;
@@ -300,12 +341,12 @@ impl PeerRecord {
             .iter()
             .map(KeyEvent::from_value)
             .collect::<Result<_, _>>()?;
-        let channel_key = fixed_bytes(&value, 7)?;
-        let envelope_key = fixed_bytes(&value, 8)?;
+        let channel_key = ChannelPublicKey::from_bytes(fixed_bytes(&value, 7)?);
+        let envelope_key = XWingPublicKey::from_bytes(fixed_bytes(&value, 8)?);
         let mode = Mode::from_u64(value.req_uint(9)?)?;
         let capabilities = value.req_uint(13)?;
-        let sig = fixed_bytes::<64>(&value, 14)?;
-        let channel_sig = fixed_bytes::<64>(&value, 15)?;
+        let sig = Signature::from_bytes(fixed_bytes::<64>(&value, 14)?);
+        let channel_sig = Signature::from_bytes(fixed_bytes::<64>(&value, 15)?);
 
         let endpoints = match value.get_key(10)? {
             None => Vec::new(),
@@ -325,6 +366,7 @@ impl PeerRecord {
                 .map(|x| {
                     x.as_bytes()
                         .and_then(|b| <[u8; 32]>::try_from(b).ok())
+                        .map(Identifier::from_bytes)
                         .ok_or(ProtoError::WrongType(11, "32-byte id"))
                 })
                 .collect::<Result<_, _>>()?,
@@ -338,17 +380,88 @@ impl PeerRecord {
                 .map(|x| {
                     x.as_bytes()
                         .and_then(|b| <[u8; 32]>::try_from(b).ok())
+                        .map(Identifier::from_bytes)
                         .ok_or(ProtoError::WrongType(12, "32-byte id"))
                 })
                 .collect::<Result<_, _>>()?,
         };
 
+        Ok(DecodedRecord {
+            id,
+            scope,
+            seq,
+            exp,
+            kel,
+            channel_key,
+            envelope_key,
+            mode,
+            endpoints,
+            links,
+            gateways,
+            capabilities,
+            sig,
+            channel_sig,
+        })
+    }
+
+    /// Parse and fully validate a record from the wire.
+    ///
+    /// `now` is injected so the same code runs in the simulator and the
+    /// daemon. `known_head`, when supplied, is the (seq, commitment) this
+    /// node already holds for the record's identifier; a record whose KEL is
+    /// behind or divergent is rejected.
+    pub fn from_bytes(
+        bytes: &[u8],
+        now: u64,
+        known_head: Option<(u64, Commitment)>,
+    ) -> Result<(PeerRecord, KelHead), ProtoError> {
+        Self::decode(bytes)?.validate(Some(now), known_head)
+    }
+
+    /// Parse and validate a record without checking the expiry horizon.
+    /// Retention sweeps need to read records whose `exp` has already passed;
+    /// every other check (structure, KEL chain, signatures) is identical.
+    pub fn from_bytes_unchecked_time(
+        bytes: &[u8],
+        known_head: Option<(u64, Commitment)>,
+    ) -> Result<(PeerRecord, KelHead), ProtoError> {
+        Self::decode(bytes)?.validate(None, known_head)
+    }
+}
+
+impl DecodedRecord {
+    /// Validate the decoded record: expiry horizon, structure, KEL chain,
+    /// identifier binding, known-head monotonicity, and both signatures.
+    pub fn validate(
+        self,
+        now: Option<u64>,
+        known_head: Option<(u64, Commitment)>,
+    ) -> Result<(PeerRecord, KelHead), ProtoError> {
+        let Self {
+            id,
+            scope,
+            seq,
+            exp,
+            kel,
+            channel_key,
+            envelope_key,
+            mode,
+            endpoints,
+            links,
+            gateways,
+            capabilities,
+            sig,
+            channel_sig,
+        } = self;
+
         // Structural validation.
-        if exp <= now {
-            return Err(ProtoError::Expired);
-        }
-        if exp > now + MAX_RECORD_HORIZON + CLOCK_SKEW {
-            return Err(ProtoError::Invalid("record expiry beyond the horizon"));
+        if let Some(now) = now {
+            if exp <= now {
+                return Err(ProtoError::Expired);
+            }
+            if exp > now + MAX_RECORD_HORIZON + CLOCK_SKEW {
+                return Err(ProtoError::Invalid("record expiry beyond the horizon"));
+            }
         }
         match mode {
             Mode::Public => {
@@ -378,18 +491,17 @@ impl PeerRecord {
         }
 
         // KEL validation and monotonicity.
-        let head = KeyEvent::validate_chain(&kel)?;
-        if head.abandoned {
+        let kel = ValidatedKel::validate(kel)?;
+        if kel.is_abandoned() {
             return Err(ProtoError::BadKeyLog("identity abandoned"));
         }
-        let expected_id = identifier(&kel)?;
-        if expected_id != id {
+        if kel.identifier() != id {
             return Err(ProtoError::BadKeyLog(
                 "identifier does not match inception event",
             ));
         }
         if let Some((known_seq, known_commitment)) = known_head {
-            match classify(known_seq, &known_commitment, &kel) {
+            match classify(known_seq, &known_commitment, kel.events()) {
                 KelRelation::Extends | KelRelation::Same => {}
                 KelRelation::Behind => {
                     return Err(ProtoError::BadKeyLog("KEL is behind the known head"));
@@ -400,6 +512,7 @@ impl PeerRecord {
             }
         }
 
+        let head = kel.head();
         let record = PeerRecord {
             id,
             scope,
@@ -430,13 +543,13 @@ impl PeerRecord {
 }
 
 impl PeerRecord {
-    /// The current signing key (last validated KEL event).
-    pub fn current_signing_key(&self) -> [u8; 32] {
-        self.kel.last().expect("validated KEL is non-empty").key
+    /// The current signing key (head of the validated KEL).
+    pub fn current_signing_key(&self) -> SigningPublicKey {
+        self.kel.current_key()
     }
 }
 
-pub fn record_hash(bytes: &[u8]) -> [u8; 32] {
+pub fn record_hash(bytes: &[u8]) -> Hash32 {
     hash(bytes)
 }
 
@@ -555,6 +668,8 @@ fn is_v4_global(ip: Ipv4Addr) -> bool {
             | [172, 16..=31, ..]
             | [192, 0, 0, _]
             | [192, 0, 2, _]
+            | [192, 88, 99, _]
+            | [192, 175, 48, _]
             | [192, 168, ..]
             | [198, 18 | 19, ..]
             | [198, 51, 100, _]

@@ -20,7 +20,7 @@ use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 use subtle::ConstantTimeEq;
 
 use crate::cookie::{CookieState, mac1};
-use crate::errors::NetError;
+use crate::errors::{HandshakeError, NetError};
 use crate::handshake::{Pending, XX_MSG1_LEN, encode_handshake_frame};
 use crate::peer::PeerIo;
 
@@ -39,7 +39,7 @@ pub const MAX_CONNECTIONS: u64 = 1024;
 
 pub struct ListenerConfig {
     /// This node's static X25519 channel key seed (32 bytes).
-    pub channel_seed: [u8; 32],
+    pub channel_seed: lattice_types::ChannelSeed,
     /// Serve `GET /status` on the same listener.
     pub status_enabled: bool,
     /// Drain flag shared with the daemon: when set, `/status` reports
@@ -201,23 +201,27 @@ fn parse_head(head: &[u8]) -> Option<HeadParsed> {
     Some(HeadParsed { method, path })
 }
 
-async fn read_head(stream: &mut TcpStream) -> Option<Vec<u8>> {
+async fn read_head(stream: &mut TcpStream) -> Result<Vec<u8>, NetError> {
     let mut buf = Vec::with_capacity(1024);
     let mut chunk = [0u8; 1024];
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
         if let Some(pos) = find_double_crlf(&buf) {
-            return Some(buf[..pos].to_vec());
+            return Ok(buf[..pos].to_vec());
         }
         if buf.len() >= MAX_HEAD {
-            return None;
+            return Err(NetError::FrameTooLarge);
         }
-        let n = tokio::time::timeout_at(deadline, stream.read(&mut chunk))
-            .await
-            .ok()?
-            .ok()?;
+        let n = match tokio::time::timeout_at(deadline, stream.read(&mut chunk)).await {
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) => return Err(NetError::Io(e)),
+            Err(_) => return Err(NetError::Timeout),
+        };
         if n == 0 {
-            return None;
+            return Err(NetError::Io(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "connection closed before the request head",
+            )));
         }
         buf.extend_from_slice(&chunk[..n]);
     }
@@ -254,13 +258,11 @@ pub async fn serve(
             let load = load.clone();
             tokio::spawn(async move {
                 let _conn_guard = _conn_guard;
-                match handle_conn(stream, peer, cfg.clone(), cookie_state, load).await {
-                    Ok(peer_io) => {
-                        let _ = cfg.on_peer.send(peer_io);
-                    }
-                    Err(_) => {
-                        // Probes, wrong paths and aborted handshakes are routine.
-                    }
+                // Handled inline (e.g. /status) or a routine probe/abort: not a peer.
+                if let Ok(Some(peer_io)) =
+                    handle_conn(stream, peer, cfg.clone(), cookie_state, load).await
+                {
+                    let _ = cfg.on_peer.send(peer_io);
                 }
             });
         }
@@ -275,12 +277,15 @@ async fn handle_conn(
     cfg: Arc<ListenerConfig>,
     cookie_state: Arc<Mutex<CookieState>>,
     load: Arc<LoadState>,
-) -> Result<PeerIo, NetError> {
+) -> Result<Option<PeerIo>, NetError> {
     load.preauth_enter();
     let _preauth = PreAuthGuard(load.clone());
-    cookie_state.lock().unwrap().tick();
-    let head = read_head(&mut stream).await.ok_or(NetError::Io)?;
-    let parsed = parse_head(&head).ok_or(NetError::Io)?;
+    cookie_state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .tick();
+    let head = read_head(&mut stream).await?;
+    let parsed = parse_head(&head).ok_or(NetError::InvalidInput("malformed request head"))?;
     let derived = crate::upgrade_path(&lattice_crypto::channel_public(&cfg.channel_seed));
 
     if parsed.path == "/status" && cfg.status_enabled && parsed.method == "GET" {
@@ -295,14 +300,14 @@ async fn handle_conn(
         out.extend_from_slice(&body);
         let _ = stream.write_all(&out).await;
         let _ = stream.shutdown().await;
-        return Err(NetError::Io); // connection handled; not a peer
+        return Ok(None); // handled inline; not a peer
     }
 
     let is_upgrade = head_has_header(&head, "upgrade", "websocket")
         && head_has_header(&head, "connection", "upgrade");
     if parsed.method != "GET" || parsed.path != derived || !is_upgrade {
         let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 9\r\nconnection: close\r\n\r\nnot found").await;
-        return Err(NetError::Io);
+        return Ok(None); // probe; not a peer
     }
 
     let prefixed = PrefixedStream {
@@ -329,9 +334,11 @@ async fn handle_conn(
         Some(ws_config),
     )
     .await
-    .map_err(|_| NetError::Handshake)?;
+    .map_err(NetError::WebSocket)?;
 
-    handshake_server(ws, peer, &cfg, &cookie_state, &load).await
+    Ok(Some(
+        handshake_server(ws, peer, &cfg, &cookie_state, &load).await?,
+    ))
 }
 
 async fn next_binary(
@@ -341,8 +348,13 @@ async fn next_binary(
     let msg = tokio::time::timeout(HANDSHAKE_TIMEOUT, fut)
         .await
         .map_err(|_| NetError::Timeout)?
-        .ok_or(NetError::Io)?
-        .map_err(|_| NetError::Io)?;
+        .ok_or_else(|| {
+            NetError::Io(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "connection closed during handshake",
+            ))
+        })?
+        .map_err(NetError::WebSocket)?;
     match msg {
         Message::Binary(b) => Ok(b.to_vec()),
         _ => Err(NetError::UnexpectedFrame),
@@ -350,8 +362,8 @@ async fn next_binary(
 }
 
 fn parse_init(ws_msg: &[u8]) -> Result<InitFrame, NetError> {
-    let v = lattice_proto::decode(ws_msg).map_err(|_| NetError::BadFrame)?;
-    match Frame::from_value(&v).map_err(|_| NetError::BadFrame)? {
+    let v = lattice_proto::decode(ws_msg).map_err(|e| NetError::BadFrame(e.into()))?;
+    match Frame::from_value(&v).map_err(NetError::BadFrame)? {
         Frame::Init(i) => Ok(i),
         _ => Err(NetError::UnexpectedFrame),
     }
@@ -377,7 +389,8 @@ async fn handshake_server(
                 &lattice_crypto::channel_public(&cfg.channel_seed),
                 &init.noise_msg,
             )
-            .ct_eq(&init.mac1),
+            .as_ref()
+            .ct_eq(init.mac1.as_ref()),
         );
         if !mac1_ok {
             return Err(NetError::BadMac);
@@ -387,21 +400,24 @@ async fn handshake_server(
         let ok = match &init.mac2 {
             Some(m2) => cookie_state
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .verify_mac2(&addr_bytes, &init.noise_msg, m2),
             None => false,
         };
         if !ok {
-            let cookie = cookie_state.lock().unwrap().issue(&addr_bytes);
+            let cookie = cookie_state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .issue(&addr_bytes);
             let frame = Frame::Cookie(CookieFrame {
                 cookie,
                 padding: vec![],
             });
             ws.send(Message::Binary(Bytes::from(
-                encode_handshake_frame(&frame).ok_or(NetError::BadFrame)?,
+                encode_handshake_frame(&frame).ok_or(NetError::FrameTooLarge)?,
             )))
             .await
-            .map_err(|_| NetError::Io)?;
+            .map_err(NetError::WebSocket)?;
             let retry = next_binary(&mut ws).await?;
             init = parse_init(&retry)?;
             if init.noise_msg.len() != 32
@@ -410,18 +426,17 @@ async fn handshake_server(
                         &lattice_crypto::channel_public(&cfg.channel_seed),
                         &init.noise_msg,
                     )
-                    .ct_eq(&init.mac1),
+                    .as_ref()
+                    .ct_eq(init.mac1.as_ref()),
                 )
             {
                 return Err(NetError::BadMac);
             }
             let ok2 = match &init.mac2 {
-                Some(m2) => {
-                    cookie_state
-                        .lock()
-                        .unwrap()
-                        .verify_mac2(&addr_bytes, &init.noise_msg, m2)
-                }
+                Some(m2) => cookie_state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .verify_mac2(&addr_bytes, &init.noise_msg, m2),
                 None => false,
             };
             if !ok2 {
@@ -433,25 +448,27 @@ async fn handshake_server(
     // Choose pattern by first-message length: XX msg1 = 32 bytes; IK msg1 is longer.
     let (mut hs, pattern) = if init.noise_msg.len() == XX_MSG1_LEN {
         (
-            Pending::responder_xx(&cfg.channel_seed).map_err(|_| NetError::Handshake)?,
+            Pending::responder_xx(&cfg.channel_seed)
+                .map_err(|e| NetError::Handshake(HandshakeError::Snow(e)))?,
             "xx",
         )
     } else {
         (
-            Pending::responder_ik(&cfg.channel_seed).map_err(|_| NetError::Handshake)?,
+            Pending::responder_ik(&cfg.channel_seed)
+                .map_err(|e| NetError::Handshake(HandshakeError::Snow(e)))?,
             "ik",
         )
     };
 
     if let Err(e) = hs.read_message(&init.noise_msg) {
         eprintln!("[lattice-net] responder read failed: {e:?}");
-        return Err(NetError::Handshake);
+        return Err(NetError::Handshake(HandshakeError::Snow(e)));
     }
     let resp_bytes = match hs.write_message(&[]) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("[lattice-net] responder write failed: {e:?}");
-            return Err(NetError::Handshake);
+            return Err(NetError::Handshake(HandshakeError::Snow(e)));
         }
     };
     let resp = RespFrame {
@@ -459,10 +476,10 @@ async fn handshake_server(
         padding: vec![],
     };
     ws.send(Message::Binary(Bytes::from(
-        encode_handshake_frame(&Frame::Resp(resp)).ok_or(NetError::BadFrame)?,
+        encode_handshake_frame(&Frame::Resp(resp)).ok_or(NetError::FrameTooLarge)?,
     )))
     .await
-    .map_err(|_| NetError::Io)?;
+    .map_err(NetError::WebSocket)?;
 
     if pattern == "xx" {
         // Third leg of XX: initiator's static delivery. No mac1 — the
@@ -471,15 +488,19 @@ async fn handshake_server(
         let init3 = parse_init(&msg3)?;
         let _ = hs
             .read_message(&init3.noise_msg)
-            .map_err(|_| NetError::Handshake)?;
+            .map_err(|e| NetError::Handshake(HandshakeError::Snow(e)))?;
     }
 
     debug_assert!(hs.is_finished());
-    let remote_static: [u8; 32] = hs
-        .remote_static()
-        .ok_or(NetError::Handshake)?
-        .try_into()
-        .map_err(|_| NetError::Handshake)?;
-    let transport = hs.finish().map_err(|_| NetError::Handshake)?;
+    let remote_static = lattice_types::X25519PublicKey::from_bytes(
+        hs.remote_static()
+            .ok_or(NetError::Handshake(HandshakeError::RemoteStatic))?
+            .as_slice()
+            .try_into()
+            .map_err(|_| NetError::Handshake(HandshakeError::RemoteStatic))?,
+    );
+    let transport = hs
+        .finish()
+        .map_err(|e| NetError::Handshake(HandshakeError::Snow(e)))?;
     Ok(PeerIo::new(ws, transport, remote_static))
 }

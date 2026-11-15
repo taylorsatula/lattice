@@ -11,6 +11,11 @@ mod seal;
 mod sign;
 mod xwing;
 
+pub use lattice_types::{
+    AeadKey, ChannelPublicKey, ChannelSeed, Commitment, DeliveryId, Hash32, Identifier,
+    KemCiphertext, LegId, Mac16, MessageId, SharedSecret, Signature, SigningPublicKey, SigningSeed,
+    X25519PublicKey, X25519Secret, XWingPublicKey, XWingSecretKey,
+};
 pub use random::{os_bytes, os_fill};
 pub use seal::{ENVELOPE_CONTEXT, HOP_CONTEXT, Sealed, open, seal};
 pub use sign::generate_seed;
@@ -19,12 +24,10 @@ pub use sign::{
     public_key, sign, verify,
 };
 pub use xwing::generate_keypair;
-pub use xwing::{
-    KEM_CIPHERTEXT_LEN, XWING_PUBLIC_KEY_LEN, XWING_SECRET_KEY_LEN, XWingKeypair, XWingSecretKey,
-};
+pub use xwing::{XWingKeypair, public_key as xwing_public_key};
 
-pub fn hash(data: &[u8]) -> [u8; 32] {
-    *blake3::hash(data).as_bytes()
+pub fn hash(data: &[u8]) -> Hash32 {
+    Hash32::from_bytes(*blake3::hash(data).as_bytes())
 }
 
 /// Constant-time equality for fixed-size secrets and commitments.

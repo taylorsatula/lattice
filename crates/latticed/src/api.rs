@@ -91,11 +91,13 @@ fn args_get(v: &Value, key: u64) -> Option<&Value> {
 }
 
 fn secret_eq(a: &[u8], b: &str) -> bool {
-    let b = b.as_bytes();
-    if a.len() != b.len() {
-        return false;
-    }
-    a.ct_eq(b).unwrap_u8() == 1
+    // Hash both sides so the comparison never branches on the configured
+    // secret's length: ct_eq runs over fixed-size digests, and the only
+    // length-dependent work is hashing the client-supplied input, whose
+    // length the client already knows.
+    let a = lattice_crypto::hash(a);
+    let b = lattice_crypto::hash(b.as_bytes());
+    a.as_bytes().ct_eq(b.as_bytes()).unwrap_u8() == 1
 }
 
 /// Application-socket connection handler.
@@ -215,7 +217,9 @@ async fn dispatch_app(
             };
             let send = lattice_core::AppSend {
                 service: _service.to_string(),
-                mid_hint: Some(lattice_crypto::os_bytes::<16>()),
+                mid_hint: Some(lattice_types::MessageId::from_bytes(
+                    lattice_crypto::os_bytes::<16>(),
+                )),
                 to: args.to,
                 tsvc: args.tsvc,
                 tmbx: args.tmbx,
@@ -244,7 +248,8 @@ async fn dispatch_app(
             let Some(mid_bytes) = args_get(&req.args, 0).and_then(Value::as_bytes) else {
                 return resp_err(req.id, ERR_BAD_ARGS);
             };
-            let Ok(mid) = <[u8; 16]>::try_from(mid_bytes) else {
+            let Ok(mid) = <[u8; 16]>::try_from(mid_bytes).map(lattice_types::MessageId::from_bytes)
+            else {
                 return resp_err(req.id, ERR_BAD_ARGS);
             };
             let (tx, rx) = tokio::sync::oneshot::channel();
@@ -311,19 +316,20 @@ async fn dispatch_app(
             if deny_unknown_args(&req.args, &[0]).is_err() {
                 return resp_err(req.id, ERR_BAD_ARGS);
             }
-            let ids: Vec<[u8; 16]> = match args_get(&req.args, 0).and_then(Value::as_array) {
-                Some(arr) => {
-                    let mut out = Vec::with_capacity(arr.len());
-                    for v in arr {
-                        match v.as_bytes().and_then(|b| <[u8; 16]>::try_from(b).ok()) {
-                            Some(id) => out.push(id),
-                            None => return resp_err(req.id, ERR_BAD_ARGS),
+            let ids: Vec<lattice_types::DeliveryId> =
+                match args_get(&req.args, 0).and_then(Value::as_array) {
+                    Some(arr) => {
+                        let mut out = Vec::with_capacity(arr.len());
+                        for v in arr {
+                            match v.as_bytes().and_then(|b| <[u8; 16]>::try_from(b).ok()) {
+                                Some(id) => out.push(lattice_types::DeliveryId::from_bytes(id)),
+                                None => return resp_err(req.id, ERR_BAD_ARGS),
+                            }
                         }
+                        out
                     }
-                    out
-                }
-                None => return resp_err(req.id, ERR_BAD_ARGS),
-            };
+                    None => return resp_err(req.id, ERR_BAD_ARGS),
+                };
             let (tx, rx) = tokio::sync::oneshot::channel();
             if api
                 .send(ApiCmd::Ack {
@@ -350,7 +356,8 @@ async fn dispatch_app(
             let Some(id_bytes) = args_get(&req.args, 0).and_then(Value::as_bytes) else {
                 return resp_err(req.id, ERR_BAD_ARGS);
             };
-            let Ok(id) = <[u8; 32]>::try_from(id_bytes) else {
+            let Ok(id) = <[u8; 32]>::try_from(id_bytes).map(lattice_types::Identifier::from_bytes)
+            else {
                 return resp_err(req.id, ERR_BAD_ARGS);
             };
             let (tx, rx) = tokio::sync::oneshot::channel();
@@ -459,7 +466,7 @@ async fn dispatch_admin(api: &mpsc::UnboundedSender<ApiCmd>, req: &Request) -> V
             };
             let ik_key = match args_get(&req.args, 1) {
                 Some(Value::Bytes(b)) => match <[u8; 32]>::try_from(b.as_slice()) {
-                    Ok(k) => Some(k),
+                    Ok(k) => Some(lattice_types::ChannelPublicKey::from_bytes(k)),
                     Err(_) => return resp_err(req.id, ERR_BAD_ARGS),
                 },
                 Some(_) => return resp_err(req.id, ERR_BAD_ARGS),
@@ -470,7 +477,7 @@ async fn dispatch_admin(api: &mpsc::UnboundedSender<ApiCmd>, req: &Request) -> V
                 .map(String::from);
             let peer_id = match args_get(&req.args, 3) {
                 Some(Value::Bytes(b)) => match <[u8; 32]>::try_from(b.as_slice()) {
-                    Ok(k) => Some(k),
+                    Ok(k) => Some(lattice_types::Identifier::from_bytes(k)),
                     Err(_) => return resp_err(req.id, ERR_BAD_ARGS),
                 },
                 Some(_) => return resp_err(req.id, ERR_BAD_ARGS),
@@ -559,7 +566,8 @@ async fn dispatch_admin(api: &mpsc::UnboundedSender<ApiCmd>, req: &Request) -> V
             let Some(id) = args_get(&req.args, 0).and_then(Value::as_bytes) else {
                 return resp_err(req.id, ERR_BAD_ARGS);
             };
-            let Ok(peer) = <[u8; 32]>::try_from(id) else {
+            let Ok(peer) = <[u8; 32]>::try_from(id).map(lattice_types::Identifier::from_bytes)
+            else {
                 return resp_err(req.id, ERR_BAD_ARGS);
             };
             let (tx, rx) = tokio::sync::oneshot::channel();

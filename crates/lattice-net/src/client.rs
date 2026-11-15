@@ -22,8 +22,10 @@ use tokio_tungstenite::tungstenite::handshake::client::{Request, generate_key};
 
 type WsStream = WebSocketStream<crate::peer::BoxedStream>;
 
+use lattice_types::{ChannelPublicKey, ChannelSeed, Mac16, X25519PublicKey};
+
 use crate::cookie::{mac1, mac2};
-use crate::errors::NetError;
+use crate::errors::{HandshakeError, NetError};
 use crate::handshake::{Pending, encode_handshake_frame};
 use crate::peer::PeerIo;
 
@@ -32,7 +34,7 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 pub enum PeerContact {
     Ik {
         addr: SocketAddr,
-        channel_key: [u8; 32],
+        channel_key: ChannelPublicKey,
     },
     Xx {
         addr: SocketAddr,
@@ -40,23 +42,26 @@ pub enum PeerContact {
     },
 }
 
-pub async fn connect(contact: PeerContact, channel_seed: &[u8; 32]) -> Result<PeerIo, NetError> {
+pub async fn connect(contact: PeerContact, channel_seed: &ChannelSeed) -> Result<PeerIo, NetError> {
     let (addr, path, mut hs, mac_key) = match &contact {
         PeerContact::Ik { addr, channel_key } => (
             *addr,
             crate::upgrade_path(channel_key),
-            Pending::initiator_ik(channel_seed, channel_key).map_err(|_| NetError::Handshake)?,
+            Pending::initiator_ik(channel_seed, channel_key)
+                .map_err(|e| NetError::Handshake(HandshakeError::Snow(e)))?,
             Some(*channel_key),
         ),
         PeerContact::Xx { addr, path } => (
             *addr,
             path.clone(),
-            Pending::initiator_xx(channel_seed).map_err(|_| NetError::Handshake)?,
+            Pending::initiator_xx(channel_seed)
+                .map_err(|e| NetError::Handshake(HandshakeError::Snow(e)))?,
             None,
         ),
     };
 
-    let tcp = TcpStream::connect(addr).await.map_err(|_| NetError::Io)?;
+    crate::path::validate_upgrade_path(&path)?;
+    let tcp = TcpStream::connect(addr).await.map_err(NetError::Io)?;
     let _ = crate::set_tcp_keepalive(&tcp);
     let boxed: crate::peer::BoxedStream = Box::pin(tcp);
     let request = Request::builder()
@@ -67,43 +72,45 @@ pub async fn connect(contact: PeerContact, channel_seed: &[u8; 32]) -> Result<Pe
         .header("Sec-WebSocket-Version", "13")
         .header("Sec-WebSocket-Key", generate_key())
         .body(())
-        .map_err(|_| NetError::Io)?;
+        .map_err(|e| NetError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)))?;
     let ws_config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
         .max_frame_size(Some(crate::MAX_WIRE_BYTES + 64))
         .max_message_size(Some(crate::MAX_WIRE_BYTES + 64));
     let (mut ws, _) = tokio_tungstenite::client_async_with_config(request, boxed, Some(ws_config))
         .await
-        .map_err(|_| NetError::Io)?;
+        .map_err(NetError::WebSocket)?;
 
-    let msg1 = hs.write_message(&[]).map_err(|_| NetError::Handshake)?;
+    let msg1 = hs
+        .write_message(&[])
+        .map_err(|e| NetError::Handshake(HandshakeError::Snow(e)))?;
     let mac1_bytes = match &mac_key {
         Some(k) => mac1(k, &msg1),
-        None => [0u8; 16],
+        None => Mac16::from_bytes([0u8; 16]),
     };
     send_init(&mut ws, &msg1, mac1_bytes, None).await?;
 
     // Handshake loop: expect Cookie (optional) then Resp.
-    let mut cookie: Option<[u8; crate::cookie::COOKIE_BYTES]> = None;
+    let mut cookie = None;
     let resp_noise = loop {
         let msg = tokio::time::timeout(HANDSHAKE_TIMEOUT, ws.next())
             .await
             .map_err(|_| NetError::Timeout)?
-            .ok_or(NetError::Io)?
-            .map_err(|_| NetError::Io)?;
+            .ok_or_else(|| {
+                NetError::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "connection closed during handshake",
+                ))
+            })?
+            .map_err(NetError::WebSocket)?;
         let Message::Binary(bytes) = msg else {
             return Err(NetError::UnexpectedFrame);
         };
         let frame = parse_frame(&bytes)?;
         match frame {
             Frame::Cookie(c) => {
-                if c.cookie.len() != crate::cookie::COOKIE_BYTES {
-                    return Err(NetError::BadCookie);
-                }
-                let mut ck = [0u8; crate::cookie::COOKIE_BYTES];
-                ck.copy_from_slice(&c.cookie);
                 // Re-send the same init with mac2 filled in.
-                send_init(&mut ws, &msg1, mac1_bytes, Some(mac2(&ck, &msg1))).await?;
-                cookie = Some(ck);
+                send_init(&mut ws, &msg1, mac1_bytes, Some(mac2(&c.cookie, &msg1))).await?;
+                cookie = Some(c.cookie);
             }
             Frame::Resp(r) => break r.noise_msg,
             _ => return Err(NetError::UnexpectedFrame),
@@ -114,46 +121,52 @@ pub async fn connect(contact: PeerContact, channel_seed: &[u8; 32]) -> Result<Pe
     // IK: one response completes the handshake. XX: one more client message.
     let _ = hs
         .read_message(&resp_noise)
-        .map_err(|_| NetError::Handshake)?;
+        .map_err(|e| NetError::Handshake(HandshakeError::Snow(e)))?;
     if matches!(contact, PeerContact::Xx { .. }) {
-        let msg3 = hs.write_message(&[]).map_err(|_| NetError::Handshake)?;
+        let msg3 = hs
+            .write_message(&[])
+            .map_err(|e| NetError::Handshake(HandshakeError::Snow(e)))?;
         let mac1_3 = match &mac_key {
             Some(k) => mac1(k, &msg3),
-            None => [0u8; 16],
+            None => Mac16::from_bytes([0u8; 16]),
         };
         send_init(&mut ws, &msg3, mac1_3, None).await?;
     }
 
-    let remote_static: [u8; 32] = hs
-        .remote_static()
-        .ok_or(NetError::Handshake)?
-        .try_into()
-        .map_err(|_| NetError::Handshake)?;
+    let remote_static = X25519PublicKey::from_bytes(
+        hs.remote_static()
+            .ok_or(NetError::Handshake(HandshakeError::RemoteStatic))?
+            .as_slice()
+            .try_into()
+            .map_err(|_| NetError::Handshake(HandshakeError::RemoteStatic))?,
+    );
 
     // IK mode pins the responder static to the record's channel key
     // (Ed25519; the handshake runs on the derived X25519 key).
     if let PeerContact::Ik { channel_key, .. } = &contact {
         let expected = lattice_crypto::channel_x25519_public_from_ed25519(channel_key)
-            .ok_or(NetError::Handshake)?;
+            .ok_or(NetError::Handshake(HandshakeError::ChannelKey))?;
         if remote_static != expected {
-            return Err(NetError::Handshake);
+            return Err(NetError::Handshake(HandshakeError::PeerMismatch));
         }
     }
 
-    let transport = hs.finish().map_err(|_| NetError::Handshake)?;
+    let transport = hs
+        .finish()
+        .map_err(|e| NetError::Handshake(HandshakeError::Snow(e)))?;
     Ok(PeerIo::new(ws, transport, remote_static))
 }
 
 fn parse_frame(bytes: &[u8]) -> Result<Frame, NetError> {
-    let v = lattice_proto::decode(bytes).map_err(|_| NetError::BadFrame)?;
-    Frame::from_value(&v).map_err(|_| NetError::BadFrame)
+    let v = lattice_proto::decode(bytes).map_err(|e| NetError::BadFrame(e.into()))?;
+    Frame::from_value(&v).map_err(NetError::BadFrame)
 }
 
 async fn send_init(
     ws: &mut WsStream,
     noise_msg: &[u8],
-    mac1: [u8; 16],
-    mac2: Option<[u8; 16]>,
+    mac1: Mac16,
+    mac2: Option<Mac16>,
 ) -> Result<(), NetError> {
     let frame = Frame::Init(InitFrame {
         noise_msg: noise_msg.to_vec(),
@@ -162,8 +175,8 @@ async fn send_init(
         padding: vec![],
     });
     // Handshake frames are padded to the 2 KB bucket.
-    let bytes = encode_handshake_frame(&frame).ok_or(NetError::BadFrame)?;
+    let bytes = encode_handshake_frame(&frame).ok_or(NetError::FrameTooLarge)?;
     ws.send(Message::Binary(Bytes::from(bytes)))
         .await
-        .map_err(|_| NetError::Io)
+        .map_err(NetError::WebSocket)
 }

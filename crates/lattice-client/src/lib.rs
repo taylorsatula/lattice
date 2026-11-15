@@ -15,32 +15,101 @@ use std::fmt;
 use std::path::Path;
 
 use lattice_proto::local::*;
-use lattice_proto::{Value, decode, encode};
+use lattice_proto::{ProtoError, Value, decode, encode};
+use lattice_types::{ChannelPublicKey, DeliveryId, Identifier, MessageId};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
+
+/// Why the connection to the daemon failed or became unusable.
+#[derive(Debug)]
+pub enum ConnectionError {
+    /// A frame from the daemon could not be decoded (CBOR or framing).
+    Decode(ProtoError),
+    /// The daemon closed the socket.
+    Closed,
+    /// No frame arrived within the read timeout.
+    Timeout,
+    /// A response frame carried a different request id than the one in flight.
+    ResponseIdMismatch { expected: u64, got: u64 },
+    /// `next_event` received a response frame instead of an event.
+    ExpectedEvent,
+    /// A frame that is neither a response nor an event.
+    UnrecognizedFrame,
+    /// The buffered frame exceeded the local maximum size.
+    FrameTooLarge,
+}
+
+impl fmt::Display for ConnectionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ConnectionError::Decode(e) => write!(f, "undecodable frame: {e}"),
+            ConnectionError::Closed => write!(f, "daemon closed the socket"),
+            ConnectionError::Timeout => write!(f, "timed out waiting for a frame"),
+            ConnectionError::ResponseIdMismatch { expected, got } => {
+                write!(f, "response id mismatch (expected {expected}, got {got})")
+            }
+            ConnectionError::ExpectedEvent => write!(f, "expected an event frame, got a response"),
+            ConnectionError::UnrecognizedFrame => write!(f, "unrecognized frame"),
+            ConnectionError::FrameTooLarge => write!(f, "frame exceeds the local maximum size"),
+        }
+    }
+}
+
+impl std::error::Error for ConnectionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            ConnectionError::Decode(e) => Some(e),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Debug)]
 pub enum Error {
     Io(std::io::Error),
-    /// The peer closed the connection or sent an undecodable frame.
-    Connection(String),
+    /// The connection to the daemon failed or became unusable.
+    Connection(ConnectionError),
     /// The daemon rejected the request with an error code (see `ERR_*` constants).
     Rejected(u64),
     BadResponse(&'static str),
+    /// The request exceeds the local frame limit and was not sent.
+    RequestTooLarge,
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::Io(e) => write!(f, "io: {e}"),
-            Error::Connection(m) => write!(f, "connection: {m}"),
-            Error::Rejected(c) => write!(f, "request rejected with error code {c}"),
+            Error::Connection(c) => write!(f, "connection: {c}"),
+            Error::Rejected(code) => {
+                write!(f, "request rejected: {} (code {code})", err_name(*code))
+            }
             Error::BadResponse(m) => write!(f, "malformed response: {m}"),
+            Error::RequestTooLarge => write!(f, "request exceeds the local frame limit"),
         }
     }
 }
 
-impl std::error::Error for Error {}
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::Io(e) => Some(e),
+            Error::Connection(c) => Some(c),
+            Error::Rejected(_) | Error::BadResponse(_) | Error::RequestTooLarge => None,
+        }
+    }
+}
+
+impl Error {
+    /// The daemon's rejection code and its name, if this is a rejection.
+    pub fn rejection(&self) -> Option<(u64, &'static str)> {
+        match self {
+            Error::Rejected(code) => Some((*code, err_name(*code))),
+            _ => None,
+        }
+    }
+}
+
 impl From<std::io::Error> for Error {
     fn from(e: std::io::Error) -> Self {
         Error::Io(e)
@@ -50,7 +119,7 @@ impl From<std::io::Error> for Error {
 /// A message to send through the local API.
 #[derive(Clone, Debug)]
 pub struct Send {
-    pub to: [u8; 32],
+    pub to: Identifier,
     pub tsvc: String,
     pub tmbx: Vec<u8>,
     pub fmbx: Vec<u8>,
@@ -64,9 +133,9 @@ pub struct Send {
 /// One inbox delivery, as returned by `fetch`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Delivery {
-    pub delivery_id: [u8; 16],
-    pub mid: [u8; 16],
-    pub from: [u8; 32],
+    pub delivery_id: DeliveryId,
+    pub mid: MessageId,
+    pub from: Identifier,
     pub fsvc: String,
     pub fmbx: Vec<u8>,
     pub tmbx: Vec<u8>,
@@ -85,7 +154,7 @@ pub struct Lookup {
 /// Result of `node` (admin).
 #[derive(Clone, Debug)]
 pub struct NodeInfo {
-    pub id: [u8; 32],
+    pub id: Identifier,
     pub mode: String,
     pub links: u64,
     pub records: u64,
@@ -149,17 +218,16 @@ impl Client {
             return Ok(ev);
         }
         let payload = self.read_frame().await?;
-        let v = decode(&payload).map_err(|e| Error::Connection(format!("decode: {e}")))?;
+        let v =
+            decode(&payload).map_err(|e| Error::Connection(ConnectionError::Decode(e.into())))?;
         match Event::from_value(&v) {
             Ok(ev) => Ok(ev),
-            Err(_) => Err(Error::Connection(
-                "expected an event frame, got a response".into(),
-            )),
+            Err(_) => Err(Error::Connection(ConnectionError::ExpectedEvent)),
         }
     }
 
     /// Send a message; returns the message id.
-    pub async fn send(&mut self, msg: &Send) -> Result<[u8; 16]> {
+    pub async fn send(&mut self, msg: &Send) -> Result<MessageId> {
         let mut args = vec![
             (Value::UInt(0), Value::Bytes(msg.to.to_vec())),
             (Value::UInt(1), Value::Text(msg.tsvc.clone())),
@@ -184,7 +252,7 @@ impl Client {
     }
 
     /// Status of a message id. `Ok(None)` means the daemon has no record of it.
-    pub async fn status(&mut self, mid: &[u8; 16]) -> Result<Option<(u64, Option<u64>)>> {
+    pub async fn status(&mut self, mid: &MessageId) -> Result<Option<(u64, Option<u64>)>> {
         let args = Value::map(vec![(Value::UInt(0), Value::Bytes(mid.to_vec()))]);
         match self.call(OP_STATUS, args).await {
             Ok(v) => {
@@ -208,7 +276,7 @@ impl Client {
     }
 
     /// Acknowledge deliveries; returns how many were removed.
-    pub async fn ack(&mut self, ids: &[[u8; 16]]) -> Result<u64> {
+    pub async fn ack(&mut self, ids: &[DeliveryId]) -> Result<u64> {
         let arr = Value::Array(ids.iter().map(|id| Value::Bytes(id.to_vec())).collect());
         let args = Value::map(vec![(Value::UInt(0), arr)]);
         let result = self.call(OP_ACK, args).await?;
@@ -216,7 +284,7 @@ impl Client {
     }
 
     /// Whether a valid record for `id` is held, its mode, and whether a path exists now.
-    pub async fn lookup(&mut self, id: &[u8; 32]) -> Result<Lookup> {
+    pub async fn lookup(&mut self, id: &Identifier) -> Result<Lookup> {
         let args = Value::map(vec![(Value::UInt(0), Value::Bytes(id.to_vec()))]);
         let result = self.call(OP_LOOKUP, args).await?;
         Ok(Lookup {
@@ -238,12 +306,24 @@ impl Client {
         Ok(NodeInfo {
             id: bytes_at(&result, 0)
                 .and_then(|b| <[u8; 32]>::try_from(b).ok())
+                .map(Identifier::from_bytes)
                 .ok_or(Error::BadResponse("node: bad id"))?,
-            mode: get(1).and_then(Value::as_text).unwrap_or("").to_string(),
-            links: get(2).and_then(Value::as_uint).unwrap_or(0),
-            records: get(3).and_then(Value::as_uint).unwrap_or(0),
-            custody_bytes: get(4).and_then(Value::as_uint).unwrap_or(0),
-            draining: get(5).and_then(Value::as_bool).unwrap_or(false),
+            mode: get(1)
+                .and_then(Value::as_text)
+                .ok_or(Error::BadResponse("node: missing mode"))?
+                .to_string(),
+            links: get(2)
+                .and_then(Value::as_uint)
+                .ok_or(Error::BadResponse("node: missing links"))?,
+            records: get(3)
+                .and_then(Value::as_uint)
+                .ok_or(Error::BadResponse("node: missing records"))?,
+            custody_bytes: get(4)
+                .and_then(Value::as_uint)
+                .ok_or(Error::BadResponse("node: missing custody_bytes"))?,
+            draining: get(5)
+                .and_then(Value::as_bool)
+                .ok_or(Error::BadResponse("node: missing draining"))?,
         })
     }
 
@@ -257,7 +337,7 @@ impl Client {
         Ok((
             lattice_proto::cbor::map_get(&result, 0)
                 .and_then(Value::as_bool)
-                .unwrap_or(false),
+                .ok_or(Error::BadResponse("drain: missing draining"))?,
             uint_at(&result, 1)?,
         ))
     }
@@ -267,9 +347,9 @@ impl Client {
     pub async fn link(
         &mut self,
         addr: &str,
-        channel_key: Option<[u8; 32]>,
+        channel_key: Option<ChannelPublicKey>,
         path: Option<String>,
-        id: Option<[u8; 32]>,
+        id: Option<Identifier>,
     ) -> Result<bool> {
         let mut args = vec![(Value::UInt(0), Value::Text(addr.to_string()))];
         if let Some(k) = channel_key {
@@ -316,7 +396,7 @@ impl Client {
     }
 
     /// Drop every link to the given peer id. Returns true if any were open.
-    pub async fn unlink(&mut self, id: &[u8; 32]) -> Result<bool> {
+    pub async fn unlink(&mut self, id: &Identifier) -> Result<bool> {
         let args = Value::map(vec![(Value::UInt(0), Value::Bytes(id.to_vec()))]);
         let result = self.call(OP_UNLINK, args).await?;
         lattice_proto::cbor::map_get(&result, 0)
@@ -330,21 +410,26 @@ impl Client {
         let id = self.next_id;
         self.next_id += 1;
         let req = Request { id, op, args };
-        let frame = frame_local(&encode(&req.to_value()))
-            .map_err(|_| Error::BadResponse("frame too large"))?;
+        let frame = frame_local(&encode(&req.to_value())).map_err(|_| Error::RequestTooLarge)?;
         self.stream.write_all(&frame).await?;
         loop {
             let payload = self.read_frame().await?;
-            let v = decode(&payload).map_err(|e| Error::Connection(format!("decode: {e}")))?;
+            let v = decode(&payload)
+                .map_err(|e| Error::Connection(ConnectionError::Decode(e.into())))?;
             match Response::from_value(&v) {
                 Ok(Response::Ok { id: rid, result }) if rid == id => return Ok(result),
                 Ok(Response::Err { id: rid, code }) if rid == id => {
                     return Err(Error::Rejected(code));
                 }
-                Ok(_) => return Err(Error::Connection("response id mismatch".into())),
+                Ok(Response::Ok { id: rid, .. }) | Ok(Response::Err { id: rid, .. }) => {
+                    return Err(Error::Connection(ConnectionError::ResponseIdMismatch {
+                        expected: id,
+                        got: rid,
+                    }));
+                }
                 Err(_) => match Event::from_value(&v) {
                     Ok(ev) => self.events.push_back(ev),
-                    Err(_) => return Err(Error::Connection("unrecognized frame".into())),
+                    Err(_) => return Err(Error::Connection(ConnectionError::UnrecognizedFrame)),
                 },
             }
         }
@@ -354,7 +439,7 @@ impl Client {
         let mut chunk = [0u8; 8192];
         loop {
             if let Some((payload, used)) = deframe_local(&self.buf)
-                .map_err(|e| Error::Connection(format!("bad frame: {e}")))?
+                .map_err(|e| Error::Connection(ConnectionError::Decode(e)))?
             {
                 let out = payload.to_vec();
                 self.buf.drain(..used);
@@ -367,14 +452,14 @@ impl Client {
             .await
             {
                 Ok(r) => r?,
-                Err(_) => return Err(Error::Connection("read timed out after 30s".into())),
+                Err(_) => return Err(Error::Connection(ConnectionError::Timeout)),
             };
             if n == 0 {
-                return Err(Error::Connection("daemon closed the socket".into()));
+                return Err(Error::Connection(ConnectionError::Closed));
             }
             self.buf.extend_from_slice(&chunk[..n]);
             if self.buf.len() > LOCAL_MAX_FRAME + LOCAL_PREFIX_LEN {
-                return Err(Error::Connection("frame exceeds maximum size".into()));
+                return Err(Error::Connection(ConnectionError::FrameTooLarge));
             }
         }
     }
@@ -393,9 +478,10 @@ fn uint_at(v: &Value, key: u64) -> Result<u64> {
         .ok_or(Error::BadResponse("expected uint field"))
 }
 
-fn take_mid(v: &Value) -> Result<[u8; 16]> {
+fn take_mid(v: &Value) -> Result<MessageId> {
     bytes_at(v, 0)
         .and_then(|b| <[u8; 16]>::try_from(b).ok())
+        .map(MessageId::from_bytes)
         .ok_or(Error::BadResponse("send: missing mid"))
 }
 
@@ -405,10 +491,13 @@ fn parse_delivery(v: &Value) -> Result<Delivery> {
     };
     Ok(Delivery {
         delivery_id: <[u8; 16]>::try_from(bytes(0)?)
+            .map(DeliveryId::from_bytes)
             .map_err(|_| Error::BadResponse("delivery: bad id"))?,
         mid: <[u8; 16]>::try_from(bytes(1)?)
+            .map(MessageId::from_bytes)
             .map_err(|_| Error::BadResponse("delivery: bad mid"))?,
         from: <[u8; 32]>::try_from(bytes(2)?)
+            .map(Identifier::from_bytes)
             .map_err(|_| Error::BadResponse("delivery: bad from"))?,
         fsvc: lattice_proto::cbor::map_get(v, 3)
             .and_then(Value::as_text)
@@ -419,4 +508,133 @@ fn parse_delivery(v: &Value) -> Result<Delivery> {
         body: bytes(6)?.to_vec(),
         received: uint_at(v, 7)?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::error::Error as StdError;
+    use tokio::net::UnixListener;
+
+    /// Serve exactly one request on a fresh Unix socket and reply with
+    /// `result` as the response payload. Returns the socket path.
+    async fn serve_once(dir: &std::path::Path, result: Value) -> std::path::PathBuf {
+        let path = dir.join("daemon.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let payload = loop {
+                if let Some((p, _)) = deframe_local(&buf).unwrap() {
+                    break p.to_vec();
+                }
+                let n = tokio::io::AsyncReadExt::read(&mut sock, &mut chunk)
+                    .await
+                    .unwrap();
+                assert!(n > 0, "client closed before sending a frame");
+                buf.extend_from_slice(&chunk[..n]);
+            };
+            let req = decode(&payload).unwrap();
+            let id = lattice_proto::cbor::map_get(&req, 0)
+                .and_then(Value::as_uint)
+                .unwrap();
+            let resp = Value::map(vec![
+                (Value::UInt(0), Value::UInt(id)),
+                (Value::UInt(1), result),
+            ]);
+            let frame = frame_local(&encode(&resp)).unwrap();
+            tokio::io::AsyncWriteExt::write_all(&mut sock, &frame)
+                .await
+                .unwrap();
+        });
+        path
+    }
+
+    fn node_result(links: Option<u64>) -> Value {
+        let mut pairs = vec![
+            (Value::UInt(0), Value::Bytes(vec![7; 32])),
+            (Value::UInt(1), Value::Text("public".into())),
+        ];
+        if let Some(l) = links {
+            pairs.push((Value::UInt(2), Value::UInt(l)));
+        }
+        pairs.extend([
+            (Value::UInt(3), Value::UInt(9)),
+            (Value::UInt(4), Value::UInt(1234)),
+            (Value::UInt(5), Value::Bool(false)),
+        ]);
+        Value::map(pairs)
+    }
+
+    #[tokio::test]
+    async fn node_missing_links_is_an_error_not_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = serve_once(dir.path(), node_result(None)).await;
+        let mut client = Client::connect_admin(&path).await.unwrap();
+        let err = client.node().await.unwrap_err();
+        assert!(matches!(err, Error::BadResponse("node: missing links")));
+    }
+
+    #[tokio::test]
+    async fn node_full_response_parses() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = serve_once(dir.path(), node_result(Some(3))).await;
+        let mut client = Client::connect_admin(&path).await.unwrap();
+        let info = client.node().await.unwrap();
+        assert_eq!(info.links, 3);
+        assert_eq!(info.records, 9);
+        assert_eq!(info.custody_bytes, 1234);
+        assert!(!info.draining);
+        assert_eq!(info.mode, "public");
+    }
+
+    #[tokio::test]
+    async fn drain_missing_draining_is_an_error_not_false() {
+        let dir = tempfile::tempdir().unwrap();
+        // custody_bytes present, draining (key 0) absent.
+        let path = serve_once(
+            dir.path(),
+            Value::map(vec![(Value::UInt(1), Value::UInt(42))]),
+        )
+        .await;
+        let mut client = Client::connect_admin(&path).await.unwrap();
+        let err = client.drain(None).await.unwrap_err();
+        assert!(matches!(err, Error::BadResponse("drain: missing draining")));
+    }
+
+    #[test]
+    fn rejection_display_names_the_code() {
+        let err = Error::Rejected(ERR_NOT_FOUND);
+        assert_eq!(err.to_string(), "request rejected: not_found (code 4)");
+        assert_eq!(err.rejection(), Some((ERR_NOT_FOUND, "not_found")));
+        let err = Error::Rejected(999);
+        assert_eq!(err.to_string(), "request rejected: unknown (code 999)");
+        assert_eq!(err.rejection(), Some((999, "unknown")));
+    }
+
+    #[test]
+    fn error_source_chain_is_wired() {
+        let io = Error::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "refused",
+        ));
+        assert_eq!(
+            io.source()
+                .and_then(|s| s.downcast_ref::<std::io::Error>())
+                .map(|e| e.kind()),
+            Some(std::io::ErrorKind::ConnectionRefused)
+        );
+        let conn = Error::Connection(ConnectionError::Decode(ProtoError::Cbor(
+            lattice_proto::DecodeError::UnexpectedEof,
+        )));
+        let source = conn.source().expect("connection error has a source");
+        assert!(source.is::<ConnectionError>());
+        let inner = source.source().expect("decode error has a source");
+        assert!(inner.is::<ProtoError>());
+        assert!(
+            inner.source().is_some(),
+            "ProtoError::Cbor carries the DecodeError"
+        );
+    }
 }

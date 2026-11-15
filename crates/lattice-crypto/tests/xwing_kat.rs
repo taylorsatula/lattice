@@ -30,14 +30,14 @@ fn draft_vectors() {
         // Key derivation: seed -> same decapsulation key, same public key.
         let secret = XWingSecretKey::from_bytes(sk);
         assert_eq!(
-            secret.public_key().as_slice(),
+            lattice_crypto::xwing_public_key(&secret).as_ref(),
             pk.as_slice(),
             "vector {i}: public key mismatch"
         );
         let derived = XWingSecretKey::from_bytes(seed);
         assert_eq!(
-            derived.public_key(),
-            secret.public_key(),
+            lattice_crypto::xwing_public_key(&derived),
+            lattice_crypto::xwing_public_key(&secret),
             "vector {i}: seed/sk mismatch"
         );
 
@@ -120,8 +120,9 @@ fn seal_roundtrip_and_tamper() {
         .is_err()
     );
     // Flip a KEM ciphertext byte.
-    let mut bad_kem = sealed.kem_ciphertext;
-    bad_kem[100] ^= 1;
+    let mut bad_kem_bytes = sealed.kem_ciphertext.into_bytes();
+    bad_kem_bytes[100] ^= 1;
+    let bad_kem = lattice_types::KemCiphertext::from_bytes(bad_kem_bytes);
     assert!(
         open(
             ENVELOPE_CONTEXT,

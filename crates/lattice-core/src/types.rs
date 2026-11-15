@@ -1,6 +1,7 @@
 //! Public types for the core: events, actions, config, identity.
 
 use lattice_proto::record::Mode;
+use lattice_types::{DeliveryId, Identifier, MessageId, X25519PublicKey};
 
 /// Link identifier assigned by the transport (simulator or sockets layer).
 pub type LinkId = u64;
@@ -9,8 +10,8 @@ pub type LinkId = u64;
 pub struct AppSend {
     /// Service making the request (must match an authenticated service at the API edge).
     pub service: String,
-    pub mid_hint: Option<[u8; 16]>,
-    pub to: [u8; 32],
+    pub mid_hint: Option<MessageId>,
+    pub to: Identifier,
     pub tsvc: String,
     pub tmbx: Vec<u8>,
     pub fmbx: Vec<u8>,
@@ -26,8 +27,8 @@ pub enum Event {
     LinkUp {
         at: u64,
         link: LinkId,
-        peer: Option<[u8; 32]>,
-        remote_ck: [u8; 32],
+        peer: Option<Identifier>,
+        remote_ck: X25519PublicKey,
         wan: bool,
     },
     LinkDown {
@@ -37,7 +38,7 @@ pub enum Event {
     Frame {
         at: u64,
         link: LinkId,
-        from: [u8; 32],
+        from: Identifier,
         frame: lattice_proto::frames::Frame,
     },
     Tick {
@@ -46,7 +47,7 @@ pub enum Event {
     AppSend(AppSend),
     AppAck {
         service: String,
-        delivery_ids: Vec<[u8; 16]>,
+        delivery_ids: Vec<DeliveryId>,
         at: u64,
     },
 }
@@ -54,9 +55,10 @@ pub enum Event {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Action {
     /// Send a frame on a link (padding applied by the transport).
-    /// `pad_to` requests a specific FRAME_BUCKETS index for the wire
-    /// padding (snow dummies must land in a sampled bucket); `None` lets the
-    /// transport pick the smallest fitting bucket.
+    /// `pad_to` requests a specific FRAME_BUCKETS index (see
+    /// `lattice_net::FRAME_BUCKETS`) for the wire padding (snow dummies
+    /// must land in a sampled bucket); `None` lets the transport pick the
+    /// smallest fitting bucket.
     SendFrame {
         link: LinkId,
         frame: lattice_proto::frames::Frame,
@@ -65,9 +67,9 @@ pub enum Action {
     /// Hand a delivery to the application.
     Deliver {
         service: String,
-        delivery_id: [u8; 16],
-        mid: [u8; 16],
-        from: [u8; 32],
+        delivery_id: DeliveryId,
+        mid: MessageId,
+        from: Identifier,
         fsvc: String,
         fmbx: Vec<u8>,
         tmbx: Vec<u8>,
@@ -78,7 +80,7 @@ pub enum Action {
     /// `service` is the originating service, so the daemon can route the
     /// event to the right application connection.
     Status {
-        mid: [u8; 16],
+        mid: MessageId,
         status: u64,
         detail: Option<u64>,
         service: String,
@@ -101,20 +103,21 @@ pub struct Config {
     pub transit_cap: u64,
     /// Per-service inbox cap, deliveries.
     pub inbox_max_deliveries: u64,
+    /// Global inbox cap across all services, deliveries. Bounds total
+    /// undelivered storage regardless of how senders label `tsvc`.
+    pub inbox_max_total: u64,
     pub record_refresh_secs: u64,
     pub reconcile_interval_secs: u64,
     pub buffer_classes: u8,
     pub retry_base_secs: u64,
     pub retry_max_secs: u64,
     pub fresh_waypoint_retries: u32,
-    pub wary_threshold: usize,
-    pub wary_list_max: usize,
     pub default_message_horizon: u64,
     pub rng_seed: u64,
     /// Endpoints to publish in our record (public mode). `ws://host[:port]/` URLs.
     pub advertise: Vec<String>,
     /// Gateway node ids for a private node's record (1-3, private mode only).
-    pub gateways: Vec<[u8; 32]>,
+    pub gateways: Vec<Identifier>,
     /// Public or private record mode.
     pub mode: Mode,
 }
@@ -131,14 +134,13 @@ impl Default for Config {
             custody_allowance: 4 * 1024 * 1024,
             transit_cap: 256 * 1024 * 1024,
             inbox_max_deliveries: 1024,
+            inbox_max_total: 4096,
             record_refresh_secs: 120,
             reconcile_interval_secs: 60,
             buffer_classes: 16,
             retry_base_secs: 30,
             retry_max_secs: 30 * 60,
             fresh_waypoint_retries: 3,
-            wary_threshold: 3,
-            wary_list_max: 32,
             default_message_horizon: 3 * 24 * 3600,
             rng_seed: 0x5eed_u64,
             advertise: Vec::new(),
@@ -148,7 +150,9 @@ impl Default for Config {
     }
 }
 
-// Failure/detail codes used in Status actions (detail field).
+// Failure/detail codes used in Status actions (detail field). Distinct from
+// the `ERR_*` codes in lattice-proto::local, which are local-API response
+// codes; these are carried in Status event details.
 pub const ERR_NO_RECORD: u64 = 100;
 pub const ERR_NO_ROUTE: u64 = 101;
 pub const ERR_INTERNAL: u64 = 102;
