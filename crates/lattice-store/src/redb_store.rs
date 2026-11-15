@@ -67,6 +67,14 @@ fn ctx<E: Into<StoreError>>(op: &'static str) -> impl FnOnce(E) -> StoreError {
     move |e| e.into().at(op)
 }
 
+/// Copy `bytes` into a fixed-size array, or report a corrupt row.
+/// redb's fixed-width table types make a wrong length impossible in a
+/// healthy database; this keeps a corrupt or foreign row from panicking
+/// the daemon.
+fn fixed<const N: usize>(bytes: &[u8], context: &'static str) -> Result<[u8; N], StoreError> {
+    bytes.try_into().map_err(|_| StoreError::Corrupt(context))
+}
+
 const SCHEMA_VERSION: u64 = 1;
 
 const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
@@ -379,8 +387,10 @@ impl Store for RedbStore {
             for entry in t.iter()? {
                 let (k, v) = entry?;
                 let key = k.value();
-                let id =
-                    Identifier::from_bytes(key[..32].try_into().expect("RECORDS key is 33 bytes"));
+                if key.len() != 33 {
+                    return Err(StoreError::Corrupt("records key"));
+                }
+                let id = Identifier::from_bytes(fixed(&key[..32], "records key")?);
                 let scope = if key[32] == 0 {
                     Scope::Wan
                 } else {
@@ -407,15 +417,12 @@ impl Store for RedbStore {
                 None => Ok(None),
                 Some(v) => {
                     let raw = v.value();
-                    let seq = u64::from_le_bytes(
-                        raw[..8].try_into().expect("KEL_HEADS value is 48 bytes"),
-                    );
-                    let commitment = Commitment::from_bytes(
-                        raw[8..40].try_into().expect("KEL_HEADS value is 48 bytes"),
-                    );
-                    let seen = u64::from_le_bytes(
-                        raw[40..].try_into().expect("KEL_HEADS value is 48 bytes"),
-                    );
+                    if raw.len() != 48 {
+                        return Err(StoreError::Corrupt("kel_heads value"));
+                    }
+                    let seq = u64::from_le_bytes(fixed(&raw[..8], "kel_heads value")?);
+                    let commitment = Commitment::from_bytes(fixed(&raw[8..40], "kel_heads value")?);
+                    let seen = u64::from_le_bytes(fixed(&raw[40..], "kel_heads value")?);
                     Ok(Some((seq, commitment, seen)))
                 }
             }
@@ -430,9 +437,10 @@ impl Store for RedbStore {
                 for entry in t.iter()? {
                     let (k, v) = entry?;
                     let raw = v.value();
-                    let seen = u64::from_le_bytes(
-                        raw[40..48].try_into().expect("KEL_HEADS value is 48 bytes"),
-                    );
+                    if raw.len() != 48 {
+                        return Err(StoreError::Corrupt("kel_heads value"));
+                    }
+                    let seen = u64::from_le_bytes(fixed(&raw[40..48], "kel_heads value")?);
                     if seen < older_than {
                         out.push(k.value());
                     }
@@ -724,21 +732,19 @@ impl Store for RedbStore {
         })
     }
 
-    fn inbox_push(&mut self, service: &str, entry: InboxEntry) -> Result<(), StoreError> {
-        let mut e = entry;
-        let _ = service; // service is carried inside the entry
-        let bytes = serde_json::to_vec(&e).map_err(|e| StoreError::Codec {
+    fn inbox_push(&mut self, entry: InboxEntry) -> Result<(), StoreError> {
+        // Keyed by delivery_id; the entry's own `tsvc` is the service tag,
+        // filtered at read time.
+        let bytes = serde_json::to_vec(&entry).map_err(|e| StoreError::Codec {
             context: "encode inbox entry",
             source: e,
         })?;
-        let id = e.delivery_id;
+        let id = entry.delivery_id;
         self.write("inbox_push", |txn| {
             let mut t = txn.open_table(INBOX)?;
             t.insert(*id.as_bytes(), bytes)?;
             Ok(())
-        })?;
-        let _ = &mut e;
-        Ok(())
+        })
     }
 
     fn inbox_fetch(&self, service: &str, max: usize) -> Result<Vec<InboxEntry>, StoreError> {
@@ -882,12 +888,12 @@ impl Store for RedbStore {
         })
     }
 
-    fn size_bucket_sample(&mut self, bucket: u8) {
-        let _ = self.bucket_bump(bucket);
+    fn size_bucket_sample(&mut self, bucket: u8) -> Result<(), StoreError> {
+        self.bucket_bump(bucket)
     }
 
-    fn size_bucket_counts(&self) -> [u64; 3] {
-        self.bucket_counts().unwrap_or([0, 0, 0])
+    fn size_bucket_counts(&self) -> Result<[u64; 3], StoreError> {
+        self.bucket_counts()
     }
 
     fn drain_get(&self) -> Result<bool, StoreError> {

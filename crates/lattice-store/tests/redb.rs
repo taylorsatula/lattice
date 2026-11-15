@@ -118,20 +118,17 @@ fn exercise<S: Store>(s: &mut S) -> String {
     s.delivered_add(h(6), 1000).unwrap();
     assert!(s.delivered_contains(&h(6), 999).unwrap());
 
-    s.inbox_push(
-        "svc",
-        InboxEntry {
-            delivery_id: did(0xD1),
-            mid: mid(1),
-            from: id(2),
-            fsvc: "svc".into(),
-            fmbx: b"a".to_vec(),
-            tsvc: "svc".into(),
-            tmbx: b"b".to_vec(),
-            body: b"hello".to_vec(),
-            received: 42,
-        },
-    )
+    s.inbox_push(InboxEntry {
+        delivery_id: did(0xD1),
+        mid: mid(1),
+        from: id(2),
+        fsvc: "svc".into(),
+        fmbx: b"a".to_vec(),
+        tsvc: "svc".into(),
+        tmbx: b"b".to_vec(),
+        body: b"hello".to_vec(),
+        received: 42,
+    })
     .unwrap();
     assert_eq!(s.inbox_len("svc").unwrap(), 1);
     assert_eq!(s.inbox_fetch("svc", 10).unwrap().len(), 1);
@@ -141,14 +138,14 @@ fn exercise<S: Store>(s: &mut S) -> String {
     s.status_set(&mid(4), 3, None).unwrap();
     assert_eq!(s.status_get(&mid(4)).unwrap(), Some((3, None)));
 
-    s.size_bucket_sample(0);
-    s.size_bucket_sample(0);
-    s.size_bucket_sample(2);
+    s.size_bucket_sample(0).unwrap();
+    s.size_bucket_sample(0).unwrap();
+    s.size_bucket_sample(2).unwrap();
     format!(
         "{:?}|{:?}|{:?}",
         s.outbound_all().unwrap().len(),
         s.custody_all().unwrap().len(),
-        s.size_bucket_counts()
+        s.size_bucket_counts().unwrap()
     )
 }
 
