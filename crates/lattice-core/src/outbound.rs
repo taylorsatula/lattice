@@ -16,6 +16,7 @@ use lattice_store::{OutboundMessage, OutboundState};
 /// State queries on the persisted state enum.
 pub(crate) trait OutboundStateExt {
     /// True for `Delivered`, `Failed`, `Expired` — the absorbing states.
+    #[must_use]
     fn is_terminal(&self) -> bool;
 }
 

@@ -23,6 +23,7 @@ impl Rng {
         self.next_u64() % n
     }
     /// True with probability p in [0, 1].
+    #[must_use]
     pub fn chance(&mut self, p: f64) -> bool {
         (self.next_u64() as f64 / u64::MAX as f64) < p
     }

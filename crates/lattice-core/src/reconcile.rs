@@ -40,6 +40,7 @@ trait ItemExt {
     fn hash(&self) -> crate::u256::U256;
 }
 
+#[must_use]
 fn in_range(item: &Item, lower: &Option<RangeBound>, upper: &Option<RangeBound>) -> bool {
     let key = (item.id, item.scope);
     if let Some(l) = lower {
@@ -153,7 +154,7 @@ pub fn entries_in(items: &[Item], range: &Range) -> Vec<Item> {
     items
         .iter()
         .filter(|i| in_range(i, &lower, &upper))
-        .cloned()
+        .copied()
         .collect()
 }
 
@@ -348,8 +349,7 @@ mod tests {
                 .iter()
                 .filter(|r| {
                     let b = range_parts(r);
-                    b.lower.map(|l| l.id <= id).unwrap_or(true)
-                        && b.upper.map(|u| id < u.id).unwrap_or(true)
+                    b.lower.is_none_or(|l| l.id <= id) && b.upper.is_none_or(|u| id < u.id)
                 })
                 .count();
             assert_eq!(hits, 1, "id {id:?} covered by {hits} subranges");

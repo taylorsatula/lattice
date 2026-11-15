@@ -100,6 +100,7 @@ impl U256 {
         U256(out)
     }
 
+    #[must_use]
     pub fn is_zero(&self) -> bool {
         self.0.iter().all(|&l| l == 0)
     }
