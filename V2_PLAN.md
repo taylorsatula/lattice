@@ -426,7 +426,6 @@ from the soak test.
 | Hold | 0 ms (immediate dispatch) |
 | Sideways probability | 15% |
 | Waypoint share | 0% (retries always use a fresh waypoint) |
-| Wary rule *k* / wary list size | 3 / 32 |
 | Size buckets | 2, 8, 32 KB |
 
 ## Out of scope for v2.0

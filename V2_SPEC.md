@@ -333,7 +333,7 @@ exactly a bucket size is refused. Frame types:
 | 20 | reconcile | `{2: [range, …]}`. Range-based set reconciliation, below |
 | 21 | want | `{2: [[id, scope], …]}` |
 | 22 | records | `{2: [peer record, …]}` |
-| 23 | wary | `{2: [id, …], 3: exp}` (optional, §8) |
+| 23 | reserved | Reserved for the wary list (see V2_DESIGN.md); not implemented in v2.0 |
 | 60 | ping | `{2: nonce}`, answered with the same frame. Replaces WebSocket ping/pong, which is not used |
 | 61 | dummy | `{2: echo}` (bool). Discarded on receipt; if `echo` is true, answered with a dummy (§ Snow) |
 | 62 | attest | `{2: id, 3: sig}`. Channel attestation, below |
@@ -614,7 +614,6 @@ redb tables, derived from the objects above:
 | `peers` | id | Saved endpoint addresses, kept independently of record expiry |
 | `inbox` | delivery id | Service, delivery fields, received |
 | `status` | mid | Latest status, for the API |
-| `wary` | id | Source ranges, expiry |
 
 The next signing key's secret is not stored here. It lives in a separate
 file, or offline (§1).
