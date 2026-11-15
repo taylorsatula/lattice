@@ -106,9 +106,7 @@ pub async fn scoped_addresses(
         .collect();
     if allowed.is_empty() {
         // Everything resolved to a disallowed address: do not dial anything.
-        return Err(NetError::InvalidInput(
-            "no address in scope for this endpoint",
-        ));
+        return Err(NetError::NoUsableAddress);
     }
     Ok(allowed
         .into_iter()
@@ -127,7 +125,9 @@ pub async fn connect_scoped(
     xx_path: Option<String>,
 ) -> Result<PeerIo, NetError> {
     let addrs = scoped_addresses(endpoint, record_ips, scope).await?;
-    let mut last_err = NetError::InvalidInput("no address in scope for this endpoint");
+    // Unreachable while `scoped_addresses` errors on an empty list; the
+    // variant still says the right thing if that ever changes.
+    let mut last_err = NetError::NoUsableAddress;
     for addr in addrs {
         let contact = match (ik_channel_key, &xx_path) {
             (Some(ck), _) => PeerContact::Ik {

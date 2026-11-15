@@ -90,7 +90,6 @@ pub async fn connect(contact: PeerContact, channel_seed: &ChannelSeed) -> Result
     send_init(&mut ws, &msg1, mac1_bytes, None).await?;
 
     // Handshake loop: expect Cookie (optional) then Resp.
-    let mut cookie = None;
     let resp_noise = loop {
         let msg = tokio::time::timeout(HANDSHAKE_TIMEOUT, ws.next())
             .await
@@ -110,14 +109,11 @@ pub async fn connect(contact: PeerContact, channel_seed: &ChannelSeed) -> Result
             Frame::Cookie(c) => {
                 // Re-send the same init with mac2 filled in.
                 send_init(&mut ws, &msg1, mac1_bytes, Some(mac2(&c.cookie, &msg1))).await?;
-                cookie = Some(c.cookie);
             }
             Frame::Resp(r) => break r.noise_msg,
             _ => return Err(NetError::UnexpectedFrame),
         }
     };
-    let _ = cookie;
-
     // IK: one response completes the handshake. XX: one more client message.
     let _ = hs
         .read_message(&resp_noise)
