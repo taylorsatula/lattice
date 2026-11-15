@@ -17,6 +17,8 @@ use std::path::Path;
 use lattice_proto::local::*;
 use lattice_proto::{ProtoError, Value, decode, encode};
 use lattice_types::{ChannelPublicKey, DeliveryId, Identifier, MessageId};
+
+pub use lattice_proto::local::{DrainState, Lookup, MessageStatus};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
@@ -143,14 +145,6 @@ pub struct Delivery {
     pub received: u64,
 }
 
-/// Result of `lookup`.
-#[derive(Clone, Copy, Debug)]
-pub struct Lookup {
-    pub have: bool,
-    pub mode: Option<u64>,
-    pub path: bool,
-}
-
 /// Result of `node` (admin).
 #[derive(Clone, Debug)]
 pub struct NodeInfo {
@@ -252,13 +246,13 @@ impl Client {
     }
 
     /// Status of a message id. `Ok(None)` means the daemon has no record of it.
-    pub async fn status(&mut self, mid: &MessageId) -> Result<Option<(u64, Option<u64>)>> {
+    pub async fn status(&mut self, mid: &MessageId) -> Result<Option<MessageStatus>> {
         let args = Value::map(vec![(Value::UInt(0), Value::Bytes(mid.to_vec()))]);
         match self.call(OP_STATUS, args).await {
             Ok(v) => {
                 let status = uint_at(&v, 0)?;
                 let detail = lattice_proto::cbor::map_get(&v, 1).and_then(Value::as_uint);
-                Ok(Some((status, detail)))
+                Ok(Some(MessageStatus { status, detail }))
             }
             Err(Error::Rejected(ERR_NOT_FOUND)) => Ok(None),
             Err(e) => Err(e),
@@ -328,18 +322,18 @@ impl Client {
     }
 
     /// Set or query drain mode. `None` reports, `Some(d)` sets.
-    pub async fn drain(&mut self, draining: Option<bool>) -> Result<(bool, u64)> {
+    pub async fn drain(&mut self, draining: Option<bool>) -> Result<DrainState> {
         let args = match draining {
             Some(d) => Value::map(vec![(Value::UInt(0), Value::Bool(d))]),
             None => Value::map(vec![]),
         };
         let result = self.call(OP_DRAIN, args).await?;
-        Ok((
-            lattice_proto::cbor::map_get(&result, 0)
+        Ok(DrainState {
+            draining: lattice_proto::cbor::map_get(&result, 0)
                 .and_then(Value::as_bool)
                 .ok_or(Error::BadResponse("drain: missing draining"))?,
-            uint_at(&result, 1)?,
-        ))
+            custody_bytes: uint_at(&result, 1)?,
+        })
     }
 
     /// Queue a dial to `addr`. Exactly one of `channel_key` (IK dial) or
@@ -438,11 +432,11 @@ impl Client {
     async fn read_frame(&mut self) -> Result<Vec<u8>> {
         let mut chunk = [0u8; 8192];
         loop {
-            if let Some((payload, used)) = deframe_local(&self.buf)
+            if let Some(frame) = deframe_local(&self.buf)
                 .map_err(|e| Error::Connection(ConnectionError::Decode(e)))?
             {
-                let out = payload.to_vec();
-                self.buf.drain(..used);
+                let out = frame.payload.to_vec();
+                self.buf.drain(..frame.consumed);
                 return Ok(out);
             }
             let n = match tokio::time::timeout(
@@ -526,8 +520,8 @@ mod tests {
             let mut buf = Vec::new();
             let mut chunk = [0u8; 4096];
             let payload = loop {
-                if let Some((p, _)) = deframe_local(&buf).unwrap() {
-                    break p.to_vec();
+                if let Some(frame) = deframe_local(&buf).unwrap() {
+                    break frame.payload.to_vec();
                 }
                 let n = tokio::io::AsyncReadExt::read(&mut sock, &mut chunk)
                     .await

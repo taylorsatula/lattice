@@ -243,7 +243,7 @@ async fn cmd_run(args: &[String]) -> std::process::ExitCode {
             on_peer: peer_tx.clone(),
         };
         match lattice_net::serve(listener_cfg, vec![*addr]).await {
-            Ok((bound, _handle)) => eprintln!("lattice: listening on {bound}"),
+            Ok(served) => eprintln!("lattice: listening on {}", served.addr),
             Err(e) => {
                 eprintln!("listen on {addr} failed: {e}");
                 return std::process::ExitCode::from(1);

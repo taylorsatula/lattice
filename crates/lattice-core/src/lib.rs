@@ -17,6 +17,6 @@ pub mod types;
 mod u256;
 
 pub use error::NodeError;
-pub use node::{Identity, Node};
+pub use node::{Identity, LookupResult, Node, RetiredEnvelopeKey};
 pub use rng::Rng;
 pub use types::{Action, AppSend, Config, Diagnostic, Event, LinkId};

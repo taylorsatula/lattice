@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use lattice_core::{Action, Event, Node};
 use lattice_crypto::os_bytes;
 use lattice_proto::frames::Frame;
+use lattice_proto::local::{DrainState, Lookup, MessageStatus};
 use lattice_store::{RedbStore, Store, StoreError};
 use lattice_types::{
     ChannelPublicKey, ChannelSeed, DeliveryId, Identifier, MessageId, X25519PublicKey,
@@ -45,7 +46,7 @@ pub enum ApiCmd {
     },
     Status {
         mid: MessageId,
-        respond: StoreReply<Option<(u64, Option<u64>)>>,
+        respond: StoreReply<Option<MessageStatus>>,
     },
     Fetch {
         service: String,
@@ -59,15 +60,15 @@ pub enum ApiCmd {
     },
     Lookup {
         id: Identifier,
-        respond: tokio::sync::oneshot::Sender<(bool, Option<u64>, bool)>,
+        respond: tokio::sync::oneshot::Sender<Lookup>,
     },
     NodeInfo {
         respond: tokio::sync::oneshot::Sender<NodeInfo>,
     },
-    /// None = report only; Some(d) = set draining to d. Returns (draining, custody_bytes).
+    /// None = report only; Some(d) = set draining to d.
     Drain {
         draining: Option<bool>,
-        respond: tokio::sync::oneshot::Sender<(bool, usize)>,
+        respond: tokio::sync::oneshot::Sender<DrainState>,
     },
     /// Rotate the signing key. `next_key_file` overrides the default location.
     Rotate {
@@ -100,6 +101,14 @@ pub struct NodeInfo {
     pub records: usize,
     pub custody_bytes: u64,
     pub draining: bool,
+}
+
+/// An application-facing event tagged with the service it belongs to; the
+/// daemon fans it out to that service's connections only.
+#[derive(Clone, Debug)]
+pub struct ServiceEvent {
+    pub service: String,
+    pub payload: Vec<u8>,
 }
 
 /// A frame plus the transport's padding hint (bucket index).
@@ -150,7 +159,7 @@ pub struct Runtime {
     roots: Vec<RootDial>,
     api_rx: Option<mpsc::UnboundedReceiver<ApiCmd>>,
     api_tx: mpsc::UnboundedSender<ApiCmd>,
-    pub app_broadcast: broadcast::Sender<(String, Vec<u8>)>,
+    pub app_broadcast: broadcast::Sender<ServiceEvent>,
     next_link: u64,
 }
 
@@ -445,14 +454,16 @@ impl Runtime {
                     service,
                     ..
                 } => {
-                    let _ = self
-                        .app_broadcast
-                        .send((service, encode_status_event(mid, status)));
+                    let _ = self.app_broadcast.send(ServiceEvent {
+                        service,
+                        payload: encode_status_event(mid, status),
+                    });
                 }
                 Action::Inbox { service, unread } => {
-                    let _ = self
-                        .app_broadcast
-                        .send((service, encode_inbox_event(unread)));
+                    let _ = self.app_broadcast.send(ServiceEvent {
+                        service,
+                        payload: encode_inbox_event(unread),
+                    });
                 }
             }
         }
@@ -501,9 +512,18 @@ impl Runtime {
             }
             ApiCmd::Lookup { id, respond } => {
                 let mut node = self.node.lock().unwrap_or_else(|e| e.into_inner());
-                let (have, mode) = node.lookup(&id);
+                let result = node.lookup(&id);
                 let path = node.has_path(&id);
-                let _ = respond.send((have, mode, path));
+                // The wire carries mode as 0 = public / 1 = private.
+                let mode = result.mode.map(|m| match m {
+                    lattice_proto::record::Mode::Public => 0,
+                    lattice_proto::record::Mode::Private => 1,
+                });
+                let _ = respond.send(Lookup {
+                    have: result.have,
+                    mode,
+                    path,
+                });
             }
             ApiCmd::NodeInfo { respond } => {
                 let mut node = self.node.lock().unwrap_or_else(|e| e.into_inner());
@@ -526,7 +546,10 @@ impl Runtime {
                         eprintln!("lattice: failed to persist drain flag: {e}");
                     }
                 }
-                let _ = respond.send((node.is_draining(), node.custody_bytes() as usize));
+                let _ = respond.send(DrainState {
+                    draining: node.is_draining(),
+                    custody_bytes: node.custody_bytes(),
+                });
             }
             ApiCmd::Link {
                 addr,

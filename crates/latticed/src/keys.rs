@@ -9,7 +9,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use lattice_core::Identity;
+use lattice_core::{Identity, RetiredEnvelopeKey};
 use lattice_crypto::{channel_public, generate_seed, hash, public_key, sign, verify};
 use lattice_types::{ChannelSeed, Commitment, SigningSeed, XWingSecretKey};
 
@@ -167,7 +167,7 @@ const RETIRED_ENVELOPE_PREFIX: &str = "envelope_seed.retired.";
 
 /// Load retired envelope keys whose grace period has not elapsed; delete the
 /// rest. Files are named `envelope_seed.retired.<unix-expiry>`.
-fn load_retired_envelope_keys(dir: &Path) -> io::Result<Vec<(XWingSecretKey, u64)>> {
+fn load_retired_envelope_keys(dir: &Path) -> io::Result<Vec<RetiredEnvelopeKey>> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -199,7 +199,10 @@ fn load_retired_envelope_keys(dir: &Path) -> io::Result<Vec<(XWingSecretKey, u64
                 format!("{name}: expected 32 bytes"),
             )
         })?;
-        out.push((XWingSecretKey::from_bytes(seed), exp));
+        out.push(RetiredEnvelopeKey {
+            secret: XWingSecretKey::from_bytes(seed),
+            retire_at: exp,
+        });
     }
     Ok(out)
 }

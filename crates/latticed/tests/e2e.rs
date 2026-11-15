@@ -7,15 +7,10 @@ use std::time::{Duration, Instant};
 
 use lattice_client::Client;
 
+mod common;
+
 fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-fn hex_decode(s: &str) -> Vec<u8> {
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
-        .collect()
 }
 
 fn free_port() -> u16 {
@@ -30,49 +25,19 @@ fn latticed() -> &'static str {
     env!("CARGO_BIN_EXE_latticed")
 }
 
-fn init_node(dir: &Path) -> (lattice_types::Identifier, lattice_types::ChannelPublicKey) {
-    let out = Command::new(latticed())
-        .args(["init", "--dir", dir.to_str().unwrap()])
-        .output()
-        .expect("latticed init");
-    assert!(
-        out.status.success(),
-        "init failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let stdout = String::from_utf8(out.stdout).unwrap();
-    let id_hex = stdout
-        .lines()
-        .find_map(|l| l.strip_prefix("node id: "))
-        .expect("init prints node id")
-        .trim()
-        .to_string();
-    let id = lattice_types::Identifier::from_bytes(hex_decode(&id_hex).try_into().unwrap());
-    let channel_key = lattice_types::ChannelPublicKey::from_bytes(
-        std::fs::read(dir.join("channel_key.pub"))
-            .unwrap()
-            .try_into()
-            .unwrap(),
-    );
-    (id, channel_key)
-}
-
 fn write_config(
     dir: &Path,
     port: u16,
     app_sock: &Path,
     admin_sock: &Path,
-    peer: Option<(
-        &str,
-        lattice_types::ChannelPublicKey,
-        lattice_types::Identifier,
-    )>,
+    peer: Option<common::PeerSpec<'_>>,
 ) {
-    let roots = match peer {
-        Some((addr, key, id)) => format!(
-            "[[roots]]\naddr = \"{addr}\"\nchannel_key = \"{}\"\nid = \"{}\"\n",
-            hex_encode(key.as_ref()),
-            hex_encode(id.as_ref()),
+    let roots = match &peer {
+        Some(peer) => format!(
+            "[[roots]]\naddr = \"{}\"\nchannel_key = \"{}\"\nid = \"{}\"\n",
+            peer.addr,
+            hex_encode(peer.channel_key.as_ref()),
+            hex_encode(peer.id.as_ref()),
         ),
         None => String::new(),
     };
@@ -126,8 +91,11 @@ async fn two_nodes_deliver_and_drain() {
     let dir_a = tmp.join("node-a");
     let dir_b = tmp.join("node-b");
 
-    let (id_a, _ck_a) = init_node(&dir_a);
-    let (id_b, ck_b) = init_node(&dir_b);
+    let common::NodeKeys { id: id_a, .. } = common::init_node(&dir_a);
+    let common::NodeKeys {
+        id: id_b,
+        channel_key: ck_b,
+    } = common::init_node(&dir_b);
 
     let port_a = free_port();
     let port_b = free_port();
@@ -141,7 +109,11 @@ async fn two_nodes_deliver_and_drain() {
         port_a,
         &app_a,
         &admin_a,
-        Some((&format!("127.0.0.1:{port_b}"), ck_b, id_b)),
+        Some(common::PeerSpec {
+            addr: &format!("127.0.0.1:{port_b}"),
+            channel_key: ck_b,
+            id: id_b,
+        }),
     );
     write_config(&dir_b, port_b, &app_b, &admin_b, None);
 
@@ -216,7 +188,7 @@ async fn two_nodes_deliver_and_drain() {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         match client_a.status(&mid).await {
-            Ok(Some((3, _))) => break, // 3 = delivered
+            Ok(Some(s)) if s.status == 3 => break, // 3 = delivered
             Ok(other) => {
                 assert!(
                     Instant::now() < deadline,
@@ -265,11 +237,15 @@ async fn two_nodes_deliver_and_drain() {
     let mut admin_b = Client::connect_admin(&admin_b)
         .await
         .expect("admin connect");
-    let (draining, _) = admin_b.drain(Some(true)).await.expect("drain on");
+    let draining = admin_b.drain(Some(true)).await.expect("drain on").draining;
     assert!(draining);
-    let (draining, _) = admin_b.drain(None).await.expect("drain query");
+    let draining = admin_b.drain(None).await.expect("drain query").draining;
     assert!(draining);
-    let (draining, _) = admin_b.drain(Some(false)).await.expect("drain off");
+    let draining = admin_b
+        .drain(Some(false))
+        .await
+        .expect("drain off")
+        .draining;
     assert!(!draining);
     let info = admin_b.node().await.expect("node info");
     assert_eq!(info.id, id_b);
@@ -302,18 +278,15 @@ fn write_config_multi(
     port: u16,
     app: &Path,
     admin: &Path,
-    peer: Option<(
-        &str,
-        lattice_types::ChannelPublicKey,
-        lattice_types::Identifier,
-    )>,
+    peer: Option<common::PeerSpec<'_>>,
     services: &[(&str, &str)],
 ) {
-    let roots = match peer {
-        Some((addr, key, id)) => format!(
-            "[[roots]]\naddr = \"{addr}\"\nchannel_key = \"{}\"\nid = \"{}\"\n",
-            hex_encode(key.as_ref()),
-            hex_encode(id.as_ref()),
+    let roots = match &peer {
+        Some(peer) => format!(
+            "[[roots]]\naddr = \"{}\"\nchannel_key = \"{}\"\nid = \"{}\"\n",
+            peer.addr,
+            hex_encode(peer.channel_key.as_ref()),
+            hex_encode(peer.id.as_ref()),
         ),
         None => String::new(),
     };
@@ -343,15 +316,11 @@ admin_socket = "{admin}"
 fn boot_node(
     tmp: &Path,
     name: &str,
-    peer: Option<(
-        &str,
-        lattice_types::ChannelPublicKey,
-        lattice_types::Identifier,
-    )>,
+    peer: Option<common::PeerSpec<'_>>,
     services: &[(&str, &str)],
 ) -> TestNode {
     let dir = tmp.join(name);
-    let (id, channel_key) = init_node(&dir);
+    let common::NodeKeys { id, channel_key } = common::init_node(&dir);
     let app = tmp.join(format!("{name}.app.sock"));
     let admin = tmp.join(format!("{name}.admin.sock"));
     let mut attempt = 0;
@@ -505,7 +474,7 @@ async fn drain_flips_status_accepting() {
     let mut admin = Client::connect_admin(&b.admin)
         .await
         .expect("admin connect");
-    let (draining, _) = admin.drain(Some(true)).await.expect("drain on");
+    let draining = admin.drain(Some(true)).await.expect("drain on").draining;
     assert!(draining);
     let during = http_get(&addr, "/status");
     assert!(
@@ -513,7 +482,7 @@ async fn drain_flips_status_accepting() {
         "draining node must report accepting=false"
     );
 
-    let (draining, _) = admin.drain(Some(false)).await.expect("drain off");
+    let draining = admin.drain(Some(false)).await.expect("drain off").draining;
     assert!(!draining);
     let after = http_get(&addr, "/status");
     assert!(status_accepting(&after), "un-drained node must accept");
@@ -546,7 +515,7 @@ async fn drain_persists_across_restart() {
     let mut admin = Client::connect_admin(&b.admin)
         .await
         .expect("admin reconnect");
-    let (draining, _) = admin.drain(None).await.expect("drain query");
+    let draining = admin.drain(None).await.expect("drain query").draining;
     assert!(draining, "drain flag must survive a restart");
 
     let _ = std::fs::remove_dir_all(&tmp);
@@ -569,7 +538,11 @@ async fn kill9_restart_redelivers() {
     let mut a = boot_node(
         &tmp,
         "a",
-        Some((&a_peer, b.channel_key, b.id)),
+        Some(common::PeerSpec {
+            addr: &a_peer,
+            channel_key: b.channel_key,
+            id: b.id,
+        }),
         &[("test", "test-secret-with-plenty-of-entropy")],
     );
     wait_for(
@@ -646,7 +619,11 @@ async fn route_default_delivers() {
     let a = boot_node(
         &tmp,
         "a",
-        Some((&a_peer, b.channel_key, b.id)),
+        Some(common::PeerSpec {
+            addr: &a_peer,
+            channel_key: b.channel_key,
+            id: b.id,
+        }),
         &[("test", "test-secret-with-plenty-of-entropy")],
     );
     wait_for(
@@ -706,7 +683,16 @@ async fn events_are_scoped_per_service() {
     ];
     let b = boot_node(&tmp, "b", None, &services);
     let a_peer = format!("127.0.0.1:{}", b.port);
-    let a = boot_node(&tmp, "a", Some((&a_peer, b.channel_key, b.id)), &services);
+    let a = boot_node(
+        &tmp,
+        "a",
+        Some(common::PeerSpec {
+            addr: &a_peer,
+            channel_key: b.channel_key,
+            id: b.id,
+        }),
+        &services,
+    );
     wait_for(
         || a.app.exists() && b.app.exists(),
         Duration::from_secs(10),
@@ -803,7 +789,11 @@ async fn drain_stops_new_accepts() {
     let a = boot_node(
         &tmp,
         "a",
-        Some((&a_peer, b.channel_key, b.id)),
+        Some(common::PeerSpec {
+            addr: &a_peer,
+            channel_key: b.channel_key,
+            id: b.id,
+        }),
         &[("test", "test-secret-with-plenty-of-entropy")],
     );
     wait_for(
@@ -847,7 +837,7 @@ async fn drain_stops_new_accepts() {
     );
     let status = client_a.status(&mid).await.expect("status");
     assert!(
-        !matches!(status, Some((3, _))),
+        !matches!(status, Some(s) if s.status == 3),
         "message must not be delivered while the recipient drains"
     );
 
@@ -895,7 +885,7 @@ async fn sigterm_sets_drain_and_it_persists() {
     let mut admin = Client::connect_admin(&b.admin)
         .await
         .expect("admin reconnect");
-    let (draining, _) = admin.drain(None).await.expect("drain query");
+    let draining = admin.drain(None).await.expect("drain query").draining;
     assert!(draining, "SIGTERM must persist the drain flag");
 
     let _ = std::fs::remove_dir_all(&tmp);
@@ -917,7 +907,11 @@ async fn unlink_closes_the_connection() {
     let a = boot_node(
         &tmp,
         "a",
-        Some((&a_peer, b.channel_key, b.id)),
+        Some(common::PeerSpec {
+            addr: &a_peer,
+            channel_key: b.channel_key,
+            id: b.id,
+        }),
         &[("test", "test-secret-with-plenty-of-entropy")],
     );
     wait_sockets(&a).await;

@@ -21,7 +21,7 @@ pub use errors::NetError;
 pub use frame::{FRAME_BUCKETS, FrameError, decode_wire, encode_wire, encode_wire_to_bucket};
 pub use path::{upgrade_path, validate_upgrade_path};
 pub use peer::PeerIo;
-pub use server::{ListenerConfig, serve};
+pub use server::{ListenerConfig, ServeHandle, serve};
 
 /// Largest post-handshake wire message: the 32768-byte bucket plus the
 /// 16-byte Poly1305 tag. Handshake frames are padded to 2048 and capped

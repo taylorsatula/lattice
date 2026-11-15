@@ -9,6 +9,26 @@ use std::time::{Duration, Instant};
 
 use lattice_types::{ChannelPublicKey, Identifier};
 
+/// The identity material `latticed init` produces for a fresh node.
+pub struct NodeKeys {
+    pub id: Identifier,
+    pub channel_key: ChannelPublicKey,
+}
+
+/// A peer to dial at boot: address, channel key, and expected id.
+#[derive(Clone, Copy)]
+pub struct PeerSpec<'a> {
+    pub addr: &'a str,
+    pub channel_key: ChannelPublicKey,
+    pub id: Identifier,
+}
+
+/// A service to expose on the application socket.
+pub struct ServiceSpec {
+    pub name: &'static str,
+    pub secret: &'static str,
+}
+
 pub fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -32,7 +52,7 @@ pub fn latticed() -> &'static str {
     env!("CARGO_BIN_EXE_latticed")
 }
 
-pub fn init_node(dir: &Path) -> (Identifier, ChannelPublicKey) {
+pub fn init_node(dir: &Path) -> NodeKeys {
     let out = Command::new(latticed())
         .args(["init", "--dir", dir.to_str().unwrap()])
         .output()
@@ -56,7 +76,7 @@ pub fn init_node(dir: &Path) -> (Identifier, ChannelPublicKey) {
             .try_into()
             .unwrap(),
     );
-    (id, channel_key)
+    NodeKeys { id, channel_key }
 }
 
 /// Config knobs for a test node. `private` switches the node to private
@@ -65,24 +85,25 @@ pub struct NodeSpec<'a> {
     pub port: u16,
     pub app: &'a Path,
     pub admin: &'a Path,
-    pub peer: Option<(&'a str, ChannelPublicKey, Identifier)>,
-    pub services: &'a [(&'a str, &'a str)],
+    pub peer: Option<PeerSpec<'a>>,
+    pub services: &'a [ServiceSpec],
     pub private_gateways: Option<Vec<Identifier>>,
 }
 
 pub fn write_config(dir: &Path, spec: &NodeSpec) {
-    let roots = match spec.peer {
-        Some((addr, key, id)) => format!(
-            "[[roots]]\naddr = \"{addr}\"\nchannel_key = \"{}\"\nid = \"{}\"\n",
-            hex_encode(key.as_ref()),
-            hex_encode(id.as_ref()),
+    let roots = match &spec.peer {
+        Some(peer) => format!(
+            "[[roots]]\naddr = \"{}\"\nchannel_key = \"{}\"\nid = \"{}\"\n",
+            peer.addr,
+            hex_encode(peer.channel_key.as_ref()),
+            hex_encode(peer.id.as_ref()),
         ),
         None => String::new(),
     };
     let services_toml = spec
         .services
         .iter()
-        .map(|(name, secret)| format!("{name} = {{ secret = \"{secret}\" }}"))
+        .map(|s| format!("{} = {{ secret = \"{}\" }}", s.name, s.secret))
         .collect::<Vec<_>>()
         .join("\n");
     let (mode, gateways) = match &spec.private_gateways {
@@ -146,8 +167,8 @@ pub struct TestNode {
 pub fn boot_node(
     tmp: &Path,
     name: &str,
-    peer: Option<(&str, ChannelPublicKey, Identifier)>,
-    services: &[(&str, &str)],
+    peer: Option<PeerSpec<'_>>,
+    services: &[ServiceSpec],
 ) -> TestNode {
     boot_node_full(tmp, name, peer, services, None)
 }
@@ -155,12 +176,12 @@ pub fn boot_node(
 pub fn boot_node_full(
     tmp: &Path,
     name: &str,
-    peer: Option<(&str, ChannelPublicKey, Identifier)>,
-    services: &[(&str, &str)],
+    peer: Option<PeerSpec<'_>>,
+    services: &[ServiceSpec],
     private_gateways: Option<Vec<Identifier>>,
 ) -> TestNode {
     let dir = tmp.join(name);
-    let (id, channel_key) = init_node(&dir);
+    let NodeKeys { id, channel_key } = init_node(&dir);
     let app = tmp.join(format!("{name}.app.sock"));
     let admin = tmp.join(format!("{name}.admin.sock"));
     let mut attempt = 0;

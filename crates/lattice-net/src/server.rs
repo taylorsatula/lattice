@@ -231,11 +231,14 @@ fn find_double_crlf(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4)
 }
 
+/// The bound address and the accept-loop task, returned by [`serve`].
+pub struct ServeHandle {
+    pub addr: SocketAddr,
+    pub handle: tokio::task::JoinHandle<()>,
+}
+
 /// Serve one listener forever. Returns the bound address immediately.
-pub async fn serve(
-    cfg: ListenerConfig,
-    bind: Vec<SocketAddr>,
-) -> io::Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
+pub async fn serve(cfg: ListenerConfig, bind: Vec<SocketAddr>) -> io::Result<ServeHandle> {
     let listener = TcpListener::bind(&bind[..]).await?;
     let local = listener.local_addr()?;
     let cookie_state = Arc::new(Mutex::new(CookieState::new(now_secs())));
@@ -274,7 +277,10 @@ pub async fn serve(
             });
         }
     });
-    Ok((local, handle))
+    Ok(ServeHandle {
+        addr: local,
+        handle,
+    })
 }
 
 /// Errors a random internet probe produces routinely: connect-and-vanish,

@@ -11,8 +11,8 @@ use lattice_proto::message::{
     BuildParams, Envelope, GatewaySeal, HopLayerPlain, KIND_MESSAGE, KIND_NEGATIVE_RECEIPT,
     KIND_RECEIPT, Message, WaypointSeal,
 };
-use lattice_proto::record::{Mode, PeerRecord, Scope, compare_lww};
-use lattice_store::{CustodyAccept, CustodyEntry, InboxEntry, OutboundState, Store};
+use lattice_proto::record::{KnownHead, Mode, PeerRecord, Scope, compare_lww};
+use lattice_store::{CustodyAccept, CustodyEntry, Exclusion, InboxEntry, OutboundState, Store};
 
 use lattice_types::{
     ChannelPublicKey, ChannelSeed, Commitment, DeliveryId, Hash32, Identifier, LegId, MessageId,
@@ -38,7 +38,23 @@ pub struct Identity {
     /// each with the unix time after which it must be deleted. Rotation
     /// replaces the active key; retired keys decrypt envelopes that were
     /// in flight when the rotation happened.
-    pub retired_xwing: Vec<(XWingSecretKey, u64)>,
+    pub retired_xwing: Vec<RetiredEnvelopeKey>,
+}
+
+/// A retired X-Wing private key kept for decryption, with the unix time
+/// after which it must be deleted.
+#[derive(Clone)]
+pub struct RetiredEnvelopeKey {
+    pub secret: XWingSecretKey,
+    pub retire_at: u64,
+}
+
+/// Result of [`Node::lookup`]: whether a valid record is held, and its
+/// mode if so.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LookupResult {
+    pub have: bool,
+    pub mode: Option<Mode>,
 }
 
 impl Identity {
@@ -78,14 +94,17 @@ impl Identity {
     pub fn rotate_envelope(&mut self, retire_at: u64) -> XWingPublicKey {
         let kp = lattice_crypto::generate_keypair();
         let old = std::mem::replace(&mut self.xwing_secret, kp.secret);
-        self.retired_xwing.push((old, retire_at));
+        self.retired_xwing.push(RetiredEnvelopeKey {
+            secret: old,
+            retire_at,
+        });
         self.xwing_public = kp.public;
         self.xwing_public
     }
 
     /// Drop retired envelope keys whose grace period has elapsed.
     pub fn sweep_retired_envelope_keys(&mut self, now: u64) {
-        self.retired_xwing.retain(|(_, exp)| *exp > now);
+        self.retired_xwing.retain(|k| k.retire_at > now);
     }
 
     /// Try to open an envelope with the current key, then any retired keys
@@ -97,8 +116,8 @@ impl Identity {
         match msg.open_envelope(&self.xwing_secret) {
             Ok(e) => Ok(e),
             Err(first_err) => {
-                for (seed, _) in &self.retired_xwing {
-                    if let Ok(e) = msg.open_envelope(seed) {
+                for retired in &self.retired_xwing {
+                    if let Ok(e) = msg.open_envelope(&retired.secret) {
                         return Ok(e);
                     }
                 }
@@ -168,7 +187,7 @@ fn attestation_preimage(
 struct PendingOffer {
     origin: PendingOrigin,
     sent_at: u64,
-    excluded: Vec<(LinkId, u64)>,
+    excluded: Vec<Exclusion>,
     /// The link this offer was sent on; excluded on timeout so the retry
     /// does not immediately re-offer to a peer that never answered.
     link: LinkId,
@@ -204,7 +223,22 @@ struct LinkState {
     pinned: bool,
     /// The peer's attestation (id, signature), received on this link.
     /// Verified against our records in `reevaluate_link_bindings`.
-    attestation: Option<(Identifier, Signature)>,
+    attestation: Option<Attestation>,
+}
+
+/// A peer's channel attestation: proof that the peer holds the KEL signing
+/// key for `id`, bound to this channel.
+#[derive(Clone, Copy)]
+struct Attestation {
+    id: Identifier,
+    sig: Signature,
+}
+
+/// A dummy frame scheduled to be sent after a short random delay.
+#[derive(Clone, Copy)]
+struct PendingEcho {
+    due: u64,
+    link: LinkId,
 }
 
 pub struct Node<S: Store> {
@@ -218,11 +252,11 @@ pub struct Node<S: Store> {
     next_link_order: Vec<LinkId>,
     reconcile_sessions: HashMap<LinkId, ReconcileSession>,
     pending: HashMap<LegId, PendingOffer>,
-    outbound_exclusions: HashMap<MessageId, Vec<(LinkId, u64)>>,
+    outbound_exclusions: HashMap<MessageId, Vec<Exclusion>>,
     snow_next: u64,
     frames_since_snow_tick: u32,
     snow_history: [u64; 3],
-    inner_pending_echo: Vec<(u64, LinkId)>,
+    inner_pending_echo: Vec<PendingEcho>,
     record_refresh_at: u64,
     next_reconcile_at: u64,
     rng: Rng,
@@ -321,10 +355,13 @@ impl<S: Store> Node<S> {
         // claims rebuild as records are re-admitted; report it.
         match node.store.record_all() {
             Ok(records) => {
-                for (_, _, bytes, _) in records {
-                    if let Ok((rec, _)) = PeerRecord::from_bytes(&bytes, now, None) {
-                        if let Some(k) = Self::claim_key(&rec) {
-                            node.ck_claims.entry(k).or_default().insert(rec.id);
+                for record in records {
+                    if let Ok(parsed) = PeerRecord::from_bytes(&record.bytes, now, None) {
+                        if let Some(k) = Self::claim_key(&parsed.record) {
+                            node.ck_claims
+                                .entry(k)
+                                .or_default()
+                                .insert(parsed.record.id);
                         }
                     }
                 }
@@ -333,9 +370,9 @@ impl<S: Store> Node<S> {
         }
         if !own_exists {
             node.publish_record(now)?;
-        } else if let Some((bytes, _)) = node.store.record_get(&id, Scope::Wan)? {
-            node.own_seq = lattice_proto::record::PeerRecord::from_bytes(&bytes, now, None)
-                .map(|(r, _)| r.seq)
+        } else if let Some(stored) = node.store.record_get(&id, Scope::Wan)? {
+            node.own_seq = lattice_proto::record::PeerRecord::from_bytes(&stored.bytes, now, None)
+                .map(|p| p.record.seq)
                 .unwrap_or(1);
         }
         // Crash recovery: anything InFlight at boot may or may not have
@@ -456,7 +493,7 @@ impl<S: Store> Node<S> {
 
     // ---------- records ----------
 
-    fn build_own_record(&self, seq: u64, now: u64) -> Result<(PeerRecord, Vec<u8>), NodeError> {
+    fn build_own_record(&self, seq: u64, now: u64) -> Result<Vec<u8>, NodeError> {
         let exp = now + 7 * 24 * 3600;
         let private = self.config.mode == Mode::Private;
         let links: Vec<Identifier> = if private {
@@ -498,12 +535,11 @@ impl<S: Store> Node<S> {
             },
             &self.identity.signing_seed,
         )?;
-        let bytes = rec.encode();
-        Ok((rec, bytes))
+        Ok(rec.encode())
     }
 
     fn publish_record(&mut self, now: u64) -> Result<(), NodeError> {
-        let (_rec, bytes) = self.build_own_record(self.own_seq, now)?;
+        let bytes = self.build_own_record(self.own_seq, now)?;
         let id = self.own_id;
         self.store.record_put(&id, self.scope, &bytes, now)?;
         self.records_version += 1;
@@ -602,10 +638,10 @@ impl<S: Store> Node<S> {
         };
         let records: Vec<RecordParts> = stored
             .iter()
-            .filter_map(|(id, _scope, bytes, _recv)| {
-                PeerRecord::from_bytes(bytes, self.now, None)
+            .filter_map(|record| {
+                PeerRecord::from_bytes(&record.bytes, self.now, None)
                     .ok()
-                    .map(|(r, _)| (*id, r.links, r.gateways))
+                    .map(|p| (record.id, p.record.links, p.record.gateways))
             })
             .collect();
         let mut graph = Graph::build(
@@ -645,13 +681,13 @@ impl<S: Store> Node<S> {
         };
         let mut items: Vec<reconcile::Item> = stored
             .iter()
-            .filter_map(|(id, scope, bytes, _)| {
-                PeerRecord::from_bytes(bytes, self.now, None)
+            .filter_map(|record| {
+                PeerRecord::from_bytes(&record.bytes, self.now, None)
                     .ok()
-                    .map(|(r, _)| reconcile::Item {
-                        id: *id,
-                        scope: scope_as_u8(*scope),
-                        seq: r.seq,
+                    .map(|p| reconcile::Item {
+                        id: record.id,
+                        scope: scope_as_u8(record.scope),
+                        seq: p.record.seq,
                     })
             })
             .collect();
@@ -686,7 +722,10 @@ impl<S: Store> Node<S> {
             return Vec::new();
         };
         let session = self.reconcile_sessions.entry(link).or_default();
-        let (reply, wants) = reconcile::respond(&items, &frame.ranges, session);
+        let reconcile::ReconcileResponse {
+            ranges: reply,
+            wants,
+        } = reconcile::respond(&items, &frame.ranges, session);
         let mut actions = Vec::new();
         if !reply.is_empty() {
             actions.push(Action::SendFrame {
@@ -707,10 +746,10 @@ impl<S: Store> Node<S> {
 
     fn on_want(&mut self, link: LinkId, frame: &WantFrame) -> Vec<Action> {
         let mut records = Vec::new();
-        for (id, scope) in &frame.wants {
-            let scope = scope_from_u8(*scope);
-            match self.store.record_get(id, scope) {
-                Ok(Some((bytes, _))) => records.push(bytes),
+        for want in &frame.wants {
+            let scope = scope_from_u8(want.scope);
+            match self.store.record_get(&want.id, scope) {
+                Ok(Some(stored)) => records.push(stored.bytes),
                 Ok(None) => {}
                 Err(e) => self.diag("record_get", &e),
             }
@@ -741,10 +780,10 @@ impl<S: Store> Node<S> {
             HashMap::new();
         match self.store.record_all() {
             Ok(records) => {
-                for (_, _, bytes, _) in records {
-                    if let Ok((rec, _)) = PeerRecord::from_bytes(&bytes, now, None) {
-                        if let Some(k) = Self::claim_key(&rec) {
-                            fresh.entry(k).or_default().insert(rec.id);
+                for record in records {
+                    if let Ok(parsed) = PeerRecord::from_bytes(&record.bytes, now, None) {
+                        if let Some(k) = Self::claim_key(&parsed.record) {
+                            fresh.entry(k).or_default().insert(parsed.record.id);
                         }
                     }
                 }
@@ -769,18 +808,18 @@ impl<S: Store> Node<S> {
     fn sweep_expired_data(&mut self, now: u64) {
         match self.store.record_all() {
             Ok(records) => {
-                for (id, scope, bytes, _) in records {
-                    if id == self.own_id {
+                for record in records {
+                    if record.id == self.own_id {
                         continue;
                     }
                     // Skip the time check: expired records must still decode so
                     // the grace period can elapse; undecodable records are dropped.
-                    let expired = match PeerRecord::from_bytes_unchecked_time(&bytes, None) {
-                        Ok((rec, _)) => rec.exp.saturating_add(RETENTION_GRACE_SECS) < now,
+                    let expired = match PeerRecord::from_bytes_unchecked_time(&record.bytes, None) {
+                        Ok(parsed) => parsed.record.exp.saturating_add(RETENTION_GRACE_SECS) < now,
                         Err(_) => true,
                     };
                     if expired {
-                        match self.store.record_remove(&id, scope) {
+                        match self.store.record_remove(&record.id, record.scope) {
                             Ok(()) => self.records_version += 1,
                             Err(e) => self.diag("record_remove", &e),
                         }
@@ -876,7 +915,7 @@ impl<S: Store> Node<S> {
             .filter_map(|(link_id, link)| {
                 link.attestation
                     .as_ref()
-                    .map(|(id, sig)| (*link_id, link.remote_ck, *id, *sig))
+                    .map(|a| (*link_id, link.remote_ck, a.id, a.sig))
             })
             .collect();
         let mut attested: HashMap<LinkId, Identifier> = HashMap::new();
@@ -940,7 +979,10 @@ impl<S: Store> Node<S> {
             Err(_) => return false,
         };
         let known = match self.store.kel_head(&decoded.id()) {
-            Ok(k) => k.map(|(seq, commitment, _)| (seq, commitment)),
+            Ok(k) => k.map(|h| KnownHead {
+                seq: h.seq,
+                commitment: h.commitment,
+            }),
             // Fail closed: without the known head we cannot rule out
             // equivocation, so refuse the record.
             Err(e) => {
@@ -949,7 +991,9 @@ impl<S: Store> Node<S> {
             }
         };
         match decoded.validate(Some(at), known) {
-            Ok((rec, head)) => {
+            Ok(parsed) => {
+                let rec = parsed.record;
+                let head = parsed.head;
                 let scope = rec.scope;
                 let existing = match self.store.record_get(&rec.id, scope) {
                     Ok(e) => e,
@@ -960,16 +1004,17 @@ impl<S: Store> Node<S> {
                         return false;
                     }
                 };
-                if let Some((old_bytes, _)) = existing {
+                if let Some(existing) = existing {
+                    let old_bytes = &existing.bytes;
                     // Lower-hash wins at equal seq (equivocation rule);
                     // otherwise normal last-writer-wins by seq.
-                    let old_seq = PeerRecord::from_bytes(&old_bytes, at, None)
-                        .map(|(r, _)| r.seq)
+                    let old_seq = PeerRecord::from_bytes(old_bytes, at, None)
+                        .map(|p| p.record.seq)
                         .unwrap_or(0);
                     if rec.seq == old_seq && bytes != old_bytes.as_slice() {
                         self.equivocations += 1;
                     }
-                    if compare_lww(bytes, rec.seq, &old_bytes, old_seq)
+                    if compare_lww(bytes, rec.seq, old_bytes, old_seq)
                         != std::cmp::Ordering::Greater
                     {
                         return false; // keep ours
@@ -983,7 +1028,7 @@ impl<S: Store> Node<S> {
                 // record a first-seen head when none exists. On a read error
                 // leave the stored head alone rather than overwrite blindly.
                 match self.store.kel_head(&rec.id) {
-                    Ok(Some((seq, _, _))) if head.seq <= seq => {}
+                    Ok(Some(stored_head)) if head.seq <= stored_head.seq => {}
                     Ok(_) => {
                         if let Err(e) =
                             self.store
@@ -1007,10 +1052,28 @@ impl<S: Store> Node<S> {
 // Messaging engine
 // ============================================================
 
-type BuildResult = (Vec<u8>, Identifier, Option<Identifier>);
+/// The wire bytes of a built message and the waypoint it was sealed to, if any.
+struct BuildOutput {
+    wire: Vec<u8>,
+    waypoint: Option<Identifier>,
+}
+
+/// The next hop for a message: the link to send on and the peer at the
+/// other end.
+struct NextHop {
+    link: LinkId,
+    peer: Identifier,
+}
+
+/// A public-mode (id, envelope key) pair eligible for waypoint selection.
+#[derive(Clone)]
+struct WaypointChoice {
+    id: Identifier,
+    envelope_key: XWingPublicKey,
+}
 
 /// Public-mode (id, envelope key) pairs eligible for waypoint selection.
-type WaypointCandidates = Vec<(Identifier, XWingPublicKey)>;
+type WaypointCandidates = Vec<WaypointChoice>;
 
 /// Why a message could not be built for sending.
 enum BuildError {
@@ -1147,9 +1210,9 @@ impl<S: Store> Node<S> {
             }
         }
         let rec = match self.store.record_get(id, scope) {
-            Ok(Some((bytes, _))) => PeerRecord::from_bytes(&bytes, self.now, None)
+            Ok(Some(stored)) => PeerRecord::from_bytes(&stored.bytes, self.now, None)
                 .ok()
-                .map(|(r, _)| r),
+                .map(|p| p.record),
             Ok(None) => None,
             // Store error: treat as missing (callers fail closed), but say so.
             Err(e) => {
@@ -1193,7 +1256,7 @@ impl<S: Store> Node<S> {
         &mut self,
         msg: &lattice_store::OutboundMessage,
         force_waypoint: bool,
-    ) -> Result<BuildResult, BuildError> {
+    ) -> Result<BuildOutput, BuildError> {
         let recipient_rec = self.lookup_validated(&msg.recipient);
         let recipient_private = recipient_rec
             .as_ref()
@@ -1237,9 +1300,9 @@ impl<S: Store> Node<S> {
             gateway_ek,
             rcpt: msg.recipient,
         });
-        let waypoint = waypoint_choice.map(|(id, ek)| WaypointSeal {
-            waypoint_id: id,
-            waypoint_ek: ek,
+        let waypoint = waypoint_choice.map(|choice| WaypointSeal {
+            waypoint_id: choice.id,
+            waypoint_ek: choice.envelope_key,
             leg: LegId::from_bytes(lattice_crypto::os_bytes::<16>()),
             exp: msg.exp,
         });
@@ -1255,30 +1318,33 @@ impl<S: Store> Node<S> {
             waypoint,
         })
         .map_err(|_| BuildError::Crypto)?;
-        Ok((wire, real_dst, used_waypoint_id))
+        Ok(BuildOutput {
+            wire,
+            waypoint: used_waypoint_id,
+        })
     }
 
     fn pick_waypoint(
         &mut self,
         recipient: &Identifier,
         exclude: &[Identifier],
-    ) -> Option<(Identifier, XWingPublicKey)> {
+    ) -> Option<WaypointChoice> {
         // Spec: exclude the sender's own links and the recipient's gateways
         // (a gateway is already the entry point; it is not a waypoint).
         let own_links: HashSet<Identifier> = self.links.values().filter_map(|l| l.peer).collect();
         let recipient_gateways: HashSet<Identifier> =
             self.record_gateways(recipient).into_iter().collect();
         let cached = self.waypoint_candidates()?;
-        let mut candidates: Vec<(Identifier, XWingPublicKey)> = cached
+        let mut candidates: Vec<WaypointChoice> = cached
             .iter()
-            .filter(|(id, _)| {
-                id != &self.own_id
-                    && id != recipient
-                    && !exclude.contains(id)
-                    && !own_links.contains(id)
-                    && !recipient_gateways.contains(id)
+            .filter(|c| {
+                c.id != self.own_id
+                    && &c.id != recipient
+                    && !exclude.contains(&c.id)
+                    && !own_links.contains(&c.id)
+                    && !recipient_gateways.contains(&c.id)
             })
-            .copied()
+            .cloned()
             .collect();
         if candidates.is_empty() {
             return None;
@@ -1307,9 +1373,12 @@ impl<S: Store> Node<S> {
         };
         let candidates: WaypointCandidates = stored
             .into_iter()
-            .filter_map(|(id, _scope, bytes, _)| {
-                let (rec, _) = PeerRecord::from_bytes(&bytes, self.now, None).ok()?;
-                (rec.mode == Mode::Public).then_some((id, rec.envelope_key))
+            .filter_map(|record| {
+                let parsed = PeerRecord::from_bytes(&record.bytes, self.now, None).ok()?;
+                (parsed.record.mode == Mode::Public).then_some(WaypointChoice {
+                    id: record.id,
+                    envelope_key: parsed.record.envelope_key,
+                })
             })
             .collect();
         let candidates = Arc::new(candidates);
@@ -1347,10 +1416,10 @@ impl<S: Store> Node<S> {
             // exactly one place.
             msg.attempts += 1;
             match self.build_attempt(&msg, force_waypoint) {
-                Ok((wire, _real_dst, used_wp)) => {
-                    match self.dispatch_wire(now, &wire, &msg, &mut actions) {
+                Ok(built) => {
+                    match self.dispatch_wire(now, &built.wire, &msg, &mut actions) {
                         DispatchResult::Sent => {
-                            if let Some(wp) = used_wp {
+                            if let Some(wp) = built.waypoint {
                                 msg.waypoints_tried.push(wp);
                             }
                             msg.mark_in_flight();
@@ -1438,16 +1507,19 @@ impl<S: Store> Node<S> {
     fn pick_next_hop(
         &mut self,
         dst: &Identifier,
-        exclude: &[(LinkId, u64)],
+        exclude: &[Exclusion],
         now: u64,
-    ) -> Option<(LinkId, Identifier)> {
+    ) -> Option<NextHop> {
         // A directly connected peer is always one hop away, even when the
         // record graph has no path to it (a private instance publishes no
         // links). Honor exclusions like any other hop.
         if let Some((id, _)) = self.links.iter().find(|(id, l)| {
-            l.peer == Some(*dst) && !exclude.iter().any(|(l, until)| l == *id && *until > now)
+            l.peer == Some(*dst) && !exclude.iter().any(|e| e.link == **id && e.until > now)
         }) {
-            return Some((*id, *dst));
+            return Some(NextHop {
+                link: *id,
+                peer: *dst,
+            });
         }
         // Distances are measured from the destination; the graph is undirected,
         // so BFS from dst gives each node's distance to the destination.
@@ -1455,8 +1527,8 @@ impl<S: Store> Node<S> {
         let dist = graph.distances(dst);
         let excluded_peers: HashSet<Identifier> = exclude
             .iter()
-            .filter(|(_, until)| *until > now)
-            .filter_map(|(l, _)| self.links.get(l).and_then(|s| s.peer))
+            .filter(|e| e.until > now)
+            .filter_map(|e| self.links.get(&e.link).and_then(|s| s.peer))
             .collect();
         let up: HashSet<Identifier> = self.links.values().filter_map(|l| l.peer).collect();
         let peer = graph.next_hop(
@@ -1472,7 +1544,7 @@ impl<S: Store> Node<S> {
             .iter()
             .find(|(_, l)| l.peer == Some(peer))
             .map(|(id, _)| *id)?;
-        Some((link, peer))
+        Some(NextHop { link, peer })
     }
 
     fn dispatch_wire(
@@ -1489,9 +1561,9 @@ impl<S: Store> Node<S> {
         let dst = parsed.header.dst;
         let leg = parsed.header.leg;
         let exclusion = self.outbound_exclusions.entry(msg.mid).or_default();
-        exclusion.retain(|(_, until)| *until > now);
+        exclusion.retain(|e| e.until > now);
         let exclusion = exclusion.clone();
-        let Some((link, _peer)) = self.pick_next_hop(&dst, &exclusion, now) else {
+        let Some(NextHop { link, peer: _peer }) = self.pick_next_hop(&dst, &exclusion, now) else {
             return DispatchResult::NoRoute;
         };
         self.pending.insert(
@@ -2012,13 +2084,17 @@ impl<S: Store> Node<S> {
         let offer_leg = lattice_proto::Message::parse(&entry.message, now)
             .map(|m| m.header.leg)
             .unwrap_or(entry.leg);
-        let excluded: Vec<(LinkId, u64)> = entry
+        let excluded: Vec<Exclusion> = entry
             .excluded
             .iter()
-            .filter(|(_, until)| *until > now)
-            .cloned()
+            .filter(|e| e.until > now)
+            .copied()
             .collect();
-        let Some((next_link, _peer)) = self.pick_next_hop(&dst, &excluded, now) else {
+        let Some(NextHop {
+            link: next_link,
+            peer: _peer,
+        }) = self.pick_next_hop(&dst, &excluded, now)
+        else {
             return; // no route right now; retried on tick
         };
         self.pending.insert(
@@ -2216,7 +2292,7 @@ impl<S: Store> Node<S> {
             )
         };
         let already_terminal = match self.store.status_get(&reference) {
-            Ok(Some((s, _))) => terminal_status(s),
+            Ok(Some(s)) => terminal_status(s.status),
             Ok(None) => false,
             // Store error: fail closed and ignore the receipt.
             Err(e) => {
@@ -2507,8 +2583,8 @@ impl<S: Store> Node<S> {
                     PendingOrigin::Outbound { mid } => {
                         let excl = self.outbound_exclusions.entry(mid).or_default();
                         add_exclusion(excl, p.link, now + self.config.retry_base_secs);
-                        for (l, u) in p.excluded {
-                            add_exclusion(excl, l, u);
+                        for e in p.excluded {
+                            add_exclusion(excl, e.link, e.until);
                         }
                         match self.store.outbound_get(&mid) {
                             Ok(Some(mut msg)) => {
@@ -2531,8 +2607,8 @@ impl<S: Store> Node<S> {
                                     p.link,
                                     now + self.config.retry_base_secs,
                                 );
-                                for (l, u) in p.excluded {
-                                    add_exclusion(&mut e.excluded, l, u);
+                                for ex in p.excluded {
+                                    add_exclusion(&mut e.excluded, ex.link, ex.until);
                                 }
                                 if let Err(e) = self.store.custody_put(e) {
                                     self.diag("custody_put", &e);
@@ -2622,14 +2698,15 @@ impl<S: Store> Node<S> {
 
     fn snow_tick(&mut self, now: u64) -> Vec<Action> {
         let mut actions = Vec::new();
-        let due: Vec<(u64, LinkId)> = self
+        let due: Vec<PendingEcho> = self
             .inner_pending_echo
             .iter()
-            .filter(|(t, _)| *t <= now)
-            .cloned()
+            .filter(|p| p.due <= now)
+            .copied()
             .collect();
-        self.inner_pending_echo.retain(|(t, _)| *t > now);
-        for (_, link) in due {
+        self.inner_pending_echo.retain(|p| p.due > now);
+        for echo in due {
+            let link = echo.link;
             if self.links.contains_key(&link) {
                 let bucket = self.sample_snow_bucket();
                 actions.push(Action::SendFrame {
@@ -2733,7 +2810,10 @@ impl<S: Store> Node<S> {
                     // i.e. ~immediate) is expressed as 0-1 ticks. Sub-second
                     // delay needs a millisecond time base.
                     let jitter = self.rng.next_u64() % 2;
-                    self.inner_pending_echo.push((at + jitter, link));
+                    self.inner_pending_echo.push(PendingEcho {
+                        due: at + jitter,
+                        link,
+                    });
                 }
                 Vec::new()
             }
@@ -2753,12 +2833,15 @@ impl<S: Store> Node<S> {
         // (or a MITM replaying on the link) sends garbage afterwards.
         let existing = self.links.get(&link).map(|l| (l.remote_ck, l.attestation));
         let keep_old = match existing {
-            Some((remote_ck, Some((id, sig)))) => self.attestation_valid(&remote_ck, &id, &sig),
+            Some((remote_ck, Some(att))) => self.attestation_valid(&remote_ck, &att.id, &att.sig),
             _ => false,
         };
         if !keep_old {
             if let Some(l) = self.links.get_mut(&link) {
-                l.attestation = Some((a.id, a.sig));
+                l.attestation = Some(Attestation {
+                    id: a.id,
+                    sig: a.sig,
+                });
             }
         }
         self.reevaluate_link_bindings(now);
@@ -2895,7 +2978,7 @@ impl<S: Store> Node<S> {
     #[doc(hidden)]
     pub fn debug_record_ids(&mut self) -> Vec<Identifier> {
         match self.store.record_all() {
-            Ok(v) => v.into_iter().map(|(id, _, _, _)| id).collect(),
+            Ok(v) => v.into_iter().map(|r| r.id).collect(),
             Err(e) => {
                 self.diag("record_all", &e);
                 Vec::new()
@@ -2917,28 +3000,31 @@ impl<S: Store> Node<S> {
         &mut self.store
     }
 
-    /// (have record, mode as 0=public/1=private)
-    pub fn lookup(&mut self, id: &Identifier) -> (bool, Option<u64>) {
+    /// Whether we hold a valid record for `id`, and its mode if so.
+    pub fn lookup(&mut self, id: &Identifier) -> LookupResult {
         for scope in [
             lattice_proto::record::Scope::Wan,
             lattice_proto::record::Scope::Hive,
         ] {
             match self.store.record_get(id, scope) {
-                Ok(Some((bytes, _))) => {
-                    let mode =
-                        lattice_proto::record::PeerRecord::from_bytes(&bytes, self.now, None)
-                            .map(|(r, _)| match r.mode {
-                                lattice_proto::record::Mode::Public => 0,
-                                lattice_proto::record::Mode::Private => 1,
-                            })
-                            .ok();
-                    return (true, mode);
+                Ok(Some(stored)) => {
+                    let mode = lattice_proto::record::PeerRecord::from_bytes(
+                        &stored.bytes,
+                        self.now,
+                        None,
+                    )
+                    .map(|p| p.record.mode)
+                    .ok();
+                    return LookupResult { have: true, mode };
                 }
                 Ok(None) => {}
                 Err(e) => self.diag("record_get", &e),
             }
         }
-        (false, None)
+        LookupResult {
+            have: false,
+            mode: None,
+        }
     }
 
     fn on_app_ack(&mut self, now: u64, service: &str, delivery_ids: &[DeliveryId]) -> Vec<Action> {
@@ -2966,12 +3052,12 @@ const ERR_INTERNAL: u64 = crate::types::ERR_INTERNAL;
 const ERR_REFUSED: u64 = crate::types::ERR_REFUSED;
 const ERR_EXPIRED: u64 = crate::types::ERR_EXPIRED;
 
-/// Insert or merge an exclusion: (link, not_before). Existing entries keep
-/// the later expiry.
-fn add_exclusion(list: &mut Vec<(u64, u64)>, link: u64, until: u64) {
-    match list.iter_mut().find(|(l, _)| *l == link) {
-        Some(existing) => existing.1 = existing.1.max(until),
-        None => list.push((link, until)),
+/// Insert or merge an exclusion: the link may not carry custody until
+/// `until`. Existing entries keep the later expiry.
+fn add_exclusion(list: &mut Vec<Exclusion>, link: LinkId, until: u64) {
+    match list.iter_mut().find(|e| e.link == link) {
+        Some(existing) => existing.until = existing.until.max(until),
+        None => list.push(Exclusion { link, until }),
     }
 }
 
@@ -3065,7 +3151,7 @@ mod tests {
         let msg = node.store.outbound_get(&mid).unwrap().unwrap();
         assert_eq!(msg.state, OutboundState::Delivered);
         assert_eq!(
-            node.store.status_get(&mid).unwrap().unwrap().0,
+            node.store.status_get(&mid).unwrap().unwrap().status,
             local::MSG_STATUS_DELIVERED
         );
     }
@@ -3107,7 +3193,7 @@ mod tests {
         let actions = node.on_receipt(1_000, &receipt(KIND_RECEIPT, mid1, recipient));
         assert!(actions.is_empty());
         assert_eq!(
-            node.store.status_get(&mid1).unwrap().unwrap().0,
+            node.store.status_get(&mid1).unwrap().unwrap().status,
             local::MSG_STATUS_EXPIRED
         );
         assert_eq!(
@@ -3126,7 +3212,7 @@ mod tests {
         let actions = node.on_receipt(1_000, &receipt(KIND_NEGATIVE_RECEIPT, mid2, recipient));
         assert!(actions.is_empty());
         assert_eq!(
-            node.store.status_get(&mid2).unwrap().unwrap().0,
+            node.store.status_get(&mid2).unwrap().unwrap().status,
             local::MSG_STATUS_DELIVERED
         );
         assert_eq!(

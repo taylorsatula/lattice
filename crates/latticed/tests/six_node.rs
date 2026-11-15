@@ -21,7 +21,10 @@ use std::time::{Duration, Instant};
 use common::*;
 use lattice_client::Client;
 
-const SERVICES: &[(&str, &str)] = &[("test", "test-secret-with-plenty-of-entropy")];
+const SERVICES: &[ServiceSpec] = &[ServiceSpec {
+    name: "test",
+    secret: "test-secret-with-plenty-of-entropy",
+}];
 
 #[tokio::test]
 async fn six_node_gate() {
@@ -35,32 +38,52 @@ async fn six_node_gate() {
     let h2 = boot_node(
         &tmp,
         "h2",
-        Some((&h1_addr, h1.channel_key, h1.id)),
+        Some(PeerSpec {
+            addr: &h1_addr,
+            channel_key: h1.channel_key,
+            id: h1.id,
+        }),
         SERVICES,
     );
     let h3 = boot_node(
         &tmp,
         "h3",
-        Some((&h1_addr, h1.channel_key, h1.id)),
+        Some(PeerSpec {
+            addr: &h1_addr,
+            channel_key: h1.channel_key,
+            id: h1.id,
+        }),
         SERVICES,
     );
     let gw = boot_node(
         &tmp,
         "gw",
-        Some((&h1_addr, h1.channel_key, h1.id)),
+        Some(PeerSpec {
+            addr: &h1_addr,
+            channel_key: h1.channel_key,
+            id: h1.id,
+        }),
         SERVICES,
     );
     let wan = boot_node(
         &tmp,
         "wan",
-        Some((&h1_addr, h1.channel_key, h1.id)),
+        Some(PeerSpec {
+            addr: &h1_addr,
+            channel_key: h1.channel_key,
+            id: h1.id,
+        }),
         SERVICES,
     );
     let gw_addr = format!("127.0.0.1:{}", gw.port);
     let priv_node = boot_node_full(
         &tmp,
         "priv",
-        Some((&gw_addr, gw.channel_key, gw.id)),
+        Some(PeerSpec {
+            addr: &gw_addr,
+            channel_key: gw.channel_key,
+            id: gw.id,
+        }),
         SERVICES,
         Some(vec![gw.id]),
     );
@@ -156,8 +179,10 @@ async fn six_node_gate() {
         .expect("send during partition");
     // While the partition holds, the message must not be delivered.
     tokio::time::sleep(Duration::from_secs(5)).await;
-    if let Some((3, _)) = c_h1.status(&mid).await.expect("status") {
-        panic!("message delivered while the WAN node was down");
+    if let Some(s) = c_h1.status(&mid).await.expect("status") {
+        if s.status == 3 {
+            panic!("message delivered while the WAN node was down");
+        }
     }
     // Heal: restart wan; it redials h1. The queued message must arrive.
     wan.restart();
@@ -201,7 +226,7 @@ async fn six_node_gate() {
 
     // ---- 6. Drain: h3 drains; new custody is refused; after un-drain, delivery resumes. ----
     let mut admin_h3 = Client::connect_admin(&h3.admin).await.expect("admin h3");
-    let (draining, _) = admin_h3.drain(Some(true)).await.expect("drain on");
+    let draining = admin_h3.drain(Some(true)).await.expect("drain on").draining;
     assert!(draining);
     let mid = c_h2
         .send(&lattice_client::Send {
@@ -218,15 +243,21 @@ async fn six_node_gate() {
         .expect("send to draining node");
     // While draining, h3 refuses custody; the message must not be delivered.
     tokio::time::sleep(Duration::from_secs(6)).await;
-    if let Some((3, _)) = c_h2.status(&mid).await.expect("status") {
-        panic!("message delivered to a draining node");
+    if let Some(s) = c_h2.status(&mid).await.expect("status") {
+        if s.status == 3 {
+            panic!("message delivered to a draining node");
+        }
     }
     let batch = c_h3.fetch(16).await.expect("fetch while draining");
     assert!(
         !batch.iter().any(|d| d.mid == mid),
         "draining node must not accept new messages"
     );
-    let (draining, _) = admin_h3.drain(Some(false)).await.expect("drain off");
+    let draining = admin_h3
+        .drain(Some(false))
+        .await
+        .expect("drain off")
+        .draining;
     assert!(!draining);
     // After un-drain, the queued message is delivered (sender retries).
     let deadline = Instant::now() + Duration::from_secs(75);

@@ -46,6 +46,27 @@ pub struct Delivery {
     pub body: Vec<u8>,
 }
 
+/// A status transition observed on a node, for tests to assert on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StatusObservation {
+    pub mid: MessageId,
+    pub status: u64,
+}
+
+/// An event scheduled on the virtual clock. `seq` breaks ties between
+/// events at the same time; lower seq runs first.
+struct ScheduledEvent {
+    at: u64,
+    seq: u64,
+    event: SimEvent,
+}
+
+/// The two endpoints of a link, as node indices.
+struct LinkEndpoints {
+    a: NodeIndex,
+    b: NodeIndex,
+}
+
 pub struct Sim<S: Store = MemStore> {
     pub nodes: Vec<Node<S>>,
     pub ids: Vec<Identifier>,
@@ -53,10 +74,10 @@ pub struct Sim<S: Store = MemStore> {
     links: Vec<Link>,
     next_link: u64,
     now: u64,
-    queue: VecDeque<(u64, u64, SimEvent)>,
+    queue: VecDeque<ScheduledEvent>,
     seq: u64,
     pub deliveries: Vec<Delivery>,
-    pub statuses: Vec<(MessageId, u64)>,
+    pub statuses: Vec<StatusObservation>,
     pub frame_counts: std::collections::HashMap<&'static str, u64>,
     configs: Vec<Config>,
     prototype: Config,
@@ -118,8 +139,11 @@ impl<S: Store> Sim<S> {
         let idx = self.nodes.len() - 1;
         self.configs.push(cfg);
         let seq = self.next_seq();
-        self.queue
-            .push_back((self.now + 1, seq, SimEvent::Tick { node: idx }));
+        self.queue.push_back(ScheduledEvent {
+            at: self.now + 1,
+            seq,
+            event: SimEvent::Tick { node: idx },
+        });
         idx
     }
 
@@ -130,7 +154,7 @@ impl<S: Store> Sim<S> {
 
     fn push_event(&mut self, at: u64, ev: SimEvent) {
         let seq = self.next_seq();
-        self.queue.push_back((at, seq, ev));
+        self.queue.push_back(ScheduledEvent { at, seq, event: ev });
     }
 
     pub fn connect(&mut self, a: NodeIndex, b: NodeIndex) -> u64 {
@@ -248,7 +272,7 @@ impl<S: Store> Sim<S> {
         link: u64,
         frame: lattice_proto::frames::Frame,
     ) {
-        let (a, b) = self.link_endpoints(link);
+        let LinkEndpoints { a, b } = self.link_endpoints(link);
         let from = if a == target { b } else { a };
         self.dispatch(
             target,
@@ -270,13 +294,13 @@ impl<S: Store> Sim<S> {
         );
     }
 
-    fn link_endpoints(&self, link: u64) -> (NodeIndex, NodeIndex) {
+    fn link_endpoints(&self, link: u64) -> LinkEndpoints {
         let l = self
             .links
             .iter()
             .find(|l| l.id == link)
             .expect("link exists");
-        (l.a, l.b)
+        LinkEndpoints { a: l.a, b: l.b }
     }
 
     /// Send a message from node `from` to the *identity* of node `to`.
@@ -302,26 +326,32 @@ impl<S: Store> Sim<S> {
     /// Run the simulation for `secs` virtual seconds.
     pub fn run_for(&mut self, secs: u64) {
         let end = self.now + secs;
-        while let Some((at, _, ev)) = self.pop_event() {
-            if at > end {
+        while let Some(ev) = self.pop_event() {
+            if ev.at > end {
                 let seq = self.next_seq();
-                self.queue.push_front((at, seq, ev));
+                self.queue.push_front(ScheduledEvent {
+                    at: ev.at,
+                    seq,
+                    event: ev.event,
+                });
                 break;
             }
-            self.now = at;
-            self.dispatch_event(ev);
+            self.now = ev.at;
+            self.dispatch_event(ev.event);
         }
         self.now = end;
     }
 
-    fn pop_event(&mut self) -> Option<(u64, u64, SimEvent)> {
+    fn pop_event(&mut self) -> Option<ScheduledEvent> {
         // queue is kept roughly ordered; do a linear-scan min extraction to keep it simple
         if self.queue.is_empty() {
             return None;
         }
         let mut best = 0;
         for (i, e) in self.queue.iter().enumerate() {
-            if e.0 < self.queue[best].0 || (e.0 == self.queue[best].0 && e.1 < self.queue[best].1) {
+            if e.at < self.queue[best].at
+                || (e.at == self.queue[best].at && e.seq < self.queue[best].seq)
+            {
                 best = i;
             }
         }
@@ -350,8 +380,11 @@ impl<S: Store> Sim<S> {
                 self.apply_actions(node, actions);
                 // re-arm the tick
                 let seq = self.next_seq();
-                self.queue
-                    .push_back((self.now + 1, seq, SimEvent::Tick { node }));
+                self.queue.push_back(ScheduledEvent {
+                    at: self.now + 1,
+                    seq,
+                    event: SimEvent::Tick { node },
+                });
             }
         }
     }
@@ -395,7 +428,7 @@ impl<S: Store> Sim<S> {
                     });
                 }
                 Action::Status { mid, status, .. } => {
-                    self.statuses.push((mid, status));
+                    self.statuses.push(StatusObservation { mid, status });
                 }
                 Action::Inbox { .. } => {}
             }
@@ -468,14 +501,14 @@ impl<S: Store> Sim<S> {
     /// claim). Read from the node's store.
     pub fn channel_key_of(&self, node: NodeIndex) -> lattice_types::ChannelPublicKey {
         let id = self.ids[node];
-        let (bytes, _) = self.nodes[node]
+        let stored = self.nodes[node]
             .store_ref()
             .record_get(&id, lattice_proto::record::Scope::Wan)
             .expect("record read")
             .expect("own record present");
-        lattice_proto::record::PeerRecord::from_bytes(&bytes, self.now, None)
+        lattice_proto::record::PeerRecord::from_bytes(&stored.bytes, self.now, None)
             .expect("own record parses")
-            .0
+            .record
             .channel_key
     }
 

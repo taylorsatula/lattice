@@ -9,11 +9,16 @@ use lattice_net::{PeerContact, connect, serve};
 use lattice_proto::frames::Frame;
 use lattice_proto::frames::PingFrame;
 
-fn test_seeds() -> (lattice_types::ChannelSeed, lattice_types::ChannelSeed) {
-    (
-        lattice_types::ChannelSeed::from_bytes([0xA1; 32]),
-        lattice_types::ChannelSeed::from_bytes([0xB2; 32]),
-    )
+struct TestSeeds {
+    server: lattice_types::ChannelSeed,
+    client: lattice_types::ChannelSeed,
+}
+
+fn test_seeds() -> TestSeeds {
+    TestSeeds {
+        server: lattice_types::ChannelSeed::from_bytes([0xA1; 32]),
+        client: lattice_types::ChannelSeed::from_bytes([0xB2; 32]),
+    }
 }
 
 async fn start_server(
@@ -34,15 +39,17 @@ async fn start_server(
         force_under_load: under_load,
         on_peer: tx,
     };
-    let (addr, _handle) = serve(cfg, vec!["127.0.0.1:0".parse().unwrap()])
+    let served = serve(cfg, vec!["127.0.0.1:0".parse().unwrap()])
         .await
         .unwrap();
-    (addr, rx, draining)
+    (served.addr, rx, draining)
 }
 
 #[tokio::test]
 async fn ik_handshake_and_ping_pong() {
-    let (server_seed, client_seed) = test_seeds();
+    let seeds = test_seeds();
+    let server_seed = seeds.server;
+    let client_seed = seeds.client;
     let server_ck = lattice_crypto::channel_public(&server_seed);
     let (addr, mut peers, _flag) = start_server(server_seed, false, false).await;
 
@@ -82,7 +89,9 @@ async fn ik_handshake_and_ping_pong() {
 
 #[tokio::test]
 async fn xx_handshake_works() {
-    let (server_seed, client_seed) = test_seeds();
+    let seeds = test_seeds();
+    let server_seed = seeds.server;
+    let client_seed = seeds.client;
     let client_seed_check = client_seed.clone();
     let path = lattice_net::upgrade_path(&lattice_crypto::channel_public(&server_seed));
     let (addr, mut peers, _flag) = start_server(server_seed.clone(), false, false).await;
@@ -113,7 +122,9 @@ async fn xx_handshake_works() {
 
 #[tokio::test]
 async fn cookie_flow_enforced_under_load() {
-    let (server_seed, client_seed) = test_seeds();
+    let seeds = test_seeds();
+    let server_seed = seeds.server;
+    let client_seed = seeds.client;
     let server_ck = lattice_crypto::channel_public(&server_seed);
     let (addr, mut peers, _flag) = start_server(server_seed, true, false).await;
 
@@ -140,7 +151,8 @@ async fn cookie_flow_enforced_under_load() {
 
 #[tokio::test]
 async fn status_endpoint_and_404() {
-    let (server_seed, _client_seed) = test_seeds();
+    let seeds = test_seeds();
+    let server_seed = seeds.server;
     let (addr, _peers, _flag) = start_server(server_seed.clone(), false, true).await;
 
     // /status returns CBOR with keys 0..3

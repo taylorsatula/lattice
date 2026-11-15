@@ -91,9 +91,9 @@ async fn run(socket: &Path, args: &[String]) -> ExitCode {
                 }
             };
             match client.drain(setting).await {
-                Ok((draining, custody)) => {
-                    println!("draining:      {draining}");
-                    println!("custody_bytes: {custody}");
+                Ok(state) => {
+                    println!("draining:      {}", state.draining);
+                    println!("custody_bytes: {}", state.custody_bytes);
                     ExitCode::SUCCESS
                 }
                 Err(e) => fail(e),

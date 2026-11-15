@@ -20,7 +20,7 @@ use tokio::sync::{broadcast, mpsc};
 use subtle::ConstantTimeEq;
 
 use crate::config::Config;
-use crate::runtime::ApiCmd;
+use crate::runtime::{ApiCmd, ServiceEvent};
 
 const MAX_FRAME: usize = LOCAL_MAX_FRAME;
 
@@ -43,9 +43,9 @@ async fn read_frame(stream: &mut UnixStream, buf: &mut Vec<u8>) -> std::io::Resu
     let mut chunk = [0u8; 8192];
     loop {
         match deframe_local(buf) {
-            Ok(Some((payload, used))) => {
-                let out = payload.to_vec();
-                buf.drain(..used);
+            Ok(Some(frame)) => {
+                let out = frame.payload.to_vec();
+                buf.drain(..frame.consumed);
                 return Ok(FrameRead::Frame(out));
             }
             Ok(None) => {}
@@ -111,7 +111,7 @@ async fn handle_app(
     mut stream: UnixStream,
     cfg: Arc<Config>,
     api: mpsc::UnboundedSender<ApiCmd>,
-    mut events: broadcast::Receiver<(String, Vec<u8>)>,
+    mut events: broadcast::Receiver<ServiceEvent>,
 ) {
     let mut buf = Vec::new();
 
@@ -198,9 +198,9 @@ async fn handle_app(
             ev = events.recv() => {
                 // Events are tagged with the originating service; a
                 // connection only ever sees its own service's events.
-                if let Ok((tag, bytes)) = ev {
-                    if tag == service {
-                        if let Ok(framed) = frame_local(&bytes) {
+                if let Ok(ev) = ev {
+                    if ev.service == service {
+                        if let Ok(framed) = frame_local(&ev.payload) {
                             if stream.write_all(&framed).await.is_err() {
                                 return;
                             }
@@ -290,9 +290,9 @@ async fn dispatch_app(
                 return resp_err(req.id, ERR_INTERNAL);
             }
             match rx.await {
-                Ok(Ok(Some((status, detail)))) => {
-                    let mut pairs = vec![(Value::UInt(0), Value::UInt(status))];
-                    if let Some(d) = detail {
+                Ok(Ok(Some(status))) => {
+                    let mut pairs = vec![(Value::UInt(0), Value::UInt(status.status))];
+                    if let Some(d) = status.detail {
                         pairs.push((Value::UInt(1), Value::UInt(d)));
                     }
                     resp_ok(req.id, Value::map(pairs))
@@ -410,12 +410,12 @@ async fn dispatch_app(
                 return resp_err(req.id, ERR_INTERNAL);
             }
             match rx.await {
-                Ok((have, mode, path)) => {
+                Ok(lookup) => {
                     let mut pairs = vec![
-                        (Value::UInt(0), Value::Bool(have)),
-                        (Value::UInt(2), Value::Bool(path)),
+                        (Value::UInt(0), Value::Bool(lookup.have)),
+                        (Value::UInt(2), Value::Bool(lookup.path)),
                     ];
-                    if let Some(m) = mode {
+                    if let Some(m) = lookup.mode {
                         pairs.push((Value::UInt(1), Value::UInt(m)));
                     }
                     resp_ok(req.id, Value::map(pairs))
@@ -500,11 +500,11 @@ async fn dispatch_admin(api: &mpsc::UnboundedSender<ApiCmd>, req: &Request) -> V
                 return resp_err(req.id, ERR_INTERNAL);
             }
             match rx.await {
-                Ok((draining, custody_bytes)) => resp_ok(
+                Ok(state) => resp_ok(
                     req.id,
                     Value::map(vec![
-                        (Value::UInt(0), Value::Bool(draining)),
-                        (Value::UInt(1), Value::UInt(custody_bytes as u64)),
+                        (Value::UInt(0), Value::Bool(state.draining)),
+                        (Value::UInt(1), Value::UInt(state.custody_bytes)),
                     ]),
                 ),
                 Err(_) => resp_err(req.id, ERR_INTERNAL),
@@ -700,7 +700,7 @@ pub async fn serve_app(
     listener: UnixListener,
     cfg: Arc<Config>,
     api: mpsc::UnboundedSender<ApiCmd>,
-    events: broadcast::Sender<(String, Vec<u8>)>,
+    events: broadcast::Sender<ServiceEvent>,
 ) -> std::io::Result<()> {
     loop {
         let (stream, _) = listener.accept().await?;

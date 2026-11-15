@@ -79,7 +79,7 @@ fn message_delivers_end_to_end_and_sender_sees_receipt() {
     let delivered = sim
         .statuses
         .iter()
-        .filter(|(m, s)| *m == mid && *s == 3)
+        .filter(|s| s.mid == mid && s.status == 3)
         .count();
     assert!(delivered >= 1, "sender should observe Delivered status");
 }
@@ -248,7 +248,7 @@ fn fair_share_caps_a_flooded_upstream() {
     eprintln!(
         "n_statuses={} in_transit={}",
         sim.statuses.len(),
-        sim.statuses.iter().filter(|s| s.1 == 2).count()
+        sim.statuses.iter().filter(|s| s.status == 2).count()
     );
     assert!(
         from_f <= 3,
@@ -382,13 +382,13 @@ fn equivocating_records_converge_to_lower_hash() {
         .record_get(&id, Scope::Wan)
         .unwrap()
         .unwrap()
-        .0;
+        .bytes;
     let stored_b = sim.nodes[b]
         .store_ref()
         .record_get(&id, Scope::Wan)
         .unwrap()
         .unwrap()
-        .0;
+        .bytes;
     assert_eq!(stored_a, first, "node A must keep the lower-hash record");
     assert_eq!(stored_b, first, "node B must keep the lower-hash record");
 }
@@ -443,8 +443,8 @@ fn forged_envelope_is_not_delivered() {
         .record_get(&target_id, Scope::Wan)
         .unwrap()
         .unwrap()
-        .0;
-    let (target_rec, _) = PeerRecord::from_bytes(&target_rec, 0, None).unwrap();
+        .bytes;
+    let target_rec = PeerRecord::from_bytes(&target_rec, 0, None).unwrap().record;
 
     let envelope = Envelope {
         kind: KIND_MESSAGE,
@@ -815,7 +815,7 @@ fn private_instance_receives_via_gateway() {
     let delivered = sim
         .statuses
         .iter()
-        .filter(|(m, s)| *m == mid && *s == 3)
+        .filter(|s| s.mid == mid && s.status == 3)
         .count();
     assert!(delivered >= 1, "sender should observe Delivered status");
 }

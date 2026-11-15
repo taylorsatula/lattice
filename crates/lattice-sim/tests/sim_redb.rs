@@ -82,7 +82,7 @@ fn redb_message_delivers_end_to_end_and_sender_sees_receipt() {
     let delivered = sim
         .statuses
         .iter()
-        .filter(|(m, s)| *m == mid && *s == 3)
+        .filter(|s| s.mid == mid && s.status == 3)
         .count();
     assert!(delivered >= 1, "sender should observe Delivered status");
 }

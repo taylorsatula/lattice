@@ -13,24 +13,18 @@
 use std::collections::HashSet;
 
 use lattice_crypto::hash;
-use lattice_proto::frames::Range;
+use lattice_proto::frames::{Range, RangeBound, RangeBounds, RecordEntry, RecordRef};
 use lattice_types::{Hash32, Identifier};
 
 pub const LEAF_LIMIT: usize = 32;
 const SPLIT: u64 = 16;
 const MAX_RANGES_PER_MSG: usize = 64;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Item {
-    pub id: Identifier,
-    pub scope: u8,
-    pub seq: u64,
-}
+/// A reconcile item: a record's (id, scope, seq). Alias for the wire
+/// type so the reconcile code and the frames share one definition.
+pub type Item = RecordEntry;
 
-impl Item {
-    pub fn key(&self) -> (Identifier, u8) {
-        (self.id, self.scope)
-    }
+impl ItemExt for RecordEntry {
     fn hash(&self) -> crate::u256::U256 {
         let mut h = Vec::with_capacity(41);
         h.extend_from_slice(self.id.as_ref());
@@ -40,31 +34,34 @@ impl Item {
     }
 }
 
-fn in_range(
-    item: &Item,
-    lower: &Option<(Identifier, u8)>,
-    upper: &Option<(Identifier, u8)>,
-) -> bool {
+/// Hashing for reconcile items. Implemented as an extension trait because
+/// `Item` is an alias for the proto crate's `RecordEntry`.
+trait ItemExt {
+    fn hash(&self) -> crate::u256::U256;
+}
+
+fn in_range(item: &Item, lower: &Option<RangeBound>, upper: &Option<RangeBound>) -> bool {
     let key = (item.id, item.scope);
     if let Some(l) = lower {
-        if key < *l {
+        if key < (l.id, l.scope) {
             return false;
         }
     }
     if let Some(u) = upper {
-        if key >= *u {
+        if key >= (u.id, u.scope) {
             return false;
         }
     }
     true
 }
 
-type RangeBounds = (Option<(Identifier, u8)>, Option<(Identifier, u8)>);
-
 fn range_parts(range: &Range) -> RangeBounds {
     match range {
         Range::Fingerprint { lower, upper, .. } | Range::Entries { lower, upper, .. } => {
-            (*lower, *upper)
+            RangeBounds {
+                lower: *lower,
+                upper: *upper,
+            }
         }
     }
 }
@@ -72,9 +69,9 @@ fn range_parts(range: &Range) -> RangeBounds {
 /// Split `range` into 16 id-space subranges. Bounds carry scope 0.
 /// Returns None when the range is too narrow to split.
 fn split(range: &Range) -> Option<Vec<Range>> {
-    let (lower, upper) = range_parts(range);
-    let lo_bytes = lower.map(|(id, _)| id);
-    let hi_bytes = upper.map(|(id, _)| id);
+    let RangeBounds { lower, upper } = range_parts(range);
+    let lo_bytes = lower.map(|b| b.id);
+    let hi_bytes = upper.map(|b| b.id);
     let lo = lo_bytes
         .map(|b| crate::u256::U256::from_bytes(b.as_bytes()))
         .unwrap_or_default();
@@ -105,15 +102,18 @@ fn split(range: &Range) -> Option<Vec<Range>> {
         let lower_b = if k == 0 {
             lower
         } else {
-            Some((Identifier::from_bytes(sub_lo.to_bytes()), 0))
+            Some(RangeBound {
+                id: Identifier::from_bytes(sub_lo.to_bytes()),
+                scope: 0,
+            })
         };
         let upper_b = if is_last {
             upper
         } else {
-            Some((
-                Identifier::from_bytes(lo.add(step.mul_small(k + 1)).to_bytes()),
-                0,
-            ))
+            Some(RangeBound {
+                id: Identifier::from_bytes(lo.add(step.mul_small(k + 1)).to_bytes()),
+                scope: 0,
+            })
         };
         out.push(Range::Fingerprint {
             lower: lower_b,
@@ -125,8 +125,15 @@ fn split(range: &Range) -> Option<Vec<Range>> {
     Some(out)
 }
 
-pub fn fingerprint(items: &[Item], range: &Range) -> (u64, Hash32) {
-    let (lower, upper) = range_parts(range);
+/// Count and XOR-sum of the items in a range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Fingerprint {
+    pub count: u64,
+    pub sum: Hash32,
+}
+
+pub fn fingerprint(items: &[Item], range: &Range) -> Fingerprint {
+    let RangeBounds { lower, upper } = range_parts(range);
     let mut count = 0u64;
     let mut sum = crate::u256::U256::default();
     for item in items {
@@ -135,11 +142,14 @@ pub fn fingerprint(items: &[Item], range: &Range) -> (u64, Hash32) {
             sum = sum.add(item.hash());
         }
     }
-    (count, Hash32::from_bytes(sum.to_bytes()))
+    Fingerprint {
+        count,
+        sum: Hash32::from_bytes(sum.to_bytes()),
+    }
 }
 
 pub fn entries_in(items: &[Item], range: &Range) -> Vec<Item> {
-    let (lower, upper) = range_parts(range);
+    let RangeBounds { lower, upper } = range_parts(range);
     items
         .iter()
         .filter(|i| in_range(i, &lower, &upper))
@@ -158,20 +168,27 @@ impl ReconcileSession {
         Self::default()
     }
     fn mark_echo(&mut self, range: &Range) -> bool {
-        let (l, u) = range_parts(range);
-        self.echoed.insert(format!("{l:?}:{u:?}"))
+        let RangeBounds { lower, upper } = range_parts(range);
+        self.echoed.insert(format!("{lower:?}:{upper:?}"))
     }
 }
 
 fn with_fp(items: &[Item], r: &Range) -> Range {
-    let (lower, upper) = range_parts(r);
-    let (count, sum) = fingerprint(items, r);
+    let RangeBounds { lower, upper } = range_parts(r);
+    let fp = fingerprint(items, r);
     Range::Fingerprint {
         lower,
         upper,
-        count,
-        sum,
+        count: fp.count,
+        sum: fp.sum,
     }
+}
+
+/// The result of answering a peer's reconcile ranges: the ranges to send
+/// back, and the records we want from the peer.
+pub struct ReconcileResponse {
+    pub ranges: Vec<Range>,
+    pub wants: Vec<RecordRef>,
 }
 
 /// Compute our reply to a peer's reconcile ranges, and the (id, scope)
@@ -180,15 +197,15 @@ pub fn respond(
     items: &[Item],
     msgs: &[Range],
     session: &mut ReconcileSession,
-) -> (Vec<Range>, Vec<(Identifier, u8)>) {
+) -> ReconcileResponse {
     let mut out = Vec::new();
-    let mut wants = Vec::new();
+    let mut wants: Vec<RecordRef> = Vec::new();
     // A peer may not make us do unbounded work: cap the ranges we process
     // and the entries we echo per response.
     for m in msgs.iter().take(MAX_RANGES_PER_MSG) {
         // Reject inverted ranges before doing any arithmetic on them.
-        let (lo, hi) = range_parts(m);
-        if let (Some(l), Some(h)) = (lo, hi) {
+        let RangeBounds { lower, upper } = range_parts(m);
+        if let (Some(l), Some(h)) = (lower, upper) {
             if l > h {
                 continue;
             }
@@ -206,8 +223,8 @@ pub fn respond(
                     count: *count,
                     sum: *sum,
                 };
-                let (my_count, my_sum) = fingerprint(items, &probe);
-                if my_count == *count && my_sum == *sum {
+                let mine = fingerprint(items, &probe);
+                if mine.count == *count && mine.sum == *sum {
                     continue;
                 }
                 let my_items = entries_in(items, &probe);
@@ -216,10 +233,7 @@ pub fn respond(
                     out.push(Range::Entries {
                         lower: *lower,
                         upper: *upper,
-                        entries: my_items
-                            .into_iter()
-                            .map(|i| (i.id, i.scope, i.seq))
-                            .collect(),
+                        entries: my_items,
                     });
                 } else if let Some(subs) = split(&probe) {
                     for sub in subs {
@@ -233,10 +247,7 @@ pub fn respond(
                     out.push(Range::Entries {
                         lower: *lower,
                         upper: *upper,
-                        entries: my_items
-                            .into_iter()
-                            .map(|i| (i.id, i.scope, i.seq))
-                            .collect(),
+                        entries: my_items,
                     });
                 }
             }
@@ -256,27 +267,24 @@ pub fn respond(
                         out.push(Range::Entries {
                             lower: *lower,
                             upper: *upper,
-                            entries: mine
-                                .into_iter()
-                                .take(LEAF_LIMIT)
-                                .map(|i| (i.id, i.scope, i.seq))
-                                .collect(),
+                            entries: mine.into_iter().take(LEAF_LIMIT).collect(),
                         });
                     }
                 }
-                for (id, scope, seq) in entries {
-                    let want = match items.binary_search_by(|i| i.key().cmp(&(*id, *scope))) {
-                        Ok(idx) => items[idx].seq < *seq,
+                for entry in entries {
+                    let key = entry.key();
+                    let want = match items.binary_search_by(|i| i.key().cmp(&key)) {
+                        Ok(idx) => items[idx].seq < entry.seq,
                         Err(_) => true,
                     };
-                    if want && wants.len() < MAX_RANGES_PER_MSG && !wants.contains(&(*id, *scope)) {
-                        wants.push((*id, *scope));
+                    if want && wants.len() < MAX_RANGES_PER_MSG && !wants.contains(&key) {
+                        wants.push(key);
                     }
                 }
             }
         }
     }
-    (out, wants)
+    ReconcileResponse { ranges: out, wants }
 }
 
 /// The initiator's opening ranges.
@@ -324,8 +332,9 @@ mod tests {
             let hits = subs
                 .iter()
                 .filter(|r| {
-                    range_parts(r).0.map(|(l, _)| l <= id).unwrap_or(true)
-                        && range_parts(r).1.map(|(u, _)| id < u).unwrap_or(true)
+                    let b = range_parts(r);
+                    b.lower.map(|l| l.id <= id).unwrap_or(true)
+                        && b.upper.map(|u| id < u.id).unwrap_or(true)
                 })
                 .count();
             assert_eq!(hits, 1, "id {id:?} covered by {hits} subranges");
@@ -345,7 +354,7 @@ mod tests {
         assert_ne!(fingerprint(&a, &full), fingerprint(&b, &full));
     }
 
-    type Wants = Vec<(Identifier, u8)>;
+    type Wants = Vec<RecordRef>;
     fn reconcile_pair(a: &[Item], b: &[Item]) -> (Wants, Wants) {
         let mut a_msg = initiate(a);
         let mut a_wants = Vec::new();
@@ -353,14 +362,14 @@ mod tests {
         let mut sa = ReconcileSession::new();
         let mut sb = ReconcileSession::new();
         for _ in 0..64 {
-            let (b_out, bw) = respond(b, &a_msg, &mut sb);
-            b_wants.extend(bw);
-            let (a_out, aw) = respond(a, &b_out, &mut sa);
-            a_wants.extend(aw);
-            if a_out.is_empty() && b_out.is_empty() {
+            let b_resp = respond(b, &a_msg, &mut sb);
+            b_wants.extend(b_resp.wants);
+            let a_resp = respond(a, &b_resp.ranges, &mut sa);
+            a_wants.extend(a_resp.wants);
+            if a_resp.ranges.is_empty() && b_resp.ranges.is_empty() {
                 break;
             }
-            a_msg = a_out;
+            a_msg = a_resp.ranges;
         }
         (a_wants, b_wants)
     }
@@ -370,8 +379,14 @@ mod tests {
         let a = sorted(vec![item(1), item(2), item(3)]);
         let b = sorted(vec![item(2), item(3), item(4)]);
         let (a_wants, b_wants) = reconcile_pair(&a, &b);
-        assert!(a_wants.contains(&(Identifier::from_bytes([4u8; 32]), 0)));
-        assert!(b_wants.contains(&(Identifier::from_bytes([1u8; 32]), 0)));
+        assert!(a_wants.contains(&RecordRef {
+            id: Identifier::from_bytes([4u8; 32]),
+            scope: 0,
+        }));
+        assert!(b_wants.contains(&RecordRef {
+            id: Identifier::from_bytes([1u8; 32]),
+            scope: 0,
+        }));
     }
 
     #[test]
@@ -411,8 +426,14 @@ mod tests {
         a.sort();
         b.sort();
         let (a_wants, b_wants) = reconcile_pair(&a, &b);
-        assert!(a_wants.contains(&(Identifier::from_bytes([0xad; 32]), 0)));
-        assert!(b_wants.contains(&(Identifier::from_bytes([0xde; 32]), 0)));
+        assert!(a_wants.contains(&RecordRef {
+            id: Identifier::from_bytes([0xad; 32]),
+            scope: 0,
+        }));
+        assert!(b_wants.contains(&RecordRef {
+            id: Identifier::from_bytes([0xde; 32]),
+            scope: 0,
+        }));
     }
 }
 
@@ -441,9 +462,9 @@ mod adversarial_tests {
             })
             .collect();
         let mut session = ReconcileSession::new();
-        let (out, _wants) = respond(&items, &msgs, &mut session);
+        let resp = respond(&items, &msgs, &mut session);
         // 64 processed ranges, one output each (all mismatch), capped at 64.
-        assert!(out.len() <= MAX_RANGES_PER_MSG);
+        assert!(resp.ranges.len() <= MAX_RANGES_PER_MSG);
     }
 
     #[test]
@@ -451,16 +472,23 @@ mod adversarial_tests {
         // Peer sends an Entries range covering 100 of our items; we must
         // echo at most LEAF_LIMIT of them.
         let items: Vec<Item> = (0..100u8).map(item).collect();
-        let entries: Vec<(Identifier, u8, u64)> =
-            items.iter().map(|i| (i.id, i.scope, i.seq)).collect();
+        let entries: Vec<RecordEntry> = items
+            .iter()
+            .map(|i| RecordEntry {
+                id: i.id,
+                scope: i.scope,
+                seq: i.seq,
+            })
+            .collect();
         let msgs = vec![Range::Entries {
             lower: None,
             upper: None,
             entries,
         }];
         let mut session = ReconcileSession::new();
-        let (out, _wants) = respond(&items, &msgs, &mut session);
-        let echoed: usize = out
+        let resp = respond(&items, &msgs, &mut session);
+        let echoed: usize = resp
+            .ranges
             .iter()
             .map(|r| match r {
                 Range::Entries { entries, .. } => entries.len(),
@@ -473,11 +501,15 @@ mod adversarial_tests {
     #[test]
     fn wants_are_capped() {
         let items: Vec<Item> = vec![];
-        let entries: Vec<(Identifier, u8, u64)> = (0..200u16)
+        let entries: Vec<RecordEntry> = (0..200u16)
             .map(|i| {
                 let mut id = [0u8; 32];
                 id[..2].copy_from_slice(&i.to_be_bytes());
-                (Identifier::from_bytes(id), 0u8, 1u64)
+                RecordEntry {
+                    id: Identifier::from_bytes(id),
+                    scope: 0,
+                    seq: 1,
+                }
             })
             .collect();
         let msgs = vec![Range::Entries {
@@ -486,7 +518,7 @@ mod adversarial_tests {
             entries,
         }];
         let mut session = ReconcileSession::new();
-        let (_out, wants) = respond(&items, &msgs, &mut session);
-        assert!(wants.len() <= MAX_RANGES_PER_MSG);
+        let resp = respond(&items, &msgs, &mut session);
+        assert!(resp.wants.len() <= MAX_RANGES_PER_MSG);
     }
 }
