@@ -161,6 +161,14 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// Surface non-fatal internal failures reported by the sans-IO core.
+/// `eprintln!` is the daemon's diagnostic channel (see `main.rs`).
+fn report_diagnostics(diags: Vec<lattice_core::Diagnostic>) {
+    for d in diags {
+        eprintln!("lattice: node diagnostic: {}: {}", d.op, d.detail);
+    }
+}
+
 /// Outbound frame writer for one link.
 async fn link_task(
     id: u64,
@@ -202,7 +210,7 @@ impl Runtime {
         now: u64,
         peer_rx: mpsc::UnboundedReceiver<lattice_net::PeerIo>,
         draining: Arc<AtomicBool>,
-    ) -> Self {
+    ) -> Result<Self, lattice_core::NodeError> {
         let channel_seed = identity.channel_seed.clone();
         let mode = if cfg.mode == "private" {
             lattice_proto::record::Mode::Private
@@ -213,11 +221,13 @@ impl Runtime {
             .gateways
             .iter()
             .map(|h| {
-                Identifier::from_bytes(
-                    crate::config::decode_hex32(h).expect("config validation checked gateway hex"),
-                )
+                Ok(Identifier::from_bytes(
+                    crate::config::decode_hex32(h).map_err(|e| {
+                        lattice_core::NodeError::Config(format!("gateway {h:?}: {e}"))
+                    })?,
+                ))
             })
-            .collect();
+            .collect::<Result<_, lattice_core::NodeError>>()?;
         let core_cfg = lattice_core::Config {
             snow_per_min: cfg.limits.snow_per_min,
             sideways_prob: cfg.limits.sideways_prob,
@@ -233,7 +243,7 @@ impl Runtime {
             mode,
             ..lattice_core::Config::default()
         };
-        let mut node = Node::new(core_cfg, identity, store, now).expect("node init");
+        let mut node = Node::new(core_cfg, identity, store, now)?;
         if draining.load(Ordering::Relaxed) {
             node.set_draining(true);
         }
@@ -241,7 +251,7 @@ impl Runtime {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (api_tx, api_rx) = mpsc::unbounded_channel();
         let (app_broadcast, _) = broadcast::channel(256);
-        Self {
+        Ok(Self {
             node: Arc::new(std::sync::Mutex::new(node)),
             draining,
             mode: if cfg.mode == "private" {
@@ -262,7 +272,7 @@ impl Runtime {
             api_tx,
             app_broadcast,
             next_link: 1,
-        }
+        })
     }
 
     pub fn api_tx(&self) -> mpsc::UnboundedSender<ApiCmd> {
@@ -293,7 +303,7 @@ impl Runtime {
         );
         // The link is registered, so the actions returned by LinkUp (the
         // attestation frame) can be routed to it.
-        let actions = {
+        let (actions, diags) = {
             let mut node = self.node.lock().unwrap_or_else(|e| e.into_inner());
             node.handle(Event::LinkUp {
                 at: now_secs(),
@@ -303,6 +313,7 @@ impl Runtime {
                 wan: true,
             })
         };
+        report_diagnostics(diags);
         self.apply_actions(actions);
         id
     }
@@ -405,10 +416,11 @@ impl Runtime {
     }
 
     fn apply(&mut self, event: Event) {
-        let actions = {
+        let (actions, diags) = {
             let mut node = self.node.lock().unwrap_or_else(|e| e.into_inner());
             node.handle(event)
         };
+        report_diagnostics(diags);
         self.apply_actions(actions);
     }
 
@@ -456,10 +468,11 @@ impl Runtime {
                     mid_hint: Some(mid),
                     ..send
                 };
-                let actions = {
+                let (actions, diags) = {
                     let mut node = self.node.lock().unwrap_or_else(|e| e.into_inner());
                     node.handle(Event::AppSend(send))
                 };
+                report_diagnostics(diags);
                 self.apply_actions(actions);
                 let _ = respond.send(mid);
             }
@@ -493,7 +506,7 @@ impl Runtime {
                 let _ = respond.send((have, mode, path));
             }
             ApiCmd::NodeInfo { respond } => {
-                let node = self.node.lock().unwrap_or_else(|e| e.into_inner());
+                let mut node = self.node.lock().unwrap_or_else(|e| e.into_inner());
                 let info = NodeInfo {
                     id: node.own_id,
                     mode: self.mode,

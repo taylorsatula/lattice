@@ -251,7 +251,14 @@ async fn cmd_run(args: &[String]) -> std::process::ExitCode {
         }
     }
 
-    let mut runtime = runtime::Runtime::new(&cfg, identity, store, now, peer_rx, draining.clone());
+    let mut runtime =
+        match runtime::Runtime::new(&cfg, identity, store, now, peer_rx, draining.clone()) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("node init: {e}");
+                return std::process::ExitCode::from(1);
+            }
+        };
 
     // Register configured roots; the runtime dials them now and redials
     // with backoff until a link is up (and again if it drops later).

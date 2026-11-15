@@ -7,6 +7,7 @@
 
 #![forbid(unsafe_code)]
 
+mod error;
 pub mod graph;
 pub mod node;
 pub mod reconcile;
@@ -14,6 +15,7 @@ pub mod rng;
 pub mod types;
 mod u256;
 
+pub use error::NodeError;
 pub use node::{Identity, Node};
 pub use rng::Rng;
-pub use types::{Action, AppSend, Config, Event, LinkId};
+pub use types::{Action, AppSend, Config, Diagnostic, Event, LinkId};

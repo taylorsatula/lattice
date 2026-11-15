@@ -176,7 +176,7 @@ impl<S: Store> Sim<S> {
         peer: Option<Identifier>,
         remote_ck: X25519PublicKey,
     ) {
-        let actions = self.nodes[node].handle(Event::LinkUp {
+        let (actions, _diags) = self.nodes[node].handle(Event::LinkUp {
             at: self.now,
             link,
             peer,
@@ -211,11 +211,11 @@ impl<S: Store> Sim<S> {
                 self.channel_keys[&self.ids[a]],
             );
         } else {
-            self.nodes[a].handle(Event::LinkDown {
+            let _ = self.nodes[a].handle(Event::LinkDown {
                 at: self.now,
                 link: link_id,
             });
-            self.nodes[b].handle(Event::LinkDown {
+            let _ = self.nodes[b].handle(Event::LinkDown {
                 at: self.now,
                 link: link_id,
             });
@@ -337,7 +337,7 @@ impl<S: Store> Sim<S> {
                 frame,
             } => {
                 let from_id = self.ids[from];
-                let actions = self.nodes[to].handle(Event::Frame {
+                let (actions, _diags) = self.nodes[to].handle(Event::Frame {
                     at: self.now,
                     link,
                     from: from_id,
@@ -346,7 +346,7 @@ impl<S: Store> Sim<S> {
                 self.apply_actions(to, actions);
             }
             SimEvent::Tick { node } => {
-                let actions = self.nodes[node].handle(Event::Tick { at: self.now });
+                let (actions, _diags) = self.nodes[node].handle(Event::Tick { at: self.now });
                 self.apply_actions(node, actions);
                 // re-arm the tick
                 let seq = self.next_seq();
@@ -357,7 +357,7 @@ impl<S: Store> Sim<S> {
     }
 
     fn dispatch(&mut self, node: NodeIndex, ev: Event) {
-        let actions = self.nodes[node].handle(ev);
+        let (actions, _diags) = self.nodes[node].handle(ev);
         self.apply_actions(node, actions);
     }
 
@@ -480,7 +480,7 @@ impl<S: Store> Sim<S> {
     }
 
     /// Number of undelivered envelopes queued inside a node (debug).
-    pub fn custody_count(&self, node: NodeIndex) -> usize {
+    pub fn custody_count(&mut self, node: NodeIndex) -> usize {
         self.nodes[node].debug_custody_count()
     }
 

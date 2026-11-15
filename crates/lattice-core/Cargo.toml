@@ -15,6 +15,7 @@ lattice-types = { version = "0.0.0", path = "../lattice-types" }
 lattice-proto = { version = "0.0.0", path = "../lattice-proto" }
 lattice-store = { version = "0.0.0", path = "../lattice-store" }
 lattice-crypto = { version = "0.0.0", path = "../lattice-crypto" }
+thiserror = "2"
 
 [dev-dependencies]
 lattice-store = { version = "0.0.0", path = "../lattice-store", features = [] }

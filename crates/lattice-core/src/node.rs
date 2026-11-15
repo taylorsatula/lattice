@@ -19,6 +19,7 @@ use lattice_types::{
     Signature, SigningPublicKey, SigningSeed, X25519PublicKey, XWingPublicKey, XWingSecretKey,
 };
 
+use crate::error::NodeError;
 use crate::graph::Graph;
 use crate::reconcile::{self, ReconcileSession};
 use crate::rng::Rng;
@@ -49,17 +50,15 @@ impl Identity {
         &mut self,
         next_seed: &SigningSeed,
         new_next_seed: Option<SigningSeed>,
-    ) -> Result<(), String> {
-        let head = self.kel.events().last().ok_or("empty key event log")?;
-        let committed = head
-            .next
-            .ok_or("identity is abandoned; it cannot rotate further")?;
+    ) -> Result<(), NodeError> {
+        let head = self.kel.events().last().ok_or(NodeError::EmptyKel)?;
+        let committed = head.next.ok_or(NodeError::Abandoned)?;
         if hash_next(next_seed) != committed {
-            return Err("next key does not match the committed pre-rotation hash".into());
+            return Err(NodeError::NextKeyMismatch);
         }
         let next_hash = new_next_seed.as_ref().map(hash_next);
         let event = KeyEvent::rotation(head, next_seed, next_hash);
-        self.kel.append(event).map_err(|e| e.to_string())?;
+        self.kel.append(event)?;
         self.signing_seed = next_seed.clone();
         Ok(())
     }
@@ -237,27 +236,35 @@ pub struct Node<S: Store> {
     /// Memoized validation of stored records, keyed by (id, scope). Same
     /// invalidation as the graph cache; bounded, cleared when full.
     record_cache: HashMap<(Identifier, u8), (u64, u64, Option<PeerRecord>)>,
+    /// Non-fatal internal failures observed since the last `handle` call.
+    /// Drained by `handle` and returned alongside the actions; the caller
+    /// decides how to surface them.
+    diagnostics: Vec<Diagnostic>,
+    /// Consecutive `outbound_due` failures; reset on success. Keeps a
+    /// persistently failing outbound queue loud instead of silent.
+    outbound_due_failures: u32,
 }
 
 impl<S: Store> Node<S> {
-    pub fn new(config: Config, identity: Identity, store: S, now: u64) -> Result<Self, String> {
+    pub fn new(config: Config, identity: Identity, store: S, now: u64) -> Result<Self, NodeError> {
         if config.mode == Mode::Private && (config.gateways.is_empty() || config.gateways.len() > 3)
         {
-            return Err("private mode requires 1-3 gateways".to_string());
+            return Err(NodeError::Config(
+                "private mode requires 1-3 gateways".to_string(),
+            ));
         }
         if identity.is_abandoned() {
-            return Err("identity is abandoned; refusing to start".to_string());
+            return Err(NodeError::Abandoned);
         }
         if config.mode == Mode::Public && !config.gateways.is_empty() {
-            return Err("gateways are only valid in private mode".to_string());
+            return Err(NodeError::Config(
+                "gateways are only valid in private mode".to_string(),
+            ));
         }
         let rng_seed = config.rng_seed;
         let id = identity.id();
         // Publish our own record if absent.
-        let own_exists = store
-            .record_get(&id, Scope::Wan)
-            .map_err(|e| e.to_string())?
-            .is_some();
+        let own_exists = store.record_get(&id, Scope::Wan)?.is_some();
         let mut node = Node {
             config,
             identity,
@@ -288,25 +295,27 @@ impl<S: Store> Node<S> {
             graph_cache: None,
             items_cache: None,
             record_cache: HashMap::new(),
+            diagnostics: Vec::new(),
+            outbound_due_failures: 0,
         };
         // Seed the claim set from records already in the store so links can be
-        // attributed immediately after a restart.
-        if let Ok(records) = node.store.record_all() {
-            for (_, _, bytes, _) in records {
-                if let Ok((rec, _)) = PeerRecord::from_bytes(&bytes, now, None) {
-                    if let Some(k) = Self::claim_key(&rec) {
-                        node.ck_claims.entry(k).or_default().insert(rec.id);
+        // attributed immediately after a restart. Best-effort: on failure the
+        // claims rebuild as records are re-admitted; report it.
+        match node.store.record_all() {
+            Ok(records) => {
+                for (_, _, bytes, _) in records {
+                    if let Ok((rec, _)) = PeerRecord::from_bytes(&bytes, now, None) {
+                        if let Some(k) = Self::claim_key(&rec) {
+                            node.ck_claims.entry(k).or_default().insert(rec.id);
+                        }
                     }
                 }
             }
+            Err(e) => node.diag("record_all", &e),
         }
         if !own_exists {
-            node.publish_record(now).map_err(|e| e.to_string())?;
-        } else if let Some((bytes, _)) = node
-            .store
-            .record_get(&id, Scope::Wan)
-            .map_err(|e| e.to_string())?
-        {
+            node.publish_record(now)?;
+        } else if let Some((bytes, _)) = node.store.record_get(&id, Scope::Wan)? {
             node.own_seq = lattice_proto::record::PeerRecord::from_bytes(&bytes, now, None)
                 .map(|(r, _)| r.seq)
                 .unwrap_or(1);
@@ -314,22 +323,41 @@ impl<S: Store> Node<S> {
         // Crash recovery: anything InFlight at boot may or may not have
         // reached the next hop. Requeue it now; the recipient dedups by mid,
         // so at-least-once survives a restart.
-        if let Ok(all) = node.store.outbound_all() {
-            for mut msg in all {
-                if msg.state == OutboundState::InFlight {
-                    msg.state = OutboundState::Queued;
-                    msg.next_attempt = now;
-                    let _ = node.store.outbound_put(&msg);
+        match node.store.outbound_all() {
+            Ok(all) => {
+                for mut msg in all {
+                    if msg.state == OutboundState::InFlight {
+                        msg.state = OutboundState::Queued;
+                        msg.next_attempt = now;
+                        if let Err(e) = node.store.outbound_put(&msg) {
+                            node.diag("outbound_put", &e);
+                        }
+                    }
                 }
             }
+            Err(e) => node.diag("outbound_all", &e),
         }
         Ok(node)
     }
 
-    pub fn handle(&mut self, event: Event) -> Vec<Action> {
+    /// Handle one event. Returns the actions to perform and any diagnostics
+    /// (non-fatal internal failures, e.g. store errors) observed while
+    /// handling it. Diagnostics are drained on every call; a caller that
+    /// drops them loses them.
+    pub fn handle(&mut self, event: Event) -> (Vec<Action>, Vec<Diagnostic>) {
         let actions = self.handle_inner(event);
         self.note_outbound_frames(&actions);
-        actions
+        (actions, std::mem::take(&mut self.diagnostics))
+    }
+
+    /// Record a non-fatal internal failure. The sans-IO core cannot log;
+    /// the caller drains these from [`Node::handle`] and decides how to
+    /// surface them.
+    fn diag(&mut self, op: &'static str, detail: impl std::fmt::Display) {
+        self.diagnostics.push(Diagnostic {
+            op,
+            detail: detail.to_string(),
+        });
     }
 
     fn note_outbound_frames(&mut self, actions: &[Action]) {
@@ -361,8 +389,10 @@ impl<S: Store> Node<S> {
                     }
                     _ => 0,
                 };
-                // Snow telemetry is best-effort; a failed counter write must
-                // not stall frame handling.
+                // Snow telemetry is best-effort: a failed counter write must
+                // not stall frame handling, and a persistent store failure is
+                // surfaced by every other store path, so this drop is
+                // deliberate.
                 let _ = self.store.size_bucket_sample(bucket);
             }
         }
@@ -402,7 +432,7 @@ impl<S: Store> Node<S> {
 
     // ---------- records ----------
 
-    fn build_own_record(&self, seq: u64, now: u64) -> Result<(PeerRecord, Vec<u8>), String> {
+    fn build_own_record(&self, seq: u64, now: u64) -> Result<(PeerRecord, Vec<u8>), NodeError> {
         let exp = now + 7 * 24 * 3600;
         let private = self.config.mode == Mode::Private;
         let links: Vec<Identifier> = if private {
@@ -443,18 +473,15 @@ impl<S: Store> Node<S> {
                 capabilities: 1,
             },
             &self.identity.signing_seed,
-        )
-        .map_err(|e| e.to_string())?;
+        )?;
         let bytes = rec.encode();
         Ok((rec, bytes))
     }
 
-    fn publish_record(&mut self, now: u64) -> Result<(), String> {
+    fn publish_record(&mut self, now: u64) -> Result<(), NodeError> {
         let (_rec, bytes) = self.build_own_record(self.own_seq, now)?;
         let id = self.own_id;
-        self.store
-            .record_put(&id, self.scope, &bytes, now)
-            .map_err(|e| e.to_string())?;
+        self.store.record_put(&id, self.scope, &bytes, now)?;
         self.records_version += 1;
         Ok(())
     }
@@ -486,7 +513,9 @@ impl<S: Store> Node<S> {
         self.next_reconcile_at = self.next_reconcile_at.min(at + 1);
         // Publish the new link set immediately so peers can route via us.
         self.own_seq += 1;
-        let _ = self.publish_record(at);
+        if let Err(e) = self.publish_record(at) {
+            self.diag("publish_record", &e);
+        }
         self.reevaluate_link_bindings(at);
         // Prove possession of our KEL key to the peer, bound to this
         // channel. The peer folds this into its link binding; without it
@@ -516,7 +545,9 @@ impl<S: Store> Node<S> {
         self.next_link_order.retain(|l| *l != link);
         self.reconcile_sessions.remove(&link);
         self.own_seq += 1;
-        let _ = self.publish_record(at);
+        if let Err(e) = self.publish_record(at) {
+            self.diag("publish_record", &e);
+        }
         Vec::new()
     }
 
@@ -535,10 +566,17 @@ impl<S: Store> Node<S> {
             }
         }
         type RecordParts = (Identifier, Vec<Identifier>, Vec<Identifier>);
-        let records: Vec<RecordParts> = self
-            .store
-            .record_all()
-            .unwrap_or_default()
+        // On store failure the graph is empty: routing degrades to "no
+        // route" (retried next call) rather than crashing or fabricating
+        // routes. The diagnostic makes the failure visible.
+        let stored = match self.store.record_all() {
+            Ok(records) => records,
+            Err(e) => {
+                self.diag("record_all", &e);
+                Vec::new()
+            }
+        };
+        let records: Vec<RecordParts> = stored
             .iter()
             .filter_map(|(id, _scope, bytes, _recv)| {
                 PeerRecord::from_bytes(bytes, self.now, None)
@@ -564,18 +602,24 @@ impl<S: Store> Node<S> {
     }
 
     /// Reconcile item list for the stored records. Memoized on the same
-    /// key as [`Self::build_graph`].
-    fn record_items(&mut self) -> Vec<reconcile::Item> {
+    /// key as [`Self::build_graph`]. Returns `None` when the record set
+    /// cannot be read: answering a reconcile with an empty set would tell
+    /// the peer we hold nothing, so the round is skipped instead.
+    fn record_items(&mut self) -> Option<Vec<reconcile::Item>> {
         let key = (self.records_version, self.now);
         if let Some((v, t, items)) = &self.items_cache {
             if (*v, *t) == key {
-                return items.clone();
+                return Some(items.clone());
             }
         }
-        let mut items: Vec<reconcile::Item> = self
-            .store
-            .record_all()
-            .unwrap_or_default()
+        let stored = match self.store.record_all() {
+            Ok(records) => records,
+            Err(e) => {
+                self.diag("record_all", &e);
+                return None;
+            }
+        };
+        let mut items: Vec<reconcile::Item> = stored
             .iter()
             .filter_map(|(id, scope, bytes, _)| {
                 PeerRecord::from_bytes(bytes, self.now, None)
@@ -590,13 +634,16 @@ impl<S: Store> Node<S> {
         items.sort();
         items.dedup();
         self.items_cache = Some((key.0, key.1, items.clone()));
-        items
+        Some(items)
     }
 
     // ---------- reconcile ----------
 
     fn reconcile_with(&mut self, _at: u64, link: LinkId) -> Vec<Action> {
-        let items = self.record_items();
+        // Store unreadable: skip this round rather than advertise an empty set.
+        let Some(items) = self.record_items() else {
+            return Vec::new();
+        };
         // a fresh round gets a fresh session so entries echo exactly once per range
         self.reconcile_sessions
             .insert(link, ReconcileSession::new());
@@ -610,7 +657,10 @@ impl<S: Store> Node<S> {
     }
 
     fn on_reconcile(&mut self, _at: u64, link: LinkId, frame: &ReconcileFrame) -> Vec<Action> {
-        let items = self.record_items();
+        // Store unreadable: say nothing rather than claim we hold nothing.
+        let Some(items) = self.record_items() else {
+            return Vec::new();
+        };
         let session = self.reconcile_sessions.entry(link).or_default();
         let (reply, wants) = reconcile::respond(&items, &frame.ranges, session);
         let mut actions = Vec::new();
@@ -635,8 +685,10 @@ impl<S: Store> Node<S> {
         let mut records = Vec::new();
         for (id, scope) in &frame.wants {
             let scope = scope_from_u8(*scope);
-            if let Ok(Some((bytes, _))) = self.store.record_get(id, scope) {
-                records.push(bytes);
+            match self.store.record_get(id, scope) {
+                Ok(Some((bytes, _))) => records.push(bytes),
+                Ok(None) => {}
+                Err(e) => self.diag("record_get", &e),
             }
         }
         if records.is_empty() {
@@ -663,13 +715,21 @@ impl<S: Store> Node<S> {
     fn sweep_ck_claims(&mut self, now: u64) {
         let mut fresh: HashMap<X25519PublicKey, std::collections::HashSet<Identifier>> =
             HashMap::new();
-        if let Ok(records) = self.store.record_all() {
-            for (_, _, bytes, _) in records {
-                if let Ok((rec, _)) = PeerRecord::from_bytes(&bytes, now, None) {
-                    if let Some(k) = Self::claim_key(&rec) {
-                        fresh.entry(k).or_default().insert(rec.id);
+        match self.store.record_all() {
+            Ok(records) => {
+                for (_, _, bytes, _) in records {
+                    if let Ok((rec, _)) = PeerRecord::from_bytes(&bytes, now, None) {
+                        if let Some(k) = Self::claim_key(&rec) {
+                            fresh.entry(k).or_default().insert(rec.id);
+                        }
                     }
                 }
+            }
+            // Keep the old claim set rather than dropping all claims on a
+            // transient read failure; report it.
+            Err(e) => {
+                self.diag("record_all", &e);
+                return;
             }
         }
         if fresh != self.ck_claims {
@@ -683,37 +743,53 @@ impl<S: Store> Node<S> {
     /// only unbounded growth left in the store; everything else already
     /// expires (seen/delivered) or is capped (inbox, custody).
     fn sweep_expired_data(&mut self, now: u64) {
-        if let Ok(records) = self.store.record_all() {
-            for (id, scope, bytes, _) in records {
-                if id == self.own_id {
-                    continue;
-                }
-                // Skip the time check: expired records must still decode so
-                // the grace period can elapse; undecodable records are dropped.
-                let expired = match PeerRecord::from_bytes_unchecked_time(&bytes, None) {
-                    Ok((rec, _)) => rec.exp.saturating_add(RETENTION_GRACE_SECS) < now,
-                    Err(_) => true,
-                };
-                if expired && self.store.record_remove(&id, scope).is_ok() {
-                    self.records_version += 1;
-                }
-            }
-        }
-        let _ = self.store.inbox_sweep_expired(INBOX_TTL_SECS, now);
-        if let Ok(all) = self.store.outbound_all() {
-            for msg in all {
-                let terminal = matches!(
-                    msg.state,
-                    OutboundState::Delivered | OutboundState::Failed | OutboundState::Expired
-                );
-                if terminal && msg.exp.saturating_add(RETENTION_GRACE_SECS) < now {
-                    let _ = self.store.outbound_remove(&msg.mid);
+        match self.store.record_all() {
+            Ok(records) => {
+                for (id, scope, bytes, _) in records {
+                    if id == self.own_id {
+                        continue;
+                    }
+                    // Skip the time check: expired records must still decode so
+                    // the grace period can elapse; undecodable records are dropped.
+                    let expired = match PeerRecord::from_bytes_unchecked_time(&bytes, None) {
+                        Ok((rec, _)) => rec.exp.saturating_add(RETENTION_GRACE_SECS) < now,
+                        Err(_) => true,
+                    };
+                    if expired {
+                        match self.store.record_remove(&id, scope) {
+                            Ok(()) => self.records_version += 1,
+                            Err(e) => self.diag("record_remove", &e),
+                        }
+                    }
                 }
             }
+            Err(e) => self.diag("record_all", &e),
         }
-        let _ = self
+        if let Err(e) = self.store.inbox_sweep_expired(INBOX_TTL_SECS, now) {
+            self.diag("inbox_sweep_expired", &e);
+        }
+        match self.store.outbound_all() {
+            Ok(all) => {
+                for msg in all {
+                    let terminal = matches!(
+                        msg.state,
+                        OutboundState::Delivered | OutboundState::Failed | OutboundState::Expired
+                    );
+                    if terminal && msg.exp.saturating_add(RETENTION_GRACE_SECS) < now {
+                        if let Err(e) = self.store.outbound_remove(&msg.mid) {
+                            self.diag("outbound_remove", &e);
+                        }
+                    }
+                }
+            }
+            Err(e) => self.diag("outbound_all", &e),
+        }
+        if let Err(e) = self
             .store
-            .kel_head_sweep(now.saturating_sub(KEL_HEAD_MAX_AGE_SECS));
+            .kel_head_sweep(now.saturating_sub(KEL_HEAD_MAX_AGE_SECS))
+        {
+            self.diag("kel_head_sweep", &e);
+        }
         self.identity.sweep_retired_envelope_keys(now);
     }
 
@@ -828,7 +904,9 @@ impl<S: Store> Node<S> {
         }
         if changed {
             self.own_seq += 1;
-            let _ = self.publish_record(at);
+            if let Err(e) = self.publish_record(at) {
+                self.diag("publish_record", &e);
+            }
             self.next_reconcile_at = self.next_reconcile_at.min(at + 1);
         }
     }
@@ -844,7 +922,10 @@ impl<S: Store> Node<S> {
             Ok(k) => k.map(|(seq, commitment, _)| (seq, commitment)),
             // Fail closed: without the known head we cannot rule out
             // equivocation, so refuse the record.
-            Err(_) => return false,
+            Err(e) => {
+                self.diag("kel_head", &e);
+                return false;
+            }
         };
         match decoded.validate(Some(at), known) {
             Ok((rec, head)) => {
@@ -853,7 +934,10 @@ impl<S: Store> Node<S> {
                     Ok(e) => e,
                     // Fail closed: without the current row we cannot apply
                     // last-writer-wins, so keep what we have.
-                    Err(_) => return false,
+                    Err(e) => {
+                        self.diag("record_get", &e);
+                        return false;
+                    }
                 };
                 if let Some((old_bytes, _)) = existing {
                     // Lower-hash wins at equal seq (equivocation rule);
@@ -870,16 +954,24 @@ impl<S: Store> Node<S> {
                         return false; // keep ours
                     }
                 }
-                if self.store.record_put(&rec.id, scope, bytes, at).is_ok() {
-                    self.records_version += 1;
+                match self.store.record_put(&rec.id, scope, bytes, at) {
+                    Ok(()) => self.records_version += 1,
+                    Err(e) => self.diag("record_put", &e),
                 }
-                let known = self.store.kel_head(&rec.id).ok().flatten();
-                // Only advance the stored head when we could read it; on a
-                // read error, leave it alone rather than overwrite blindly.
-                if known.map(|(seq, _, _)| head.seq > seq).unwrap_or(false) {
-                    let _ = self
-                        .store
-                        .kel_head_put(&rec.id, head.seq, head.commitment, at);
+                // Advance the stored head only when we could read it, and
+                // record a first-seen head when none exists. On a read error
+                // leave the stored head alone rather than overwrite blindly.
+                match self.store.kel_head(&rec.id) {
+                    Ok(Some((seq, _, _))) if head.seq <= seq => {}
+                    Ok(_) => {
+                        if let Err(e) =
+                            self.store
+                                .kel_head_put(&rec.id, head.seq, head.commitment, at)
+                        {
+                            self.diag("kel_head_put", &e);
+                        }
+                    }
+                    Err(e) => self.diag("kel_head", &e),
                 }
                 self.note_ck_claim(&rec);
                 self.reevaluate_link_bindings(at);
@@ -985,7 +1077,8 @@ impl<S: Store> Node<S> {
             next_attempt: now,
             route: send.route,
         };
-        if self.store.outbound_push(&outbound).is_err() {
+        if let Err(e) = self.store.outbound_push(&outbound) {
+            self.diag("outbound_push", &e);
             return vec![Action::Status {
                 mid,
                 status: local::MSG_STATUS_FAILED,
@@ -1006,10 +1099,12 @@ impl<S: Store> Node<S> {
     /// Presence check only; does not validate. Used where a missing record
     /// is the error condition and validation happens (and is memoized)
     /// downstream.
-    fn has_record(&self, id: &Identifier) -> bool {
+    fn has_record(&mut self, id: &Identifier) -> bool {
         for scope in [Scope::Wan, Scope::Hive] {
-            if let Ok(Some(_)) = self.store.record_get(id, scope) {
-                return true;
+            match self.store.record_get(id, scope) {
+                Ok(Some(_)) => return true,
+                Ok(None) => {}
+                Err(e) => self.diag("record_get", &e),
             }
         }
         false
@@ -1027,16 +1122,17 @@ impl<S: Store> Node<S> {
                 return rec.clone();
             }
         }
-        let rec = self
-            .store
-            .record_get(id, scope)
-            .ok()
-            .flatten()
-            .and_then(|(bytes, _)| {
-                PeerRecord::from_bytes(&bytes, self.now, None)
-                    .ok()
-                    .map(|(r, _)| r)
-            });
+        let rec = match self.store.record_get(id, scope) {
+            Ok(Some((bytes, _))) => PeerRecord::from_bytes(&bytes, self.now, None)
+                .ok()
+                .map(|(r, _)| r),
+            Ok(None) => None,
+            // Store error: treat as missing (callers fail closed), but say so.
+            Err(e) => {
+                self.diag("record_get", &e);
+                None
+            }
+        };
         if self.record_cache.len() >= 256 {
             self.record_cache.clear();
         }
@@ -1148,10 +1244,16 @@ impl<S: Store> Node<S> {
         let own_links: HashSet<Identifier> = self.links.values().filter_map(|l| l.peer).collect();
         let recipient_gateways: HashSet<Identifier> =
             self.record_gateways(recipient).into_iter().collect();
-        let mut candidates: Vec<(Identifier, XWingPublicKey)> = self
-            .store
-            .record_all()
-            .unwrap_or_default()
+        // On store failure there is no candidate set; report and skip
+        // waypoint selection (a direct route may still work).
+        let stored = match self.store.record_all() {
+            Ok(records) => records,
+            Err(e) => {
+                self.diag("record_all", &e);
+                return None;
+            }
+        };
+        let mut candidates: Vec<(Identifier, XWingPublicKey)> = stored
             .into_iter()
             .filter_map(|(id, _scope, bytes, _)| {
                 if id == self.own_id
@@ -1176,8 +1278,23 @@ impl<S: Store> Node<S> {
     fn pump_outbound(&mut self, now: u64) -> Vec<Action> {
         let mut actions = Vec::new();
         let due = match self.store.outbound_due(now) {
-            Ok(d) => d,
-            Err(_) => return actions,
+            Ok(d) => {
+                self.outbound_due_failures = 0;
+                d
+            }
+            Err(e) => {
+                // The queue stalls until the store recovers. That is the safe
+                // direction (nothing is lost or double-sent), but it must not
+                // be silent: report every failure with a consecutive count so
+                // a persistent outage is loud, not a one-off.
+                self.outbound_due_failures = self.outbound_due_failures.saturating_add(1);
+                let n = self.outbound_due_failures;
+                self.diag(
+                    "outbound_due",
+                    format_args!("{e} (consecutive failure #{n})"),
+                );
+                return actions;
+            }
         };
         for mut msg in due {
             if msg.state != OutboundState::Queued {
@@ -1199,24 +1316,32 @@ impl<S: Store> Node<S> {
                             // The receipt clock starts when the message
                             // actually goes on the wire, not at enqueue.
                             msg.receipt_deadline = Some(now + self.receipt_timeout_for(&msg));
-                            let _ = self.store.outbound_put(&msg);
+                            if let Err(e) = self.store.outbound_put(&msg) {
+                                self.diag("outbound_put", &e);
+                            }
                         }
                         DispatchResult::NoRoute => {
                             msg.state = OutboundState::Queued;
                             msg.next_attempt = now + self.backoff(msg.attempts);
-                            let _ = self.store.outbound_put(&msg);
+                            if let Err(e) = self.store.outbound_put(&msg) {
+                                self.diag("outbound_put", &e);
+                            }
                         }
                     }
                 }
                 Err(BuildError::NoRoute) => {
                     if msg.attempts > self.config.fresh_waypoint_retries + 1 {
                         msg.state = OutboundState::Failed;
-                        let _ = self.store.outbound_put(&msg);
-                        let _ = self.store.status_set(
+                        if let Err(e) = self.store.outbound_put(&msg) {
+                            self.diag("outbound_put", &e);
+                        }
+                        if let Err(e) = self.store.status_set(
                             &msg.mid,
                             local::MSG_STATUS_FAILED,
                             Some(ERR_NO_ROUTE),
-                        );
+                        ) {
+                            self.diag("status_set", &e);
+                        }
                         actions.push(Action::Status {
                             mid: msg.mid,
                             status: local::MSG_STATUS_FAILED,
@@ -1225,18 +1350,24 @@ impl<S: Store> Node<S> {
                         });
                     } else {
                         msg.next_attempt = now + self.config.retry_base_secs;
-                        let _ = self.store.outbound_put(&msg);
+                        if let Err(e) = self.store.outbound_put(&msg) {
+                            self.diag("outbound_put", &e);
+                        }
                     }
                 }
                 Err(BuildError::Crypto) => {
                     // Deterministic failure: retrying cannot help.
                     msg.state = OutboundState::Failed;
-                    let _ = self.store.outbound_put(&msg);
-                    let _ = self.store.status_set(
+                    if let Err(e) = self.store.outbound_put(&msg) {
+                        self.diag("outbound_put", &e);
+                    }
+                    if let Err(e) = self.store.status_set(
                         &msg.mid,
                         local::MSG_STATUS_FAILED,
                         Some(ERR_INTERNAL),
-                    );
+                    ) {
+                        self.diag("status_set", &e);
+                    }
                     actions.push(Action::Status {
                         mid: msg.mid,
                         status: local::MSG_STATUS_FAILED,
@@ -1357,7 +1488,16 @@ impl<S: Store> Node<S> {
             return actions;
         }
         let leg_hash = lattice_crypto::hash(leg.as_ref());
-        if self.store.seen_contains(&leg_hash, now).unwrap_or(true) {
+        // Fail closed on store error: treat the leg as already seen so a
+        // broken store cannot cause double-processing.
+        let seen = match self.store.seen_contains(&leg_hash, now) {
+            Ok(v) => v,
+            Err(e) => {
+                self.diag("seen_contains", &e);
+                true
+            }
+        };
+        if seen {
             actions.push(Action::SendFrame {
                 pad_to: None,
                 link,
@@ -1394,7 +1534,6 @@ impl<S: Store> Node<S> {
             d.get(&dst).copied().unwrap_or(u32::MAX) as usize
         };
         let class = dist.min(BUF_CLASSES - 1) as u8;
-        let upstream_count = self.links.len().max(1) as u64;
         // Fair-share accounting is per (destination, upstream link): each
         // upstream gets custody_allowance/N per destination. The spec's
         // wording suggests a per-upstream aggregate cap; the per-destination
@@ -1402,14 +1541,7 @@ impl<S: Store> Node<S> {
         // equivalent otherwise. If per-upstream aggregate accounting is ever
         // wanted, add a second counter keyed by upstream alone and check both
         // here — the store already keys shares by (dest, upstream).
-        let share_limit = self.config.custody_allowance / upstream_count;
-        if self
-            .store
-            .share_get(&dst, link)
-            .unwrap_or(u64::MAX)
-            .saturating_add(msg_len)
-            > share_limit
-        {
+        if self.share_exceeded(&dst, link, msg_len) {
             actions.push(self.busy(link, leg));
             return actions;
         }
@@ -1417,10 +1549,7 @@ impl<S: Store> Node<S> {
         // of the transit cap, so a flood in one class cannot starve the
         // others and waits can't form a cycle (a class-d message only ever
         // waits on class < d room at the next hop).
-        let class_bytes = self.store.custody_class_bytes().unwrap_or([u64::MAX; 16]);
-        if class_bytes[class as usize].saturating_add(msg_len)
-            > self.config.transit_cap / BUF_CLASSES as u64
-        {
+        if self.class_full(class, msg_len) {
             actions.push(self.busy(link, leg));
             return actions;
         }
@@ -1442,7 +1571,8 @@ impl<S: Store> Node<S> {
             seen_hash: leg_hash,
             seen_exp: msg.header.exp,
         };
-        if self.store.custody_accept(accept).is_err() {
+        if let Err(e) = self.store.custody_accept(accept) {
+            self.diag("custody_accept", &e);
             actions.push(self.busy(link, leg));
             return actions;
         }
@@ -1457,6 +1587,35 @@ impl<S: Store> Node<S> {
         });
         self.forward_custody(now, leg, &mut actions);
         actions
+    }
+
+    /// Fair-share check for a destination on an upstream link. On store
+    /// error, fail closed (treat the allowance as exhausted) and report.
+    fn share_exceeded(&mut self, dest: &Identifier, link: LinkId, msg_len: u64) -> bool {
+        let upstream_count = self.links.len().max(1) as u64;
+        let share_limit = self.config.custody_allowance / upstream_count;
+        let used = match self.store.share_get(dest, link) {
+            Ok(v) => v,
+            Err(e) => {
+                self.diag("share_get", &e);
+                u64::MAX
+            }
+        };
+        used.saturating_add(msg_len) > share_limit
+    }
+
+    /// Transit-cap check for a buffer class. On store error, fail closed
+    /// (treat the class as full) and report.
+    fn class_full(&mut self, class: u8, msg_len: u64) -> bool {
+        let class_bytes = match self.store.custody_class_bytes() {
+            Ok(b) => b,
+            Err(e) => {
+                self.diag("custody_class_bytes", &e);
+                [u64::MAX; 16]
+            }
+        };
+        class_bytes[class as usize].saturating_add(msg_len)
+            > self.config.transit_cap / BUF_CLASSES as u64
     }
 
     fn busy(&self, link: LinkId, leg: LegId) -> Action {
@@ -1510,22 +1669,11 @@ impl<S: Store> Node<S> {
                     // second leg: fair-share + transit cap apply, same as relay.
                     let msg_len = inner.len() as u64;
                     let class = self.class_for(&hdr_dst);
-                    let upstream_count = self.links.len().max(1) as u64;
-                    let share_limit = self.config.custody_allowance / upstream_count;
-                    if self
-                        .store
-                        .share_get(&hdr_dst, link)
-                        .unwrap_or(u64::MAX)
-                        .saturating_add(msg_len)
-                        > share_limit
-                    {
+                    if self.share_exceeded(&hdr_dst, link, msg_len) {
                         actions.push(self.busy(link, leg));
                         return actions;
                     }
-                    let class_bytes = self.store.custody_class_bytes().unwrap_or([u64::MAX; 16]);
-                    if class_bytes[class as usize].saturating_add(msg_len)
-                        > self.config.transit_cap / BUF_CLASSES as u64
-                    {
+                    if self.class_full(class, msg_len) {
                         actions.push(self.busy(link, leg));
                         return actions;
                     }
@@ -1546,7 +1694,8 @@ impl<S: Store> Node<S> {
                         seen_hash: *leg_hash,
                         seen_exp: hdr_exp,
                     };
-                    if self.store.custody_accept(accept).is_err() {
+                    if let Err(e) = self.store.custody_accept(accept) {
+                        self.diag("custody_accept", &e);
                         actions.push(self.busy(link, leg));
                         return actions;
                     }
@@ -1576,22 +1725,11 @@ impl<S: Store> Node<S> {
                     };
                     let msg_len = stripped.len() as u64;
                     let class = self.class_for(&rcpt);
-                    let upstream_count = self.links.len().max(1) as u64;
-                    let share_limit = self.config.custody_allowance / upstream_count;
-                    if self
-                        .store
-                        .share_get(&rcpt, link)
-                        .unwrap_or(u64::MAX)
-                        .saturating_add(msg_len)
-                        > share_limit
-                    {
+                    if self.share_exceeded(&rcpt, link, msg_len) {
                         actions.push(self.busy(link, leg));
                         return actions;
                     }
-                    let class_bytes = self.store.custody_class_bytes().unwrap_or([u64::MAX; 16]);
-                    if class_bytes[class as usize].saturating_add(msg_len)
-                        > self.config.transit_cap / BUF_CLASSES as u64
-                    {
+                    if self.class_full(class, msg_len) {
                         actions.push(self.busy(link, leg));
                         return actions;
                     }
@@ -1612,7 +1750,8 @@ impl<S: Store> Node<S> {
                         seen_hash: *leg_hash,
                         seen_exp: msg.header.exp,
                     };
-                    if self.store.custody_accept(accept).is_err() {
+                    if let Err(e) = self.store.custody_accept(accept) {
+                        self.diag("custody_accept", &e);
                         actions.push(self.busy(link, leg));
                         return actions;
                     }
@@ -1663,7 +1802,9 @@ impl<S: Store> Node<S> {
                 if !opened.verify_signature(&key, msg.routing_header_bytes()) {
                     // Well-formed envelope, bad signature: refuse, and tell the
                     // sender if we can authenticate them at all.
-                    let _ = self.store.seen_add(*leg_hash, msg.header.exp);
+                    if let Err(e) = self.store.seen_add(*leg_hash, msg.header.exp) {
+                        self.diag("seen_add", &e);
+                    }
                     actions.push(self.refuse(link, leg));
                     actions.extend(self.send_negative_receipt(
                         now,
@@ -1685,7 +1826,9 @@ impl<S: Store> Node<S> {
         }
         if opened.kind == KIND_RECEIPT || opened.kind == KIND_NEGATIVE_RECEIPT {
             // Receipts get custody-acknowledged but never receipt-replied (no ping-pong).
-            let _ = self.store.seen_add(*leg_hash, msg.header.exp);
+            if let Err(e) = self.store.seen_add(*leg_hash, msg.header.exp) {
+                self.diag("seen_add", &e);
+            }
             actions.extend(self.on_receipt(now, &opened));
             actions.push(Action::SendFrame {
                 pad_to: None,
@@ -1700,12 +1843,19 @@ impl<S: Store> Node<S> {
         }
         let mid_bytes = opened.mid;
         let mid_hash = lattice_crypto::hash(mid_bytes.as_ref());
-        if self
-            .store
-            .delivered_contains(&mid_hash, now)
-            .unwrap_or(true)
-        {
-            let _ = self.store.seen_add(*leg_hash, msg.header.exp);
+        // Fail closed on store error: treat the message as already delivered
+        // so a broken store cannot cause duplicate delivery.
+        let already_delivered = match self.store.delivered_contains(&mid_hash, now) {
+            Ok(v) => v,
+            Err(e) => {
+                self.diag("delivered_contains", &e);
+                true
+            }
+        };
+        if already_delivered {
+            if let Err(e) = self.store.seen_add(*leg_hash, msg.header.exp) {
+                self.diag("seen_add", &e);
+            }
             actions.extend(self.send_receipt(now, &opened));
             actions.push(Action::SendFrame {
                 pad_to: None,
@@ -1718,8 +1868,22 @@ impl<S: Store> Node<S> {
             });
             return actions;
         }
-        let inbox_len = self.store.inbox_len(&opened.tsvc).unwrap_or(u64::MAX);
-        let inbox_total = self.store.inbox_len_total().unwrap_or(u64::MAX);
+        // Fail closed on store error: treat the inbox as full rather than
+        // accept a delivery we cannot account for.
+        let inbox_len = match self.store.inbox_len(&opened.tsvc) {
+            Ok(v) => v,
+            Err(e) => {
+                self.diag("inbox_len", &e);
+                u64::MAX
+            }
+        };
+        let inbox_total = match self.store.inbox_len_total() {
+            Ok(v) => v,
+            Err(e) => {
+                self.diag("inbox_len_total", &e);
+                u64::MAX
+            }
+        };
         if inbox_len >= self.config.inbox_max_deliveries
             || inbox_total >= self.config.inbox_max_total
         {
@@ -1737,12 +1901,17 @@ impl<S: Store> Node<S> {
             body: opened.body.clone().unwrap_or_default(),
             received: now,
         };
-        if self.store.inbox_push(entry.clone()).is_err() {
+        if let Err(e) = self.store.inbox_push(entry.clone()) {
+            self.diag("inbox_push", &e);
             actions.push(self.busy(link, leg));
             return actions;
         }
-        let _ = self.store.delivered_add(mid_hash, msg.header.exp);
-        let _ = self.store.seen_add(*leg_hash, msg.header.exp);
+        if let Err(e) = self.store.delivered_add(mid_hash, msg.header.exp) {
+            self.diag("delivered_add", &e);
+        }
+        if let Err(e) = self.store.seen_add(*leg_hash, msg.header.exp) {
+            self.diag("seen_add", &e);
+        }
         actions.push(Action::Deliver {
             service: opened.tsvc.clone(),
             delivery_id: entry.delivery_id,
@@ -1754,7 +1923,15 @@ impl<S: Store> Node<S> {
             body: opened.body.clone().unwrap_or_default(),
             received: now,
         });
-        let unread = self.store.inbox_len(&opened.tsvc).unwrap_or(0);
+        // Best effort: on store error report 0 rather than fail the delivery;
+        // the diagnostic carries the real failure.
+        let unread = match self.store.inbox_len(&opened.tsvc) {
+            Ok(v) => v,
+            Err(e) => {
+                self.diag("inbox_len", &e);
+                0
+            }
+        };
         actions.push(Action::Inbox {
             service: opened.tsvc.clone(),
             unread,
@@ -1800,15 +1977,24 @@ impl<S: Store> Node<S> {
     fn forward_custody(&mut self, now: u64, leg: LegId, actions: &mut Vec<Action>) {
         let entry = match self.store.custody_get(&leg) {
             Ok(Some(e)) => e,
-            _ => return,
+            // The entry is gone (already delivered or swept): nothing to do.
+            Ok(None) => return,
+            Err(e) => {
+                self.diag("custody_get", &e);
+                return;
+            }
         };
         if entry.exp <= now {
-            let _ = self.store.custody_remove(&leg);
-            let _ = self.store.share_add(
+            if let Err(e) = self.store.custody_remove(&leg) {
+                self.diag("custody_remove", &e);
+            }
+            if let Err(e) = self.store.share_add(
                 &entry.destination,
                 entry.upstream,
                 -(entry.message.len() as i64),
-            );
+            ) {
+                self.diag("share_add", &e);
+            }
             return;
         }
         let dst = entry.destination;
@@ -1858,14 +2044,23 @@ impl<S: Store> Node<S> {
             CUSTODY_ACCEPTED => match pending.as_ref().map(|p| &p.origin) {
                 Some(PendingOrigin::Outbound { mid }) => {
                     let mut service = String::new();
-                    if let Ok(Some(mut msg)) = self.store.outbound_get(mid) {
-                        msg.state = OutboundState::InFlight;
-                        service = msg.envelope.fsvc.clone();
-                        let _ = self.store.outbound_put(&msg);
+                    match self.store.outbound_get(mid) {
+                        Ok(Some(mut msg)) => {
+                            msg.state = OutboundState::InFlight;
+                            service = msg.envelope.fsvc.clone();
+                            if let Err(e) = self.store.outbound_put(&msg) {
+                                self.diag("outbound_put", &e);
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(e) => self.diag("outbound_get", &e),
                     }
-                    let _ = self
+                    if let Err(e) = self
                         .store
-                        .status_set(mid, local::MSG_STATUS_IN_TRANSIT, None);
+                        .status_set(mid, local::MSG_STATUS_IN_TRANSIT, None)
+                    {
+                        self.diag("status_set", &e);
+                    }
                     actions.push(Action::Status {
                         mid: *mid,
                         status: local::MSG_STATUS_IN_TRANSIT,
@@ -1874,12 +2069,18 @@ impl<S: Store> Node<S> {
                     });
                 }
                 Some(PendingOrigin::Relay { custody_leg }) => {
-                    if let Ok(Some(e)) = self.store.custody_remove(custody_leg) {
-                        let _ = self.store.share_add(
-                            &e.destination,
-                            e.upstream,
-                            -(e.message.len() as i64),
-                        );
+                    match self.store.custody_remove(custody_leg) {
+                        Ok(Some(e)) => {
+                            if let Err(e) = self.store.share_add(
+                                &e.destination,
+                                e.upstream,
+                                -(e.message.len() as i64),
+                            ) {
+                                self.diag("share_add", &e);
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(e) => self.diag("custody_remove", &e),
                     }
                 }
                 None => {}
@@ -1893,16 +2094,22 @@ impl<S: Store> Node<S> {
                 if let Some(p) = pending {
                     match p.origin {
                         PendingOrigin::Outbound { mid } => {
-                            if let Ok(Some(mut msg)) = self.store.outbound_get(&mid) {
-                                let until = if busy { now + retry } else { msg.exp };
-                                add_exclusion(
-                                    self.outbound_exclusions.entry(mid).or_default(),
-                                    link,
-                                    until,
-                                );
-                                msg.state = OutboundState::Queued;
-                                msg.next_attempt = now + if busy { retry } else { 0 };
-                                let _ = self.store.outbound_put(&msg);
+                            match self.store.outbound_get(&mid) {
+                                Ok(Some(mut msg)) => {
+                                    let until = if busy { now + retry } else { msg.exp };
+                                    add_exclusion(
+                                        self.outbound_exclusions.entry(mid).or_default(),
+                                        link,
+                                        until,
+                                    );
+                                    msg.state = OutboundState::Queued;
+                                    msg.next_attempt = now + if busy { retry } else { 0 };
+                                    if let Err(e) = self.store.outbound_put(&msg) {
+                                        self.diag("outbound_put", &e);
+                                    }
+                                }
+                                Ok(None) => {}
+                                Err(e) => self.diag("outbound_get", &e),
                             }
                             // Immediate retry against a different neighbor, if one exists now.
                             if !busy {
@@ -1911,19 +2118,31 @@ impl<S: Store> Node<S> {
                         }
                         PendingOrigin::Relay { custody_leg } => {
                             if busy {
-                                if let Ok(Some(mut e)) = self.store.custody_get(&custody_leg) {
-                                    add_exclusion(&mut e.excluded, link, now + retry);
-                                    let _ = self.store.custody_put(e);
+                                match self.store.custody_get(&custody_leg) {
+                                    Ok(Some(mut e)) => {
+                                        add_exclusion(&mut e.excluded, link, now + retry);
+                                        if let Err(e) = self.store.custody_put(e) {
+                                            self.diag("custody_put", &e);
+                                        }
+                                    }
+                                    Ok(None) => {}
+                                    Err(e) => self.diag("custody_get", &e),
                                 }
                                 self.forward_custody(now, custody_leg, &mut actions);
                             } else {
                                 // The downstream already holds it: drop ours and release the share.
-                                if let Ok(Some(done)) = self.store.custody_remove(&custody_leg) {
-                                    let _ = self.store.share_add(
-                                        &done.destination,
-                                        done.upstream,
-                                        -(done.message.len() as i64),
-                                    );
+                                match self.store.custody_remove(&custody_leg) {
+                                    Ok(Some(done)) => {
+                                        if let Err(e) = self.store.share_add(
+                                            &done.destination,
+                                            done.upstream,
+                                            -(done.message.len() as i64),
+                                        ) {
+                                            self.diag("share_add", &e);
+                                        }
+                                    }
+                                    Ok(None) => {}
+                                    Err(e) => self.diag("custody_remove", &e),
                                 }
                             }
                         }
@@ -1935,17 +2154,25 @@ impl<S: Store> Node<S> {
                     match p.origin {
                         PendingOrigin::Outbound { mid } => {
                             let mut service = String::new();
-                            if let Ok(Some(mut msg)) = self.store.outbound_get(&mid) {
-                                msg.state = OutboundState::Failed;
-                                self.outbound_exclusions.remove(&msg.mid);
-                                service = msg.envelope.fsvc.clone();
-                                let _ = self.store.outbound_put(&msg);
+                            match self.store.outbound_get(&mid) {
+                                Ok(Some(mut msg)) => {
+                                    msg.state = OutboundState::Failed;
+                                    self.outbound_exclusions.remove(&msg.mid);
+                                    service = msg.envelope.fsvc.clone();
+                                    if let Err(e) = self.store.outbound_put(&msg) {
+                                        self.diag("outbound_put", &e);
+                                    }
+                                }
+                                Ok(None) => {}
+                                Err(e) => self.diag("outbound_get", &e),
                             }
-                            let _ = self.store.status_set(
+                            if let Err(e) = self.store.status_set(
                                 &mid,
                                 local::MSG_STATUS_FAILED,
                                 Some(ERR_REFUSED),
-                            );
+                            ) {
+                                self.diag("status_set", &e);
+                            }
                             actions.push(Action::Status {
                                 mid,
                                 status: local::MSG_STATUS_FAILED,
@@ -1954,12 +2181,18 @@ impl<S: Store> Node<S> {
                             });
                         }
                         PendingOrigin::Relay { custody_leg } => {
-                            if let Ok(Some(e)) = self.store.custody_remove(&custody_leg) {
-                                let _ = self.store.share_add(
-                                    &e.destination,
-                                    e.upstream,
-                                    -(e.message.len() as i64),
-                                );
+                            match self.store.custody_remove(&custody_leg) {
+                                Ok(Some(e)) => {
+                                    if let Err(e) = self.store.share_add(
+                                        &e.destination,
+                                        e.upstream,
+                                        -(e.message.len() as i64),
+                                    ) {
+                                        self.diag("share_add", &e);
+                                    }
+                                }
+                                Ok(None) => {}
+                                Err(e) => self.diag("custody_remove", &e),
                             }
                         }
                     }
@@ -1985,13 +2218,21 @@ impl<S: Store> Node<S> {
             Ok(Some((s, _))) => terminal_status(s),
             Ok(None) => false,
             // Store error: fail closed and ignore the receipt.
-            Err(_) => true,
+            Err(e) => {
+                self.diag("status_get", &e);
+                true
+            }
         };
         match envelope.kind {
             KIND_RECEIPT | KIND_NEGATIVE_RECEIPT => {
-                let Ok(Some(mut msg)) = self.store.outbound_get(&reference) else {
+                let mut msg = match self.store.outbound_get(&reference) {
+                    Ok(Some(msg)) => msg,
                     // Not one of ours (or already forgotten): nothing to update.
-                    return actions;
+                    Ok(None) => return actions,
+                    Err(e) => {
+                        self.diag("outbound_get", &e);
+                        return actions;
+                    }
                 };
                 // A receipt is authoritative only from the message's recipient.
                 // The signature is verified by the caller; this binds the
@@ -2007,7 +2248,9 @@ impl<S: Store> Node<S> {
                     } else {
                         OutboundState::Failed
                     };
-                    let _ = self.store.outbound_put(&msg);
+                    if let Err(e) = self.store.outbound_put(&msg) {
+                        self.diag("outbound_put", &e);
+                    }
                 }
                 // Terminal states are sticky: a late receipt must not flip
                 // Delivered/Failed/Expired.
@@ -2019,7 +2262,9 @@ impl<S: Store> Node<S> {
                 } else {
                     (local::MSG_STATUS_FAILED, envelope.reason)
                 };
-                let _ = self.store.status_set(&reference, status, detail);
+                if let Err(e) = self.store.status_set(&reference, status, detail) {
+                    self.diag("status_set", &e);
+                }
                 self.outbound_exclusions.remove(&reference);
                 actions.push(Action::Status {
                     mid: reference,
@@ -2097,7 +2342,8 @@ impl<S: Store> Node<S> {
             next_attempt: now,
             route: 0,
         };
-        if self.store.outbound_push(&outbound).is_err() {
+        if let Err(e) = self.store.outbound_push(&outbound) {
+            self.diag("outbound_push", &e);
             return Vec::new();
         }
         self.pump_outbound(now)
@@ -2123,7 +2369,9 @@ impl<S: Store> Node<S> {
 
         if now >= self.record_refresh_at {
             self.own_seq += 1;
-            let _ = self.publish_record(now);
+            if let Err(e) = self.publish_record(now) {
+                self.diag("publish_record", &e);
+            }
             self.record_refresh_at = now + self.config.record_refresh_secs;
         }
 
@@ -2138,60 +2386,76 @@ impl<S: Store> Node<S> {
         }
 
         // Expire originated messages.
-        if let Ok(all) = self.store.outbound_all() {
-            for mut msg in all {
-                if matches!(msg.state, OutboundState::Queued | OutboundState::InFlight)
-                    && msg.exp <= now
-                {
-                    msg.state = OutboundState::Expired;
-                    let _ = self.store.outbound_put(&msg);
-                    let _ = self.store.status_set(
-                        &msg.mid,
-                        local::MSG_STATUS_EXPIRED,
-                        Some(ERR_EXPIRED),
-                    );
-                    actions.push(Action::Status {
-                        mid: msg.mid,
-                        status: local::MSG_STATUS_EXPIRED,
-                        detail: Some(ERR_EXPIRED),
-                        service: msg.envelope.fsvc.clone(),
-                    });
+        match self.store.outbound_all() {
+            Ok(all) => {
+                for mut msg in all {
+                    if matches!(msg.state, OutboundState::Queued | OutboundState::InFlight)
+                        && msg.exp <= now
+                    {
+                        msg.state = OutboundState::Expired;
+                        if let Err(e) = self.store.outbound_put(&msg) {
+                            self.diag("outbound_put", &e);
+                        }
+                        if let Err(e) = self.store.status_set(
+                            &msg.mid,
+                            local::MSG_STATUS_EXPIRED,
+                            Some(ERR_EXPIRED),
+                        ) {
+                            self.diag("status_set", &e);
+                        }
+                        actions.push(Action::Status {
+                            mid: msg.mid,
+                            status: local::MSG_STATUS_EXPIRED,
+                            detail: Some(ERR_EXPIRED),
+                            service: msg.envelope.fsvc.clone(),
+                        });
+                    }
                 }
             }
+            Err(e) => self.diag("outbound_all", &e),
         }
 
         // Receipt deadlines: retry via a fresh waypoint, else fail.
-        if let Ok(all) = self.store.outbound_all() {
-            for mut msg in all {
-                if msg.state != OutboundState::InFlight {
-                    continue;
-                }
-                let Some(deadline) = msg.receipt_deadline else {
-                    continue;
-                };
-                if now < deadline {
-                    continue;
-                }
-                if msg.attempts > self.config.fresh_waypoint_retries {
-                    msg.state = OutboundState::Failed;
-                    let _ = self.store.outbound_put(&msg);
-                    let _ = self.store.status_set(
-                        &msg.mid,
-                        local::MSG_STATUS_FAILED,
-                        Some(ERR_NO_ROUTE),
-                    );
-                    actions.push(Action::Status {
-                        mid: msg.mid,
-                        status: local::MSG_STATUS_FAILED,
-                        detail: Some(ERR_NO_ROUTE),
-                        service: msg.envelope.fsvc.clone(),
-                    });
-                } else {
-                    msg.state = OutboundState::Queued;
-                    msg.next_attempt = now;
-                    let _ = self.store.outbound_put(&msg);
+        match self.store.outbound_all() {
+            Ok(all) => {
+                for mut msg in all {
+                    if msg.state != OutboundState::InFlight {
+                        continue;
+                    }
+                    let Some(deadline) = msg.receipt_deadline else {
+                        continue;
+                    };
+                    if now < deadline {
+                        continue;
+                    }
+                    if msg.attempts > self.config.fresh_waypoint_retries {
+                        msg.state = OutboundState::Failed;
+                        if let Err(e) = self.store.outbound_put(&msg) {
+                            self.diag("outbound_put", &e);
+                        }
+                        if let Err(e) = self.store.status_set(
+                            &msg.mid,
+                            local::MSG_STATUS_FAILED,
+                            Some(ERR_NO_ROUTE),
+                        ) {
+                            self.diag("status_set", &e);
+                        }
+                        actions.push(Action::Status {
+                            mid: msg.mid,
+                            status: local::MSG_STATUS_FAILED,
+                            detail: Some(ERR_NO_ROUTE),
+                            service: msg.envelope.fsvc.clone(),
+                        });
+                    } else {
+                        msg.state = OutboundState::Queued;
+                        msg.next_attempt = now;
+                        if let Err(e) = self.store.outbound_put(&msg) {
+                            self.diag("outbound_put", &e);
+                        }
+                    }
                 }
             }
+            Err(e) => self.diag("outbound_all", &e),
         }
 
         // Custody offers that never got an answer: exclude the link and retry.
@@ -2210,25 +2474,37 @@ impl<S: Store> Node<S> {
                         for (l, u) in p.excluded {
                             add_exclusion(excl, l, u);
                         }
-                        if let Ok(Some(mut msg)) = self.store.outbound_get(&mid) {
-                            if msg.state == OutboundState::InFlight {
-                                msg.state = OutboundState::Queued;
-                                msg.next_attempt = now + self.config.retry_base_secs;
-                                let _ = self.store.outbound_put(&msg);
+                        match self.store.outbound_get(&mid) {
+                            Ok(Some(mut msg)) => {
+                                if msg.state == OutboundState::InFlight {
+                                    msg.state = OutboundState::Queued;
+                                    msg.next_attempt = now + self.config.retry_base_secs;
+                                    if let Err(e) = self.store.outbound_put(&msg) {
+                                        self.diag("outbound_put", &e);
+                                    }
+                                }
                             }
+                            Ok(None) => {}
+                            Err(e) => self.diag("outbound_get", &e),
                         }
                     }
                     PendingOrigin::Relay { custody_leg } => {
-                        if let Ok(Some(mut e)) = self.store.custody_get(&custody_leg) {
-                            add_exclusion(
-                                &mut e.excluded,
-                                p.link,
-                                now + self.config.retry_base_secs,
-                            );
-                            for (l, u) in p.excluded {
-                                add_exclusion(&mut e.excluded, l, u);
+                        match self.store.custody_get(&custody_leg) {
+                            Ok(Some(mut e)) => {
+                                add_exclusion(
+                                    &mut e.excluded,
+                                    p.link,
+                                    now + self.config.retry_base_secs,
+                                );
+                                for (l, u) in p.excluded {
+                                    add_exclusion(&mut e.excluded, l, u);
+                                }
+                                if let Err(e) = self.store.custody_put(e) {
+                                    self.diag("custody_put", &e);
+                                }
                             }
-                            let _ = self.store.custody_put(e);
+                            Ok(None) => {}
+                            Err(e) => self.diag("custody_get", &e),
                         }
                         self.forward_custody(now, custody_leg, &mut actions);
                     }
@@ -2239,35 +2515,49 @@ impl<S: Store> Node<S> {
         // Custody entries with nothing in flight get a forwarding attempt.
         // Lower classes first: messages closer to their destination drain
         // first, which is what keeps the class partition deadlock-free.
-        if let Ok(mut all) = self.store.custody_all() {
-            all.sort_by_key(|e| e.class);
-            for entry in all {
-                let offer_leg = lattice_proto::Message::parse(&entry.message, now)
-                    .map(|m| m.header.leg)
-                    .unwrap_or(entry.leg);
-                let in_flight = self.pending.contains_key(&offer_leg);
-                if !in_flight {
-                    self.forward_custody(now, entry.leg, &mut actions);
-                }
-            }
-        }
-
-        // Expire custody entries whose messages timed out.
-        if let Ok(all) = self.store.custody_all() {
-            for entry in all {
-                if entry.exp <= now {
-                    if let Ok(Some(e)) = self.store.custody_remove(&entry.leg) {
-                        let _ = self.store.share_add(
-                            &e.destination,
-                            e.upstream,
-                            -(e.message.len() as i64),
-                        );
+        match self.store.custody_all() {
+            Ok(mut all) => {
+                all.sort_by_key(|e| e.class);
+                for entry in all {
+                    let offer_leg = lattice_proto::Message::parse(&entry.message, now)
+                        .map(|m| m.header.leg)
+                        .unwrap_or(entry.leg);
+                    let in_flight = self.pending.contains_key(&offer_leg);
+                    if !in_flight {
+                        self.forward_custody(now, entry.leg, &mut actions);
                     }
                 }
             }
+            Err(e) => self.diag("custody_all", &e),
         }
 
-        let _ = self.store.sweep_expired(now);
+        // Expire custody entries whose messages timed out.
+        match self.store.custody_all() {
+            Ok(all) => {
+                for entry in all {
+                    if entry.exp <= now {
+                        match self.store.custody_remove(&entry.leg) {
+                            Ok(Some(e)) => {
+                                if let Err(e) = self.store.share_add(
+                                    &e.destination,
+                                    e.upstream,
+                                    -(e.message.len() as i64),
+                                ) {
+                                    self.diag("share_add", &e);
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(e) => self.diag("custody_remove", &e),
+                        }
+                    }
+                }
+            }
+            Err(e) => self.diag("custody_all", &e),
+        }
+
+        if let Err(e) = self.store.sweep_expired(now) {
+            self.diag("sweep_expired", &e);
+        }
         actions.extend(self.pump_outbound(now));
         actions
     }
@@ -2344,8 +2634,9 @@ impl<S: Store> Node<S> {
 
     fn note_snow_send(&mut self, bucket: usize) {
         self.snow_history[bucket.min(2)] += 1;
-        // Snow telemetry is best-effort; a failed counter write must not
-        // stall sending.
+        // Snow telemetry is best-effort: a failed counter write must not
+        // stall sending, and a persistent store failure is surfaced by every
+        // other store path, so this drop is deliberate.
         let _ = self.store.size_bucket_sample(bucket.min(2) as u8);
     }
 
@@ -2440,7 +2731,12 @@ impl<S: Store> Node<S> {
     /// Rebuild from parts after a simulated crash. The store holds the
     /// pre-crash custody state; the node re-announces nothing and simply
     /// resumes (it holds its own record already).
-    pub fn restore(config: Config, identity: Identity, store: S, now: u64) -> Result<Self, String> {
+    pub fn restore(
+        config: Config,
+        identity: Identity,
+        store: S,
+        now: u64,
+    ) -> Result<Self, NodeError> {
         Self::new(config, identity, store, now)
     }
 
@@ -2453,7 +2749,7 @@ impl<S: Store> Node<S> {
         identity: Identity,
         now: u64,
         publish: bool,
-    ) -> Result<(), String> {
+    ) -> Result<(), NodeError> {
         self.identity = identity;
         if !publish {
             return Ok(());
@@ -2473,9 +2769,17 @@ impl<S: Store> Node<S> {
         self.draining
     }
 
-    /// Bytes currently held in custody (for drain reporting).
-    pub fn custody_bytes(&self) -> u64 {
-        self.store.custody_bytes().unwrap_or(0)
+    /// Bytes currently held in custody (for drain reporting). On store
+    /// error, reports 0 and records a diagnostic; the drain report is
+    /// best-effort and the daemon logs the diagnostic.
+    pub fn custody_bytes(&mut self) -> u64 {
+        match self.store.custody_bytes() {
+            Ok(v) => v,
+            Err(e) => {
+                self.diag("custody_bytes", &e);
+                0
+            }
+        }
     }
 
     /// Is there currently a path to `dst` over the known record graph?
@@ -2500,41 +2804,61 @@ impl<S: Store> Node<S> {
         self.links.get(&link).map(|l| l.peer)
     }
 
-    /// Test/diagnostic accessors (not part of the daemon API).
+    /// Test/diagnostic accessors (not part of the daemon API). Store errors
+    /// read as zero/empty and are recorded as diagnostics.
     #[doc(hidden)]
-    pub fn debug_custody_count(&self) -> usize {
-        self.store.custody_all().map(|v| v.len()).unwrap_or(0)
+    pub fn debug_custody_count(&mut self) -> usize {
+        match self.store.custody_all() {
+            Ok(v) => v.len(),
+            Err(e) => {
+                self.diag("custody_all", &e);
+                0
+            }
+        }
     }
 
     #[doc(hidden)]
-    pub fn debug_custody_classes(&self) -> Vec<u8> {
-        self.store
-            .custody_all()
-            .map(|v| v.into_iter().map(|e| e.class).collect())
-            .unwrap_or_default()
+    pub fn debug_custody_classes(&mut self) -> Vec<u8> {
+        match self.store.custody_all() {
+            Ok(v) => v.into_iter().map(|e| e.class).collect(),
+            Err(e) => {
+                self.diag("custody_all", &e);
+                Vec::new()
+            }
+        }
     }
 
     #[doc(hidden)]
-    pub fn debug_custody_upstreams(&self) -> Vec<u64> {
-        self.store
-            .custody_all()
-            .map(|v| v.into_iter().map(|e| e.upstream).collect())
-            .unwrap_or_default()
+    pub fn debug_custody_upstreams(&mut self) -> Vec<u64> {
+        match self.store.custody_all() {
+            Ok(v) => v.into_iter().map(|e| e.upstream).collect(),
+            Err(e) => {
+                self.diag("custody_all", &e);
+                Vec::new()
+            }
+        }
     }
 
     #[doc(hidden)]
-    pub fn debug_record_count(&self) -> usize {
-        self.store.record_count().unwrap_or(0)
+    pub fn debug_record_count(&mut self) -> usize {
+        match self.store.record_count() {
+            Ok(v) => v,
+            Err(e) => {
+                self.diag("record_count", &e);
+                0
+            }
+        }
     }
 
     #[doc(hidden)]
-    pub fn debug_record_ids(&self) -> Vec<Identifier> {
-        self.store
-            .record_all()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|(id, _, _, _)| id)
-            .collect()
+    pub fn debug_record_ids(&mut self) -> Vec<Identifier> {
+        match self.store.record_all() {
+            Ok(v) => v.into_iter().map(|(id, _, _, _)| id).collect(),
+            Err(e) => {
+                self.diag("record_all", &e);
+                Vec::new()
+            }
+        }
     }
 
     #[doc(hidden)]
@@ -2552,19 +2876,24 @@ impl<S: Store> Node<S> {
     }
 
     /// (have record, mode as 0=public/1=private)
-    pub fn lookup(&self, id: &Identifier) -> (bool, Option<u64>) {
+    pub fn lookup(&mut self, id: &Identifier) -> (bool, Option<u64>) {
         for scope in [
             lattice_proto::record::Scope::Wan,
             lattice_proto::record::Scope::Hive,
         ] {
-            if let Ok(Some((bytes, _))) = self.store.record_get(id, scope) {
-                let mode = lattice_proto::record::PeerRecord::from_bytes(&bytes, self.now, None)
-                    .map(|(r, _)| match r.mode {
-                        lattice_proto::record::Mode::Public => 0,
-                        lattice_proto::record::Mode::Private => 1,
-                    })
-                    .ok();
-                return (true, mode);
+            match self.store.record_get(id, scope) {
+                Ok(Some((bytes, _))) => {
+                    let mode =
+                        lattice_proto::record::PeerRecord::from_bytes(&bytes, self.now, None)
+                            .map(|(r, _)| match r.mode {
+                                lattice_proto::record::Mode::Public => 0,
+                                lattice_proto::record::Mode::Private => 1,
+                            })
+                            .ok();
+                    return (true, mode);
+                }
+                Ok(None) => {}
+                Err(e) => self.diag("record_get", &e),
             }
         }
         (false, None)
@@ -2572,8 +2901,16 @@ impl<S: Store> Node<S> {
 
     fn on_app_ack(&mut self, now: u64, service: &str, delivery_ids: &[DeliveryId]) -> Vec<Action> {
         let _ = now;
-        let _ = self.store.inbox_ack(service, delivery_ids);
-        let unread = self.store.inbox_len(service).unwrap_or(0);
+        if let Err(e) = self.store.inbox_ack(service, delivery_ids) {
+            self.diag("inbox_ack", &e);
+        }
+        let unread = match self.store.inbox_len(service) {
+            Ok(v) => v,
+            Err(e) => {
+                self.diag("inbox_len", &e);
+                0
+            }
+        };
         vec![Action::Inbox {
             service: service.to_string(),
             unread,
@@ -2794,7 +3131,10 @@ mod tests {
         let err = id
             .rotate(&SigningSeed::from_bytes([9u8; 32]), Some(next_next))
             .unwrap_err();
-        assert!(err.contains("pre-rotation"), "unexpected error: {err}");
+        assert!(
+            matches!(err, NodeError::NextKeyMismatch),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -2805,7 +3145,10 @@ mod tests {
         let err = id
             .rotate(&SigningSeed::from_bytes([7u8; 32]), None)
             .unwrap_err();
-        assert!(err.contains("abandoned"), "unexpected error: {err}");
+        assert!(
+            matches!(err, NodeError::Abandoned),
+            "unexpected error: {err}"
+        );
         let head = KeyEvent::validate_chain(&id.kel).unwrap();
         assert!(head.abandoned);
     }

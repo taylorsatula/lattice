@@ -628,6 +628,7 @@ dependencies = [
  "lattice-proto",
  "lattice-store",
  "lattice-types",
+ "thiserror",
 ]
 
 [[package]]

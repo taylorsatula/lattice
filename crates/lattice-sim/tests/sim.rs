@@ -514,7 +514,7 @@ fn custody_drains_after_delivery() {
     sim.force_app_send(0, send);
     sim.run_for(20);
     assert!(sim.deliveries.iter().any(|d| d.body == b"track me"));
-    for (i, node) in sim.nodes.iter().enumerate() {
+    for (i, node) in sim.nodes.iter_mut().enumerate() {
         assert_eq!(
             node.debug_custody_count(),
             0,

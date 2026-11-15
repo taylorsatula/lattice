@@ -6,6 +6,22 @@ use lattice_types::{DeliveryId, Identifier, MessageId, X25519PublicKey};
 /// Link identifier assigned by the transport (simulator or sockets layer).
 pub type LinkId = u64;
 
+/// A non-fatal internal failure observed by the sans-IO core.
+///
+/// The core cannot log and cannot act on these itself; the caller (daemon
+/// or simulator) drains them from [`crate::Node::handle`] and decides how
+/// to surface them. A diagnostic means "the node kept going, but something
+/// it tried to do did not happen" — e.g. a store write was lost. The node
+/// never silently drops a store failure without either reporting it here
+/// or carrying a comment explaining why dropping is correct.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Diagnostic {
+    /// Static tag naming the operation that failed (e.g. `"outbound_put"`).
+    pub op: &'static str,
+    /// The underlying error, rendered.
+    pub detail: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct AppSend {
     /// Service making the request (must match an authenticated service at the API edge).
