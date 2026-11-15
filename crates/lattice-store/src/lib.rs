@@ -98,13 +98,6 @@ pub struct KelHeadSeen {
     pub seen: u64,
 }
 
-/// A saved peer address.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SavedPeer {
-    pub id: Identifier,
-    pub address: String,
-}
-
 /// A neighbor excluded from custody forwarding until `until` (unix time).
 ///
 /// Serialized as `[link, until]` inside custody entries; the serde impls
@@ -226,10 +219,6 @@ pub trait Store {
     ) -> Result<(), StoreError>;
     /// Drop KEL heads last seen before `older_than`. Returns how many were removed.
     fn kel_head_sweep(&mut self, older_than: u64) -> Result<usize, StoreError>;
-
-    // saved peer addresses, kept beyond record expiry
-    fn peer_save(&mut self, id: &Identifier, address: &str) -> Result<(), StoreError>;
-    fn peer_saved(&self) -> Result<Vec<SavedPeer>, StoreError>;
 
     // outbound queue
     fn outbound_push(&mut self, msg: &OutboundMessage) -> Result<(), StoreError>;

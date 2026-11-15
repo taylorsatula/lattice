@@ -91,7 +91,6 @@ const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
 const RECORDS: TableDefinition<[u8; 33], Vec<u8>> = TableDefinition::new("records");
 const RECORD_RECV: TableDefinition<[u8; 33], u64> = TableDefinition::new("record_recv");
 const KEL_HEADS: TableDefinition<[u8; 32], [u8; 48]> = TableDefinition::new("kel_heads");
-const PEERS: TableDefinition<[u8; 32], &str> = TableDefinition::new("peers");
 const OUTBOUND: TableDefinition<[u8; 16], Vec<u8>> = TableDefinition::new("outbound");
 const CUSTODY: TableDefinition<[u8; 16], Vec<u8>> = TableDefinition::new("custody");
 const SHARES: TableDefinition<[u8; 40], u64> = TableDefinition::new("shares");
@@ -198,7 +197,6 @@ impl RedbStore {
             RECORDS,
             RECORD_RECV,
             KEL_HEADS,
-            PEERS,
             OUTBOUND,
             CUSTODY,
             SHARES,
@@ -497,29 +495,6 @@ impl Store for RedbStore {
             let mut t = txn.open_table(KEL_HEADS)?;
             t.insert(*id.as_bytes(), raw)?;
             Ok(())
-        })
-    }
-
-    fn peer_save(&mut self, id: &Identifier, address: &str) -> Result<(), StoreError> {
-        self.write("peer_save", |txn| {
-            let mut t = txn.open_table(PEERS)?;
-            t.insert(*id.as_bytes(), address)?;
-            Ok(())
-        })
-    }
-
-    fn peer_saved(&self) -> Result<Vec<SavedPeer>, StoreError> {
-        self.read("peer_saved", |txn| {
-            let t = txn.open_table(PEERS)?;
-            let mut out = Vec::new();
-            for entry in t.iter()? {
-                let (k, v) = entry?;
-                out.push(SavedPeer {
-                    id: Identifier::from_bytes(k.value()),
-                    address: v.value().to_string(),
-                });
-            }
-            Ok(out)
         })
     }
 

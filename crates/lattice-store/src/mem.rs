@@ -12,7 +12,6 @@ use lattice_types::{Commitment, DeliveryId, Hash32, Identifier, LegId, MessageId
 pub struct MemStore {
     records: HashMap<(Identifier, u8), RecordBytes>,
     kel_heads: HashMap<Identifier, KelHeadSeen>,
-    saved_peers: HashMap<Identifier, String>,
     outbound: HashMap<MessageId, OutboundMessage>,
     custody: HashMap<LegId, CustodyEntry>,
     shares: HashMap<(Identifier, u64), u64>,
@@ -108,21 +107,6 @@ impl Store for MemStore {
         let before = self.kel_heads.len();
         self.kel_heads.retain(|_, h| h.seen >= older_than);
         Ok(before - self.kel_heads.len())
-    }
-
-    fn peer_save(&mut self, id: &Identifier, address: &str) -> Result<(), StoreError> {
-        self.saved_peers.insert(*id, address.to_string());
-        Ok(())
-    }
-    fn peer_saved(&self) -> Result<Vec<SavedPeer>, StoreError> {
-        Ok(self
-            .saved_peers
-            .iter()
-            .map(|(k, v)| SavedPeer {
-                id: *k,
-                address: v.clone(),
-            })
-            .collect())
     }
 
     fn outbound_push(&mut self, msg: &OutboundMessage) -> Result<(), StoreError> {

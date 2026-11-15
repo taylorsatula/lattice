@@ -611,7 +611,6 @@ redb tables, derived from the objects above:
 | `seen` | BLAKE3(leg) | Expiry. Hop-level dedup |
 | `delivered` | BLAKE3(mid) | Expiry. Recipient-level dedup |
 | `kel_heads` | id | Latest KEL sn and event hash, last-seen time (kept one year) |
-| `peers` | id | Saved endpoint addresses, kept independently of record expiry |
 | `inbox` | delivery id | Service, delivery fields, received |
 | `status` | mid | Latest status, for the API |
 
