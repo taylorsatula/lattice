@@ -76,6 +76,10 @@ pub enum NetError {
     Timeout,
     /// The input or configuration is invalid (bad endpoint, bad path, ...).
     InvalidInput(&'static str),
+    /// No address survived scope filtering (or none was provided), so no
+    /// connection was attempted — e.g. every record IP was private-scoped
+    /// for a WAN record.
+    NoUsableAddress,
 }
 
 impl From<std::io::Error> for NetError {
@@ -100,6 +104,7 @@ impl core::fmt::Display for NetError {
             NetError::UnexpectedFrame => write!(f, "unexpected frame"),
             NetError::Timeout => write!(f, "operation timed out"),
             NetError::InvalidInput(m) => write!(f, "invalid input: {m}"),
+            NetError::NoUsableAddress => write!(f, "no usable address for this endpoint"),
         }
     }
 }
@@ -119,7 +124,8 @@ impl std::error::Error for NetError {
             | NetError::FrameTooLarge
             | NetError::UnexpectedFrame
             | NetError::Timeout
-            | NetError::InvalidInput(_) => None,
+            | NetError::InvalidInput(_)
+            | NetError::NoUsableAddress => None,
         }
     }
 }

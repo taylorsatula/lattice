@@ -28,15 +28,15 @@ pub struct CookieState {
     now: u64,
 }
 
-fn mac(key: &[u8], msg: &[u8]) -> [u8; 32] {
-    debug_assert!(key.len() <= 32, "Blake2s accepts at most 32-byte keys");
+fn mac<const N: usize>(key: &[u8; N], msg: &[u8]) -> [u8; 32] {
+    debug_assert!(N <= 32, "Blake2s accepts at most 32-byte keys");
     let mut m = <Blake2sMac256 as KeyInit>::new_from_slice(key)
         .expect("Blake2s accepts keys of 0..=32 bytes");
     m.update(msg);
     m.finalize().into_bytes().into()
 }
 
-fn mac16(key: &[u8], msg: &[u8]) -> Mac16 {
+fn mac16<const N: usize>(key: &[u8; N], msg: &[u8]) -> Mac16 {
     Mac16::from_bytes(mac(key, msg)[..16].try_into().unwrap())
 }
 
@@ -96,7 +96,7 @@ impl CookieState {
     /// Verify `mac2` for the given client address and init message.
     pub fn verify_mac2(&self, addr: &[u8], init_msg: &[u8], mac2: &Mac16) -> bool {
         self.cookie_candidates(addr).iter().any(|cookie| {
-            mac16(cookie.as_ref(), init_msg)
+            mac16(cookie.as_bytes(), init_msg)
                 .as_ref()
                 .ct_eq(mac2.as_ref())
                 .unwrap_u8()
@@ -107,12 +107,12 @@ impl CookieState {
 
 /// mac1 over the init message, keyed by the responder's channel key.
 pub fn mac1(channel_key: &ChannelPublicKey, init_msg: &[u8]) -> Mac16 {
-    mac16(channel_key.as_ref(), init_msg)
+    mac16(channel_key.as_bytes(), init_msg)
 }
 
 /// mac2 over the init message, keyed by the cookie the client received.
 pub fn mac2(cookie: &Cookie, init_msg: &[u8]) -> Mac16 {
-    mac16(cookie.as_ref(), init_msg)
+    mac16(cookie.as_bytes(), init_msg)
 }
 
 #[cfg(test)]

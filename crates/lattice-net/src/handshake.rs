@@ -9,19 +9,18 @@ pub const PARAMS_XX: &str = "Noise_XX_25519_ChaChaPoly_BLAKE2s";
 /// Size of an XX first message (a bare 32-byte ephemeral key).
 /// An IK first message is strictly larger (32 + 48-byte encrypted static +
 /// 16-byte tag for the empty payload), so length discrimination is exact
-/// for these two patterns. If either pattern or its payload changes, this
-/// constant and the server-side branch must change with it.
+/// for these two patterns. If either pattern or its payload changes, these
+/// constants and the server-side branch must change with it; the
+/// `msg1_lengths_match_pattern_constants` test pins both.
 pub const XX_MSG1_LEN: usize = 32;
 
-pub enum Role {
-    Initiator,
-    Responder,
-}
+/// Size of an IK first message: 32-byte ephemeral + 48-byte encrypted
+/// static key (32-byte key + 16-byte Poly1305 tag) + 16-byte tag for the
+/// empty payload.
+pub const IK_MSG1_LEN: usize = 96;
 
 pub struct Pending {
     pub state: HandshakeState,
-    /// The exact bytes of the first message, for mac1/mac2 recomputation on retry.
-    pub first_message: Option<Vec<u8>>,
     pub ik: bool,
 }
 
@@ -37,11 +36,7 @@ impl Pending {
             .local_private_key(x_seed.as_ref())?
             .remote_public_key(x_pub.as_ref())?
             .build_initiator()?;
-        Ok(Self {
-            state,
-            first_message: None,
-            ik: true,
-        })
+        Ok(Self { state, ik: true })
     }
 
     pub fn initiator_xx(seed: &ChannelSeed) -> Result<Self, snow::Error> {
@@ -49,11 +44,7 @@ impl Pending {
         let state = Builder::new(PARAMS_XX.parse()?)
             .local_private_key(x_seed.as_ref())?
             .build_initiator()?;
-        Ok(Self {
-            state,
-            first_message: None,
-            ik: false,
-        })
+        Ok(Self { state, ik: false })
     }
 
     pub fn responder_ik(seed: &ChannelSeed) -> Result<Self, snow::Error> {
@@ -61,11 +52,7 @@ impl Pending {
         let state = Builder::new(PARAMS_IK.parse()?)
             .local_private_key(x_seed.as_ref())?
             .build_responder()?;
-        Ok(Self {
-            state,
-            first_message: None,
-            ik: true,
-        })
+        Ok(Self { state, ik: true })
     }
 
     pub fn responder_xx(seed: &ChannelSeed) -> Result<Self, snow::Error> {
@@ -73,20 +60,13 @@ impl Pending {
         let state = Builder::new(PARAMS_XX.parse()?)
             .local_private_key(x_seed.as_ref())?
             .build_responder()?;
-        Ok(Self {
-            state,
-            first_message: None,
-            ik: false,
-        })
+        Ok(Self { state, ik: false })
     }
 
     pub fn write_message(&mut self, payload: &[u8]) -> Result<Vec<u8>, snow::Error> {
         let mut buf = vec![0u8; 2048];
         let n = self.state.write_message(payload, &mut buf)?;
         buf.truncate(n);
-        if self.first_message.is_none() {
-            self.first_message = Some(buf.clone());
-        }
         Ok(buf)
     }
 
@@ -95,10 +75,6 @@ impl Pending {
         let n = self.state.read_message(msg, &mut buf)?;
         buf.truncate(n);
         Ok(buf)
-    }
-
-    pub fn is_finished(&self) -> bool {
-        self.state.is_handshake_finished()
     }
 
     pub fn remote_static(&self) -> Option<Vec<u8>> {
@@ -113,7 +89,7 @@ impl Pending {
 /// Encode a handshake frame (Init/Resp/Cookie) padded to exactly 2048 bytes.
 pub fn encode_handshake_frame(frame: &lattice_proto::frames::Frame) -> Option<Vec<u8>> {
     use lattice_proto::frames::{CookieFrame, Frame, InitFrame, RespFrame};
-    let build = |pad: usize| -> Vec<u8> {
+    let build = |pad: usize| -> Option<Vec<u8>> {
         let padded = match frame {
             Frame::Init(f) => Frame::Init(InitFrame {
                 padding: vec![0u8; pad],
@@ -127,14 +103,16 @@ pub fn encode_handshake_frame(frame: &lattice_proto::frames::Frame) -> Option<Ve
                 padding: vec![0u8; pad],
                 ..f.clone()
             }),
-            _ => panic!("only handshake frames are padded"),
+            // Only handshake frames may be padded; anything else is a
+            // caller bug, reported as None rather than a panic.
+            _ => return None,
         };
-        lattice_proto::encode(&padded.to_value())
+        Some(lattice_proto::encode(&padded.to_value()))
     };
-    let base = build(0).len();
+    let base = build(0)?.len();
     let mut pad = 2048usize.saturating_sub(base);
     for _ in 0..16 {
-        let enc = build(pad);
+        let enc = build(pad)?;
         match enc.len().cmp(&2048) {
             std::cmp::Ordering::Equal => return Some(enc),
             std::cmp::Ordering::Less => pad += 2048 - enc.len(),
@@ -142,4 +120,21 @@ pub fn encode_handshake_frame(frame: &lattice_proto::frames::Frame) -> Option<Ve
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The server dispatches IK vs XX on the msg1 length; if either pattern's
+    // msg1 ever changes size, the dispatch silently mis-routes. Pin both.
+    #[test]
+    fn msg1_lengths_match_pattern_constants() {
+        let seed = ChannelSeed::from_bytes([0xA1; 32]);
+        let responder = lattice_crypto::channel_public(&ChannelSeed::from_bytes([0xB2; 32]));
+        let mut ik = Pending::initiator_ik(&seed, &responder).unwrap();
+        let mut xx = Pending::initiator_xx(&seed).unwrap();
+        assert_eq!(ik.write_message(&[]).unwrap().len(), IK_MSG1_LEN);
+        assert_eq!(xx.write_message(&[]).unwrap().len(), XX_MSG1_LEN);
+    }
 }
