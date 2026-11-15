@@ -555,12 +555,14 @@ pub fn record_hash(bytes: &[u8]) -> Hash32 {
 
 /// Equivocation: two records, same (id, scope, seq), different bytes.
 /// Callers must have validated both signatures before calling.
+#[must_use]
 pub fn is_equivocation(a: &PeerRecord, a_bytes: &[u8], b: &PeerRecord, b_bytes: &[u8]) -> bool {
     a.id == b.id && a.scope == b.scope && a.seq == b.seq && a_bytes != b_bytes
 }
 
 /// Last-writer-wins comparison: higher seq wins; equal seq, lower hash wins.
 /// Returns Ordering of `a` vs `b` (Greater means a wins).
+#[must_use]
 pub fn compare_lww(a_bytes: &[u8], a_seq: u64, b_bytes: &[u8], b_seq: u64) -> std::cmp::Ordering {
     match a_seq.cmp(&b_seq) {
         // Equal seq: the record with the lower BLAKE3 hash wins.
@@ -612,6 +614,7 @@ fn validate_endpoint(ep: &Endpoint, scope: Scope) -> Result<(), ProtoError> {
     Ok(())
 }
 
+#[must_use]
 pub fn is_globally_routable(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => is_v4_global(v4),
@@ -635,6 +638,7 @@ pub fn is_globally_routable(ip: IpAddr) -> bool {
 /// IPv6 ranges that embed an IPv4 address. A WAN endpoint naming one of
 /// these is either a deprecated transition mechanism or a tunnel whose
 /// embedded destination we cannot vet, so fail closed.
+#[must_use]
 fn is_ipv4_embedding(v6: &std::net::Ipv6Addr) -> bool {
     let s = v6.segments();
     // ::/96 — deprecated IPv4-compatible addresses (::a.b.c.d)
@@ -656,6 +660,7 @@ fn is_ipv4_embedding(v6: &std::net::Ipv6Addr) -> bool {
     false
 }
 
+#[must_use]
 fn is_v4_global(ip: Ipv4Addr) -> bool {
     let o = ip.octets();
     let private = matches!(

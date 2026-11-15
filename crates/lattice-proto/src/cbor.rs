@@ -65,10 +65,22 @@ impl fmt::Display for DecodeError {
 impl std::error::Error for DecodeError {}
 
 impl Value {
+    /// Build a map from `pairs`, sorting keys into canonical order.
+    ///
+    /// # Panics
+    ///
+    /// Panics if two pairs carry equal keys. The decoder rejects duplicate
+    /// keys, so a duplicate here would encode to bytes nothing can decode;
+    /// every call site builds maps from literal unique keys, so a duplicate
+    /// is always a programming error and is reported at the call site
+    /// rather than emitted as undecodable bytes.
     pub fn map(pairs: Vec<(Value, Value)>) -> Value {
         let mut indexed: Vec<(Vec<u8>, Value, Value)> =
             pairs.into_iter().map(|(k, v)| (encode(&k), k, v)).collect();
         indexed.sort_by(|a, b| a.0.len().cmp(&b.0.len()).then_with(|| a.0.cmp(&b.0)));
+        for w in indexed.windows(2) {
+            assert!(w[0].0 != w[1].0, "Value::map: duplicate key {:?}", w[0].1);
+        }
         Value::Map(indexed.into_iter().map(|(_, k, v)| (k, v)).collect())
     }
 
@@ -108,6 +120,7 @@ impl Value {
             _ => None,
         }
     }
+    #[must_use]
     pub fn is_null(&self) -> bool {
         matches!(self, Value::Null)
     }

@@ -24,7 +24,7 @@ pub use sign::{
     public_key, sign, verify,
 };
 pub use xwing::generate_keypair;
-pub use xwing::{XWingKeypair, public_key as xwing_public_key};
+pub use xwing::{SealError, XWingKeypair, public_key as xwing_public_key};
 
 pub fn hash(data: &[u8]) -> Hash32 {
     Hash32::from_bytes(*blake3::hash(data).as_bytes())

@@ -124,6 +124,7 @@ impl KeyEvent {
     }
 
     /// Signature check for this single event against its own key.
+    #[must_use]
     pub fn verify_signature(&self) -> bool {
         verify(&self.key, &encode(&self.unsigned_value()), &self.sig)
     }
@@ -282,6 +283,7 @@ impl ValidatedKel {
     }
 
     /// Always false: a validated KEL holds at least the inception event.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         false
     }
@@ -303,6 +305,7 @@ impl ValidatedKel {
 
     /// True if the chain ends in an abandonment (a rotation with no
     /// next-key commitment).
+    #[must_use]
     pub fn is_abandoned(&self) -> bool {
         self.head.abandoned
     }

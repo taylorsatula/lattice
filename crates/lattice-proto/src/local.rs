@@ -34,6 +34,10 @@ pub const OP_LINK: u64 = 105;
 pub const OP_UNLINK: u64 = 106;
 pub const OP_DRAIN: u64 = 107;
 
+// Local-API response codes carried in `Response::Err`. This is a separate
+// namespace from the `ERR_*` detail codes in `lattice-core::types` (100-104,
+// carried in Status event details); the two families share no values and
+// must not be mixed.
 pub const ERR_UNKNOWN_OP: u64 = 1;
 pub const ERR_BAD_ARGS: u64 = 2;
 pub const ERR_AUTH: u64 = 3;
@@ -162,6 +166,7 @@ impl Event {
 /// Service names are 1-64 bytes of `[A-Za-z0-9._-]`. The spec does not
 /// constrain them; this bound keeps names printable, path-safe and
 /// comparable, and matches the daemon's config validation exactly.
+#[must_use]
 fn valid_service_name(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 64

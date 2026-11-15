@@ -96,8 +96,7 @@ impl SealedLayer {
         aad: &[u8],
         plaintext: &[u8],
     ) -> Result<Self, ProtoError> {
-        let s =
-            seal(context, public, aad, plaintext).map_err(|e| ProtoError::Crypto(e.to_string()))?;
+        let s = seal(context, public, aad, plaintext)?;
         Ok(Self {
             kem: s.kem_ciphertext,
             ct: s.ciphertext,
@@ -109,8 +108,7 @@ impl SealedLayer {
         secret: &XWingSecretKey,
         aad: &[u8],
     ) -> Result<Vec<u8>, ProtoError> {
-        open(context, secret, aad, &self.kem, &self.ct)
-            .map_err(|e| ProtoError::Crypto(e.to_string()))
+        Ok(open(context, secret, aad, &self.kem, &self.ct)?)
     }
 }
 
@@ -215,6 +213,7 @@ impl Envelope {
         self.sig = lattice_crypto::sign(signing_seed, &preimage);
     }
 
+    #[must_use]
     pub fn verify_signature(
         &self,
         from_key: &SigningPublicKey,
@@ -223,6 +222,30 @@ impl Envelope {
         let mut preimage = routing_header_bytes.to_vec();
         preimage.extend_from_slice(&encode(&self.unsigned_value()));
         lattice_crypto::verify(from_key, &preimage, &self.sig)
+    }
+
+    /// Reject an implausible `created`: later than `now + CLOCK_SKEW`, or
+    /// older than the message horizon. `created` is not used for any
+    /// security decision, but it is stored, relayed in receipts and shown
+    /// to applications, so an absurd value must not propagate.
+    ///
+    /// `from_value` cannot check this (it has no clock); callers that hold
+    /// `now` must call this after opening an envelope from the wire.
+    pub fn validate_created(&self, now: u64) -> Result<(), ProtoError> {
+        if self.created > now.saturating_add(CLOCK_SKEW) {
+            return Err(ProtoError::Invalid("envelope created in the future"));
+        }
+        if self
+            .created
+            .saturating_add(MAX_MESSAGE_HORIZON)
+            .saturating_add(CLOCK_SKEW)
+            < now
+        {
+            return Err(ProtoError::Invalid(
+                "envelope created beyond the message horizon",
+            ));
+        }
+        Ok(())
     }
 
     pub fn to_value(&self) -> Value {

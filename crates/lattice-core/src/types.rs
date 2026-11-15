@@ -150,9 +150,10 @@ impl Default for Config {
     }
 }
 
-// Failure/detail codes used in Status actions (detail field). Distinct from
-// the `ERR_*` codes in lattice-proto::local, which are local-API response
-// codes; these are carried in Status event details.
+// Failure/detail codes used in Status actions (detail field). This is a
+// separate namespace from the `ERR_*` codes in lattice-proto::local (1-6,
+// local-API response codes); these are carried in Status event details.
+// The two families share no values and must not be mixed.
 pub const ERR_NO_RECORD: u64 = 100;
 pub const ERR_NO_ROUTE: u64 = 101;
 pub const ERR_INTERNAL: u64 = 102;

@@ -1650,6 +1650,12 @@ impl<S: Store> Node<S> {
                 return actions;
             }
         };
+        if opened.validate_created(now).is_err() {
+            // Absurd `created` (future beyond skew, or older than the
+            // message horizon): refuse custody rather than store or relay it.
+            actions.push(self.refuse(link, leg));
+            return actions;
+        }
         match self.signing_key_for(&opened.from) {
             Some(key) => {
                 if !opened.verify_signature(&key, msg.routing_header_bytes()) {

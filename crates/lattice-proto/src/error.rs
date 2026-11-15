@@ -1,3 +1,4 @@
+use lattice_crypto::SealError;
 use thiserror::Error;
 
 use crate::cbor::DecodeError;
@@ -23,5 +24,5 @@ pub enum ProtoError {
     #[error("expired or too-far-horizon object")]
     Expired,
     #[error("crypto: {0}")]
-    Crypto(String),
+    Crypto(#[from] SealError),
 }
