@@ -30,28 +30,34 @@ async fn write_frame(stream: &mut UnixStream, payload: &[u8]) -> std::io::Result
     stream.write_all(&framed).await
 }
 
-async fn read_frame(
-    stream: &mut UnixStream,
-    buf: &mut Vec<u8>,
-) -> std::io::Result<Option<Vec<u8>>> {
+/// Outcome of reading one local-API frame. `Eof` is a clean peer close;
+/// `BadFrame` is bytes the deframer rejected (or an over-long unframed
+/// buffer) — the stream is desynced and must not be read further.
+enum FrameRead {
+    Frame(Vec<u8>),
+    Eof,
+    BadFrame,
+}
+
+async fn read_frame(stream: &mut UnixStream, buf: &mut Vec<u8>) -> std::io::Result<FrameRead> {
     let mut chunk = [0u8; 8192];
     loop {
         match deframe_local(buf) {
             Ok(Some((payload, used))) => {
                 let out = payload.to_vec();
                 buf.drain(..used);
-                return Ok(Some(out));
+                return Ok(FrameRead::Frame(out));
             }
             Ok(None) => {}
-            Err(_) => return Ok(None),
+            Err(_) => return Ok(FrameRead::BadFrame),
         }
         let n = stream.read(&mut chunk).await?;
         if n == 0 {
-            return Ok(None);
+            return Ok(FrameRead::Eof);
         }
         buf.extend_from_slice(&chunk[..n]);
         if buf.len() > MAX_FRAME + LOCAL_PREFIX_LEN + 1 {
-            return Ok(None);
+            return Ok(FrameRead::BadFrame);
         }
     }
 }
@@ -116,15 +122,28 @@ async fn handle_app(
     )
     .await
     {
-        Ok(Ok(Some(f))) => f,
-        _ => return,
+        Ok(Ok(FrameRead::Frame(f))) => f,
+        // Pre-auth: stay silent toward the peer (probe resistance), but log.
+        Ok(Ok(FrameRead::BadFrame)) => {
+            eprintln!("lattice: app socket: undecodable hello frame; closing");
+            return;
+        }
+        Ok(Ok(FrameRead::Eof)) => return,
+        Ok(Err(e)) => {
+            eprintln!("lattice: app socket: read error during hello: {e}");
+            return;
+        }
+        Err(_) => return,
     };
     let req = match decode(&hello)
         .ok()
         .and_then(|v| Request::from_value(&v).ok())
     {
         Some(r) => r,
-        None => return,
+        None => {
+            eprintln!("lattice: app socket: hello frame did not decode as a request; closing");
+            return;
+        }
     };
     if req.op != OP_HELLO {
         let _ = write_frame(&mut stream, &resp_err(req.id, ERR_AUTH)).await;
@@ -190,7 +209,21 @@ async fn handle_app(
                 }
             }
             frame = read_frame(&mut stream, &mut buf) => {
-                let Some(frame) = frame.ok().flatten() else { return };
+                let frame = match frame {
+                    Ok(FrameRead::Frame(f)) => f,
+                    Ok(FrameRead::Eof) => return,
+                    // Authenticated peer: tell it the stream is unusable instead of
+                    // dropping the connection without a word.
+                    Ok(FrameRead::BadFrame) => {
+                        eprintln!("lattice: app socket: undecodable frame; closing connection");
+                        let _ = write_frame(&mut stream, &resp_err(0, ERR_BAD_ARGS)).await;
+                        return;
+                    }
+                    Err(e) => {
+                        eprintln!("lattice: app socket: read error: {e}");
+                        return;
+                    }
+                };
                 let Some(req) = decode(&frame).ok().and_then(|v| Request::from_value(&v).ok()) else {
                     let _ = write_frame(&mut stream, &resp_err(0, ERR_BAD_ARGS)).await;
                     continue;
@@ -257,14 +290,18 @@ async fn dispatch_app(
                 return resp_err(req.id, ERR_INTERNAL);
             }
             match rx.await {
-                Ok(Some((status, detail))) => {
+                Ok(Ok(Some((status, detail)))) => {
                     let mut pairs = vec![(Value::UInt(0), Value::UInt(status))];
                     if let Some(d) = detail {
                         pairs.push((Value::UInt(1), Value::UInt(d)));
                     }
                     resp_ok(req.id, Value::map(pairs))
                 }
-                Ok(None) => resp_err(req.id, ERR_NOT_FOUND),
+                Ok(Ok(None)) => resp_err(req.id, ERR_NOT_FOUND),
+                Ok(Err(e)) => {
+                    eprintln!("lattice: status_get failed: {e}");
+                    resp_err(req.id, ERR_INTERNAL)
+                }
                 Err(_) => resp_err(req.id, ERR_INTERNAL),
             }
         }
@@ -288,7 +325,7 @@ async fn dispatch_app(
                 return resp_err(req.id, ERR_INTERNAL);
             }
             match rx.await {
-                Ok(rows) => {
+                Ok(Ok(rows)) => {
                     let items: Vec<Value> = rows
                         .into_iter()
                         .map(|e| {
@@ -308,6 +345,10 @@ async fn dispatch_app(
                         req.id,
                         Value::map(vec![(Value::UInt(0), Value::Array(items))]),
                     )
+                }
+                Ok(Err(e)) => {
+                    eprintln!("lattice: inbox_fetch failed: {e}");
+                    resp_err(req.id, ERR_INTERNAL)
                 }
                 Err(_) => resp_err(req.id, ERR_INTERNAL),
             }
@@ -342,10 +383,14 @@ async fn dispatch_app(
                 return resp_err(req.id, ERR_INTERNAL);
             }
             match rx.await {
-                Ok(n) => resp_ok(
+                Ok(Ok(n)) => resp_ok(
                     req.id,
                     Value::map(vec![(Value::UInt(0), Value::UInt(n as u64))]),
                 ),
+                Ok(Err(e)) => {
+                    eprintln!("lattice: inbox_ack failed: {e}");
+                    resp_err(req.id, ERR_INTERNAL)
+                }
                 Err(_) => resp_err(req.id, ERR_INTERNAL),
             }
         }
@@ -386,8 +431,19 @@ async fn dispatch_app(
 async fn handle_admin(mut stream: UnixStream, api: mpsc::UnboundedSender<ApiCmd>) {
     let mut buf = Vec::new();
     loop {
-        let Some(frame) = read_frame(&mut stream, &mut buf).await.ok().flatten() else {
-            return;
+        let frame = match read_frame(&mut stream, &mut buf).await {
+            Ok(FrameRead::Frame(f)) => f,
+            Ok(FrameRead::Eof) => return,
+            // Owner-only socket, no probe threat: say why the connection ends.
+            Ok(FrameRead::BadFrame) => {
+                eprintln!("lattice: admin socket: undecodable frame; closing connection");
+                let _ = write_frame(&mut stream, &resp_err(0, ERR_BAD_ARGS)).await;
+                return;
+            }
+            Err(e) => {
+                eprintln!("lattice: admin socket: read error: {e}");
+                return;
+            }
         };
         let Some(req) = decode(&frame)
             .ok()
