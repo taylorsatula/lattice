@@ -19,15 +19,7 @@ pub mod record;
 
 pub use cbor::{DecodeError, Value, decode, encode};
 pub use error::ProtoError;
-pub use frames::Frame;
-pub use kel::{KelHead, KelRelation, KeyEvent, KeyEventKind, ValidatedKel, classify};
-pub use message::{
-    BuildParams, Envelope, GatewaySeal, Header, HopLayerPlain, Message, SealedLayer, WaypointSeal,
-};
-pub use record::{
-    Endpoint, KnownHead, Mode, ParsedRecord, PeerRecord, Scope, ValidatedRecord, compare_lww,
-    is_equivocation, is_globally_routable, record_hash,
-};
+pub use message::Message;
 
 /// Largest message on the wire (bucket 3) and the derived message buckets.
 pub const MESSAGE_BUCKETS: [usize; 3] = [2048 - 64, 8192 - 64, 32768 - 64];
