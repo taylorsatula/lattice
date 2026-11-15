@@ -50,11 +50,11 @@ fn write_seed(dir: &Path, name: &str, seed: &impl AsRef<[u8]>) -> io::Result<()>
     let path = dir.join(name);
     #[cfg(unix)]
     {
+        use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
         let mut opts = fs::OpenOptions::new();
         opts.write(true).create(true).truncate(true).mode(0o600);
         let mut f = opts.open(&path)?;
-        use std::io::Write;
         f.write_all(seed.as_ref())?;
     }
     #[cfg(not(unix))]
@@ -170,8 +170,7 @@ const RETIRED_ENVELOPE_PREFIX: &str = "envelope_seed.retired.";
 fn load_retired_envelope_keys(dir: &Path) -> io::Result<Vec<RetiredEnvelopeKey>> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_secs());
     let mut out = Vec::new();
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
@@ -322,8 +321,7 @@ pub fn rotate_envelope_key(dir: &Path, grace_secs: u64) -> io::Result<lattice_co
     let mut identity = load_identity(dir)?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_secs());
     let retire_at = now + grace_secs;
     // Persist the retired key before swapping, so a crash mid-rotation does
     // not strand envelopes encrypted to it.
