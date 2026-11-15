@@ -76,6 +76,15 @@ fn fixed<const N: usize>(bytes: &[u8], context: &'static str) -> Result<[u8; N],
     bytes.try_into().map_err(|_| StoreError::Corrupt(context))
 }
 
+/// Open each listed table so reads never fail on a fresh database.
+/// Table definitions have heterogeneous key/value types, so they cannot
+/// share one array; this expands to one `open_table` call per table.
+macro_rules! ensure_tables {
+    ($txn:expr, $op:expr, $($table:expr),+ $(,)?) => {{
+        $($txn.open_table($table).map_err(ctx($op))?;)+
+    }};
+}
+
 const SCHEMA_VERSION: u64 = 1;
 
 const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
@@ -131,7 +140,7 @@ fn migrate(txn: &redb::WriteTransaction, from: u64) -> Result<(), StoreError> {
 /// Read a u64 counter from the meta table inside a write transaction.
 fn meta_u64(txn: &redb::WriteTransaction, key: &str) -> Result<u64, StoreError> {
     let meta = txn.open_table(META)?;
-    Ok(meta.get(key)?.map(|v| v.value()).unwrap_or(0))
+    Ok(meta.get(key)?.map_or(0, |v| v.value()))
 }
 
 /// Add `delta` (signed) to a u64 counter in the meta table.
@@ -183,44 +192,22 @@ impl RedbStore {
                 Some(_) => {}
             }
         }
-        // Initialize empty tables so reads never fail on a fresh database.
-        txn.open_table(RECORDS).map_err(ctx(OP))?;
-        txn.open_table(RECORD_RECV).map_err(ctx(OP))?;
-        txn.open_table(KEL_HEADS).map_err(ctx(OP))?;
-        txn.open_table(PEERS).map_err(ctx(OP))?;
-        txn.open_table(OUTBOUND).map_err(ctx(OP))?;
-        txn.open_table(CUSTODY).map_err(ctx(OP))?;
-        txn.open_table(SHARES).map_err(ctx(OP))?;
-        txn.open_table(SEEN).map_err(ctx(OP))?;
-        txn.open_table(DELIVERED).map_err(ctx(OP))?;
-        txn.open_table(INBOX).map_err(ctx(OP))?;
-        txn.open_table(STATUS).map_err(ctx(OP))?;
-        // Rebuild the custody byte counters from the table so they can never
-        // drift from the rows actually present.
-        let mut custody_bytes: u64 = 0;
-        let mut class_bytes = [0u64; 16];
-        {
-            let t = txn.open_table(CUSTODY).map_err(ctx(OP))?;
-            for entry in t.iter().map_err(ctx(OP))? {
-                let (_, v) = entry.map_err(ctx(OP))?;
-                let e: CustodyEntry =
-                    serde_json::from_slice(&v.value()).map_err(|e| StoreError::Codec {
-                        context: "decode custody entry",
-                        source: e,
-                    })?;
-                custody_bytes += e.message.len() as u64;
-                class_bytes[(e.class as usize).min(15)] += e.message.len() as u64;
-            }
-        }
-        {
-            let mut meta = txn.open_table(META).map_err(ctx(OP))?;
-            meta.insert("custody_bytes", custody_bytes)
-                .map_err(ctx(OP))?;
-            for (i, b) in class_bytes.iter().enumerate() {
-                meta.insert(format!("custody_class_{i}").as_str(), *b)
-                    .map_err(ctx(OP))?;
-            }
-        }
+        ensure_tables!(
+            txn,
+            OP,
+            RECORDS,
+            RECORD_RECV,
+            KEL_HEADS,
+            PEERS,
+            OUTBOUND,
+            CUSTODY,
+            SHARES,
+            SEEN,
+            DELIVERED,
+            INBOX,
+            STATUS,
+        );
+        rebuild_custody_counters(&txn, OP)?;
         txn.commit().map_err(ctx(OP))?;
         Ok(Self { db })
     }
@@ -252,7 +239,7 @@ impl RedbStore {
             let table = txn.open_table(META)?;
             let mut out = [0u64; 3];
             for (i, key) in ["bucket_0", "bucket_1", "bucket_2"].iter().enumerate() {
-                out[i] = table.get(*key)?.map(|v| v.value()).unwrap_or(0);
+                out[i] = table.get(*key)?.map_or(0, |v| v.value());
             }
             Ok(out)
         })
@@ -262,11 +249,42 @@ impl RedbStore {
         self.write("bucket_bump", |txn| {
             let mut table = txn.open_table(META)?;
             let key = format!("bucket_{}", bucket.min(2));
-            let cur = table.get(key.as_str())?.map(|v| v.value()).unwrap_or(0);
+            let cur = table.get(key.as_str())?.map_or(0, |v| v.value());
             table.insert(key.as_str(), cur + 1)?;
             Ok(())
         })
     }
+}
+
+/// Rebuild the custody byte counters from the CUSTODY table so they can
+/// never drift from the rows actually present. Runs on open.
+fn rebuild_custody_counters(
+    txn: &redb::WriteTransaction,
+    op: &'static str,
+) -> Result<(), StoreError> {
+    let mut custody_bytes: u64 = 0;
+    let mut class_bytes = [0u64; 16];
+    {
+        let t = txn.open_table(CUSTODY).map_err(ctx(op))?;
+        for entry in t.iter().map_err(ctx(op))? {
+            let (_, v) = entry.map_err(ctx(op))?;
+            let e: CustodyEntry =
+                serde_json::from_slice(&v.value()).map_err(|e| StoreError::Codec {
+                    context: "decode custody entry",
+                    source: e,
+                })?;
+            custody_bytes += e.message.len() as u64;
+            class_bytes[(e.class as usize).min(15)] += e.message.len() as u64;
+        }
+    }
+    let mut meta = txn.open_table(META).map_err(ctx(op))?;
+    meta.insert("custody_bytes", custody_bytes)
+        .map_err(ctx(op))?;
+    for (i, b) in class_bytes.iter().enumerate() {
+        meta.insert(format!("custody_class_{i}").as_str(), *b)
+            .map_err(ctx(op))?;
+    }
+    Ok(())
 }
 
 /// Insert a custody row and bump the byte counter, in the caller's txn.
@@ -313,7 +331,7 @@ fn share_add_txn(
 ) -> Result<u64, StoreError> {
     let key = share_key(dest, upstream);
     let mut t = txn.open_table(SHARES)?;
-    let cur = t.get(key)?.map(|v| v.value()).unwrap_or(0);
+    let cur = t.get(key)?.map_or(0, |v| v.value());
     let next = (cur as i64)
         .checked_add(bytes)
         .ok_or_else(|| StoreError::CounterOverflow("share".into()))?;
@@ -343,7 +361,7 @@ impl Store for RedbStore {
                 return Ok(None);
             };
             let recv = txn.open_table(RECORD_RECV)?;
-            let at = recv.get(key)?.map(|v| v.value()).unwrap_or(0);
+            let at = recv.get(key)?.map_or(0, |v| v.value());
             Ok(Some(RecordBytes {
                 bytes,
                 received: at,
@@ -396,7 +414,7 @@ impl Store for RedbStore {
                 } else {
                     Scope::Hive
                 };
-                let recv = r.get(key)?.map(|v| v.value()).unwrap_or(0);
+                let recv = r.get(key)?.map_or(0, |v| v.value());
                 out.push(StoredRecord {
                     id,
                     scope,
@@ -659,7 +677,7 @@ impl Store for RedbStore {
     fn custody_bytes(&self) -> Result<u64, StoreError> {
         self.read("custody_bytes", |txn| {
             let meta = txn.open_table(META)?;
-            Ok(meta.get("custody_bytes")?.map(|v| v.value()).unwrap_or(0))
+            Ok(meta.get("custody_bytes")?.map_or(0, |v| v.value()))
         })
     }
 
@@ -670,8 +688,7 @@ impl Store for RedbStore {
             for (i, slot) in out.iter_mut().enumerate() {
                 *slot = meta
                     .get(format!("custody_class_{i}").as_str())?
-                    .map(|v| v.value())
-                    .unwrap_or(0);
+                    .map_or(0, |v| v.value());
             }
             Ok(out)
         })
@@ -690,16 +707,14 @@ impl Store for RedbStore {
         let key = share_key(dest, upstream);
         self.read("share_get", |txn| {
             let t = txn.open_table(SHARES)?;
-            Ok(t.get(key)?.map(|v| v.value()).unwrap_or(0))
+            Ok(t.get(key)?.map_or(0, |v| v.value()))
         })
     }
 
     fn seen_contains(&self, hash: &Hash32, now: u64) -> Result<bool, StoreError> {
         self.read("seen_contains", |txn| {
             let t = txn.open_table(SEEN)?;
-            Ok(t.get(hash.as_bytes())?
-                .map(|v| v.value() > now)
-                .unwrap_or(false))
+            Ok(t.get(hash.as_bytes())?.is_some_and(|v| v.value() > now))
         })
     }
 
@@ -710,9 +725,7 @@ impl Store for RedbStore {
     fn delivered_contains(&self, hash: &Hash32, now: u64) -> Result<bool, StoreError> {
         self.read("delivered_contains", |txn| {
             let t = txn.open_table(DELIVERED)?;
-            Ok(t.get(hash.as_bytes())?
-                .map(|v| v.value() > now)
-                .unwrap_or(false))
+            Ok(t.get(hash.as_bytes())?.is_some_and(|v| v.value() > now))
         })
     }
 
@@ -915,8 +928,7 @@ impl Store for RedbStore {
             let meta = txn.open_table(META)?;
             Ok(meta
                 .get("drain")?
-                .map(|v| DrainState::from(v.value() != 0))
-                .unwrap_or(DrainState::Serving))
+                .map_or(DrainState::Serving, |v| DrainState::from(v.value() != 0)))
         })
     }
 
