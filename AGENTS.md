@@ -25,11 +25,11 @@ Lattice is a key-anchored mesh for cross-node messaging. There is no DNS depende
 | `V2_SPEC.md` | Normative wire format: CBOR objects, channels, message flow, local API, storage tables. |
 | `V2_PLAN.md` | Implementation plan: phases, exit criteria, initial defaults, candidate dependencies, risks. |
 | `V1_DESIGN_INVENTORY.md` | Inventory of v1 choices kept as redesign reference; not normative. |
-| `docs/` | v1-era normative docs (`PROTOCOL.md`, `THREAT_MODEL.md`, ...). Superseded by the V2 documents; read only for historical behavior. `docs/AGENTS.md` still presents them as normative and is stale. |
+| `docs/` | v1-era docs (`PROTOCOL.md`, `THREAT_MODEL.md`, ...). Superseded by the V2 documents; read only for historical behavior. `docs/AGENTS.md` marks them as historical. |
 | `old/` | The pre-v2 Python tree as it stood at the move (largely the unmerged Python v2 rewrite; its tests and packaging moved with it). Not built, not maintained, not a base for new work. Frozen at commit `d652a8f`. |
 | `old/lattice-c1-RESUME.md` | Resume note for the abandoned Python effort; historical. |
 | `LICENSE`, `.github/`, `.gitignore`, `.kata.toml`, `.pi/` | License, CI (Rust: fmt/clippy/test/msrv/deny/geiger/workspace-lints), ignore rules, tooling config. |
-| `Cargo.toml`, `crates/` | The v2 Rust workspace: virtual manifest at the root, nine member crates under `crates/`, each with `#![forbid(unsafe_code)]`. Laid out in `V2_PLAN.md`. |
+| `Cargo.toml`, `crates/` | The v2 Rust workspace: virtual manifest at the root, ten member crates under `crates/` (including `lattice-types`, the leaf newtype crate), each with `#![forbid(unsafe_code)]`. Laid out in `V2_PLAN.md`. |
 | `clients/python/` | Python client for the local API (`lattice-client`): framing, hello, send/status/fetch/ack/lookup, events, admin ops. Passes `vectors/`; has an integration test against a live daemon. |
 | `vectors/` | CBOR/signature regression anchors and X-Wing KATs; self-generated, see `vectors/README.md`. |
 | `fuzz/` | cargo-fuzz targets for parsers/decoders; not in the workspace. |
@@ -58,7 +58,6 @@ When asked to make a change, first restate the invariants that apply, then expla
 
 ## Pending items
 
-- `docs/AGENTS.md` still presents the v1 documents as normative; it is stale.
 - Phase 7 (release/soak/runbook) is not started; `v2.0.0` is untagged.
 - GitHub has not run the new CI yet; local runs of every step pass. Push is the operator's call.
 - The packaged `latticed` runs as root under the shipped unit; move to a dedicated user when packaging adds one.
