@@ -240,14 +240,22 @@ impl Store for MemStore {
         Ok(())
     }
     fn inbox_fetch(&self, service: &str, max: usize) -> Result<Vec<InboxEntry>, StoreError> {
-        Ok(self
+        // Match the redb backend's (received, delivery_id) order rather than
+        // bare insertion order, so ties on `received` break by delivery id.
+        let mut entries: Vec<InboxEntry> = self
             .inbox
             .get(service)
             .into_iter()
             .flatten()
-            .take(max)
             .cloned()
-            .collect())
+            .collect();
+        entries.sort_by(|a, b| {
+            a.received
+                .cmp(&b.received)
+                .then(a.delivery_id.cmp(&b.delivery_id))
+        });
+        entries.truncate(max);
+        Ok(entries)
     }
     fn inbox_ack(
         &mut self,

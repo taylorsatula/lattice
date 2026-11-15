@@ -33,13 +33,14 @@ pub enum StoreError {
         #[source]
         source: Box<dyn std::error::Error + Send + Sync>,
     },
-    /// A value failed to (de)serialize. `context` names the value being
-    /// encoded or decoded (e.g. `"decode custody entry"`).
+    /// A value failed to (de)serialize or re-validate on read. `context`
+    /// names the value being encoded, decoded or validated (e.g. `"decode
+    /// custody entry"`).
     #[error("{context}: {source}")]
     Codec {
         context: &'static str,
         #[source]
-        source: serde_json::Error,
+        source: Box<dyn std::error::Error + Send + Sync>,
     },
     /// An internal counter would overflow.
     #[error("counter {0} overflow")]

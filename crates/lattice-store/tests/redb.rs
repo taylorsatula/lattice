@@ -1,5 +1,7 @@
 //! redb backend: persistence, schema guard, and MemStore equivalence.
 
+use redb::ReadableTable;
+
 use lattice_proto::local::MessageStatus;
 use lattice_proto::message::Envelope;
 use lattice_proto::record::Scope;
@@ -481,4 +483,148 @@ fn serde_shapes_match_legacy_format() {
     }];
     let json = serde_json::to_value(&with_exclusions).unwrap();
     assert_eq!(json["excluded"], serde_json::json!([[9, 123]]));
+}
+
+fn inbox_entry(delivery: u8, received: u64, tsvc: &str) -> InboxEntry {
+    InboxEntry {
+        delivery_id: did(delivery),
+        mid: mid(1),
+        from: id(2),
+        fsvc: "svc".into(),
+        fmbx: b"a".to_vec(),
+        tsvc: tsvc.into(),
+        tmbx: b"b".to_vec(),
+        body: b"hello".to_vec(),
+        received,
+    }
+}
+
+#[test]
+fn outbound_row_with_invalid_envelope_fails_read() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("bad-envelope.redb");
+    {
+        let mut s = RedbStore::open(&path).unwrap();
+        s.outbound_push(&outbound(1)).unwrap();
+    }
+    // Hand-corrupt the stored row: envelope kind 99 fails Envelope::from_value.
+    {
+        let db = redb::Database::create(&path).unwrap();
+        let txn = db.begin_write().unwrap();
+        {
+            let mut t = txn
+                .open_table(redb::TableDefinition::<[u8; 16], Vec<u8>>::new("outbound"))
+                .unwrap();
+            let raw = t.get(mid(1).as_bytes()).unwrap().unwrap().value();
+            let mut v: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+            v["envelope"]["kind"] = serde_json::json!(99);
+            t.insert(mid(1).as_bytes(), serde_json::to_vec(&v).unwrap())
+                .unwrap();
+        }
+        txn.commit().unwrap();
+    }
+    let s = RedbStore::open(&path).unwrap();
+    assert!(matches!(
+        s.outbound_get(&mid(1)),
+        Err(lattice_store::StoreError::Codec { .. })
+    ));
+    assert!(matches!(
+        s.outbound_all(),
+        Err(lattice_store::StoreError::Codec { .. })
+    ));
+}
+
+#[test]
+fn outbound_bounded_fields_are_clamped_on_read() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut s = RedbStore::open(tmp.path().join("clamp.redb")).unwrap();
+    let mut msg = outbound(1);
+    msg.priority = 7;
+    msg.route = 9;
+    s.outbound_push(&msg).unwrap();
+    let got = s.outbound_get(&mid(1)).unwrap().unwrap();
+    assert_eq!(got.priority, 3);
+    assert_eq!(got.route, 2);
+    let all = s.outbound_all().unwrap();
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0].priority, 3);
+    assert_eq!(all[0].route, 2);
+}
+
+#[test]
+fn custody_class_is_clamped_on_read() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut s = RedbStore::open(tmp.path().join("class-clamp.redb")).unwrap();
+    let mut e = custody(1);
+    e.class = 200;
+    s.custody_put(e).unwrap();
+    assert_eq!(s.custody_get(&leg(1)).unwrap().unwrap().class, 15);
+    assert_eq!(s.custody_all().unwrap()[0].class, 15);
+}
+
+fn check_inbox_fifo<S: Store>(s: &mut S) {
+    // Insert out of order, including a tie on `received` broken by delivery id.
+    for (d, received) in [(0x03u8, 30u64), (0x01, 10), (0x04, 20), (0x02, 20)] {
+        s.inbox_push(inbox_entry(d, received, "svc")).unwrap();
+    }
+    // A different service interleaved must not leak into "svc".
+    s.inbox_push(inbox_entry(0x7f, 5, "other")).unwrap();
+
+    let got = s.inbox_fetch("svc", 10).unwrap();
+    let order: Vec<DeliveryId> = got.iter().map(|e| e.delivery_id).collect();
+    assert_eq!(order, vec![did(0x01), did(0x02), did(0x04), did(0x03)]);
+
+    let first_two = s.inbox_fetch("svc", 2).unwrap();
+    assert_eq!(
+        first_two.iter().map(|e| e.delivery_id).collect::<Vec<_>>(),
+        vec![did(0x01), did(0x02)]
+    );
+    assert_eq!(s.inbox_len("svc").unwrap(), 4);
+    assert_eq!(s.inbox_len_total().unwrap(), 5);
+}
+
+#[test]
+fn inbox_fetch_is_fifo_per_service() {
+    check_inbox_fifo(&mut MemStore::new());
+    let tmp = tempfile::tempdir().unwrap();
+    let mut redb = RedbStore::open(tmp.path().join("fifo.redb")).unwrap();
+    check_inbox_fifo(&mut redb);
+}
+
+#[test]
+fn inbox_ack_removes_by_delivery_id() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut s = RedbStore::open(tmp.path().join("ack.redb")).unwrap();
+    s.inbox_push(inbox_entry(0x01, 1, "svc")).unwrap();
+    s.inbox_push(inbox_entry(0x02, 2, "svc")).unwrap();
+    s.inbox_push(inbox_entry(0x03, 3, "svc")).unwrap();
+    // Same delivery id under another service: its row must survive the ack.
+    s.inbox_push(inbox_entry(0x02, 2, "other")).unwrap();
+
+    let removed = s.inbox_ack("svc", &[did(0x02), did(0x09)]).unwrap();
+    assert_eq!(removed, 1);
+    let remaining: Vec<DeliveryId> = s
+        .inbox_fetch("svc", 10)
+        .unwrap()
+        .iter()
+        .map(|e| e.delivery_id)
+        .collect();
+    assert_eq!(remaining, vec![did(0x01), did(0x03)]);
+    assert_eq!(s.inbox_len("other").unwrap(), 1);
+    assert_eq!(s.inbox_ack("svc", &[did(0x09)]).unwrap(), 0);
+}
+
+#[test]
+fn inbox_sweep_expired_drops_old_entries() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut s = RedbStore::open(tmp.path().join("sweep.redb")).unwrap();
+    s.inbox_push(inbox_entry(0x01, 100, "svc")).unwrap();
+    s.inbox_push(inbox_entry(0x02, 5000, "svc")).unwrap();
+    s.inbox_push(inbox_entry(0x03, 100, "other")).unwrap();
+
+    let dropped = s.inbox_sweep_expired(1000, 2000).unwrap();
+    assert_eq!(dropped, 2);
+    assert_eq!(s.inbox_len("svc").unwrap(), 1);
+    assert_eq!(s.inbox_len("other").unwrap(), 0);
+    assert_eq!(s.inbox_fetch("svc", 10).unwrap()[0].delivery_id, did(0x02));
 }

@@ -611,8 +611,10 @@ redb tables, derived from the objects above:
 | `seen` | BLAKE3(leg) | Expiry. Hop-level dedup |
 | `delivered` | BLAKE3(mid) | Expiry. Recipient-level dedup |
 | `kel_heads` | id | Latest KEL sn and event hash, last-seen time (kept one year) |
-| `inbox` | delivery id | Service, delivery fields, received |
+| `inbox` | (service, received, delivery_id) | Service, delivery fields, received |
 | `status` | mid | Latest status, for the API |
+
+Deliveries are returned oldest-first per service, ties broken by delivery id.
 
 The next signing key's secret is not stored here. It lives in a separate
 file, or offline (§1).
