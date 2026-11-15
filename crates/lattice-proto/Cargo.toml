@@ -11,6 +11,7 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+lattice-types = { version = "0.0.0", path = "../lattice-types" }
 lattice-crypto = { version = "0.0.0", path = "../lattice-crypto" }
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }

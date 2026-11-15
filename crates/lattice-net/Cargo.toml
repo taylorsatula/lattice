@@ -11,6 +11,7 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+lattice-types = { version = "0.0.0", path = "../lattice-types" }
 socket2 = "0.6"
 lattice-proto = { version = "0.0.0", path = "../lattice-proto" }
 lattice-core = { version = "0.0.0", path = "../lattice-core" }

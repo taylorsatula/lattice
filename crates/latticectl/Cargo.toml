@@ -12,6 +12,7 @@ name = "latticectl"
 path = "src/main.rs"
 
 [dependencies]
+lattice-types = { version = "0.0.0", path = "../lattice-types" }
 lattice-client = { version = "0.0.0", path = "../lattice-client" }
 tokio = { version = "1", features = ["rt"] }
 
