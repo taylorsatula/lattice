@@ -14,7 +14,7 @@ mod redb_store;
 pub use mem::MemStore;
 pub use redb_store::RedbStore;
 
-use lattice_proto::local::MessageStatus;
+use lattice_proto::local::{DrainState, MessageStatus};
 use lattice_proto::record::Scope;
 use lattice_types::{Commitment, DeliveryId, Hash32, Identifier, LegId, MessageId};
 
@@ -293,7 +293,8 @@ pub trait Store {
     fn size_bucket_sample(&mut self, bucket: u8) -> Result<(), StoreError>;
     fn size_bucket_counts(&self) -> Result<[u64; 3], StoreError>;
 
-    // drain flag: persisted so a restart does not silently accept new work
-    fn drain_get(&self) -> Result<bool, StoreError>;
-    fn drain_set(&mut self, draining: bool) -> Result<(), StoreError>;
+    // drain flag: persisted so a restart does not silently accept new work.
+    // Backends store it as 0/1; the enum is the in-memory form.
+    fn drain_get(&self) -> Result<DrainState, StoreError>;
+    fn drain_set(&mut self, state: DrainState) -> Result<(), StoreError>;
 }

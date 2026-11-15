@@ -4,7 +4,7 @@
 //! boundaries hiding bugs the in-memory store tolerates).
 
 use lattice_core::Config;
-use lattice_sim::Sim;
+use lattice_sim::{LinkState, Sim};
 use lattice_store::RedbStore;
 use lattice_types::{ChannelSeed, MessageId, XWingPublicKey};
 
@@ -98,14 +98,14 @@ fn redb_partition_holds_then_heals() {
     sim.connect(1, 2);
     let link = sim.link_between(1, 2).unwrap();
     sim.run_for(6);
-    sim.set_link(link, false);
+    sim.set_link(link, LinkState::Down);
     let mid = sim.app_send(0, 2, b"after heal");
     sim.run_for(3);
     assert!(
         sim.deliveries.iter().all(|d| d.mid != mid),
         "no delivery while partitioned"
     );
-    sim.set_link(link, true);
+    sim.set_link(link, LinkState::Up);
     sim.run_for(20);
     assert!(
         sim.deliveries.iter().any(|d| d.mid == mid),
@@ -124,7 +124,7 @@ fn redb_crash_during_custody_preserves_message() {
     sim.connect(1, 2);
     let link_bc = sim.link_between(1, 2).unwrap();
     sim.run_for(6);
-    sim.set_link(link_bc, false);
+    sim.set_link(link_bc, LinkState::Down);
     let mid = sim.app_send(0, 2, b"survive my crash");
     sim.run_for(4);
     assert_eq!(
@@ -133,7 +133,7 @@ fn redb_crash_during_custody_preserves_message() {
         "B should hold the message in custody"
     );
     sim.crash_node(1);
-    sim.set_link(link_bc, true);
+    sim.set_link(link_bc, LinkState::Up);
     sim.run_for(20);
     assert!(
         sim.deliveries.iter().any(|d| d.mid == mid),

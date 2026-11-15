@@ -15,6 +15,7 @@
 
 use crate::cbor::Value;
 use crate::error::ProtoError;
+use crate::record::Mode;
 
 pub const LOCAL_MAX_FRAME: usize = 64 * 1024;
 pub const LOCAL_PREFIX_LEN: usize = 4;
@@ -100,22 +101,78 @@ impl From<MessageStatus> for (u64, Option<u64>) {
     }
 }
 
+/// Whether the node is serving or draining (refusing new custody).
+///
+/// The wire and the on-disk flag carry this as a bool (`true` = draining);
+/// this enum is the in-memory form. Stored as 0/1 in redb's `META["drain"]`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DrainState {
+    #[default]
+    Serving,
+    Draining,
+}
+
+impl DrainState {
+    pub fn is_draining(self) -> bool {
+        matches!(self, Self::Draining)
+    }
+}
+
+impl From<bool> for DrainState {
+    fn from(draining: bool) -> Self {
+        if draining {
+            Self::Draining
+        } else {
+            Self::Serving
+        }
+    }
+}
+
+impl From<DrainState> for bool {
+    fn from(state: DrainState) -> bool {
+        state.is_draining()
+    }
+}
+
+/// A drain request: query the current state, or set it. The wire encodes
+/// `Query` as an absent arg key and `Set` as key 0 carrying a bool.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DrainRequest {
+    Query,
+    Set(DrainState),
+}
+
 /// Drain state as reported by the daemon: whether it is draining and how
 /// many bytes of custody it holds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DrainState {
+pub struct DrainStatus {
     pub draining: bool,
     pub custody_bytes: u64,
 }
 
-/// Result of a record lookup: whether a valid record is held, its mode
-/// (0 = public, 1 = private; absent when unknown), and whether a path
-/// exists right now.
+/// Result of a record lookup: whether a valid record is held (and its
+/// mode), and whether a path exists right now.
+///
+/// `Present` with `mode: None` means a record is held but its stored bytes
+/// no longer decode (e.g. it expired); the record is still held.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Lookup {
-    pub have: bool,
-    pub mode: Option<u64>,
-    pub path: bool,
+pub enum Lookup {
+    Absent { path: bool },
+    Present { mode: Option<Mode>, path: bool },
+}
+
+impl Lookup {
+    /// Whether a valid record is held.
+    pub fn have(&self) -> bool {
+        matches!(self, Self::Present { .. })
+    }
+
+    /// Whether a path to the peer exists right now.
+    pub fn path(&self) -> bool {
+        match *self {
+            Self::Absent { path } | Self::Present { path, .. } => path,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -335,10 +392,13 @@ pub fn deframe_local(buf: &[u8]) -> Result<Option<LocalFrame<'_>>, ProtoError> {
 }
 
 /// The public `/status` object served on the WebSocket listener.
-pub fn encode_status(up: bool, accepting: bool, versions: &[u64]) -> Vec<u8> {
+///
+/// Key 1 (`up`) is always true: the endpoint cannot be served by a node
+/// that is down, so the flag carries no information and is not a parameter.
+pub fn encode_status(accepting: bool, versions: &[u64]) -> Vec<u8> {
     crate::cbor::encode(&Value::map(vec![
         (Value::UInt(0), Value::UInt(1)),
-        (Value::UInt(1), Value::Bool(up)),
+        (Value::UInt(1), Value::Bool(true)),
         (Value::UInt(2), Value::Bool(accepting)),
         (
             Value::UInt(3),

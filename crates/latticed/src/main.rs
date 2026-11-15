@@ -195,7 +195,7 @@ async fn cmd_run(args: &[String]) -> std::process::ExitCode {
             return std::process::ExitCode::from(1);
         }
     };
-    let draining = Arc::new(std::sync::atomic::AtomicBool::new(drain_flag));
+    let draining = Arc::new(std::sync::atomic::AtomicBool::new(drain_flag.is_draining()));
     let cfg = Arc::new(cfg);
 
     // Install signal handlers before binding any socket, so SIGTERM/SIGINT

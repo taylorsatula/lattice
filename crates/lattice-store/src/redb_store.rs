@@ -10,6 +10,7 @@ use std::path::Path;
 use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
 
 use crate::*;
+use lattice_proto::local::DrainState;
 use lattice_proto::record::Scope;
 use lattice_types::{Commitment, DeliveryId, Hash32, Identifier, LegId, MessageId};
 
@@ -909,17 +910,20 @@ impl Store for RedbStore {
         self.bucket_counts()
     }
 
-    fn drain_get(&self) -> Result<bool, StoreError> {
+    fn drain_get(&self) -> Result<DrainState, StoreError> {
         self.read("drain_get", |txn| {
             let meta = txn.open_table(META)?;
-            Ok(meta.get("drain")?.map(|v| v.value() != 0).unwrap_or(false))
+            Ok(meta
+                .get("drain")?
+                .map(|v| DrainState::from(v.value() != 0))
+                .unwrap_or(DrainState::Serving))
         })
     }
 
-    fn drain_set(&mut self, draining: bool) -> Result<(), StoreError> {
+    fn drain_set(&mut self, state: DrainState) -> Result<(), StoreError> {
         self.write("drain_set", |txn| {
             let mut meta = txn.open_table(META)?;
-            meta.insert("drain", if draining { 1 } else { 0 })?;
+            meta.insert("drain", u64::from(state.is_draining()))?;
             Ok(())
         })
     }

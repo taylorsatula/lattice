@@ -20,7 +20,8 @@ use tokio::sync::{broadcast, mpsc};
 use subtle::ConstantTimeEq;
 
 use crate::config::Config;
-use crate::runtime::{ApiCmd, ServiceEvent};
+use crate::runtime::{ApiCmd, LinkOutcome, ServiceEvent};
+use lattice_core::RotationKind;
 
 const MAX_FRAME: usize = LOCAL_MAX_FRAME;
 
@@ -412,11 +413,11 @@ async fn dispatch_app(
             match rx.await {
                 Ok(lookup) => {
                     let mut pairs = vec![
-                        (Value::UInt(0), Value::Bool(lookup.have)),
-                        (Value::UInt(2), Value::Bool(lookup.path)),
+                        (Value::UInt(0), Value::Bool(lookup.have())),
+                        (Value::UInt(2), Value::Bool(lookup.path())),
                     ];
-                    if let Some(m) = lookup.mode {
-                        pairs.push((Value::UInt(1), Value::UInt(m)));
+                    if let Lookup::Present { mode: Some(m), .. } = lookup {
+                        pairs.push((Value::UInt(1), Value::UInt(m.as_u64())));
                     }
                     resp_ok(req.id, Value::map(pairs))
                 }
@@ -488,11 +489,19 @@ async fn dispatch_admin(api: &mpsc::UnboundedSender<ApiCmd>, req: &Request) -> V
             if deny_unknown_args(&req.args, &[0]).is_err() {
                 return resp_err(req.id, ERR_BAD_ARGS);
             }
-            let setting = args_get(&req.args, 0).and_then(Value::as_bool);
+            // Absent key 0 = query; present key 0 must be a bool.
+            let request = match args_get(&req.args, 0) {
+                None => DrainRequest::Query,
+                Some(v) => match v.as_bool() {
+                    Some(true) => DrainRequest::Set(DrainState::Draining),
+                    Some(false) => DrainRequest::Set(DrainState::Serving),
+                    None => return resp_err(req.id, ERR_BAD_ARGS),
+                },
+            };
             let (tx, rx) = tokio::sync::oneshot::channel();
             if api
                 .send(ApiCmd::Drain {
-                    draining: setting,
+                    request,
                     respond: tx,
                 })
                 .is_err()
@@ -556,11 +565,11 @@ async fn dispatch_admin(api: &mpsc::UnboundedSender<ApiCmd>, req: &Request) -> V
                 return resp_err(req.id, ERR_INTERNAL);
             }
             match rx.await {
-                Ok(true) => resp_ok(
+                Ok(LinkOutcome::Queued) => resp_ok(
                     req.id,
                     Value::map(vec![(Value::UInt(0), Value::Bool(true))]),
                 ),
-                Ok(false) => resp_err(req.id, ERR_BAD_ARGS),
+                Ok(LinkOutcome::Rejected) => resp_err(req.id, ERR_BAD_ARGS),
                 Err(_) => resp_err(req.id, ERR_INTERNAL),
             }
         }
@@ -573,12 +582,16 @@ async fn dispatch_admin(api: &mpsc::UnboundedSender<ApiCmd>, req: &Request) -> V
                 Some(Value::Text(t)) => Some(t.clone()),
                 Some(_) => return resp_err(req.id, ERR_BAD_ARGS),
             };
-            let abandon = req.op == OP_ABANDON;
+            let kind = if req.op == OP_ABANDON {
+                RotationKind::Abandon
+            } else {
+                RotationKind::Rotate
+            };
             let (tx, rx) = tokio::sync::oneshot::channel();
             if api
                 .send(ApiCmd::Rotate {
                     next_key_file,
-                    abandon,
+                    kind,
                     respond: tx,
                 })
                 .is_err()
@@ -634,9 +647,9 @@ async fn dispatch_admin(api: &mpsc::UnboundedSender<ApiCmd>, req: &Request) -> V
                 return resp_err(req.id, ERR_INTERNAL);
             }
             match rx.await {
-                Ok(found) => resp_ok(
+                Ok(removed) => resp_ok(
                     req.id,
-                    Value::map(vec![(Value::UInt(0), Value::Bool(found))]),
+                    Value::map(vec![(Value::UInt(0), Value::Bool(removed > 0))]),
                 ),
                 Err(_) => resp_err(req.id, ERR_INTERNAL),
             }

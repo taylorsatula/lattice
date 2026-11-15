@@ -26,6 +26,32 @@ use crate::reconcile::{self, ReconcileSession};
 use crate::rng::Rng;
 use crate::types::*;
 
+/// Which kind of rotation an identity reload represents.
+///
+/// `Rotate` publishes the updated record; `Abandon` is a rotation with no
+/// next-key commitment — the identity is terminal and nothing is published
+/// (peers reject abandoned records at validation anyway).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RotationKind {
+    Rotate,
+    Abandon,
+}
+
+/// What a dummy frame asks of the peer: an echo reply, or silence.
+/// The wire carries this as `DummyFrame.echo`; this enum is the internal
+/// form so call sites don't pass a bare bool.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DummyKind {
+    Echo,
+    Silent,
+}
+
+impl From<DummyKind> for bool {
+    fn from(kind: DummyKind) -> bool {
+        matches!(kind, DummyKind::Echo)
+    }
+}
+
 pub struct Identity {
     pub signing_seed: SigningSeed,
     /// The validated key event log. Validated at construction; rotation
@@ -50,11 +76,12 @@ pub struct RetiredEnvelopeKey {
 }
 
 /// Result of [`Node::lookup`]: whether a valid record is held, and its
-/// mode if so.
+/// mode if so. `Present` with `mode: None` means a record is held but its
+/// stored bytes no longer decode (e.g. it expired); the record is still held.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct LookupResult {
-    pub have: bool,
-    pub mode: Option<Mode>,
+pub enum LookupResult {
+    Absent,
+    Present { mode: Option<Mode> },
 }
 
 impl Identity {
@@ -261,7 +288,7 @@ pub struct Node<S: Store> {
     next_reconcile_at: u64,
     rng: Rng,
     now: u64,
-    draining: bool,
+    draining: local::DrainState,
     equivocations: u64,
     /// channel_key -> set of node ids whose records claim that key.
     /// Attribution of a link to a peer is allowed only when exactly one id
@@ -336,7 +363,7 @@ impl<S: Store> Node<S> {
             next_reconcile_at: now + 1,
             rng: Rng::new(rng_seed),
             now,
-            draining: false,
+            draining: local::DrainState::Serving,
             equivocations: 0,
             ck_claims: HashMap::new(),
             next_claim_sweep_at: now + CLAIM_SWEEP_SECS,
@@ -466,8 +493,7 @@ impl<S: Store> Node<S> {
                 link,
                 peer,
                 remote_ck,
-                wan,
-            } => self.on_link_up(at, link, peer, remote_ck, wan),
+            } => self.on_link_up(at, link, peer, remote_ck),
             Event::LinkDown { at, link } => self.on_link_down(at, link),
             Event::Frame {
                 at,
@@ -552,10 +578,8 @@ impl<S: Store> Node<S> {
         link: LinkId,
         peer: Option<Identifier>,
         remote_ck: X25519PublicKey,
-        wan: bool,
     ) -> Vec<Action> {
         self.touch(at);
-        let _ = wan;
         self.links.insert(
             link,
             LinkState {
@@ -970,13 +994,16 @@ impl<S: Store> Node<S> {
             self.next_reconcile_at = self.next_reconcile_at.min(at + 1);
         }
     }
-    fn admit_record(&mut self, at: u64, bytes: &[u8]) -> bool {
+    /// Admit a record into the store. Rejections are silent by design:
+    /// the caller (`on_records`) cannot act on them, and the interesting
+    /// cases (equivocation, store failure) are already counted or logged.
+    fn admit_record(&mut self, at: u64, bytes: &[u8]) {
         // Decode once to learn the claimed id, look up the known head,
         // then validate exactly once. Validating the bytes twice (the old
         // behavior) doubled the KEL signature checks on every admission.
         let decoded = match lattice_proto::record::PeerRecord::decode(bytes) {
             Ok(d) => d,
-            Err(_) => return false,
+            Err(_) => return,
         };
         let known = match self.store.kel_head(&decoded.id()) {
             Ok(k) => k.map(|h| KnownHead {
@@ -987,63 +1014,57 @@ impl<S: Store> Node<S> {
             // equivocation, so refuse the record.
             Err(e) => {
                 self.diag("kel_head", &e);
-                return false;
+                return;
             }
         };
-        match decoded.validate(Some(at), known) {
-            Ok(parsed) => {
-                let rec = parsed.record;
-                let head = parsed.head;
-                let scope = rec.scope;
-                let existing = match self.store.record_get(&rec.id, scope) {
-                    Ok(e) => e,
-                    // Fail closed: without the current row we cannot apply
-                    // last-writer-wins, so keep what we have.
-                    Err(e) => {
-                        self.diag("record_get", &e);
-                        return false;
-                    }
-                };
-                if let Some(existing) = existing {
-                    let old_bytes = &existing.bytes;
-                    // Lower-hash wins at equal seq (equivocation rule);
-                    // otherwise normal last-writer-wins by seq.
-                    let old_seq = PeerRecord::from_bytes(old_bytes, at, None)
-                        .map(|p| p.record.seq)
-                        .unwrap_or(0);
-                    if rec.seq == old_seq && bytes != old_bytes.as_slice() {
-                        self.equivocations += 1;
-                    }
-                    if compare_lww(bytes, rec.seq, old_bytes, old_seq)
-                        != std::cmp::Ordering::Greater
-                    {
-                        return false; // keep ours
-                    }
+        if let Ok(parsed) = decoded.validate(Some(at), known) {
+            let rec = parsed.record;
+            let head = parsed.head;
+            let scope = rec.scope;
+            let existing = match self.store.record_get(&rec.id, scope) {
+                Ok(e) => e,
+                // Fail closed: without the current row we cannot apply
+                // last-writer-wins, so keep what we have.
+                Err(e) => {
+                    self.diag("record_get", &e);
+                    return;
                 }
-                match self.store.record_put(&rec.id, scope, bytes, at) {
-                    Ok(()) => self.records_version += 1,
-                    Err(e) => self.diag("record_put", &e),
+            };
+            if let Some(existing) = existing {
+                let old_bytes = &existing.bytes;
+                // Lower-hash wins at equal seq (equivocation rule);
+                // otherwise normal last-writer-wins by seq.
+                let old_seq = PeerRecord::from_bytes(old_bytes, at, None)
+                    .map(|p| p.record.seq)
+                    .unwrap_or(0);
+                if rec.seq == old_seq && bytes != old_bytes.as_slice() {
+                    self.equivocations += 1;
                 }
-                // Advance the stored head only when we could read it, and
-                // record a first-seen head when none exists. On a read error
-                // leave the stored head alone rather than overwrite blindly.
-                match self.store.kel_head(&rec.id) {
-                    Ok(Some(stored_head)) if head.seq <= stored_head.seq => {}
-                    Ok(_) => {
-                        if let Err(e) =
-                            self.store
-                                .kel_head_put(&rec.id, head.seq, head.commitment, at)
-                        {
-                            self.diag("kel_head_put", &e);
-                        }
-                    }
-                    Err(e) => self.diag("kel_head", &e),
+                if compare_lww(bytes, rec.seq, old_bytes, old_seq) != std::cmp::Ordering::Greater {
+                    return; // keep ours
                 }
-                self.note_ck_claim(&rec);
-                self.reevaluate_link_bindings(at);
-                true
             }
-            Err(_) => false,
+            match self.store.record_put(&rec.id, scope, bytes, at) {
+                Ok(()) => self.records_version += 1,
+                Err(e) => self.diag("record_put", &e),
+            }
+            // Advance the stored head only when we could read it, and
+            // record a first-seen head when none exists. On a read error
+            // leave the stored head alone rather than overwrite blindly.
+            match self.store.kel_head(&rec.id) {
+                Ok(Some(stored_head)) if head.seq <= stored_head.seq => {}
+                Ok(_) => {
+                    if let Err(e) = self
+                        .store
+                        .kel_head_put(&rec.id, head.seq, head.commitment, at)
+                    {
+                        self.diag("kel_head_put", &e);
+                    }
+                }
+                Err(e) => self.diag("kel_head", &e),
+            }
+            self.note_ck_claim(&rec);
+            self.reevaluate_link_bindings(at);
         }
     }
 }
@@ -1252,11 +1273,15 @@ impl<S: Store> Node<S> {
     }
 
     /// Build a wire message for one attempt. Returns (bytes, routing destination, waypoint used).
+    /// A retry (`attempts > 0` on entry) forces waypoint routing: the direct
+    /// path already failed once. Counts the attempt, so this is the one
+    /// place `attempts` is incremented.
     fn build_attempt(
         &mut self,
-        msg: &lattice_store::OutboundMessage,
-        force_waypoint: bool,
+        msg: &mut lattice_store::OutboundMessage,
     ) -> Result<BuildOutput, BuildError> {
+        let force_waypoint = msg.attempts > 0;
+        msg.attempts += 1;
         let recipient_rec = self.lookup_validated(&msg.recipient);
         let recipient_private = recipient_rec
             .as_ref()
@@ -1411,11 +1436,7 @@ impl<S: Store> Node<S> {
             if msg.state != OutboundState::Queued {
                 continue;
             }
-            let force_waypoint = msg.attempts > 0;
-            // Every pass through the pump is one send attempt; count it in
-            // exactly one place.
-            msg.attempts += 1;
-            match self.build_attempt(&msg, force_waypoint) {
+            match self.build_attempt(&mut msg) {
                 Ok(built) => {
                     match self.dispatch_wire(now, &built.wire, &msg, &mut actions) {
                         DispatchResult::Sent => {
@@ -1596,7 +1617,7 @@ impl<S: Store> Node<S> {
             Err(_) => return actions, // undecodable: no leg to answer to; drop
         };
         let leg = msg.header.leg;
-        if self.draining {
+        if self.draining.is_draining() {
             actions.push(self.busy(link, leg));
             return actions;
         }
@@ -2682,10 +2703,10 @@ impl<S: Store> Node<S> {
 
     /// Build a dummy whose padded size lands in the given bucket class
     /// (0=2K, 1=8K, 2=32K). Sizes approximate frame overhead.
-    fn dummy_frame(echo: bool) -> Frame {
+    fn dummy_frame(kind: DummyKind) -> Frame {
         // Bucket selection happens at the transport: the frame is padded
         // into the sampled bucket via `Action::SendFrame::pad_to`.
-        Frame::Dummy(DummyFrame { echo })
+        Frame::Dummy(DummyFrame { echo: kind.into() })
     }
 
     fn random_link(&mut self) -> Option<LinkId> {
@@ -2712,7 +2733,7 @@ impl<S: Store> Node<S> {
                 actions.push(Action::SendFrame {
                     pad_to: Some(bucket),
                     link,
-                    frame: Self::dummy_frame(false),
+                    frame: Self::dummy_frame(DummyKind::Silent),
                 });
                 self.note_snow_send(bucket);
             }
@@ -2744,7 +2765,11 @@ impl<S: Store> Node<S> {
             actions.push(Action::SendFrame {
                 pad_to: Some(b),
                 link,
-                frame: Self::dummy_frame(echo),
+                frame: Self::dummy_frame(if echo {
+                    DummyKind::Echo
+                } else {
+                    DummyKind::Silent
+                }),
             });
             self.note_snow_send(b);
         }
@@ -2867,16 +2892,16 @@ impl<S: Store> Node<S> {
 
     /// Swap in a new identity (after a rotation) and republish the record.
     /// The identifier is unchanged by rotation, so the record keeps its id.
-    /// `publish` is false for abandonment: peers reject abandoned records at
-    /// validation, so there is nothing useful to publish.
+    /// `kind` is [`RotationKind::Abandon`] for abandonment: peers reject
+    /// abandoned records at validation, so there is nothing useful to publish.
     pub fn reload_identity(
         &mut self,
         identity: Identity,
         now: u64,
-        publish: bool,
+        kind: RotationKind,
     ) -> Result<(), NodeError> {
         self.identity = identity;
-        if !publish {
+        if kind == RotationKind::Abandon {
             return Ok(());
         }
         self.own_seq += 1;
@@ -2886,11 +2911,11 @@ impl<S: Store> Node<S> {
     /// Enter or leave draining: while draining, every custody offer is
     /// answered `busy` and nothing new starts. Existing custody is finished
     /// and reported via custody count.
-    pub fn set_draining(&mut self, draining: bool) {
-        self.draining = draining;
+    pub fn set_drain(&mut self, state: local::DrainState) {
+        self.draining = state;
     }
 
-    pub fn is_draining(&self) -> bool {
+    pub fn drain_state(&self) -> local::DrainState {
         self.draining
     }
 
@@ -3015,16 +3040,13 @@ impl<S: Store> Node<S> {
                     )
                     .map(|p| p.record.mode)
                     .ok();
-                    return LookupResult { have: true, mode };
+                    return LookupResult::Present { mode };
                 }
                 Ok(None) => {}
                 Err(e) => self.diag("record_get", &e),
             }
         }
-        LookupResult {
-            have: false,
-            mode: None,
-        }
+        LookupResult::Absent
     }
 
     fn on_app_ack(&mut self, now: u64, service: &str, delivery_ids: &[DeliveryId]) -> Vec<Action> {
@@ -3249,7 +3271,7 @@ mod tests {
         assert_eq!(id.signing_seed, next_seed);
         assert!(!id.is_abandoned());
         let head = KeyEvent::validate_chain(&id.kel).unwrap();
-        assert!(!head.abandoned);
+        assert!(!head.is_abandoned());
         assert_eq!(head.seq, 1);
     }
 
@@ -3278,7 +3300,7 @@ mod tests {
             "unexpected error: {err}"
         );
         let head = KeyEvent::validate_chain(&id.kel).unwrap();
-        assert!(head.abandoned);
+        assert!(head.is_abandoned());
     }
 
     fn sealed_message_to(id: &Identity, body: &[u8]) -> lattice_proto::message::Message {

@@ -157,6 +157,15 @@ pub fn entries_in(items: &[Item], range: &Range) -> Vec<Item> {
         .collect()
 }
 
+/// Whether a range has been echoed before in this session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EchoMark {
+    /// First time this range is echoed.
+    Fresh,
+    /// This range was already echoed; do not echo it again.
+    Seen,
+}
+
 /// Per-neighbor session state: an entry may be echoed once per range.
 #[derive(Default)]
 pub struct ReconcileSession {
@@ -167,9 +176,15 @@ impl ReconcileSession {
     pub fn new() -> Self {
         Self::default()
     }
-    fn mark_echo(&mut self, range: &Range) -> bool {
+    /// Record that `range` has been echoed; reports whether this is the
+    /// first time.
+    fn note_echo(&mut self, range: &Range) -> EchoMark {
         let RangeBounds { lower, upper } = range_parts(range);
-        self.echoed.insert(format!("{lower:?}:{upper:?}"))
+        if self.echoed.insert(format!("{lower:?}:{upper:?}")) {
+            EchoMark::Fresh
+        } else {
+            EchoMark::Seen
+        }
     }
 }
 
@@ -229,7 +244,7 @@ pub fn respond(
                 }
                 let my_items = entries_in(items, &probe);
                 if my_items.len() <= LEAF_LIMIT {
-                    session.mark_echo(&probe);
+                    session.note_echo(&probe);
                     out.push(Range::Entries {
                         lower: *lower,
                         upper: *upper,
@@ -243,7 +258,7 @@ pub fn respond(
                         out.push(with_fp(items, &sub));
                     }
                 } else {
-                    session.mark_echo(&probe);
+                    session.note_echo(&probe);
                     out.push(Range::Entries {
                         lower: *lower,
                         upper: *upper,
@@ -261,7 +276,7 @@ pub fn respond(
                     upper: *upper,
                     entries: entries.clone(),
                 };
-                if session.mark_echo(&probe) {
+                if session.note_echo(&probe) == EchoMark::Fresh {
                     let mine = entries_in(items, &probe);
                     if !mine.is_empty() {
                         out.push(Range::Entries {

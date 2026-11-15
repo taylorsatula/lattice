@@ -5,10 +5,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use lattice_core::{Action, Event, Node};
+use lattice_core::{Action, Event, Node, RotationKind};
 use lattice_crypto::os_bytes;
 use lattice_proto::frames::Frame;
-use lattice_proto::local::{DrainState, Lookup, MessageStatus};
+use lattice_proto::local::{DrainRequest, DrainState, DrainStatus, Lookup, MessageStatus};
 use lattice_store::{RedbStore, Store, StoreError};
 use lattice_types::{
     ChannelPublicKey, ChannelSeed, DeliveryId, Identifier, MessageId, X25519PublicKey,
@@ -65,15 +65,15 @@ pub enum ApiCmd {
     NodeInfo {
         respond: tokio::sync::oneshot::Sender<NodeInfo>,
     },
-    /// None = report only; Some(d) = set draining to d.
+    /// Query or set drain mode; the reply carries the resulting state.
     Drain {
-        draining: Option<bool>,
-        respond: tokio::sync::oneshot::Sender<DrainState>,
+        request: DrainRequest,
+        respond: tokio::sync::oneshot::Sender<DrainStatus>,
     },
     /// Rotate the signing key. `next_key_file` overrides the default location.
     Rotate {
         next_key_file: Option<String>,
-        abandon: bool,
+        kind: RotationKind,
         respond: tokio::sync::oneshot::Sender<Result<String, String>>,
     },
     /// Rotate the envelope (X-Wing) key; old key kept decrypt-only for 2 days.
@@ -82,15 +82,23 @@ pub enum ApiCmd {
     },
     UnlinkByPeer {
         peer: Identifier,
-        respond: tokio::sync::oneshot::Sender<bool>,
+        respond: tokio::sync::oneshot::Sender<usize>,
     },
     Link {
         addr: String,
         ik_key: Option<ChannelPublicKey>,
         path: Option<String>,
         peer_id: Option<Identifier>,
-        respond: tokio::sync::oneshot::Sender<bool>,
+        respond: tokio::sync::oneshot::Sender<LinkOutcome>,
     },
+}
+
+/// Outcome of a link request: whether the daemon queued the dial, or
+/// rejected it (unparseable address).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LinkOutcome {
+    Queued,
+    Rejected,
 }
 
 #[derive(Clone, Debug)]
@@ -254,7 +262,7 @@ impl Runtime {
         };
         let mut node = Node::new(core_cfg, identity, store, now)?;
         if draining.load(Ordering::Relaxed) {
-            node.set_draining(true);
+            node.set_drain(DrainState::Draining);
         }
         let (link_tx, link_rx) = mpsc::unbounded_channel();
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
@@ -319,7 +327,6 @@ impl Runtime {
                 link: id,
                 peer,
                 remote_ck,
-                wan: true,
             })
         };
         report_diagnostics(diags);
@@ -377,8 +384,8 @@ impl Runtime {
     fn begin_drain(&mut self) {
         self.draining.store(true, Ordering::Relaxed);
         let mut node = self.node.lock().unwrap_or_else(|e| e.into_inner());
-        node.set_draining(true);
-        if let Err(e) = node.store_mut().drain_set(true) {
+        node.set_drain(DrainState::Draining);
+        if let Err(e) = node.store_mut().drain_set(DrainState::Draining) {
             eprintln!("lattice: failed to persist drain flag: {e}");
         }
         eprintln!("lattice: draining (refusing new custody); exiting");
@@ -512,18 +519,12 @@ impl Runtime {
             }
             ApiCmd::Lookup { id, respond } => {
                 let mut node = self.node.lock().unwrap_or_else(|e| e.into_inner());
-                let result = node.lookup(&id);
                 let path = node.has_path(&id);
-                // The wire carries mode as 0 = public / 1 = private.
-                let mode = result.mode.map(|m| match m {
-                    lattice_proto::record::Mode::Public => 0,
-                    lattice_proto::record::Mode::Private => 1,
-                });
-                let _ = respond.send(Lookup {
-                    have: result.have,
-                    mode,
-                    path,
-                });
+                let lookup = match node.lookup(&id) {
+                    lattice_core::LookupResult::Absent => Lookup::Absent { path },
+                    lattice_core::LookupResult::Present { mode } => Lookup::Present { mode, path },
+                };
+                let _ = respond.send(lookup);
             }
             ApiCmd::NodeInfo { respond } => {
                 let mut node = self.node.lock().unwrap_or_else(|e| e.into_inner());
@@ -533,21 +534,21 @@ impl Runtime {
                     links: self.links.len(),
                     records: node.debug_record_count(),
                     custody_bytes: node.custody_bytes(),
-                    draining: node.is_draining(),
+                    draining: node.drain_state().is_draining(),
                 };
                 let _ = respond.send(info);
             }
-            ApiCmd::Drain { draining, respond } => {
+            ApiCmd::Drain { request, respond } => {
                 let mut node = self.node.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(d) = draining {
-                    node.set_draining(d);
-                    self.draining.store(d, Ordering::Relaxed);
-                    if let Err(e) = node.store_mut().drain_set(d) {
+                if let DrainRequest::Set(state) = request {
+                    node.set_drain(state);
+                    self.draining.store(state.is_draining(), Ordering::Relaxed);
+                    if let Err(e) = node.store_mut().drain_set(state) {
                         eprintln!("lattice: failed to persist drain flag: {e}");
                     }
                 }
-                let _ = respond.send(DrainState {
-                    draining: node.is_draining(),
+                let _ = respond.send(DrainStatus {
+                    draining: node.drain_state().is_draining(),
                     custody_bytes: node.custody_bytes(),
                 });
             }
@@ -568,11 +569,15 @@ impl Runtime {
                         peer_id,
                     });
                 }
-                let _ = respond.send(ok);
+                let _ = respond.send(if ok {
+                    LinkOutcome::Queued
+                } else {
+                    LinkOutcome::Rejected
+                });
             }
             ApiCmd::Rotate {
                 next_key_file,
-                abandon,
+                kind,
                 respond,
             } => {
                 let result = (|| {
@@ -580,21 +585,21 @@ impl Runtime {
                     let rotation = crate::keys::rotate_signing_key(
                         &dir,
                         next_key_file.as_deref().map(std::path::Path::new),
-                        abandon,
+                        kind,
                     )
                     .map_err(|e| e.to_string())?;
                     let now = now_secs();
                     let mut node = self.node.lock().unwrap_or_else(|e| e.into_inner());
-                    node.reload_identity(rotation.identity, now, !abandon)
+                    node.reload_identity(rotation.identity, now, kind)
                         .map_err(|e| e.to_string())?;
-                    if abandon {
-                        node.set_draining(true);
+                    if kind == RotationKind::Abandon {
+                        node.set_drain(DrainState::Draining);
                         self.draining.store(true, Ordering::Relaxed);
-                        if let Err(e) = node.store_mut().drain_set(true) {
+                        if let Err(e) = node.store_mut().drain_set(DrainState::Draining) {
                             eprintln!("lattice: failed to persist drain flag: {e}");
                         }
                     }
-                    Ok(if abandon {
+                    Ok(if kind == RotationKind::Abandon {
                         "identity abandoned".to_string()
                     } else {
                         format!(
@@ -615,7 +620,7 @@ impl Runtime {
                         .map_err(|e| e.to_string())?;
                     let now = now_secs();
                     let mut node = self.node.lock().unwrap_or_else(|e| e.into_inner());
-                    node.reload_identity(identity, now, true)
+                    node.reload_identity(identity, now, RotationKind::Rotate)
                         .map_err(|e| e.to_string())?;
                     Ok("envelope key rotated; old key kept decrypt-only for 2 days".to_string())
                 })();
@@ -624,7 +629,7 @@ impl Runtime {
             ApiCmd::UnlinkByPeer { peer, respond } => {
                 let before = self.links.len();
                 self.unlink(peer);
-                let _ = respond.send(self.links.len() < before);
+                let _ = respond.send(before - self.links.len());
             }
         }
     }
@@ -640,7 +645,7 @@ impl Runtime {
             Ok(a) => a,
             Err(_) => return,
         };
-        let pinned = pinned_peer(ik_key.is_some(), peer_id);
+        let pinned = pinned_peer(ik_key.as_ref(), peer_id);
         if peer_id.is_some() && pinned.is_none() {
             eprintln!(
                 "lattice: ignoring configured peer id for {addr}: XX dials authenticate no one; \
@@ -732,26 +737,30 @@ fn encode_status_event(mid: MessageId, status: u64) -> Vec<u8> {
 /// Pin the configured peer id only for IK-authenticated dials. An XX dial
 /// proves nothing about who is on the other end; pinning then would bind the
 /// link to an unverified id. Record-based attribution binds it later.
-fn pinned_peer(ik: bool, peer_id: Option<Identifier>) -> Option<Identifier> {
-    if ik { peer_id } else { None }
+fn pinned_peer(
+    ik_key: Option<&ChannelPublicKey>,
+    peer_id: Option<Identifier>,
+) -> Option<Identifier> {
+    if ik_key.is_some() { peer_id } else { None }
 }
 
 #[cfg(test)]
 mod tests {
     use super::pinned_peer;
-    use lattice_types::Identifier;
+    use lattice_types::{ChannelPublicKey, Identifier};
 
     #[test]
     fn ik_dial_pins_configured_id() {
         let id = Identifier::from_bytes([7u8; 32]);
-        assert_eq!(pinned_peer(true, Some(id)), Some(id));
-        assert_eq!(pinned_peer(true, None), None);
+        let ck = ChannelPublicKey::from_bytes([9u8; 32]);
+        assert_eq!(pinned_peer(Some(&ck), Some(id)), Some(id));
+        assert_eq!(pinned_peer(Some(&ck), None), None);
     }
 
     #[test]
     fn xx_dial_never_pins() {
         let id = Identifier::from_bytes([7u8; 32]);
-        assert_eq!(pinned_peer(false, Some(id)), None);
-        assert_eq!(pinned_peer(false, None), None);
+        assert_eq!(pinned_peer(None, Some(id)), None);
+        assert_eq!(pinned_peer(None, None), None);
     }
 }

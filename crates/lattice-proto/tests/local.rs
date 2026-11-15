@@ -79,7 +79,7 @@ fn length_prefix_roundtrip() {
 
 #[test]
 fn status_encodes() {
-    let bytes = encode_status(true, false, &[1]);
+    let bytes = encode_status(false, &[1]);
     let v = lattice_proto::decode(&bytes).unwrap();
     let m = v.as_map().unwrap();
     let up = m

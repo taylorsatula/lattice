@@ -288,7 +288,7 @@ pub async fn wait_for_path(client: &mut lattice_client::Client, id: &Identifier,
     let deadline = Instant::now() + Duration::from_secs(secs);
     loop {
         match client.lookup(id).await {
-            Ok(l) if l.have && l.path => return,
+            Ok(l) if l.have() && l.path() => return,
             _ => {
                 assert!(Instant::now() < deadline, "never learned a path");
                 tokio::time::sleep(Duration::from_millis(250)).await;

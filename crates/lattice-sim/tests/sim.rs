@@ -1,5 +1,6 @@
 use lattice_core::Config;
-use lattice_sim::Sim;
+use lattice_proto::local::DrainState;
+use lattice_sim::{LinkState, Sim};
 use lattice_types::{ChannelSeed, Identifier, LegId, MessageId, Signature, XWingPublicKey};
 
 fn fast_config() -> Config {
@@ -94,14 +95,14 @@ fn partition_holds_then_heals() {
     sim.connect(1, 2);
     let link = sim.link_between(1, 2).unwrap();
     sim.run_for(6);
-    sim.set_link(link, false);
+    sim.set_link(link, LinkState::Down);
     let mid = sim.app_send(0, 2, b"after heal");
     sim.run_for(3);
     assert!(
         sim.deliveries.iter().all(|d| d.mid != mid),
         "no delivery while partitioned"
     );
-    sim.set_link(link, true);
+    sim.set_link(link, LinkState::Up);
     sim.run_for(20);
     assert!(
         sim.deliveries.iter().any(|d| d.mid == mid),
@@ -119,7 +120,7 @@ fn crash_during_custody_preserves_message() {
     sim.connect(1, 2);
     let link_bc = sim.link_between(1, 2).unwrap();
     sim.run_for(6);
-    sim.set_link(link_bc, false);
+    sim.set_link(link_bc, LinkState::Down);
     let mid = sim.app_send(0, 2, b"survive my crash");
     sim.run_for(4);
     assert_eq!(
@@ -128,7 +129,7 @@ fn crash_during_custody_preserves_message() {
         "B should hold the message in custody"
     );
     sim.crash_node(1);
-    sim.set_link(link_bc, true);
+    sim.set_link(link_bc, LinkState::Up);
     sim.run_for(20);
     assert!(
         sim.deliveries.iter().any(|d| d.mid == mid),
@@ -194,10 +195,10 @@ fn expired_message_is_not_delivered() {
     sim.force_app_send(0, send);
     sim.run_for(1);
     assert_eq!(sim.custody_count(1), 1, "B holds the message in custody");
-    sim.set_link(link_bc, false);
+    sim.set_link(link_bc, LinkState::Down);
     sim.run_for(10);
     assert_eq!(sim.custody_count(1), 0, "expired custody must be dropped");
-    sim.set_link(link_bc, true);
+    sim.set_link(link_bc, LinkState::Up);
     sim.run_for(10);
     assert!(
         sim.deliveries.iter().all(|d| d.body != b"expires"),
@@ -229,7 +230,7 @@ fn fair_share_caps_a_flooded_upstream() {
     let rd = sim.connect(r, d);
     sim.run_for(6); // converge
     // Jam the R->D link so custody backs up at R.
-    sim.set_link(rd, false);
+    sim.set_link(rd, LinkState::Down);
     // F floods.
     for i in 0..20u8 {
         sim.app_send(f, d, &vec![i; 400]);
@@ -622,11 +623,11 @@ fn queued_message_survives_receipt_timeout_and_delivers() {
     sim.connect(0, 1);
     let link = sim.link_between(0, 1).unwrap();
     sim.run_for(6); // let records converge before partitioning
-    sim.set_link(link, false);
+    sim.set_link(link, LinkState::Down);
     sim.run_for(2);
     let mid = sim.app_send(0, 1, b"late but alive");
     sim.run_for(30);
-    sim.set_link(link, true);
+    sim.set_link(link, LinkState::Up);
     sim.run_for(15);
     assert!(
         sim.deliveries.iter().any(|d| d.mid == mid),
@@ -653,7 +654,7 @@ fn buffer_class_isolates_full_classes() {
     sim.connect(b, c);
     sim.connect(c, d);
     // C is draining: B cannot hand off, so B holds what it accepts.
-    sim.nodes[c].set_draining(true);
+    sim.nodes[c].set_drain(DrainState::Draining);
     // Wait until A has a route to D (records gossip through B).
     let d_id = sim.ids[d];
     for _ in 0..30 {

@@ -322,7 +322,7 @@ async fn handle_conn(
     if parsed.path == "/status" && cfg.status_enabled && parsed.method == "GET" {
         let draining = cfg.draining.load(std::sync::atomic::Ordering::Relaxed);
         let accepting = !draining && !load.under_load();
-        let body = lattice_proto::local::encode_status(true, accepting, &[1]);
+        let body = lattice_proto::local::encode_status(accepting, &[1]);
         let resp = format!(
             "HTTP/1.1 200 OK\r\ncontent-type: application/cbor\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
             body.len()

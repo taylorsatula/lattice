@@ -18,7 +18,7 @@ use lattice_proto::local::*;
 use lattice_proto::{ProtoError, Value, decode, encode};
 use lattice_types::{ChannelPublicKey, DeliveryId, Identifier, MessageId};
 
-pub use lattice_proto::local::{DrainState, Lookup, MessageStatus};
+pub use lattice_proto::local::{DrainRequest, DrainState, DrainStatus, Lookup, MessageStatus};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
@@ -156,6 +156,14 @@ pub struct NodeInfo {
     pub draining: bool,
 }
 
+/// Outcome of an `unlink` request: whether at least one open link to the
+/// peer was dropped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnlinkOutcome {
+    Removed,
+    NotFound,
+}
+
 type Result<T> = std::result::Result<T, Error>;
 
 pub struct Client {
@@ -281,14 +289,28 @@ impl Client {
     pub async fn lookup(&mut self, id: &Identifier) -> Result<Lookup> {
         let args = Value::map(vec![(Value::UInt(0), Value::Bytes(id.to_vec()))]);
         let result = self.call(OP_LOOKUP, args).await?;
-        Ok(Lookup {
-            have: lattice_proto::cbor::map_get(&result, 0)
-                .and_then(Value::as_bool)
-                .ok_or(Error::BadResponse("lookup: missing have"))?,
-            mode: lattice_proto::cbor::map_get(&result, 1).and_then(Value::as_uint),
-            path: lattice_proto::cbor::map_get(&result, 2)
-                .and_then(Value::as_bool)
-                .ok_or(Error::BadResponse("lookup: missing path"))?,
+        let have = lattice_proto::cbor::map_get(&result, 0)
+            .and_then(Value::as_bool)
+            .ok_or(Error::BadResponse("lookup: missing have"))?;
+        let path = lattice_proto::cbor::map_get(&result, 2)
+            .and_then(Value::as_bool)
+            .ok_or(Error::BadResponse("lookup: missing path"))?;
+        let mode = match lattice_proto::cbor::map_get(&result, 1) {
+            None => None,
+            Some(v) => {
+                let raw = v.as_uint().ok_or(Error::BadResponse("lookup: bad mode"))?;
+                Some(
+                    lattice_proto::record::Mode::from_u64(raw)
+                        .map_err(|_| Error::BadResponse("lookup: bad mode"))?,
+                )
+            }
+        };
+        // A `have: false` reply carrying a mode is malformed but harmless;
+        // the record half is dropped.
+        Ok(if have {
+            Lookup::Present { mode, path }
+        } else {
+            Lookup::Absent { path }
         })
     }
 
@@ -321,14 +343,17 @@ impl Client {
         })
     }
 
-    /// Set or query drain mode. `None` reports, `Some(d)` sets.
-    pub async fn drain(&mut self, draining: Option<bool>) -> Result<DrainState> {
-        let args = match draining {
-            Some(d) => Value::map(vec![(Value::UInt(0), Value::Bool(d))]),
-            None => Value::map(vec![]),
+    /// Query or set drain mode. [`DrainRequest::Query`] reports;
+    /// [`DrainRequest::Set`] sets and then reports.
+    pub async fn drain(&mut self, request: DrainRequest) -> Result<DrainStatus> {
+        let args = match request {
+            DrainRequest::Query => Value::map(vec![]),
+            DrainRequest::Set(state) => {
+                Value::map(vec![(Value::UInt(0), Value::Bool(state.is_draining()))])
+            }
         };
         let result = self.call(OP_DRAIN, args).await?;
-        Ok(DrainState {
+        Ok(DrainStatus {
             draining: lattice_proto::cbor::map_get(&result, 0)
                 .and_then(Value::as_bool)
                 .ok_or(Error::BadResponse("drain: missing draining"))?,
@@ -338,13 +363,17 @@ impl Client {
 
     /// Queue a dial to `addr`. Exactly one of `channel_key` (IK dial) or
     /// `path` (XX dial) is required; `id` pins the expected peer.
+    ///
+    /// Returns `Ok(())` once the daemon has accepted the dial; the daemon
+    /// rejects with `ERR_BAD_ARGS` when the address is unparseable or
+    /// neither a key nor a path is given.
     pub async fn link(
         &mut self,
         addr: &str,
         channel_key: Option<ChannelPublicKey>,
         path: Option<String>,
         id: Option<Identifier>,
-    ) -> Result<bool> {
+    ) -> Result<()> {
         let mut args = vec![(Value::UInt(0), Value::Text(addr.to_string()))];
         if let Some(k) = channel_key {
             args.push((Value::UInt(1), Value::Bytes(k.to_vec())));
@@ -356,9 +385,13 @@ impl Client {
             args.push((Value::UInt(3), Value::Bytes(i.to_vec())));
         }
         let result = self.call(OP_LINK, Value::map(args)).await?;
-        lattice_proto::cbor::map_get(&result, 0)
-            .and_then(Value::as_bool)
-            .ok_or(Error::BadResponse("link: missing result"))
+        match lattice_proto::cbor::map_get(&result, 0).and_then(Value::as_bool) {
+            Some(true) => Ok(()),
+            // The daemon answers `false` only when it refused the dial; it
+            // normally rejects with ERR_BAD_ARGS instead.
+            Some(false) => Err(Error::Rejected(ERR_BAD_ARGS)),
+            None => Err(Error::BadResponse("link: missing result")),
+        }
     }
 
     /// Rotate the signing key using the pre-committed next key.
@@ -389,13 +422,15 @@ impl Client {
         text_at(&result, 0)
     }
 
-    /// Drop every link to the given peer id. Returns true if any were open.
-    pub async fn unlink(&mut self, id: &Identifier) -> Result<bool> {
+    /// Drop every link to the given peer id.
+    pub async fn unlink(&mut self, id: &Identifier) -> Result<UnlinkOutcome> {
         let args = Value::map(vec![(Value::UInt(0), Value::Bytes(id.to_vec()))]);
         let result = self.call(OP_UNLINK, args).await?;
-        lattice_proto::cbor::map_get(&result, 0)
-            .and_then(Value::as_bool)
-            .ok_or(Error::BadResponse("unlink: missing result"))
+        match lattice_proto::cbor::map_get(&result, 0).and_then(Value::as_bool) {
+            Some(true) => Ok(UnlinkOutcome::Removed),
+            Some(false) => Ok(UnlinkOutcome::NotFound),
+            None => Err(Error::BadResponse("unlink: missing result")),
+        }
     }
 
     // ── internals ────────────────────────────────────────────────────
@@ -593,7 +628,7 @@ mod tests {
         )
         .await;
         let mut client = Client::connect_admin(&path).await.unwrap();
-        let err = client.drain(None).await.unwrap_err();
+        let err = client.drain(DrainRequest::Query).await.unwrap_err();
         assert!(matches!(err, Error::BadResponse("drain: missing draining")));
     }
 

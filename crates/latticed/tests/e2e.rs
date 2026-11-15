@@ -5,7 +5,7 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use lattice_client::Client;
+use lattice_client::{Client, DrainRequest, DrainState, UnlinkOutcome};
 
 mod common;
 
@@ -134,7 +134,7 @@ async fn two_nodes_deliver_and_drain() {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         match client_a.lookup(&id_b).await {
-            Ok(l) if l.have && l.path => break,
+            Ok(l) if l.have() && l.path() => break,
             _ => {
                 assert!(Instant::now() < deadline, "A never learned a path to B");
                 tokio::time::sleep(Duration::from_millis(250)).await;
@@ -237,12 +237,20 @@ async fn two_nodes_deliver_and_drain() {
     let mut admin_b = Client::connect_admin(&admin_b)
         .await
         .expect("admin connect");
-    let draining = admin_b.drain(Some(true)).await.expect("drain on").draining;
-    assert!(draining);
-    let draining = admin_b.drain(None).await.expect("drain query").draining;
+    let draining = admin_b
+        .drain(DrainRequest::Set(DrainState::Draining))
+        .await
+        .expect("drain on")
+        .draining;
     assert!(draining);
     let draining = admin_b
-        .drain(Some(false))
+        .drain(DrainRequest::Query)
+        .await
+        .expect("drain query")
+        .draining;
+    assert!(draining);
+    let draining = admin_b
+        .drain(DrainRequest::Set(DrainState::Serving))
         .await
         .expect("drain off")
         .draining;
@@ -419,7 +427,7 @@ async fn wait_for_path(client: &mut Client, id: &lattice_types::Identifier, secs
     let deadline = Instant::now() + Duration::from_secs(secs);
     loop {
         match client.lookup(id).await {
-            Ok(l) if l.have && l.path => return,
+            Ok(l) if l.have() && l.path() => return,
             _ => {
                 assert!(Instant::now() < deadline, "never learned a path");
                 tokio::time::sleep(Duration::from_millis(250)).await;
@@ -474,7 +482,11 @@ async fn drain_flips_status_accepting() {
     let mut admin = Client::connect_admin(&b.admin)
         .await
         .expect("admin connect");
-    let draining = admin.drain(Some(true)).await.expect("drain on").draining;
+    let draining = admin
+        .drain(DrainRequest::Set(DrainState::Draining))
+        .await
+        .expect("drain on")
+        .draining;
     assert!(draining);
     let during = http_get(&addr, "/status");
     assert!(
@@ -482,7 +494,11 @@ async fn drain_flips_status_accepting() {
         "draining node must report accepting=false"
     );
 
-    let draining = admin.drain(Some(false)).await.expect("drain off").draining;
+    let draining = admin
+        .drain(DrainRequest::Set(DrainState::Serving))
+        .await
+        .expect("drain off")
+        .draining;
     assert!(!draining);
     let after = http_get(&addr, "/status");
     assert!(status_accepting(&after), "un-drained node must accept");
@@ -507,7 +523,10 @@ async fn drain_persists_across_restart() {
     let mut admin = Client::connect_admin(&b.admin)
         .await
         .expect("admin connect");
-    admin.drain(Some(true)).await.expect("drain on");
+    admin
+        .drain(DrainRequest::Set(DrainState::Draining))
+        .await
+        .expect("drain on");
     drop(admin);
 
     b.restart();
@@ -515,7 +534,11 @@ async fn drain_persists_across_restart() {
     let mut admin = Client::connect_admin(&b.admin)
         .await
         .expect("admin reconnect");
-    let draining = admin.drain(None).await.expect("drain query").draining;
+    let draining = admin
+        .drain(DrainRequest::Query)
+        .await
+        .expect("drain query")
+        .draining;
     assert!(draining, "drain flag must survive a restart");
 
     let _ = std::fs::remove_dir_all(&tmp);
@@ -809,7 +832,10 @@ async fn drain_stops_new_accepts() {
     let mut admin_b = Client::connect_admin(&b.admin).await.expect("admin B");
     wait_for_path(&mut client_a, &b.id, 30).await;
 
-    admin_b.drain(Some(true)).await.expect("drain B");
+    admin_b
+        .drain(DrainRequest::Set(DrainState::Draining))
+        .await
+        .expect("drain B");
 
     let mid = client_a
         .send(&lattice_client::Send {
@@ -841,7 +867,10 @@ async fn drain_stops_new_accepts() {
         "message must not be delivered while the recipient drains"
     );
 
-    admin_b.drain(Some(false)).await.expect("un-drain B");
+    admin_b
+        .drain(DrainRequest::Set(DrainState::Serving))
+        .await
+        .expect("un-drain B");
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
@@ -885,7 +914,11 @@ async fn sigterm_sets_drain_and_it_persists() {
     let mut admin = Client::connect_admin(&b.admin)
         .await
         .expect("admin reconnect");
-    let draining = admin.drain(None).await.expect("drain query").draining;
+    let draining = admin
+        .drain(DrainRequest::Query)
+        .await
+        .expect("drain query")
+        .draining;
     assert!(draining, "SIGTERM must persist the drain flag");
 
     let _ = std::fs::remove_dir_all(&tmp);
@@ -932,7 +965,10 @@ async fn unlink_closes_the_connection() {
 
     // A unlinks B; B must observe the connection drop (its link count falls to 0).
     let removed = admin_a.unlink(&b.id).await.expect("unlink");
-    assert!(removed, "unlink should report a removed link");
+    assert!(
+        matches!(removed, UnlinkOutcome::Removed),
+        "unlink should report a removed link"
+    );
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let info = admin_b.node().await.expect("node B");

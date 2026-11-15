@@ -53,13 +53,15 @@ pub enum Mode {
 }
 
 impl Mode {
-    fn as_u64(self) -> u64 {
+    /// Wire encoding: 0 = public, 1 = private.
+    pub fn as_u64(self) -> u64 {
         match self {
             Mode::Public => MODE_PUBLIC,
             Mode::Private => MODE_PRIVATE,
         }
     }
-    fn from_u64(v: u64) -> Result<Self, ProtoError> {
+    /// Inverse of [`Mode::as_u64`]; rejects values other than 0 and 1.
+    pub fn from_u64(v: u64) -> Result<Self, ProtoError> {
         match v {
             MODE_PUBLIC => Ok(Self::Public),
             MODE_PRIVATE => Ok(Self::Private),
