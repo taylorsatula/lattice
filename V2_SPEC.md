@@ -3,8 +3,6 @@
 Companion to `V2_DESIGN.md`. Every object here is derived from a decision in
 that document; section references (§n) point back to it.
 
-Wire version 2; see §9 for the revision.
-
 ## 1. Conventions
 
 - **Encoding:** deterministic CBOR (RFC 8949 §4.2): shortest-form integers,
@@ -12,12 +10,12 @@ Wire version 2; see §9 for the revision.
   the exact encoded bytes.
 - **Maps use small integer keys,** as COSE does, for compactness. The tables
   below give each key's number.
-- **Every top-level object** carries `0: v` (protocol version, currently 2)
+- **Every top-level object** carries `0: v` (protocol version, currently 1)
   and `1: t` (object type).
 - **Unknown keys are rejected,** not ignored. Within a version the format is
   closed; extensions come with a new version number. A node refuses objects
   whose version it doesn't support, and advertises the versions it supports
-  in its record's capabilities. There is no compatibility with v1.
+  in its record's capabilities.
 - **Sizes:**
 
   | Object | Limit |
@@ -160,8 +158,8 @@ The KEL travels as its own object, not embedded in records.
   `abandon` admin operation (§7) publishes it before draining.
 - **Reconciliation.** KEL objects are reconciled in the same set as records
   (§6), as entries with scope 255 (reserved; never valid in a record), `seq`
-  equal to the head sn, and hash-prefix equal to the first 8 bytes of the
-  head event's event hash.
+  and `khs` both equal to the head sn, and hash-prefix equal to the first 8
+  bytes of the head event's event hash.
 
 ## 3. Peer record (§2)
 
@@ -395,7 +393,7 @@ Each WebSocket binary frame carries one CBOR value.
   derived upgrade path remains the admission gate for that pattern. IK/XX is
   distinguished by first-message length (32 bytes = XX, otherwise IK);
   changing either pattern's message sizes requires changing this rule in the
-  same revision.
+  same version.
 - **mac2** is keyed by the cookie and required only when the responder is
   under load. A responder under load that receives an init without a valid
   mac2 answers with a `cookie` frame and keeps no state. The cookie is an
@@ -418,7 +416,7 @@ Each WebSocket binary frame carries one CBOR value.
 - **After the handshake,** each side checks that the peer's Noise static key
   equals the `ck` in that peer's record. With XX, it first obtains the
   record through gossip. This check is the only binding between a link and
-  an identity; there is no attestation frame (removed in wire version 2).
+  an identity; there is no attestation frame.
   The cross-signed record (§3) plus the Noise static key are the whole
   binding.
 
@@ -440,7 +438,7 @@ exactly a bucket size is refused. Frame types:
 | 24 | kels | `{2: [kel, …]}`. KEL objects (§2) |
 | 60 | ping | `{2: nonce}`, answered with the same frame. Replaces WebSocket ping/pong, which is not used |
 | 61 | dummy | `{2: echo}` (bool). Discarded on receipt; if `echo` is true, answered with a dummy (§ Snow) |
-| 62 | reserved | Removed in wire version 2 (was `attest`); not sent, not accepted |
+| 62 | reserved | Reserved (was `attest` in early drafts); not sent, not accepted |
 
 - **Large gossip** that doesn't fit one 32 KB frame is split across several
   `reconcile`, `records` or `kels` frames.
@@ -458,8 +456,9 @@ exactly a bucket size is refused. Frame types:
 The reconciliation set holds two kinds of entries: records (scope 0 or 1)
 and KELs (scope 255, reserved; never valid in a record). Entries are
 ordered by (id, scope). Each entry's item hash is
-BLAKE3(id ‖ scope ‖ seq ‖ hash-prefix), with `scope` a single byte, `seq`
-as 8 little-endian bytes (the record's seq, or the KEL head's sn), and
+BLAKE3(id ‖ scope ‖ khs ‖ seq ‖ hash-prefix), with `scope` a single byte,
+`khs` and `seq` as 8 little-endian bytes each (for a record, the record's
+`khs` and `seq`; for a KEL entry, both equal the head sn), and
 `hash-prefix` the first 8 bytes of the record's hash (BLAKE3 of its exact
 encoding) or, for a KEL entry, the first 8 bytes of the head event's event
 hash. A range's fingerprint is the count of entries and the sum of their
@@ -479,8 +478,9 @@ frame carries KEL objects.
   beyond the per-range limit.
 
 - **A range** is `{0: lower bound, 1: upper bound, 2: [count, sum]}` or
-  `{0: lower, 1: upper, 3: [[id, scope, seq, hash-prefix], …]}` (an explicit
-  list, used for small ranges; `hash-prefix` is 8 bytes).
+  `{0: lower, 1: upper, 3: [[id, scope, khs, seq, hash-prefix], …]}` (an
+  explicit list, used for small ranges; `khs` and `seq` are 8 bytes,
+  `hash-prefix` is 8 bytes).
 - **A round** starts with one range covering everything. The receiver
   compares fingerprints:
   - **Equal:** done.
@@ -489,10 +489,10 @@ frame carries KEL objects.
   - **Different and small** (32 entries or fewer): reply with the explicit
     list.
 - **Fetching:** each side sends `want` for entries it lacks, holds at a
-  lower seq than the peer's, or holds at an equal seq whose hash-prefix is
-  higher than the peer's (the lower hash wins; equal prefixes are treated
-  as identical). For a KEL entry the
-  same rule applies with the head sn and the head event hash prefix. The
+  lower (khs, seq) than the peer's, or holds at an equal (khs, seq) whose
+  hash-prefix is higher than the peer's (the lower hash wins; equal prefixes
+  are treated as identical). The same rule applies to KEL entries, whose
+  `khs` and `seq` are both the head sn. The
   other side answers with `records`, or with `kels` for KEL entries (a KEL
   entry is wanted as `[id, 255]`). A node
   that receives a record whose KEL it does not hold, or whose head is ahead
@@ -734,65 +734,5 @@ verifies it against the commitment and never writes it to disk (§1).
 **Schema versioning.** The store starts at schema version 1. At startup the
 daemon reads `meta`. If the version is older than the daemon's, it runs the
 explicit migrations for each step in order before serving. If it is newer,
-the daemon refuses to start. There is no migration from v1's SQLite
-database.
-
-## 9. Wire revision 2
-
-This revision is wire version 2. Every object that carries `v` carries 2.
-The test vectors and the Python client are regenerated in the same change.
-This section, together with the revised §1–§8, supersedes the corresponding
-parts of the previous text (wire version 1); where they differ, this
-revision governs. The changes, all part of wire version 2:
-
-1. **KEL object (H-01).** The key event log is a separate gossiped object
-   (§2), not embedded in records. Records carry only the KEL head (`khs`,
-   `khc`) and the current signing key (`k`); the full KEL is no longer in
-   the record. A receiver that lacks the KEL, or holds one behind the
-   record's head, drops the record and wants the KEL; reconciliation
-   delivers it. KEL objects are reconciled in the same set as records
-   (scope 255), are retained for the KEL-head retention period, and are the
-   carrier of abandonment tombstones.
-2. **Record order and `seq` (H-02).** `seq` is `max(previous seq + 1, unix
-   seconds)`. Records for the same (id, scope) are totally ordered by
-   (`khs`, `seq`, record hash); admission and last-writer-wins use this
-   order (§3).
-3. **Buckets (H-05).** The frame bucket ladder is 2048 / 4096 / 8192 /
-   32768 bytes (§1, §6).
-4. **Custody reply codes (H-11).** `ALREADY_HAVE` (1) means the receiver
-   holds custody of the leg; `SEEN` (4) means the receiver has seen the leg
-   but does not hold it and wants the sender to try elsewhere. Neither
-   releases the sender's custody; both exclude the link for that leg
-   (§6).
-5. **Reconcile item hash (R-25).** The item hash covers
-   (id, scope, seq, hash-prefix), where hash-prefix is the first 8 bytes of
-   the record's hash (or, for a KEL entry, of the head event's event hash).
-   Explicit lists carry the prefix; a node wants an entry when the peer's
-   seq is higher, or equal with a lower hash-prefix (§6).
-6. **Noise prologue (R-57).** The handshake prologue is `"lattice v1" ‖ 0x00
-   ‖` the upgrade path as it appears in the request line (§6).
-7. **Domain-separated preimages (R-58).** Every signature preimage is
-   prefixed with a context string naming the object type (§1).
-8. **Attestation removed (H-08).** The `attest` frame (62) and the
-   attestation exchange are removed; this is a wire change. The `csig` on
-   the record is the sole binding between a record and its channel key, and
-   the Noise static key check after the handshake is the sole binding
-   between a link and an identity (§3, §6).
-9. **Gateway consent (H-21).** A public record may carry `serves`, the
-   private ids the gateway agrees to serve (at most 16). The
-   private↔gateway pseudo-edge exists only when both records name each
-   other (§3).
-10. **Negative receipt reason 2 (H-12).** Reason 2 is sent only when the
-    signature verifies but the envelope is otherwise invalid. On signature
-    failure the node refuses custody and sends no receipt of any kind
-    (§5, §7).
-11. **Text forms (R-47).** Identifiers are lowercase base32 (RFC 4648, no
-    padding), 52 characters; lowercase hex (64 characters) is accepted
-    everywhere an identifier is accepted; the address form is
-    `service:mailbox@identifier` (§1).
-12. **Wire version.** Objects carry `v = 2`; the vectors and the Python
-    client are regenerated in the same change.
-
-Note on naming: `lattice v1` in the context strings and the Noise prologue
-is the protocol name and is unchanged by this revision; the wire version is
-carried in object key 0.
+the daemon refuses to start. There is no migration from the retired
+Python implementation's SQLite database.
