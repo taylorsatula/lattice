@@ -87,3 +87,21 @@ jobs:
             echo "== $d"
             (cd "$d" && cargo geiger) || true
           done
+
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - name: build fuzz targets
+        run: cargo +nightly fuzz build
+      - name: smoke-run fuzz targets (45s each)
+        run: |
+          set -e
+          for target in cbor_decode frame_decode message_open message_parse record_parse parse_init local_deframe decode_kel; do
+            echo "== $target"
+            cargo +nightly fuzz run "$target" -- -max_total_time=45 -timeout=25
+          done
