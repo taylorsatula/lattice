@@ -946,3 +946,31 @@ fn sideways_turns_do_not_lose_messages() {
         );
     }
 }
+
+#[test]
+fn frame_exceeding_the_bucket_is_rejected_by_the_encode_path() {
+    // An Offer whose message pushes the frame past the largest bucket
+    // (32768 bytes) must fail wire encoding rather than be truncated or
+    // silently dropped.
+    let oversize = lattice_proto::frames::Frame::Offer(lattice_proto::frames::OfferFrame {
+        message: vec![0xAB; 40_000],
+    });
+    let err = lattice_sim::encode_frame_wire(&oversize, None)
+        .expect_err("a frame larger than every bucket must be rejected");
+    assert!(
+        matches!(
+            err,
+            lattice_sim::WireError::Frame(lattice_net::FrameError::TooLarge)
+        ),
+        "expected TooLarge, got {err}"
+    );
+
+    // A frame that fits the largest bucket encodes and round-trips.
+    let fits = lattice_proto::frames::Frame::Offer(lattice_proto::frames::OfferFrame {
+        message: vec![0xAB; 1024],
+    });
+    let wire = lattice_sim::encode_frame_wire(&fits, None).expect("frame fits a bucket");
+    assert!(lattice_net::FRAME_BUCKETS.contains(&wire.len()));
+    let back = lattice_sim::decode_frame_wire(&wire).expect("wire round-trips");
+    assert_eq!(back, fits);
+}
