@@ -6,6 +6,19 @@ use snow::{Builder, HandshakeState, TransportState};
 pub const PARAMS_IK: &str = "Noise_IK_25519_ChaChaPoly_BLAKE2s";
 pub const PARAMS_XX: &str = "Noise_XX_25519_ChaChaPoly_BLAKE2s";
 
+/// The Noise prologue (spec §6): `"lattice v1" ‖ 0x00 ‖` the upgrade path
+/// exactly as it appears in the request line, including the leading `/`.
+/// Both patterns use the same prologue. Binding the protocol name and the
+/// path into the handshake hash keeps a handshake from one path from being
+/// replayed on another, and separates this protocol's handshakes from any
+/// other Noise protocol that shares the pattern.
+pub fn prologue(upgrade_path: &str) -> Vec<u8> {
+    let mut p = Vec::with_capacity(10 + 1 + upgrade_path.len());
+    p.extend_from_slice(b"lattice v1\x00");
+    p.extend_from_slice(upgrade_path.as_bytes());
+    p
+}
+
 /// Size of an XX first message (a bare 32-byte ephemeral key).
 /// An IK first message is strictly larger (32 + 48-byte encrypted static +
 /// 16-byte tag for the empty payload), so length discrimination is exact
@@ -27,6 +40,7 @@ impl Pending {
     pub fn initiator_ik(
         seed: &ChannelSeed,
         responder_static: &ChannelPublicKey,
+        prologue: &[u8],
     ) -> Result<Self, snow::Error> {
         let x_seed = lattice_crypto::channel_x25519_seed(seed);
         let x_pub = lattice_crypto::channel_x25519_public_from_ed25519(responder_static)
@@ -34,30 +48,34 @@ impl Pending {
         let state = Builder::new(PARAMS_IK.parse()?)
             .local_private_key(x_seed.as_ref())?
             .remote_public_key(x_pub.as_ref())?
+            .prologue(prologue)?
             .build_initiator()?;
         Ok(Self { state })
     }
 
-    pub fn initiator_xx(seed: &ChannelSeed) -> Result<Self, snow::Error> {
+    pub fn initiator_xx(seed: &ChannelSeed, prologue: &[u8]) -> Result<Self, snow::Error> {
         let x_seed = lattice_crypto::channel_x25519_seed(seed);
         let state = Builder::new(PARAMS_XX.parse()?)
             .local_private_key(x_seed.as_ref())?
+            .prologue(prologue)?
             .build_initiator()?;
         Ok(Self { state })
     }
 
-    pub fn responder_ik(seed: &ChannelSeed) -> Result<Self, snow::Error> {
+    pub fn responder_ik(seed: &ChannelSeed, prologue: &[u8]) -> Result<Self, snow::Error> {
         let x_seed = lattice_crypto::channel_x25519_seed(seed);
         let state = Builder::new(PARAMS_IK.parse()?)
             .local_private_key(x_seed.as_ref())?
+            .prologue(prologue)?
             .build_responder()?;
         Ok(Self { state })
     }
 
-    pub fn responder_xx(seed: &ChannelSeed) -> Result<Self, snow::Error> {
+    pub fn responder_xx(seed: &ChannelSeed, prologue: &[u8]) -> Result<Self, snow::Error> {
         let x_seed = lattice_crypto::channel_x25519_seed(seed);
         let state = Builder::new(PARAMS_XX.parse()?)
             .local_private_key(x_seed.as_ref())?
+            .prologue(prologue)?
             .build_responder()?;
         Ok(Self { state })
     }
@@ -131,9 +149,29 @@ mod tests {
     fn msg1_lengths_match_pattern_constants() {
         let seed = ChannelSeed::from_bytes([0xA1; 32]);
         let responder = lattice_crypto::channel_public(&ChannelSeed::from_bytes([0xB2; 32]));
-        let mut ik = Pending::initiator_ik(&seed, &responder).unwrap();
-        let mut xx = Pending::initiator_xx(&seed).unwrap();
+        let pro = prologue("/abc");
+        let mut ik = Pending::initiator_ik(&seed, &responder, &pro).unwrap();
+        let mut xx = Pending::initiator_xx(&seed, &pro).unwrap();
         assert_eq!(ik.write_message(&[]).unwrap().len(), IK_MSG1_LEN);
         assert_eq!(xx.write_message(&[]).unwrap().len(), XX_MSG1_LEN);
+    }
+
+    #[test]
+    fn prologue_is_spec_shaped() {
+        // "lattice v1" ‖ 0x00 ‖ the upgrade path, leading slash included.
+        assert_eq!(prologue("/k7f3"), b"lattice v1\x00/k7f3");
+    }
+
+    #[test]
+    fn prologue_mismatch_fails_handshake() {
+        // A handshake bound to one path must not complete on another.
+        let seed_a = ChannelSeed::from_bytes([0xA1; 32]);
+        let seed_b = ChannelSeed::from_bytes([0xB2; 32]);
+        let responder = lattice_crypto::channel_public(&seed_b);
+        let mut initiator =
+            Pending::initiator_ik(&seed_a, &responder, &prologue("/path-one")).unwrap();
+        let mut responder = Pending::responder_ik(&seed_b, &prologue("/path-two")).unwrap();
+        let msg1 = initiator.write_message(&[]).unwrap();
+        assert!(responder.read_message(&msg1).is_err());
     }
 }

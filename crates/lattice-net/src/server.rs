@@ -522,15 +522,17 @@ async fn handshake_server(
 
     // Choose pattern by first-message length: XX msg1 = XX_MSG1_LEN bytes;
     // IK msg1 = IK_MSG1_LEN (see handshake.rs; a test pins both).
+    let derived = crate::upgrade_path(&channel_public);
+    let prologue = crate::handshake::prologue(&derived);
     let (mut hs, pattern) = if init.noise_msg.len() == XX_MSG1_LEN {
         (
-            Pending::responder_xx(&cfg.channel_seed)
+            Pending::responder_xx(&cfg.channel_seed, &prologue)
                 .map_err(|e| NetError::Handshake(HandshakeError::Snow(e)))?,
             "xx",
         )
     } else {
         (
-            Pending::responder_ik(&cfg.channel_seed)
+            Pending::responder_ik(&cfg.channel_seed, &prologue)
                 .map_err(|e| NetError::Handshake(HandshakeError::Snow(e)))?,
             "ik",
         )

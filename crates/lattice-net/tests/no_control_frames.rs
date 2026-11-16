@@ -38,9 +38,11 @@ async fn non_binary_frame_tears_down_without_pong() {
 
     // Raw client: complete the IK handshake by hand so we can inject a
     // WebSocket-level Ping afterwards.
-    let url = format!("ws://{addr}{}", upgrade_path(&server_ck));
+    let path = upgrade_path(&server_ck);
+    let prologue = lattice_net::handshake::prologue(&path);
+    let url = format!("ws://{addr}{path}");
     let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
-    let mut hs = Pending::initiator_ik(&client_seed, &server_ck).unwrap();
+    let mut hs = Pending::initiator_ik(&client_seed, &server_ck, &prologue).unwrap();
     let msg1 = hs.write_message(&[]).unwrap();
     let mac1 = lattice_net::cookie::mac1(&server_ck, &msg1);
     let init = Frame::Init(InitFrame {

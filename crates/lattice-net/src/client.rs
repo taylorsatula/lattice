@@ -47,20 +47,27 @@ pub enum PeerContact {
 
 pub async fn connect(contact: PeerContact, channel_seed: &ChannelSeed) -> Result<PeerIo, NetError> {
     let (addr, path, mut hs, mac_key) = match &contact {
-        PeerContact::Ik { addr, channel_key } => (
-            *addr,
-            crate::upgrade_path(channel_key),
-            Pending::initiator_ik(channel_seed, channel_key)
-                .map_err(|e| NetError::Handshake(HandshakeError::Snow(e)))?,
-            Some(*channel_key),
-        ),
-        PeerContact::Xx { addr, path } => (
-            *addr,
-            path.clone(),
-            Pending::initiator_xx(channel_seed)
-                .map_err(|e| NetError::Handshake(HandshakeError::Snow(e)))?,
-            None,
-        ),
+        PeerContact::Ik { addr, channel_key } => {
+            let path = crate::upgrade_path(channel_key);
+            let prologue = crate::handshake::prologue(&path);
+            (
+                *addr,
+                path,
+                Pending::initiator_ik(channel_seed, channel_key, &prologue)
+                    .map_err(|e| NetError::Handshake(HandshakeError::Snow(e)))?,
+                Some(*channel_key),
+            )
+        }
+        PeerContact::Xx { addr, path } => {
+            let prologue = crate::handshake::prologue(path);
+            (
+                *addr,
+                path.clone(),
+                Pending::initiator_xx(channel_seed, &prologue)
+                    .map_err(|e| NetError::Handshake(HandshakeError::Snow(e)))?,
+                None,
+            )
+        }
     };
 
     crate::path::validate_upgrade_path(&path)?;

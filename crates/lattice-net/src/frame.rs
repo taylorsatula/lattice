@@ -4,7 +4,7 @@
 
 use lattice_proto::cbor::{self, Value};
 
-pub const FRAME_BUCKETS: [usize; 3] = [2048, 8192, 32768];
+pub const FRAME_BUCKETS: [usize; 4] = [2048, 4096, 8192, 32768];
 
 /// Why a wire frame failed to encode or decode.
 #[derive(Debug)]
