@@ -12,27 +12,69 @@ use std::net::{IpAddr, SocketAddr};
 
 use lattice_proto::record::{Scope, is_globally_routable};
 
-use crate::client::{PeerContact, connect};
+use crate::client::{DialTarget, PeerContact, connect};
 use crate::errors::NetError;
 use crate::peer::PeerIo;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scheme {
+    /// Plain WebSocket; confidentiality comes from Noise.
+    Ws,
+    /// WebSocket over TLS. The TLS session is an opaque outer wrapper: no
+    /// certificate trust decisions are made (Noise authenticates the peer);
+    /// it exists for reachability through TLS-terminating fronts.
+    Wss,
+}
+
+impl Scheme {
+    fn default_port(self) -> u16 {
+        match self {
+            Scheme::Ws => 80,
+            Scheme::Wss => 443,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EndpointUrl {
+    pub scheme: Scheme,
     pub host: String,
     pub port: u16,
+    /// Path prefix from the URL, without trailing slashes ("" when none).
+    /// The dialer prepends it to the derived upgrade path.
+    pub path_prefix: String,
+}
+
+impl EndpointUrl {
+    /// The value for the `Host` header: the URL's host (bracketed when it is
+    /// an IPv6 literal), with `:port` appended when the port is not the
+    /// scheme's default.
+    pub fn host_header(&self) -> String {
+        let bare = match self.host.parse::<std::net::IpAddr>() {
+            Ok(std::net::IpAddr::V6(_)) => format!("[{}]", self.host),
+            _ => self.host.clone(),
+        };
+        if self.port == self.scheme.default_port() {
+            bare
+        } else {
+            format!("{bare}:{}", self.port)
+        }
+    }
 }
 
 pub fn parse_endpoint(url: &str) -> Result<EndpointUrl, NetError> {
-    let (scheme, rest) = url
-        .split_once("://")
-        .ok_or(NetError::InvalidInput("endpoint must be a ws:// URL"))?;
-    match scheme {
-        // Lattice speaks plain WebSocket; confidentiality comes from Noise.
-        // wss is rejected rather than silently downgraded.
-        "ws" => {}
-        _ => return Err(NetError::InvalidInput("endpoint scheme must be ws")),
-    }
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let (scheme, rest) = url.split_once("://").ok_or(NetError::InvalidInput(
+        "endpoint must be a ws:// or wss:// URL",
+    ))?;
+    let scheme = match scheme {
+        "ws" => Scheme::Ws,
+        "wss" => Scheme::Wss,
+        _ => return Err(NetError::InvalidInput("endpoint scheme must be ws or wss")),
+    };
+    let (authority, path_and_rest) = match rest.find(['/', '?', '#']) {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, ""),
+    };
     if authority.is_empty() || authority.contains('@') {
         return Err(NetError::InvalidInput(
             "endpoint must have a host and no userinfo",
@@ -44,32 +86,68 @@ pub fn parse_endpoint(url: &str) -> Result<EndpointUrl, NetError> {
             .find(']')
             .ok_or(NetError::InvalidInput("unterminated [v6] host"))?;
         let h = &rest[..end];
+        h.parse::<std::net::Ipv6Addr>()
+            .map_err(|_| NetError::InvalidInput("bad bracketed IPv6 host"))?;
         let after = &rest[end + 1..];
         let port = match after.strip_prefix(':') {
-            Some(p) => p
-                .parse::<u16>()
-                .map_err(|_| NetError::InvalidInput("invalid port"))?,
-            None => 80,
+            Some(p) => parse_port(p)?,
+            None if after.is_empty() => scheme.default_port(),
+            None => return Err(NetError::InvalidInput("trailing data after [v6] host")),
         };
-        if port == 0 {
-            return Err(NetError::InvalidInput("port must be non-zero"));
-        }
         (h.to_string(), port)
     } else if let Some((h, p)) = authority.rsplit_once(':') {
-        let port = p
-            .parse::<u16>()
-            .map_err(|_| NetError::InvalidInput("invalid port"))?;
-        if p.bytes().any(|b| !b.is_ascii_digit()) || port == 0 {
+        if p.bytes().any(|b| !b.is_ascii_digit()) {
             return Err(NetError::InvalidInput("invalid port"));
         }
-        (h.to_string(), port)
+        (h.to_string(), parse_port(p)?)
     } else {
-        (authority.to_string(), 80)
+        (authority.to_string(), scheme.default_port())
     };
     if host.is_empty() {
         return Err(NetError::InvalidInput("empty host"));
     }
-    Ok(EndpointUrl { host, port })
+    let path = path_and_rest.split(['?', '#']).next().unwrap_or("");
+    if path_and_rest.contains(['?', '#']) {
+        return Err(NetError::InvalidInput(
+            "endpoint URL must not carry a query or fragment",
+        ));
+    }
+    let path_prefix = normalize_path_prefix(path)?;
+    Ok(EndpointUrl {
+        scheme,
+        host,
+        port,
+        path_prefix,
+    })
+}
+
+fn parse_port(p: &str) -> Result<u16, NetError> {
+    let port: u16 = p
+        .parse()
+        .map_err(|_| NetError::InvalidInput("invalid port"))?;
+    if port == 0 {
+        return Err(NetError::InvalidInput("port must be non-zero"));
+    }
+    Ok(port)
+}
+
+/// Normalize the URL's path into a prefix for the upgrade request line.
+/// The path goes on the request line verbatim, so it is restricted to
+/// visible ASCII; trailing slashes are dropped so the derived upgrade
+/// path joins cleanly.
+fn normalize_path_prefix(path: &str) -> Result<String, NetError> {
+    if path.is_empty() || path == "/" {
+        return Ok(String::new());
+    }
+    if !path.starts_with('/') {
+        return Err(NetError::InvalidInput("endpoint path must start with /"));
+    }
+    if !path.bytes().all(|b| (0x21..=0x7e).contains(&b)) {
+        return Err(NetError::InvalidInput(
+            "endpoint path contains invalid characters",
+        ));
+    }
+    Ok(path.trim_end_matches('/').to_string())
 }
 
 /// Addresses worth dialing for an endpoint, after scope enforcement.
@@ -129,13 +207,19 @@ pub async fn connect_scoped(
     // variant still says the right thing if that ever changes.
     let mut last_err = NetError::NoUsableAddress;
     for addr in addrs {
+        let target = DialTarget {
+            addr,
+            host: endpoint.host_header(),
+            path_prefix: endpoint.path_prefix.clone(),
+            tls: endpoint.scheme == Scheme::Wss,
+        };
         let contact = match (ik_channel_key, &xx_path) {
             (Some(ck), _) => PeerContact::Ik {
-                addr,
+                target,
                 channel_key: ck,
             },
             (None, Some(path)) => PeerContact::Xx {
-                addr,
+                target,
                 path: path.clone(),
             },
             (None, None) => {
@@ -215,10 +299,58 @@ mod tests {
     fn parse_variants() {
         let p = parse_endpoint("ws://mesh.example.com/path").unwrap();
         assert_eq!(p.port, 80);
+        assert_eq!(p.scheme, Scheme::Ws);
+        assert_eq!(p.path_prefix, "/path");
         let p = parse_endpoint("ws://[fd00::1]:8443/").unwrap();
         assert_eq!(p.host, "fd00::1");
         assert_eq!(p.port, 8443);
+        assert_eq!(p.path_prefix, "");
         assert!(parse_endpoint("https://x/").is_err());
         assert!(parse_endpoint("ws://user:pw@host/").is_err());
+    }
+
+    #[test]
+    fn parse_wss_and_default_ports() {
+        let p = parse_endpoint("wss://front.example.com/").unwrap();
+        assert_eq!(p.scheme, Scheme::Wss);
+        assert_eq!(p.port, 443);
+        let p = parse_endpoint("wss://front.example.com:8443/lattice/").unwrap();
+        assert_eq!(p.port, 8443);
+        assert_eq!(p.path_prefix, "/lattice");
+        let p = parse_endpoint("ws://mesh.example.com/").unwrap();
+        assert_eq!(p.port, 80);
+        // Nested prefixes are kept, trailing slashes trimmed.
+        let p = parse_endpoint("wss://front.example.com/a/b/c/").unwrap();
+        assert_eq!(p.path_prefix, "/a/b/c");
+        // A bare path separator is no prefix at all.
+        let p = parse_endpoint("ws://mesh.example.com/").unwrap();
+        assert_eq!(p.path_prefix, "");
+        // Bracketed IPv6 over wss.
+        let p = parse_endpoint("wss://[2001:4860:4860::8888]/").unwrap();
+        assert_eq!(p.host, "2001:4860:4860::8888");
+        assert_eq!(p.port, 443);
+    }
+
+    #[test]
+    fn parse_rejects_bad_paths_and_queries() {
+        assert!(parse_endpoint("wss://front.example.com/lat tice/").is_err());
+        assert!(parse_endpoint("wss://front.example.com/\u{7f}x").is_err());
+        assert!(parse_endpoint("wss://front.example.com/?token=abc").is_err());
+        assert!(parse_endpoint("wss://front.example.com/#frag").is_err());
+        assert!(parse_endpoint("wss://front.example.com/lattice?x=y").is_err());
+    }
+
+    #[test]
+    fn host_header_uses_url_host_and_default_port_rules() {
+        let p = parse_endpoint("wss://front.example.com/").unwrap();
+        assert_eq!(p.host_header(), "front.example.com");
+        let p = parse_endpoint("wss://front.example.com:8443/").unwrap();
+        assert_eq!(p.host_header(), "front.example.com:8443");
+        let p = parse_endpoint("ws://mesh.example.com:8080/").unwrap();
+        assert_eq!(p.host_header(), "mesh.example.com:8080");
+        let p = parse_endpoint("ws://[2001:4860:4860::8888]/").unwrap();
+        assert_eq!(p.host_header(), "[2001:4860:4860::8888]");
+        let p = parse_endpoint("ws://[2001:4860:4860::8888]:8443/").unwrap();
+        assert_eq!(p.host_header(), "[2001:4860:4860::8888]:8443");
     }
 }

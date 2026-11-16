@@ -770,24 +770,20 @@ pub fn record_order_parts(
 }
 
 fn validate_endpoint(ep: &Endpoint, scope: Scope) -> Result<(), ProtoError> {
-    let rest = ep.url.strip_prefix("ws://").ok_or(ProtoError::Invalid(
-        "endpoint scheme must be ws (Noise provides confidentiality; TLS is not used)",
-    ))?;
-    let hostport = rest.split('/').next().unwrap_or("");
+    // ws:// is the default; wss:// is an opaque outer TLS wrapper (no
+    // certificate trust decisions; Noise authenticates the peer).
+    let rest = ep
+        .url
+        .strip_prefix("ws://")
+        .or_else(|| ep.url.strip_prefix("wss://"))
+        .ok_or(ProtoError::Invalid("endpoint scheme must be ws or wss"))?;
+    let hostport = rest.split(['/', '?', '#']).next().unwrap_or("");
     if hostport.is_empty() || hostport.contains('@') {
         return Err(ProtoError::Invalid(
             "endpoint has no host or carries userinfo",
         ));
     }
-    let host = match hostport.rsplit_once(':') {
-        Some((h, port)) => {
-            if h.is_empty() || port.parse::<u16>().is_err() || port.parse::<u16>() == Ok(0) {
-                return Err(ProtoError::Invalid("bad endpoint port"));
-            }
-            h
-        }
-        None => hostport,
-    };
+    let host = parse_host_port(hostport)?;
     if let Ok(ip) = host.parse::<IpAddr>() {
         if scope == Scope::Wan && !is_globally_routable(ip) {
             return Err(ProtoError::Invalid(
@@ -810,6 +806,43 @@ fn validate_endpoint(ep: &Endpoint, scope: Scope) -> Result<(), ProtoError> {
         }
     }
     Ok(())
+}
+
+/// Split `host[:port]` or `[v6][:port]` into the bare host, validating the
+/// port. A bracketed host must be a valid IPv6 literal; a bare host with
+/// colons is not accepted (IPv6 literals must be bracketed).
+fn parse_host_port(hostport: &str) -> Result<&str, ProtoError> {
+    if let Some(rest) = hostport.strip_prefix('[') {
+        let end = rest
+            .find(']')
+            .ok_or(ProtoError::Invalid("unterminated [v6] host"))?;
+        let host = &rest[..end];
+        host.parse::<std::net::Ipv6Addr>()
+            .map_err(|_| ProtoError::Invalid("bad bracketed IPv6 host"))?;
+        match rest[end + 1..].strip_prefix(':') {
+            Some(port) => check_port(port)?,
+            None if rest[end + 1..].is_empty() => {}
+            None => return Err(ProtoError::Invalid("trailing data after [v6] host")),
+        }
+        return Ok(host);
+    }
+    match hostport.rsplit_once(':') {
+        Some((h, port)) => {
+            if h.is_empty() {
+                return Err(ProtoError::Invalid("bad endpoint port"));
+            }
+            check_port(port)?;
+            Ok(h)
+        }
+        None => Ok(hostport),
+    }
+}
+
+fn check_port(port: &str) -> Result<(), ProtoError> {
+    match port.parse::<u16>() {
+        Ok(0) | Err(_) => Err(ProtoError::Invalid("bad endpoint port")),
+        Ok(_) => Ok(()),
+    }
 }
 
 #[must_use]

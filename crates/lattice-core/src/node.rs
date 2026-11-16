@@ -595,7 +595,7 @@ impl<S: Store> Node<S> {
                 .iter()
                 .map(|url| lattice_proto::record::Endpoint {
                     url: url.clone(),
-                    ips: Vec::new(),
+                    ips: self.config.advertise_ips.clone(),
                 })
                 .collect()
         };
@@ -3873,6 +3873,35 @@ mod tests {
         lattice_proto::record::PeerRecord::from_bytes_unchecked_time(&stored.bytes, &kel)
             .ok()
             .map(|v| v.into_inner())
+    }
+
+    #[test]
+    fn advertised_ips_land_in_own_record() {
+        let cfg = Config {
+            snow_per_min: 0.0,
+            advertise: vec!["ws://mesh.example.com/".to_string()],
+            advertise_ips: vec![
+                "1.2.3.4".parse().unwrap(),
+                "2001:4860:4860::8888".parse().unwrap(),
+            ],
+            ..Config::default()
+        };
+        let node = Node::new(
+            cfg,
+            Identity::from_seed(&lattice_crypto::os_bytes::<32>()),
+            MemStore::new(),
+            1_000,
+        )
+        .expect("node construction");
+        let rec = stored_record(&node, &node.own_id, Scope::Wan).expect("own record stored");
+        assert_eq!(rec.endpoints.len(), 1);
+        assert_eq!(
+            rec.endpoints[0].ips,
+            vec![
+                "1.2.3.4".parse::<std::net::IpAddr>().unwrap(),
+                "2001:4860:4860::8888".parse().unwrap(),
+            ]
+        );
     }
 
     #[test]

@@ -15,7 +15,13 @@ listen = ["0.0.0.0:8443"]
 
 # Endpoints advertised in this node's record (public mode). Required for
 # other nodes to dial you; otherwise use hive/roots-based setups.
+# wss:// is allowed as an opaque outer TLS wrapper (no certificate trust;
+# Noise authenticates the peer) for TLS-terminating fronts; ws:// is the
+# default. A path prefix is carried through to the upgrade request.
 # advertise = ["ws://node.example.net:8443/"]
+# Literal IPs to advertise in the record's endpoints, for hosts without a
+# stable DNS name. WAN records require globally routable addresses.
+# ips = ["203.0.113.10"]
 
 # Peers to dial at startup. Give each either a channel_key (IK handshake)
 # or a path (XX upgrade path). Optional id pins the expected peer.

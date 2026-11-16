@@ -338,7 +338,7 @@ async fn handle_conn(
 
     let is_upgrade = head_has_header(&head, "upgrade", "websocket")
         && head_has_header(&head, "connection", "upgrade");
-    if parsed.method != "GET" || parsed.path != derived || !is_upgrade {
+    if parsed.method != "GET" || !is_upgrade_path(&parsed.path, &derived) || !is_upgrade {
         let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 9\r\nconnection: close\r\n\r\nnot found").await;
         return Ok(None); // probe; not a peer
     }
@@ -348,7 +348,7 @@ async fn handle_conn(
         inner: stream,
     };
     let boxed: crate::peer::BoxedStream = Box::pin(prefixed);
-    let expected = derived.clone();
+    let expected = parsed.path.clone();
     let ws_config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
         .max_frame_size(Some(crate::MAX_WIRE_BYTES + 64))
         .max_message_size(Some(crate::MAX_WIRE_BYTES + 64));
@@ -370,8 +370,18 @@ async fn handle_conn(
     .map_err(NetError::WebSocket)?;
 
     Ok(Some(
-        handshake_server(ws, peer, &cfg, &cookie_state, &load).await?,
+        handshake_server(ws, peer, &cfg, &cookie_state, &load, &parsed.path).await?,
     ))
+}
+
+/// An endpoint URL may carry a path prefix (e.g. `wss://front/lattice/`),
+/// which the dialer prepends to the derived upgrade path. A front that
+/// routes on path and forwards the request unchanged delivers
+/// `GET /<prefix>/<derived>`; the derived path is the secret either way.
+/// A front that rewrites the path breaks the handshake (the prologue binds
+/// the request-line path), which fails closed.
+fn is_upgrade_path(path: &str, derived: &str) -> bool {
+    path == derived || (path.len() > derived.len() && path.ends_with(derived))
 }
 
 async fn next_binary(
@@ -466,6 +476,7 @@ async fn handshake_server(
     cfg: &ListenerConfig,
     cookie_state: &Arc<Mutex<CookieState>>,
     load: &LoadState,
+    request_path: &str,
 ) -> Result<PeerIo, NetError> {
     let addr_bytes = peer.to_string().into_bytes();
     let under_load = load.under_load();
@@ -521,9 +532,10 @@ async fn handshake_server(
     }
 
     // Choose pattern by first-message length: XX msg1 = XX_MSG1_LEN bytes;
-    // IK msg1 = IK_MSG1_LEN (see handshake.rs; a test pins both).
-    let derived = crate::upgrade_path(&channel_public);
-    let prologue = crate::handshake::prologue(&derived);
+    // IK msg1 = IK_MSG1_LEN (see handshake.rs; a test pins both). The
+    // prologue binds the request-line path exactly as observed, including
+    // any endpoint URL path prefix a front passed through.
+    let prologue = crate::handshake::prologue(request_path);
     let (mut hs, pattern) = if init.noise_msg.len() == XX_MSG1_LEN {
         (
             Pending::responder_xx(&cfg.channel_seed, &prologue)

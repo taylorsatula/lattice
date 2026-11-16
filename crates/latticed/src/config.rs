@@ -35,9 +35,15 @@ pub struct Config {
     /// Path of the admin socket (mode 0600).
     #[serde(default = "default_admin_socket")]
     pub admin_socket: PathBuf,
-    /// Endpoints to advertise in our record (public mode). `ws://host[:port]/` URLs.
+    /// Endpoints to advertise in our record (public mode). `ws://host[:port]/` or `wss://host[:port]/` URLs.
     #[serde(default)]
     pub advertise: Vec<String>,
+    /// Literal IP addresses to advertise in the record's endpoints (public
+    /// mode). Useful when the host has no stable DNS name; connecting nodes
+    /// prefer these over resolving the URL's host. WAN records require
+    /// globally routable addresses (enforced when the record is built).
+    #[serde(default)]
+    pub ips: Vec<String>,
     /// Gateway node ids (hex, 32 bytes). Required in private mode; forbidden otherwise.
     #[serde(default)]
     pub gateways: Vec<String>,
@@ -237,10 +243,16 @@ pub fn validate(cfg: &Config) -> Result<(), String> {
         _ => unreachable!("mode checked above"),
     }
     for (i, ep) in cfg.advertise.iter().enumerate() {
-        if !ep.starts_with("ws://") {
-            return Err(format!("advertise[{i}] must be a ws:// URL, got {ep:?}"));
+        if !ep.starts_with("ws://") && !ep.starts_with("wss://") {
+            return Err(format!(
+                "advertise[{i}] must be a ws:// or wss:// URL, got {ep:?}"
+            ));
         }
         // Full validation (host syntax, port) happens by building the record at startup.
+    }
+    for (i, ip) in cfg.ips.iter().enumerate() {
+        ip.parse::<std::net::IpAddr>()
+            .map_err(|_| format!("ips[{i}] {ip:?} is not an IP address"))?;
     }
     for (i, cidr) in cfg.hive.iter().enumerate() {
         parse_cidr(cidr).map_err(|e| format!("hive[{i}] {cidr:?}: {e}"))?;
@@ -517,6 +529,31 @@ mira = { secret = "change-me-0123456789abcdef" }
         let toml_str =
             with_hive("\"10.0.0.0/8\", \"192.168.0.0/16\", \"fd00::/8\", \"2001:db8::/32\"");
         validate_str(&toml_str).expect("valid CIDRs must validate");
+    }
+
+    #[test]
+    fn accepts_valid_ips() {
+        let toml_str = format!("ips = [\"1.2.3.4\", \"2001:4860:4860::8888\"]\n{BASE}");
+        validate_str(&toml_str).expect("valid IPs must validate");
+    }
+
+    #[test]
+    fn rejects_invalid_ips() {
+        for bad in ["\"999.1.2.3\"", "\"not-an-ip\"", "\"1.2.3.4/32\"", "\"\""] {
+            let toml_str = format!("ips = [{bad}]\n{BASE}");
+            let err = validate_str(&toml_str).unwrap_err();
+            assert!(err.contains("ips[0]"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn advertise_accepts_ws_and_wss() {
+        for url in ["ws://node.example.com/", "wss://node.example.com/"] {
+            let toml_str = format!("advertise = [\"{url}\"]\n{BASE}");
+            validate_str(&toml_str).unwrap_or_else(|e| panic!("{url}: {e}"));
+        }
+        let toml_str = format!("advertise = [\"https://node.example.com/\"]\n{BASE}");
+        assert!(validate_str(&toml_str).is_err());
     }
 
     #[test]

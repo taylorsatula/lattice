@@ -138,8 +138,12 @@ pub struct Config {
     pub fresh_waypoint_retries: u32,
     pub default_message_horizon: u64,
     pub rng_seed: u64,
-    /// Endpoints to publish in our record (public mode). `ws://host[:port]/` URLs.
+    /// Endpoints to publish in our record (public mode). `ws://` or `wss://` URLs.
     pub advertise: Vec<String>,
+    /// Literal IP addresses advertised in the record's endpoints (public
+    /// mode). Useful when the host has no stable DNS name; connecting
+    /// nodes prefer these over resolving the URL's host.
+    pub advertise_ips: Vec<std::net::IpAddr>,
     /// Gateway node ids for a private node's record (1-3, private mode only).
     pub gateways: Vec<Identifier>,
     /// Public or private record mode.
@@ -172,6 +176,7 @@ impl Default for Config {
             default_message_horizon: 3 * 24 * 3600,
             rng_seed: 0x5eed_u64,
             advertise: Vec::new(),
+            advertise_ips: Vec::new(),
             gateways: Vec::new(),
             mode: Mode::Public,
             services: Vec::new(),
