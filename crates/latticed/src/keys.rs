@@ -378,6 +378,51 @@ pub fn self_test(identity: &Identity) -> io::Result<()> {
 
 const RETIRED_ENVELOPE_PREFIX: &str = "envelope_seed.retired.";
 
+/// Parse the expiry out of a retired-key file name
+/// (`envelope_seed.retired.<unix-expiry>`). Returns `None` for anything
+/// else, including the live `envelope_seed`.
+fn retired_envelope_key_expiry(name: &str) -> Option<u64> {
+    name.strip_prefix(RETIRED_ENVELOPE_PREFIX)?
+        .parse::<u64>()
+        .ok()
+}
+
+/// Delete retired envelope key files whose grace period has elapsed.
+/// Called from the daemon's periodic sweep; errors are logged, never
+/// fatal. Returns the number of files removed.
+pub fn sweep_expired_retired_envelope_keys(dir: &Path, now: u64) -> u64 {
+    let mut removed = 0;
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            eprintln!(
+                "lattice: retired envelope key sweep: cannot read {}: {e}",
+                dir.display()
+            );
+            return 0;
+        }
+    };
+    for entry in entries {
+        let Ok(entry) = entry else { continue };
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(exp) = retired_envelope_key_expiry(name) else {
+            continue;
+        };
+        if exp > now {
+            continue;
+        }
+        match fs::remove_file(entry.path()) {
+            Ok(()) => removed += 1,
+            Err(e) => eprintln!(
+                "lattice: failed to remove expired retired envelope key {}: {e}",
+                entry.path().display()
+            ),
+        }
+    }
+    removed
+}
+
 /// Load retired envelope keys whose grace period has not elapsed; delete the
 /// rest. Files are named `envelope_seed.retired.<unix-expiry>`.
 fn load_retired_envelope_keys(dir: &Path) -> io::Result<Vec<RetiredEnvelopeKey>> {
@@ -389,10 +434,7 @@ fn load_retired_envelope_keys(dir: &Path) -> io::Result<Vec<RetiredEnvelopeKey>>
         let entry = entry?;
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        let Some(exp_str) = name.strip_prefix(RETIRED_ENVELOPE_PREFIX) else {
-            continue;
-        };
-        let Ok(exp) = exp_str.parse::<u64>() else {
+        let Some(exp) = retired_envelope_key_expiry(name) else {
             continue;
         };
         if exp <= now {
@@ -621,6 +663,24 @@ mod tests {
             err.to_string().contains("envelope"),
             "unexpected error: {err}"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sweep_expired_retired_envelope_keys_removes_only_expired() {
+        let dir = temp_dir("retired-sweep");
+        fs::create_dir_all(&dir).unwrap();
+        let now = 1_000_000u64;
+        fs::write(dir.join("envelope_seed.retired.999999"), [1u8; 32]).unwrap();
+        fs::write(dir.join("envelope_seed.retired.1000001"), [2u8; 32]).unwrap();
+        fs::write(dir.join("envelope_seed"), [3u8; 32]).unwrap();
+        fs::write(dir.join("envelope_seed.retired.garbage"), [4u8; 32]).unwrap();
+        let removed = sweep_expired_retired_envelope_keys(&dir, now);
+        assert_eq!(removed, 1);
+        assert!(!dir.join("envelope_seed.retired.999999").exists());
+        assert!(dir.join("envelope_seed.retired.1000001").exists());
+        assert!(dir.join("envelope_seed").exists());
+        assert!(dir.join("envelope_seed.retired.garbage").exists());
         let _ = fs::remove_dir_all(&dir);
     }
 

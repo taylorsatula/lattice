@@ -163,6 +163,11 @@ struct RootDial {
 /// root's `in_flight` slot.
 const DIAL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15);
 
+/// Cadence for deleting expired retired-envelope-key files. Matches the
+/// core's data-sweep interval (`DATA_SWEEP_SECS` in lattice-core), which is
+/// what drops the keys from memory; the files must not outlive the keys.
+const RETIRED_KEY_SWEEP_SECS: u64 = 3600;
+
 struct LinkHandle {
     peer: Option<Identifier>,
     addr: Option<std::net::SocketAddr>,
@@ -193,6 +198,10 @@ pub struct Runtime {
     api_tx: mpsc::UnboundedSender<ApiCmd>,
     pub app_broadcast: broadcast::Sender<ServiceEvent>,
     next_link: u64,
+    /// Next time the retired-envelope-key file sweep runs. Mirrors the
+    /// core's data-sweep cadence (`DATA_SWEEP_SECS` in lattice-core); the
+    /// core drops expired keys from memory, this deletes the files.
+    next_retired_key_sweep: u64,
 }
 
 fn now_secs() -> u64 {
@@ -319,6 +328,9 @@ impl Runtime {
             api_tx,
             app_broadcast,
             next_link: 1,
+            // The startup load already deleted expired files; first sweep an
+            // hour from now.
+            next_retired_key_sweep: now + RETIRED_KEY_SWEEP_SECS,
         })
     }
 
@@ -490,7 +502,15 @@ impl Runtime {
                     } else {
                         tick_deferrals = 0;
                         self.redial_roots();
-                        self.apply(Event::Tick { at: now_secs() });
+                        let now = now_secs();
+                        self.apply(Event::Tick { at: now });
+                        if now >= self.next_retired_key_sweep {
+                            crate::keys::sweep_expired_retired_envelope_keys(
+                                &self.identity_dir,
+                                now,
+                            );
+                            self.next_retired_key_sweep = now + RETIRED_KEY_SWEEP_SECS;
+                        }
                     }
                 }
             }
