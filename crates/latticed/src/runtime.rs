@@ -204,9 +204,7 @@ impl FrameClass {
                 Self::Gossip
             }
             Frame::Dummy(_) => Self::Snow,
-            Frame::Ping(_) | Frame::Init(_) | Frame::Cookie(_) | Frame::Resp(_) => {
-                Self::Control
-            }
+            Frame::Ping(_) | Frame::Init(_) | Frame::Cookie(_) | Frame::Resp(_) => Self::Control,
         }
     }
 
