@@ -5,11 +5,17 @@ the Rust implementation and serve as a cross-language regression anchor.
 """
 
 import json
+import sys
 from pathlib import Path
 
 import pytest
 
-from lattice import objects, wire
+from lattice import wire
+
+# The object-verification helpers live in the test suite (not in the
+# package). Make them importable regardless of pytest's import mode.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import objects  # noqa: E402
 
 VECTORS = Path(__file__).resolve().parents[3] / "vectors" / "vectors.json"
 
@@ -22,9 +28,10 @@ FRAME_TYPES = {
     20: "reconcile",
     21: "want",
     22: "records",
+    23: "reserved",
+    24: "kels",
     60: "ping",
     61: "dummy",
-    62: "attest",
 }
 
 
@@ -44,10 +51,21 @@ def check_key_event(v, raw):
     assert ev.encode() == raw, "re-encode mismatch"
 
 
+def check_kel_object(v, raw):
+    kel = objects.parse_kel_object(raw)
+    assert kel.identifier.hex() == v["expect"]["id"]
+    assert kel.head.seq == v["expect"]["head_seq"]
+    assert kel.head.commitment.hex() == v["expect"]["head_commitment"]
+    assert kel.is_abandoned == v["expect"]["abandoned"]
+    assert objects.encode_kel_object(kel) == raw, "re-encode mismatch"
+
+
 def check_record(v, raw):
-    rec = objects.parse_record(raw, now=v["now"])
+    kel = objects.parse_kel_object(bytes.fromhex(v["kel"]))
+    rec = objects.parse_record(raw, v["now"], kel)
     assert rec.id.hex() == v["expect"]["id"]
     assert rec.seq == v["expect"]["seq"]
+    assert rec.khs == v["expect"]["khs"]
     assert rec.mode == v["expect"]["mode"]
     assert rec.scope == v["expect"]["scope"]
     # Re-encode: unsigned + sig + channel_sig.
@@ -62,6 +80,17 @@ def check_frame(v, raw):
     assert isinstance(obj, dict)
     ftype = FRAME_TYPES.get(obj[0])
     assert ftype == v["expect"]["type"], f"frame type {obj.get(0)} != {v['expect']['type']}"
+    if "result" in v["expect"]:
+        assert obj[3] == v["expect"]["result"]
+    if "nonce" in v["expect"]:
+        assert obj[2] == v["expect"]["nonce"]
+    if "echo" in v["expect"]:
+        assert obj[2] is v["expect"]["echo"]
+    if ftype == "reconcile":
+        # Every explicit-list entry is [id, scope, khs, seq, hash-prefix].
+        for rng in obj[2]:
+            for entry in rng.get(3, []):
+                assert len(entry) == 5, "reconcile entry must have 5 fields"
     assert wire.encode(obj) == raw, "re-encode mismatch"
 
 
@@ -79,6 +108,7 @@ def check_message(v, raw):
 
 CHECKS = {
     "key_event": check_key_event,
+    "kel_object": check_kel_object,
     "peer_record": check_record,
     "frame": check_frame,
     "message": check_message,
@@ -97,10 +127,13 @@ def test_single_byte_flips_are_rejected(vector):
     # of a signed object must be rejected. Frames are covered by the Rust
     # suite; here we cover the signed objects.
     kind = vector["kind"]
-    if kind not in ("key_event", "peer_record", "message"):
+    if kind not in ("key_event", "peer_record", "kel_object", "message"):
         pytest.skip("frames are covered by the Rust suite")
     raw = bytes.fromhex(vector["hex"])
     now = vector.get("now")
+    kel = None
+    if kind == "peer_record":
+        kel = objects.parse_kel_object(bytes.fromhex(vector["kel"]))
     for i in range(len(raw)):
         bad = bytearray(raw)
         bad[i] ^= 0x01
@@ -109,8 +142,10 @@ def test_single_byte_flips_are_rejected(vector):
             if kind == "key_event":
                 ev = objects.parse_key_event(bad)
                 assert ev.verify_signature(), "corrupted key event accepted"
+            elif kind == "kel_object":
+                objects.parse_kel_object(bad)
             elif kind == "peer_record":
-                objects.parse_record(bad, now=now)
+                objects.parse_record(bad, now, kel)
             else:  # message
                 msg = objects.parse_message(bad, now=now)
                 env = objects.open_envelope(
@@ -123,3 +158,24 @@ def test_single_byte_flips_are_rejected(vector):
             continue  # rejected, as required
         else:
             pytest.fail(f"{vector['name']}: single-byte flip at offset {i} was accepted")
+
+
+def test_decode_rejects_non_canonical_cbor():
+    # Non-shortest-form integer (23 encoded in 2 bytes).
+    with pytest.raises(ValueError):
+        wire.decode(bytes.fromhex("1817"))
+    # Duplicate map keys.
+    with pytest.raises(ValueError):
+        wire.decode(bytes.fromhex("a2016161016162"))
+    # Indefinite-length array.
+    with pytest.raises(ValueError):
+        wire.decode(bytes.fromhex("9f01ff"))
+    # Map keys out of canonical order ({2: 'a', 1: 'b'}).
+    with pytest.raises(ValueError):
+        wire.decode(bytes.fromhex("a2026161016162"))
+    # Trailing bytes after the top-level value.
+    with pytest.raises(ValueError):
+        wire.decode(bytes.fromhex("0102"))
+    # Floats are not on the wire.
+    with pytest.raises(ValueError):
+        wire.decode(bytes.fromhex("fb3ff0000000000000"))

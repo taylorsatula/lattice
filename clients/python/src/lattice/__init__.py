@@ -1,5 +1,10 @@
 """Lattice local-API client for Python.
 
+The package is the local-API client only: it speaks to a running
+``latticed`` over its Unix sockets. Object verification (KEL, record and
+message checks) is not part of the package; it lives in the test suite
+(``tests/objects.py``) and is not a supported public API.
+
 See README.md for a tour and the hook-in guide.
 """
 

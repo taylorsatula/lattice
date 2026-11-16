@@ -11,7 +11,16 @@ requires-python = ">=3.9"
 license = { text = "MIT" }
 dependencies = [
     "cbor2>=5.4",
-    "cryptography>=42",
+    # X-Wing (draft-connolly-cfrg-xwing-kem-06) is implemented in tests/crypto.py
+    # on top of cryptography's ML-KEM-768 (added in cryptography 47.0.0) and
+    # X25519; there is no x-wing package. Pin the floor at 47 so the ML-KEM
+    # module is guaranteed present, and keep it in lockstep with the Rust
+    # `x-wing` crate. Version-bump plan: when the draft becomes an RFC (or
+    # cryptography ships a native X-Wing), re-check the combiner (label and
+    # concatenation order) against the new document, regenerate
+    # vectors/vectors.json from the Rust implementation, and bump this floor
+    # and the Rust crate together. See README.md ("X-Wing").
+    "cryptography>=47",
     "blake3>=0.4",
 ]
 

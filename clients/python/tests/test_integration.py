@@ -9,12 +9,11 @@ or target/release/latticed relative to the repo root. If none exists, the
 test builds it with `cargo build -p latticed`.
 """
 
-import json
+import base64
 import os
 import shutil
 import socket
 import subprocess
-import sys
 import tempfile
 import time
 from pathlib import Path
@@ -37,6 +36,24 @@ def find_daemon() -> Path:
     return REPO_ROOT / "target" / "debug" / "latticed"
 
 
+def parse_node_id(text: str) -> bytes:
+    """Parse the `node id:` line printed by `latticed init`.
+
+    Current daemons print the 52-char lowercase base32 text form (RFC 4648,
+    no padding); older ones printed 64-char hex. Both are accepted.
+    """
+    token = text.strip()
+    if len(token) == 64:
+        return bytes.fromhex(token)
+    if len(token) == 52:
+        padded = token.upper() + "=" * ((8 - len(token) % 8) % 8)
+        raw = base64.b32decode(padded)
+        if len(raw) != 32:
+            raise ValueError(f"base32 node id decoded to {len(raw)} bytes, expected 32")
+        return raw
+    raise ValueError(f"unrecognized node id form: {token!r}")
+
+
 def free_port() -> int:
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
@@ -48,12 +65,12 @@ def init_node(daemon: Path, dir: Path) -> tuple[bytes, bytes]:
         [str(daemon), "init", "--dir", str(dir)],
         check=True, capture_output=True, text=True,
     ).stdout
-    id_hex = next(
+    id_text = next(
         line.split(":", 1)[1].strip()
         for line in out.splitlines()
         if line.startswith("node id:")
     )
-    node_id = bytes.fromhex(id_hex)
+    node_id = parse_node_id(id_text)
     channel_key = (dir / "channel_key.pub").read_bytes()
     return node_id, channel_key
 
@@ -67,7 +84,8 @@ def write_config(dir: Path, port: int, app: Path, admin: Path,
             f'[[roots]]\naddr = "{addr}"\n'
             f'channel_key = "{key.hex()}"\nid = "{node_id.hex()}"\n'
         )
-    (dir / "lattice.toml").write_text(
+    config = dir / "lattice.toml"
+    config.write_text(
         f"""identity_dir = "{dir}"
 mode = "public"
 listen = ["127.0.0.1:{port}"]
@@ -82,6 +100,9 @@ reconcile_interval_secs = 1
 
 {roots}"""
     )
+    # The daemon refuses to start if the config (which carries service
+    # secrets) is readable by group/other.
+    config.chmod(0o600)
 
 
 class Node:
