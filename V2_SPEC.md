@@ -652,6 +652,7 @@ Operation, event and error codes are part of the wire contract:
 | `fetch` | 4 | | | | | not found | 4 |
 | `ack` | 5 | | | | | | |
 | `lookup` | 6 | | | | | | |
+| `ping` | 7 | | | | | | |
 | `node` | 101 | | | | | | |
 | `rotate` | 102 | | | | | | |
 | `abandon` | 103 | | | | | | |
