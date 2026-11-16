@@ -636,6 +636,7 @@ The local API is how any application, MIRA or otherwise, uses Lattice.
 | `fetch` | max | Deliveries: delivery id, mid, from, fsvc, fmbx, tmbx, body, received |
 | `ack` | delivery ids | Removes them from the inbox |
 | `lookup` | id | Whether a valid record is held, its mode, and whether a path exists right now |
+| `ping` | (none) | Empty result; resets the connection's read-idle timer |
 
 | Event | Data |
 |---|---|

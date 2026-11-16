@@ -14,8 +14,9 @@ use std::sync::Arc;
 use lattice_proto::local::{
     DrainRequest, DrainState, ERR_AUTH, ERR_BAD_ARGS, ERR_FAILED, ERR_INTERNAL, ERR_NOT_FOUND,
     ERR_UNKNOWN_OP, LOCAL_MAX_FRAME, LOCAL_PREFIX_LEN, Lookup, OP_ABANDON, OP_ACK, OP_DRAIN,
-    OP_FETCH, OP_HELLO, OP_LINK, OP_LOOKUP, OP_NODE, OP_ROTATE, OP_ROTATE_ENVELOPE, OP_SEND,
-    OP_STATUS, OP_UNLINK, ROUTE_DEFAULT, Request, Response, SendArgs, deframe_local, frame_local,
+    OP_FETCH, OP_HELLO, OP_LINK, OP_LOOKUP, OP_NODE, OP_PING, OP_ROTATE, OP_ROTATE_ENVELOPE,
+    OP_SEND, OP_STATUS, OP_UNLINK, ROUTE_DEFAULT, Request, Response, SendArgs, deframe_local,
+    frame_local,
 };
 use lattice_proto::{Value, decode, encode};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -43,9 +44,8 @@ const MAX_APP_CONNECTIONS: usize = 64;
 ///
 /// After the hello handshake completes, a connection that delivers no
 /// inbound frame for this long is closed. Event-only subscribers (apps
-/// that send nothing after hello) will be disconnected and must send any
-/// op periodically or reconnect; there is no ping op today, and a future
-/// OP_PING would be the proper fix.
+/// that send nothing after hello) should send `OP_PING` periodically to
+/// stay connected; any inbound frame resets the deadline.
 const APP_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
 async fn write_frame(stream: &mut UnixStream, payload: &[u8]) -> std::io::Result<()> {
@@ -300,6 +300,15 @@ async fn dispatch_app(
         OP_FETCH => handle_fetch(api, service, req).await,
         OP_ACK => handle_ack(api, service, req).await,
         OP_LOOKUP => handle_lookup(api, req).await,
+        OP_PING => {
+            if deny_unknown_args(&req.args, &[]).is_err() {
+                resp_err(req.id, ERR_BAD_ARGS)
+            } else {
+                // No-op; reaching this arm already reset the connection's
+                // idle deadline in the read loop.
+                resp_ok(req.id, Value::map(vec![]))
+            }
+        }
         _ => resp_err(req.id, ERR_UNKNOWN_OP),
     }
 }
@@ -376,6 +385,54 @@ async fn handle_status(
     .await
 }
 
+fn fetch_item(e: lattice_store::InboxEntry) -> Value {
+    Value::map(vec![
+        (Value::UInt(0), Value::Bytes(e.delivery_id.to_vec())),
+        (Value::UInt(1), Value::Bytes(e.mid.to_vec())),
+        (Value::UInt(2), Value::Bytes(e.from.to_vec())),
+        (Value::UInt(3), Value::Text(e.fsvc)),
+        (Value::UInt(4), Value::Bytes(e.fmbx)),
+        (Value::UInt(5), Value::Bytes(e.tmbx)),
+        (Value::UInt(6), Value::Bytes(e.body)),
+        (Value::UInt(7), Value::UInt(e.received)),
+    ])
+}
+
+fn fetch_result(items: &[Value]) -> Value {
+    Value::map(vec![(Value::UInt(0), Value::Array(items.to_vec()))])
+}
+
+/// Encode the `fetch` response, adding deliveries until the encoded frame
+/// would exceed `LOCAL_MAX_FRAME`. At least one delivery is included
+/// whenever any exist (a single delivery is far below the cap: a message
+/// fits a 32 KiB bucket); the rest stay in the inbox for the next fetch,
+/// which is safe because `fetch` does not consume. If a lone delivery
+/// somehow exceeds the cap, an error response is returned instead of an
+/// over-cap frame.
+fn fetch_response(req_id: u64, rows: Vec<lattice_store::InboxEntry>) -> Vec<u8> {
+    let mut items: Vec<Value> = Vec::with_capacity(rows.len().min(64));
+    let mut encoded = None;
+    for e in rows {
+        items.push(fetch_item(e));
+        let candidate = encode(
+            &Response::Ok {
+                id: req_id,
+                result: fetch_result(&items),
+            }
+            .to_value(),
+        );
+        if candidate.len() > LOCAL_MAX_FRAME {
+            if items.len() == 1 {
+                return resp_err(req_id, ERR_INTERNAL);
+            }
+            items.pop();
+            break;
+        }
+        encoded = Some(candidate);
+    }
+    encoded.unwrap_or_else(|| resp_ok(req_id, fetch_result(&items)))
+}
+
 async fn handle_fetch(
     api: &mpsc::UnboundedSender<ApiCmd>,
     service: &str,
@@ -397,27 +454,7 @@ async fn handle_fetch(
             respond: tx,
         },
         |resp| match resp {
-            Ok(rows) => {
-                let items: Vec<Value> = rows
-                    .into_iter()
-                    .map(|e| {
-                        Value::map(vec![
-                            (Value::UInt(0), Value::Bytes(e.delivery_id.to_vec())),
-                            (Value::UInt(1), Value::Bytes(e.mid.to_vec())),
-                            (Value::UInt(2), Value::Bytes(e.from.to_vec())),
-                            (Value::UInt(3), Value::Text(e.fsvc)),
-                            (Value::UInt(4), Value::Bytes(e.fmbx)),
-                            (Value::UInt(5), Value::Bytes(e.tmbx)),
-                            (Value::UInt(6), Value::Bytes(e.body)),
-                            (Value::UInt(7), Value::UInt(e.received)),
-                        ])
-                    })
-                    .collect();
-                resp_ok(
-                    req.id,
-                    Value::map(vec![(Value::UInt(0), Value::Array(items))]),
-                )
-            }
+            Ok(rows) => fetch_response(req.id, rows),
             Err(e) => {
                 eprintln!("lattice: inbox_fetch failed: {e}");
                 resp_err(req.id, ERR_INTERNAL)
@@ -828,5 +865,139 @@ pub async fn serve_admin(
         let (stream, _) = listener.accept().await?;
         let api = api.clone();
         tokio::spawn(handle_admin(stream, api));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(body_len: usize, tag: u8) -> lattice_store::InboxEntry {
+        lattice_store::InboxEntry {
+            delivery_id: lattice_types::DeliveryId::from_bytes([tag; 16]),
+            mid: lattice_types::MessageId::from_bytes([tag.wrapping_add(1); 16]),
+            from: lattice_types::Identifier::from_bytes([tag.wrapping_add(2); 32]),
+            fsvc: "svc".to_string(),
+            fmbx: b"fmbx".to_vec(),
+            tsvc: "svc".to_string(),
+            tmbx: b"tmbx".to_vec(),
+            body: vec![tag; body_len],
+            received: 1_700_000_000,
+        }
+    }
+
+    fn decode_fetch_response(bytes: &[u8]) -> (u64, Vec<Value>) {
+        let v = decode(bytes).expect("response decodes");
+        match Response::from_value(&v).expect("response parses") {
+            Response::Ok { id, result } => {
+                let items = lattice_proto::cbor::map_get(&result, 0)
+                    .and_then(Value::as_array)
+                    .map(<[Value]>::to_vec)
+                    .expect("fetch result carries an items array");
+                (id, items)
+            }
+            Response::Err { code, .. } => panic!("expected ok response, got error {code}"),
+        }
+    }
+
+    #[test]
+    fn fetch_response_caps_at_frame_limit() {
+        // ~30 KB bodies: two fit under the 64 KiB cap, three do not.
+        let rows: Vec<_> = (0..5).map(|i| entry(30 * 1024, i + 1)).collect();
+        let out = fetch_response(7, rows);
+        assert!(out.len() <= LOCAL_MAX_FRAME);
+        let (id, items) = decode_fetch_response(&out);
+        assert_eq!(id, 7);
+        assert!(!items.is_empty(), "at least one delivery must be returned");
+        assert!(items.len() < 5);
+    }
+
+    #[test]
+    fn fetch_response_returns_a_maximal_prefix() {
+        let rows: Vec<_> = (0..5).map(|i| entry(30 * 1024, i + 1)).collect();
+        let out = fetch_response(7, rows.clone());
+        let (_, items) = decode_fetch_response(&out);
+        // One more delivery on top of the returned set must exceed the cap.
+        let mut bigger = items.clone();
+        bigger.push(fetch_item(rows[items.len()].clone()));
+        let encoded = encode(
+            &Response::Ok {
+                id: 7,
+                result: fetch_result(&bigger),
+            }
+            .to_value(),
+        );
+        assert!(encoded.len() > LOCAL_MAX_FRAME);
+    }
+
+    #[test]
+    fn fetch_response_returns_all_when_small() {
+        let rows: Vec<_> = (0..3).map(|i| entry(16, i + 1)).collect();
+        let out = fetch_response(9, rows);
+        let (id, items) = decode_fetch_response(&out);
+        assert_eq!(id, 9);
+        assert_eq!(items.len(), 3);
+    }
+
+    #[test]
+    fn fetch_response_empty_inbox() {
+        let out = fetch_response(11, vec![]);
+        let (id, items) = decode_fetch_response(&out);
+        assert_eq!(id, 11);
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn fetch_response_single_oversized_delivery_errors_instead_of_overflowing() {
+        // A lone delivery larger than the frame cap must not produce an
+        // over-cap frame; the daemon reports an internal error instead.
+        let out = fetch_response(13, vec![entry(LOCAL_MAX_FRAME + 1, 1)]);
+        assert!(out.len() <= LOCAL_MAX_FRAME);
+        let v = decode(&out).unwrap();
+        match Response::from_value(&v).unwrap() {
+            Response::Err { id, code } => {
+                assert_eq!(id, 13);
+                assert_eq!(code, ERR_INTERNAL);
+            }
+            Response::Ok { .. } => panic!("expected error response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn ping_returns_empty_ok() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let req = Request {
+            id: 42,
+            op: OP_PING,
+            args: Value::map(vec![]),
+        };
+        let out = dispatch_app(&tx, "svc", &req).await;
+        let v = decode(&out).expect("response decodes");
+        match Response::from_value(&v).expect("response parses") {
+            Response::Ok { id, result } => {
+                assert_eq!(id, 42);
+                assert_eq!(result, Value::map(vec![]));
+            }
+            Response::Err { code, .. } => panic!("expected ok, got error {code}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn ping_rejects_args() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let req = Request {
+            id: 43,
+            op: OP_PING,
+            args: Value::map(vec![(Value::UInt(0), Value::UInt(1))]),
+        };
+        let out = dispatch_app(&tx, "svc", &req).await;
+        let v = decode(&out).expect("response decodes");
+        match Response::from_value(&v).expect("response parses") {
+            Response::Err { id, code } => {
+                assert_eq!(id, 43);
+                assert_eq!(code, ERR_BAD_ARGS);
+            }
+            Response::Ok { .. } => panic!("expected error"),
+        }
     }
 }
