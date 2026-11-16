@@ -169,11 +169,193 @@ const DIAL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15);
 /// what drops the keys from memory; the files must not outlive the keys.
 const RETIRED_KEY_SWEEP_SECS: u64 = 3600;
 
+/// Per-link outbound queue capacity, in frames. Frames are at most 32 KiB,
+/// so a full queue is at most ~2 MiB per link.
+const OUTBOUND_CAPACITY: usize = 64;
+/// Depth at which low-priority classes (snow, then gossip) are shed instead
+/// of enqueued, and from which the over-mark timer runs.
+const OUTBOUND_HIGH_WATER: usize = 48;
+/// How long the outbound queue may stay at/over the high-water mark before
+/// the link is closed. A peer that cannot drain its queue is worse than a
+/// reconnect; TCP keepalive (~90s) is the backstop when no frames flow.
+const OVER_MARK_SECS: u64 = 10;
+/// Inbound (socket -> event loop) channel capacity, in frames. A peer that
+/// floods past this is disconnected by `link_task` rather than buffered.
+const INBOUND_CAPACITY: usize = 256;
+
+/// Outbound/inbound frame classes for per-peer rate limiting and shedding.
+/// Custody is message custody (offers and custody replies): shed last.
+/// Gossip is record anti-entropy (reconcile/want/records): shed second.
+/// Snow is cover traffic: shed first. Control is ping/attest (and the
+/// handshake frames, which never reach the runtime): shed after gossip.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FrameClass {
+    Custody,
+    Gossip,
+    Snow,
+    Control,
+}
+
+impl FrameClass {
+    fn of(frame: &Frame) -> Self {
+        match frame {
+            Frame::Offer(_) | Frame::Custody(_) => Self::Custody,
+            Frame::Reconcile(_) | Frame::Want(_) | Frame::Records(_) => Self::Gossip,
+            Frame::Dummy(_) => Self::Snow,
+            Frame::Ping(_)
+            | Frame::Attest(_)
+            | Frame::Init(_)
+            | Frame::Cookie(_)
+            | Frame::Resp(_) => Self::Control,
+        }
+    }
+
+    fn index(self) -> usize {
+        match self {
+            Self::Custody => 0,
+            Self::Gossip => 1,
+            Self::Snow => 2,
+            Self::Control => 3,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Custody => "custody",
+            Self::Gossip => "gossip",
+            Self::Snow => "snow",
+            Self::Control => "control",
+        }
+    }
+}
+
+/// Token bucket: `capacity` burst, `refill_per_sec` sustained.
+struct TokenBucket {
+    tokens: f64,
+    capacity: f64,
+    refill_per_sec: f64,
+    last_refill: u64,
+}
+
+impl TokenBucket {
+    fn new(capacity: f64, refill_per_sec: f64, now: u64) -> Self {
+        Self {
+            tokens: capacity,
+            capacity,
+            refill_per_sec,
+            last_refill: now,
+        }
+    }
+
+    fn allow(&mut self, now: u64) -> bool {
+        let elapsed = now.saturating_sub(self.last_refill);
+        if elapsed > 0 {
+            self.tokens = (self.tokens + elapsed as f64 * self.refill_per_sec).min(self.capacity);
+            self.last_refill = now;
+        }
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Per-link (capacity, refill/sec) for outbound classes. Custody is sized
+/// for a relay pushing offers; gossip covers a reconcile round (~3 frames
+/// per interval) with headroom; snow caps even a misconfigured snow_per_min.
+const OUT_CUSTODY: (f64, f64) = (64.0, 16.0);
+const OUT_GOSSIP: (f64, f64) = (16.0, 1.0);
+const OUT_SNOW: (f64, f64) = (4.0, 0.25);
+const OUT_CONTROL: (f64, f64) = (16.0, 2.0);
+/// Per-link (capacity, refill/sec) for inbound classes. Gossip inbound is a
+/// touch more generous than outbound: a peer answering our wants may push a
+/// burst of records.
+const IN_CUSTODY: (f64, f64) = (64.0, 16.0);
+const IN_GOSSIP: (f64, f64) = (16.0, 2.0);
+const IN_SNOW: (f64, f64) = (4.0, 0.5);
+const IN_CONTROL: (f64, f64) = (16.0, 2.0);
+
+fn out_buckets(now: u64) -> [TokenBucket; 4] {
+    [
+        TokenBucket::new(OUT_CUSTODY.0, OUT_CUSTODY.1, now),
+        TokenBucket::new(OUT_GOSSIP.0, OUT_GOSSIP.1, now),
+        TokenBucket::new(OUT_SNOW.0, OUT_SNOW.1, now),
+        TokenBucket::new(OUT_CONTROL.0, OUT_CONTROL.1, now),
+    ]
+}
+
+fn in_buckets(now: u64) -> [TokenBucket; 4] {
+    [
+        TokenBucket::new(IN_CUSTODY.0, IN_CUSTODY.1, now),
+        TokenBucket::new(IN_GOSSIP.0, IN_GOSSIP.1, now),
+        TokenBucket::new(IN_SNOW.0, IN_SNOW.1, now),
+        TokenBucket::new(IN_CONTROL.0, IN_CONTROL.1, now),
+    ]
+}
+
+/// Per-link drop/shed counters, logged (throttled) as they happen and
+/// summarized when the link closes.
+#[derive(Default)]
+struct LinkStats {
+    shed_snow: u64,
+    shed_gossip: u64,
+    shed_control: u64,
+    shed_custody: u64,
+    rate_limited: u64,
+    inbound_dropped: u64,
+    high_water_hits: u64,
+}
+
+impl LinkStats {
+    fn shed(&mut self, class: FrameClass) -> u64 {
+        let n = match class {
+            FrameClass::Snow => &mut self.shed_snow,
+            FrameClass::Gossip => &mut self.shed_gossip,
+            FrameClass::Control => &mut self.shed_control,
+            FrameClass::Custody => &mut self.shed_custody,
+        };
+        *n += 1;
+        *n
+    }
+
+    fn total_shed(&self) -> u64 {
+        self.shed_snow + self.shed_gossip + self.shed_control + self.shed_custody
+    }
+
+    fn is_quiet(&self) -> bool {
+        self.total_shed() == 0
+            && self.rate_limited == 0
+            && self.inbound_dropped == 0
+            && self.high_water_hits == 0
+    }
+
+    fn summary(&self) -> String {
+        format!(
+            "shed(snow={} gossip={} control={} custody={}) rate_limited={} inbound_dropped={} high_water_hits={}",
+            self.shed_snow,
+            self.shed_gossip,
+            self.shed_control,
+            self.shed_custody,
+            self.rate_limited,
+            self.inbound_dropped,
+            self.high_water_hits
+        )
+    }
+}
+
 struct LinkHandle {
     peer: Option<Identifier>,
     addr: Option<std::net::SocketAddr>,
-    tx: mpsc::UnboundedSender<OutFrame>,
+    tx: mpsc::Sender<OutFrame>,
     task: tokio::task::AbortHandle,
+    buckets: [TokenBucket; 4],
+    in_buckets: [TokenBucket; 4],
+    stats: LinkStats,
+    /// When the outbound queue first reached the high-water mark and has
+    /// not drained below it since. `None` while under the mark.
+    over_mark_since: Option<u64>,
 }
 
 pub struct Runtime {
@@ -190,8 +372,8 @@ pub struct Runtime {
     /// outstanding: a tick dispatches queued messages, and dispatching
     /// before the link exists parks the message behind a NoRoute backoff.
     dials_in_flight: u32,
-    link_rx: Option<mpsc::UnboundedReceiver<LinkEvent>>,
-    link_tx: mpsc::UnboundedSender<LinkEvent>,
+    link_rx: Option<mpsc::Receiver<LinkEvent>>,
+    link_tx: mpsc::Sender<LinkEvent>,
     cmd_rx: mpsc::UnboundedReceiver<Cmd>,
     cmd_tx: mpsc::UnboundedSender<Cmd>,
     roots: Vec<RootDial>,
@@ -220,11 +402,16 @@ fn report_diagnostics(diags: Vec<lattice_core::Diagnostic>) {
 }
 
 /// Outbound frame writer for one link.
+///
+/// The inbound channel is bounded: when it is full the peer is flooding
+/// faster than the event loop drains, so the link is torn down instead of
+/// buffering without bound. The final `Down` is awaited so the runtime
+/// always learns the link died; it completes once the loop drains one slot.
 async fn link_task(
     id: u64,
     mut io: lattice_net::PeerIo,
-    inbound: mpsc::UnboundedSender<LinkEvent>,
-    mut outbound: mpsc::UnboundedReceiver<OutFrame>,
+    inbound: mpsc::Sender<LinkEvent>,
+    mut outbound: mpsc::Receiver<OutFrame>,
 ) {
     loop {
         tokio::select! {
@@ -241,7 +428,16 @@ async fn link_task(
             res = io.recv_frame() => {
                 match res {
                     Ok(Some(frame)) => {
-                        let _ = inbound.send(LinkEvent::Frame { link: id, frame });
+                        match inbound.try_send(LinkEvent::Frame { link: id, frame }) {
+                            Ok(()) => {}
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                eprintln!(
+                                    "lattice: link {id}: inbound queue full ({INBOUND_CAPACITY} frames); disconnecting flooding peer"
+                                );
+                                break;
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => break,
+                        }
                     }
                     Ok(None) => break,
                     Err(_) => break,
@@ -249,7 +445,7 @@ async fn link_task(
             }
         }
     }
-    let _ = inbound.send(LinkEvent::Down { link: id });
+    let _ = inbound.send(LinkEvent::Down { link: id }).await;
 }
 
 impl Runtime {
@@ -300,7 +496,7 @@ impl Runtime {
         if draining.load(Ordering::Relaxed) {
             node.set_drain(DrainState::Draining);
         }
-        let (link_tx, link_rx) = mpsc::unbounded_channel();
+        let (link_tx, link_rx) = mpsc::channel(INBOUND_CAPACITY);
         let (dial_tx, dial_rx) = mpsc::unbounded_channel();
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (api_tx, api_rx) = mpsc::unbounded_channel();
@@ -361,9 +557,10 @@ impl Runtime {
     ) -> u64 {
         let id = self.next_link;
         self.next_link += 1;
-        let (outbound_tx, outbound_rx) = mpsc::unbounded_channel();
+        let (outbound_tx, outbound_rx) = mpsc::channel(OUTBOUND_CAPACITY);
         let inbound = self.link_tx.clone();
         let task = tokio::spawn(link_task(id, io, inbound, outbound_rx));
+        let now = now_secs();
         self.links.insert(
             id,
             LinkHandle {
@@ -371,6 +568,10 @@ impl Runtime {
                 addr,
                 tx: outbound_tx,
                 task: task.abort_handle(),
+                buckets: out_buckets(now),
+                in_buckets: in_buckets(now),
+                stats: LinkStats::default(),
+                over_mark_since: None,
             },
         );
         // The link is registered, so the actions returned by LinkUp (the
@@ -481,11 +682,35 @@ impl Runtime {
                 },
                 Some(ev) = link_rx.recv() => match ev {
                     LinkEvent::Frame { link, frame } => {
-                        let peer = self.links.get(&link).and_then(|l| l.peer);
-                        self.apply(Event::Frame { at: now_secs(), link, from: peer.unwrap_or(Identifier::from_bytes([0u8; 32])), frame }).await;
+                        let now = now_secs();
+                        // Per-link inbound rate limit, applied at the core
+                        // boundary. Frames from a link we already tore down
+                        // are dropped: the core has been told LinkDown.
+                        let admitted = match self.links.get_mut(&link) {
+                            Some(h) => {
+                                let class = FrameClass::of(&frame);
+                                if h.in_buckets[class.index()].allow(now) {
+                                    Some(h.peer)
+                                } else {
+                                    h.stats.inbound_dropped += 1;
+                                    let n = h.stats.inbound_dropped;
+                                    if n == 1 || n % 64 == 0 {
+                                        eprintln!(
+                                            "lattice: link {link}: dropping inbound {} frame (rate limited; {n} total)",
+                                            class.name()
+                                        );
+                                    }
+                                    None
+                                }
+                            }
+                            None => None,
+                        };
+                        if let Some(peer) = admitted {
+                            self.apply(Event::Frame { at: now, link, from: peer.unwrap_or(Identifier::from_bytes([0u8; 32])), frame }).await;
+                        }
                     }
                     LinkEvent::Down { link } => {
-                        if self.links.remove(&link).is_some() {
+                        if self.remove_link(link) {
                             self.apply(Event::LinkDown { at: now_secs(), link }).await;
                         }
                     }
@@ -523,10 +748,10 @@ impl Runtime {
     /// so `handle` runs on the blocking thread pool and the async loop
     /// only awaits the outcome; the worker is never blocked on a commit.
     /// Events are still processed strictly in order: each event's actions
-    /// are applied before the next event is dispatched. A duplicate link
-    /// dropped while applying actions is fed back through the same queue
-    /// as a LinkDown, so the core observes it after the binding change
-    /// that caused it.
+    /// are applied before the next event is dispatched. A link dropped or
+    /// force-closed while applying actions is fed back through the same
+    /// queue as a LinkDown, so the core observes it after the binding
+    /// change that caused it.
     async fn apply(&mut self, event: Event) {
         let mut queue = std::collections::VecDeque::from([event]);
         while let Some(event) = queue.pop_front() {
@@ -559,8 +784,9 @@ impl Runtime {
     }
 
     /// Apply the actions returned by the core. Returns the ids of links
-    /// dropped as duplicates (a newer link to the same peer exists); the
-    /// caller feeds `Event::LinkDown` for each back into the core.
+    /// dropped as duplicates (a newer link to the same peer exists) or
+    /// force-closed because the peer cannot keep up; the caller feeds
+    /// `Event::LinkDown` for each back into the core.
     fn apply_actions(&mut self, actions: Vec<Action>) -> Vec<u64> {
         let mut dropped = Vec::new();
         for action in actions {
@@ -570,8 +796,8 @@ impl Runtime {
                     frame,
                     pad_to,
                 } => {
-                    if let Some(h) = self.links.get(&link) {
-                        let _ = h.tx.send(OutFrame { frame, pad_to });
+                    if let Some(closed) = self.enqueue_outbound(link, frame, pad_to) {
+                        dropped.push(closed);
                     }
                 }
                 // Deliver is followed by an Inbox action carrying the unread
@@ -632,10 +858,107 @@ impl Runtime {
         match self.links.remove(&id) {
             Some(h) => {
                 h.task.abort();
+                if !h.stats.is_quiet() {
+                    eprintln!("lattice: link {id} closed: {}", h.stats.summary());
+                }
                 true
             }
             None => false,
         }
+    }
+
+    /// Admit a frame to a link's outbound queue, applying the per-class
+    /// token bucket, the high-water mark and the hard cap. Returns the
+    /// link id if the link was closed because the peer cannot keep up;
+    /// the caller feeds `LinkDown` back to the core.
+    ///
+    /// Order of checks:
+    /// 1. Token bucket for the frame's class; an empty bucket drops the
+    ///    frame (counted) regardless of queue depth.
+    /// 2. At/over the high-water mark, snow and gossip are shed (counted);
+    ///    custody and control fall through to the hard cap.
+    /// 3. A queue that stays at/over the mark for `OVER_MARK_SECS` closes
+    ///    the link; a custody frame that cannot be enqueued at the hard
+    ///    cap closes it immediately.
+    fn enqueue_outbound(&mut self, link: u64, frame: Frame, pad_to: Option<usize>) -> Option<u64> {
+        let now = now_secs();
+        let class = FrameClass::of(&frame);
+        let mut force_close = false;
+        if let Some(h) = self.links.get_mut(&link) {
+            // 1. Per-class token bucket.
+            if !h.buckets[class.index()].allow(now) {
+                h.stats.rate_limited += 1;
+                let n = h.stats.rate_limited;
+                if n == 1 || n % 64 == 0 {
+                    eprintln!(
+                        "lattice: link {link}: outbound {} frame dropped (rate limited; {n} total)",
+                        class.name()
+                    );
+                }
+                return None;
+            }
+            let depth = h.tx.max_capacity() - h.tx.capacity();
+            // 2. High-water bookkeeping.
+            if depth >= OUTBOUND_HIGH_WATER {
+                if h.over_mark_since.is_none() {
+                    h.over_mark_since = Some(now);
+                    eprintln!(
+                        "lattice: link {link}: outbound queue at high-water mark ({depth}/{OUTBOUND_CAPACITY})"
+                    );
+                }
+                h.stats.high_water_hits += 1;
+            } else {
+                h.over_mark_since = None;
+            }
+            // 3. Queue stuck over the mark: the peer is not draining.
+            if let Some(since) = h.over_mark_since {
+                if now.saturating_sub(since) >= OVER_MARK_SECS {
+                    eprintln!(
+                        "lattice: link {link}: outbound queue over high-water for {}s; closing link",
+                        now.saturating_sub(since)
+                    );
+                    force_close = true;
+                }
+            }
+            // 4. Shed low-priority classes at/over the mark.
+            let shed_low = !force_close
+                && depth >= OUTBOUND_HIGH_WATER
+                && matches!(class, FrameClass::Snow | FrameClass::Gossip);
+            if shed_low {
+                let n = h.stats.shed(class);
+                if n == 1 || n % 64 == 0 {
+                    eprintln!(
+                        "lattice: link {link}: shedding {class_name} frame at high-water ({n} total)",
+                        class_name = class.name()
+                    );
+                }
+            } else if force_close {
+                h.stats.shed(class);
+            } else {
+                // 5. Enqueue; the hard cap applies to every class.
+                match h.tx.try_send(OutFrame { frame, pad_to }) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        let n = h.stats.shed(class);
+                        eprintln!(
+                            "lattice: link {link}: outbound queue full; shedding {} frame ({n} total)",
+                            class.name()
+                        );
+                        if class == FrameClass::Custody {
+                            // A custody frame had to be dropped: the peer is
+                            // not draining. A reconnect beats a wedged link.
+                            force_close = true;
+                        }
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {}
+                }
+            }
+        }
+        if force_close && self.remove_link(link) {
+            eprintln!("lattice: link {link} closed: peer cannot keep up with outbound traffic");
+            return Some(link);
+        }
+        None
     }
 
     async fn handle_api(&mut self, api: ApiCmd) {
@@ -942,8 +1265,207 @@ fn pinned_peer(
 
 #[cfg(test)]
 mod tests {
-    use super::pinned_peer;
+    use super::*;
+    use lattice_proto::frames::{
+        CustodyFrame, DummyFrame, Frame, OfferFrame, PingFrame, ReconcileFrame,
+    };
     use lattice_types::{ChannelPublicKey, Identifier};
+
+    fn test_runtime(dir: &std::path::Path) -> Runtime {
+        std::fs::create_dir_all(dir).unwrap();
+        crate::keys::init_identity(dir, None).unwrap();
+        let identity = crate::keys::load_identity(dir).unwrap();
+        let store = lattice_store::RedbStore::open(dir.join("node.redb")).unwrap();
+        let cfg = crate::config::Config {
+            identity_dir: dir.to_path_buf(),
+            mode: "public".to_string(),
+            listen: vec![],
+            hive: vec![],
+            roots: vec![],
+            services: std::collections::HashMap::new(),
+            status: false,
+            app_socket: dir.join("app.sock"),
+            admin_socket: dir.join("admin.sock"),
+            advertise: vec![],
+            gateways: vec![],
+            limits: crate::config::Limits::default(),
+        };
+        let (_peer_tx, peer_rx) = tokio::sync::mpsc::unbounded_channel();
+        let draining = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        Runtime::new(&cfg, identity, store, 1_000, peer_rx, draining).unwrap()
+    }
+
+    fn attach_test_link(rt: &mut Runtime, link: u64) {
+        let (tx, _rx) = mpsc::channel(OUTBOUND_CAPACITY);
+        // Keep the receiver alive by leaking it into the test's runtime; the
+        // queue depth is what the test manipulates.
+        std::mem::forget(_rx);
+        let task = tokio::spawn(async {}).abort_handle();
+        let now = now_secs();
+        rt.links.insert(
+            link,
+            LinkHandle {
+                peer: None,
+                addr: None,
+                tx,
+                task,
+                buckets: out_buckets(now),
+                in_buckets: in_buckets(now),
+                stats: LinkStats::default(),
+                over_mark_since: None,
+            },
+        );
+    }
+
+    fn custody_frame() -> Frame {
+        Frame::Offer(OfferFrame {
+            message: vec![7u8; 32],
+        })
+    }
+
+    fn snow_frame() -> Frame {
+        Frame::Dummy(DummyFrame { echo: false })
+    }
+
+    fn gossip_frame() -> Frame {
+        Frame::Reconcile(ReconcileFrame { ranges: vec![] })
+    }
+
+    #[tokio::test]
+    async fn high_water_sheds_snow_and_gossip_but_not_custody() {
+        let dir = std::env::temp_dir().join(format!(
+            "latticed-shed-test-{}-{}",
+            std::process::id(),
+            now_secs()
+        ));
+        let mut rt = test_runtime(&dir);
+        attach_test_link(&mut rt, 1);
+        // Fill to the high-water mark with custody frames.
+        for _ in 0..OUTBOUND_HIGH_WATER {
+            assert_eq!(rt.enqueue_outbound(1, custody_frame(), None), None);
+        }
+        // Snow and gossip are shed at the mark; custody still gets through.
+        assert_eq!(rt.enqueue_outbound(1, snow_frame(), None), None);
+        assert_eq!(rt.enqueue_outbound(1, gossip_frame(), None), None);
+        let h = rt.links.get(&1).unwrap();
+        assert_eq!(h.stats.shed_snow, 1);
+        assert_eq!(h.stats.shed_gossip, 1);
+        assert_eq!(h.tx.max_capacity() - h.tx.capacity(), OUTBOUND_HIGH_WATER);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn custody_frame_at_hard_cap_closes_the_link() {
+        let dir = std::env::temp_dir().join(format!(
+            "latticed-cap-test-{}-{}",
+            std::process::id(),
+            now_secs()
+        ));
+        let mut rt = test_runtime(&dir);
+        attach_test_link(&mut rt, 1);
+        for _ in 0..OUTBOUND_CAPACITY {
+            assert_eq!(rt.enqueue_outbound(1, custody_frame(), None), None);
+        }
+        // Refill the custody bucket so the bucket is not what stops us.
+        rt.links.get_mut(&1).unwrap().buckets[FrameClass::Custody.index()].tokens = 10.0;
+        // One more custody frame cannot be enqueued: the link is closed.
+        assert_eq!(rt.enqueue_outbound(1, custody_frame(), None), Some(1));
+        assert!(!rt.links.contains_key(&1));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn token_bucket_rate_limits_outbound() {
+        let dir = std::env::temp_dir().join(format!(
+            "latticed-rate-test-{}-{}",
+            std::process::id(),
+            now_secs()
+        ));
+        let mut rt = test_runtime(&dir);
+        attach_test_link(&mut rt, 1);
+        // Snow bucket holds 4; the 5th snow frame is rate limited.
+        for _ in 0..4 {
+            assert_eq!(rt.enqueue_outbound(1, snow_frame(), None), None);
+        }
+        assert_eq!(rt.enqueue_outbound(1, snow_frame(), None), None);
+        let h = rt.links.get(&1).unwrap();
+        assert_eq!(h.stats.rate_limited, 1);
+        assert_eq!(h.tx.max_capacity() - h.tx.capacity(), 4);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn over_mark_timeout_closes_the_link() {
+        let dir = std::env::temp_dir().join(format!(
+            "latticed-overmark-test-{}-{}",
+            std::process::id(),
+            now_secs()
+        ));
+        let mut rt = test_runtime(&dir);
+        attach_test_link(&mut rt, 1);
+        for _ in 0..OUTBOUND_HIGH_WATER {
+            assert_eq!(rt.enqueue_outbound(1, custody_frame(), None), None);
+        }
+        // Simulate the queue having been stuck over the mark for long enough.
+        let past = now_secs().saturating_sub(OVER_MARK_SECS + 1);
+        rt.links.get_mut(&1).unwrap().over_mark_since = Some(past);
+        // Any further frame (even gossip, which would otherwise be shed)
+        // closes the link.
+        assert_eq!(rt.enqueue_outbound(1, gossip_frame(), None), Some(1));
+        assert!(!rt.links.contains_key(&1));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn frame_class_assignment() {
+        assert_eq!(
+            FrameClass::of(&Frame::Offer(OfferFrame { message: vec![] })),
+            FrameClass::Custody
+        );
+        assert_eq!(
+            FrameClass::of(&Frame::Custody(CustodyFrame {
+                leg: lattice_types::LegId::from_bytes([0u8; 16]),
+                result: 0,
+                retry_after: None,
+            })),
+            FrameClass::Custody
+        );
+        assert_eq!(
+            FrameClass::of(&Frame::Reconcile(ReconcileFrame { ranges: vec![] })),
+            FrameClass::Gossip
+        );
+        assert_eq!(
+            FrameClass::of(&Frame::Dummy(DummyFrame { echo: false })),
+            FrameClass::Snow
+        );
+        assert_eq!(
+            FrameClass::of(&Frame::Ping(PingFrame { nonce: 1 })),
+            FrameClass::Control
+        );
+    }
+
+    #[test]
+    fn token_bucket_bursts_then_throttles() {
+        let mut b = TokenBucket::new(2.0, 1.0, 1000);
+        assert!(b.allow(1000));
+        assert!(b.allow(1000));
+        assert!(!b.allow(1000));
+        // One second later one token has refilled.
+        assert!(b.allow(1001));
+        assert!(!b.allow(1001));
+        // Tokens accumulate up to capacity, not beyond.
+        assert!(b.allow(1010));
+        assert!(b.allow(1010));
+        assert!(!b.allow(1010));
+    }
+
+    #[test]
+    fn token_bucket_refill_is_capped_by_capacity() {
+        let mut b = TokenBucket::new(1.0, 10.0, 0);
+        // Long idle: refill must not exceed capacity.
+        assert!(b.allow(1000));
+        assert!(!b.allow(1000));
+    }
 
     #[test]
     fn ik_dial_pins_configured_id() {
