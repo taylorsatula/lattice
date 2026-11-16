@@ -65,13 +65,13 @@ pub fn init_node(dir: &Path) -> NodeKeys {
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8(out.stdout).unwrap();
-    let id_hex = stdout
+    let id_text = stdout
         .lines()
         .find_map(|l| l.strip_prefix("node id: "))
         .expect("init prints node id")
         .trim()
         .to_string();
-    let id = Identifier::from_bytes(hex_decode(&id_hex).try_into().unwrap());
+    let id = lattice_proto::text::parse_id(&id_text).expect("node id is a text-form identifier");
     let next_key_hex = stdout
         .lines()
         .find_map(|l| l.strip_prefix("next signing key (hex): "))

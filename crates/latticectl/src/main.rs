@@ -5,15 +5,19 @@
 //! Commands:
 //!   node                       show node identity, mode, links, custody, drain state
 //!   drain [on|off|status]      set or query drain mode (default: status)
-//!   link <addr> [--key HEX] [--path STR] [--id HEX]
+//!   link <addr> [--key HEX] [--path STR] [--id ID]
 //!                              dial a peer (key = channel key for IK, path = upgrade path for XX)
-//!   unlink <id-hex>            drop and demote all links to this peer
+//!   unlink <id>                drop and demote all links to this peer
 //!   rotate --next-key-file P --next-next-commitment HEX
 //!                              rotate the signing key: P is the offline, pre-committed
 //!                              next key; HEX is the BLAKE3 commitment to the following
 //!                              key (generated offline)
 //!   abandon --next-key-file P  permanently abandon the identity
 //!   rotate-envelope            rotate the envelope (X-Wing) key
+//!
+//! Identifiers are printed and accepted in the spec text form (§1):
+//! lowercase base32, 52 chars. Hex (64 chars) is accepted on input
+//! everywhere an identifier is accepted.
 
 #![forbid(unsafe_code)]
 
@@ -21,6 +25,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use lattice_client::Client;
+use lattice_client::text::{encode_id, parse_id};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -98,7 +103,7 @@ async fn run(socket: &Path, args: &[String]) -> ExitCode {
 async fn cmd_node(client: &mut Client) -> ExitCode {
     match client.node().await {
         Ok(n) => {
-            println!("id:            {}", hex(n.id.as_ref()));
+            println!("id:            {}", encode_id(&n.id));
             println!("mode:          {}", n.mode);
             println!("links:         {}", n.links);
             println!("records:       {}", n.records);
@@ -108,15 +113,6 @@ async fn cmd_node(client: &mut Client) -> ExitCode {
         }
         Err(e) => fail(&e),
     }
-}
-
-fn hex(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        let _ = write!(s, "{b:02x}");
-    }
-    s
 }
 
 async fn cmd_drain(client: &mut Client, args: &[String]) -> ExitCode {
@@ -174,8 +170,8 @@ async fn cmd_link(client: &mut Client, args: &[String]) -> ExitCode {
                     eprintln!("--id needs a value");
                     return ExitCode::from(2);
                 };
-                match decode_hex32(v) {
-                    Ok(k) => id = Some(lattice_types::Identifier::from_bytes(k)),
+                match parse_id(v) {
+                    Ok(parsed) => id = Some(parsed),
                     Err(e) => {
                         eprintln!("--id: {e}");
                         return ExitCode::from(2);
@@ -193,7 +189,7 @@ async fn cmd_link(client: &mut Client, args: &[String]) -> ExitCode {
         }
     }
     let Some(addr) = addr else {
-        eprintln!("usage: latticectl link <addr> [--key HEX | --path STR] [--id HEX]");
+        eprintln!("usage: latticectl link <addr> [--key HEX | --path STR] [--id ID]");
         return ExitCode::from(2);
     };
     if key.is_none() && path.is_none() {
@@ -210,11 +206,11 @@ async fn cmd_link(client: &mut Client, args: &[String]) -> ExitCode {
 }
 
 async fn cmd_unlink(client: &mut Client, args: &[String]) -> ExitCode {
-    let Some(hex) = args.get(1) else {
-        eprintln!("usage: latticectl unlink <id-hex>");
+    let Some(id_arg) = args.get(1) else {
+        eprintln!("usage: latticectl unlink <id>");
         return ExitCode::from(2);
     };
-    match decode_hex32(hex).map(lattice_types::Identifier::from_bytes) {
+    match parse_id(id_arg) {
         Ok(id) => match client.unlink(&id).await {
             Ok(lattice_client::UnlinkOutcome::Removed) => {
                 println!("unlinked");

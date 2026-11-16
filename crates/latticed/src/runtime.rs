@@ -839,7 +839,8 @@ impl Runtime {
                             for dup in bound {
                                 if self.remove_link(dup) {
                                     eprintln!(
-                                        "lattice: dropping duplicate link {dup} to peer {p:?} (keeping link {keep})"
+                                        "lattice: dropping duplicate link {dup} to peer {} (keeping link {keep})",
+                                        lattice_proto::text::encode_id(&p)
                                     );
                                     dropped.push(dup);
                                 }

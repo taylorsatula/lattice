@@ -68,7 +68,7 @@ fn cmd_init(args: &[String]) -> std::process::ExitCode {
             if let Ok(Ok(id)) =
                 keys::load_identity(&dir).map(|id| lattice_proto::kel::identifier(&id.kel))
             {
-                println!("node id: {}", hex(id.as_ref()));
+                println!("node id: {}", lattice_proto::text::encode_id(&id));
             }
             match &outcome.next_key_path {
                 Some(path) => {
