@@ -135,6 +135,10 @@ pub struct Config {
     pub gateways: Vec<Identifier>,
     /// Public or private record mode.
     pub mode: Mode,
+    /// Names of the services this node serves. A message addressed to any
+    /// other service is accepted into custody but never stored or delivered;
+    /// the sender gets a negative receipt (reason 1).
+    pub services: Vec<String>,
 }
 
 impl Default for Config {
@@ -161,6 +165,7 @@ impl Default for Config {
             advertise: Vec::new(),
             gateways: Vec::new(),
             mode: Mode::Public,
+            services: Vec::new(),
         }
     }
 }

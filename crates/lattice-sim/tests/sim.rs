@@ -10,6 +10,7 @@ fn fast_config() -> Config {
         snow_per_min: 0.0,
         receipt_timeout_public: 30,
         fresh_waypoint_retries: 1,
+        services: vec!["test".to_string()],
         ..Config::default()
     }
 }
@@ -309,6 +310,85 @@ fn duplicate_mid_is_not_delivered_twice() {
     sim.run_for(10);
     let n = sim.deliveries.iter().filter(|d| d.mid == mid).count();
     assert_eq!(n, 1, "duplicate mid must not be delivered twice");
+}
+
+#[test]
+fn unknown_service_gets_negative_receipt_and_no_inbox_entry() {
+    use lattice_store::Store;
+
+    let mut sim = Sim::new(fast_config());
+    for _ in 0..2 {
+        sim.add_node();
+    }
+    sim.connect(0, 1);
+    wait_for_path(&mut sim, 0, 1);
+    wait_for_path(&mut sim, 1, 0);
+    let mid = MessageId::from_bytes([0x5Au8; 16]);
+    let to_id = sim.ids[1];
+    let make = || lattice_core::AppSend {
+        service: "test".into(),
+        mid_hint: Some(mid),
+        to: to_id,
+        tsvc: "no-such-service".into(),
+        tmbx: b"inbox".to_vec(),
+        fmbx: b"outbox".to_vec(),
+        body: b"hello?".to_vec(),
+        exp: None,
+        priority: 1,
+        route: 0,
+    };
+    sim.force_app_send(0, make());
+    sim.run_for(10);
+    assert!(
+        sim.deliveries.iter().all(|d| d.mid != mid),
+        "unknown service must not be delivered"
+    );
+    assert_eq!(
+        sim.nodes[1]
+            .store_ref()
+            .inbox_len("no-such-service")
+            .unwrap(),
+        0,
+        "unknown service must not consume inbox space"
+    );
+    let status = sim.nodes[0]
+        .store_ref()
+        .status_get(&mid)
+        .unwrap()
+        .expect("sender must record a status for the mid");
+    assert_eq!(status.status, lattice_proto::local::MSG_STATUS_FAILED);
+    assert_eq!(
+        status.detail,
+        Some(lattice_proto::message::REASON_UNKNOWN_SERVICE),
+        "negative receipt must carry reason 1 (unknown service)"
+    );
+
+    // Redelivery of the same mid: still no delivery, no inbox entry, and the
+    // sender stays on the failed status.
+    sim.force_app_send(0, make());
+    sim.run_for(10);
+    assert!(
+        sim.deliveries.iter().all(|d| d.mid != mid),
+        "redelivered mid must not be delivered"
+    );
+    assert_eq!(
+        sim.nodes[1]
+            .store_ref()
+            .inbox_len("no-such-service")
+            .unwrap(),
+        0,
+        "redelivered mid must not consume inbox space"
+    );
+    let status = sim.nodes[0]
+        .store_ref()
+        .status_get(&mid)
+        .unwrap()
+        .expect("sender must record a status for the mid");
+    assert_eq!(status.status, lattice_proto::local::MSG_STATUS_FAILED);
+    assert_eq!(
+        status.detail,
+        Some(lattice_proto::message::REASON_UNKNOWN_SERVICE)
+    );
 }
 
 #[test]
