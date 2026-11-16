@@ -337,11 +337,40 @@ pub fn self_test(identity: &Identity) -> io::Result<()> {
             "signing key failed self-test",
         ));
     }
-    let derived = lattice_crypto::xwing_public_key(&identity.xwing_secret);
-    if derived != identity.xwing_public {
+    // Seal a payload to the node's own envelope public key and open it
+    // again. This exercises X-Wing encapsulation and decapsulation against
+    // the loaded secret, so a secret that does not match the stored public
+    // key (or a broken KEM) fails here instead of on the first inbound
+    // envelope.
+    let sealed = lattice_crypto::seal(
+        lattice_crypto::ENVELOPE_CONTEXT,
+        &identity.xwing_public,
+        b"",
+        msg,
+    )
+    .map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("envelope seal failed: {e}"),
+        )
+    })?;
+    let opened = lattice_crypto::open(
+        lattice_crypto::ENVELOPE_CONTEXT,
+        &identity.xwing_secret,
+        b"",
+        &sealed.kem_ciphertext,
+        &sealed.ciphertext,
+    )
+    .map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("envelope open failed: {e}"),
+        )
+    })?;
+    if opened != msg {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "envelope key does not match its public half",
+            "envelope round-trip returned different bytes",
         ));
     }
     Ok(())
@@ -567,6 +596,32 @@ mod tests {
 
     fn commitment_of(seed: &SigningSeed) -> Commitment {
         next_key_commitment(seed)
+    }
+
+    #[test]
+    fn self_test_passes_on_fresh_identity() {
+        let dir = temp_dir("self-test-ok");
+        init_identity(&dir, None).unwrap();
+        let identity = load_identity(&dir).unwrap();
+        self_test(&identity).expect("fresh identity must pass the self-test");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn self_test_fails_when_envelope_public_does_not_match_secret() {
+        let dir = temp_dir("self-test-mismatch");
+        init_identity(&dir, None).unwrap();
+        let mut identity = load_identity(&dir).unwrap();
+        // Swap in a different envelope keypair's public half: the secret no
+        // longer matches the public key the record would advertise.
+        let other = lattice_crypto::generate_keypair();
+        identity.xwing_public = other.public;
+        let err = expect_err(self_test(&identity));
+        assert!(
+            err.to_string().contains("envelope"),
+            "unexpected error: {err}"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

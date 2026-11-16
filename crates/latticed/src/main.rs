@@ -160,6 +160,56 @@ fn record_self_test(cfg: &config::Config, identity: &lattice_core::Identity) -> 
         .map_err(|e| e.to_string())
 }
 
+/// Compare the stored own record (if any) against the loaded secrets.
+/// Catches a store that disagrees with the identity directory — e.g. the
+/// identity was re-initialized without clearing the store — before the
+/// node publishes or honors a record carrying keys it does not hold.
+/// Absent record is fine: first boot publishes it.
+///
+/// The envelope key may match either the current key or a retired key
+/// still inside its grace period: an envelope rotation rewrites
+/// `envelope_seed` before the republished record reaches the store, so a
+/// crash in between leaves the store advertising the previous key. The
+/// channel key has no rotation path, so it must always match exactly.
+fn verify_stored_own_record(
+    store: &lattice_store::RedbStore,
+    identity: &lattice_core::Identity,
+) -> Result<(), String> {
+    use lattice_store::Store;
+    let id = identity.id();
+    let Some(stored) = store
+        .record_get(&id, lattice_proto::record::Scope::Wan)
+        .map_err(|e| format!("read own record: {e}"))?
+    else {
+        return Ok(());
+    };
+    // Expiry is not checked: an expired own record is still evidence about
+    // which keys the store holds, and the node republishes on refresh.
+    let record = lattice_proto::record::PeerRecord::from_bytes_unchecked_time(&stored.bytes, None)
+        .map_err(|e| format!("stored own record does not validate: {e}"))?;
+    let want_channel = lattice_crypto::channel_public(&identity.channel_seed);
+    if record.channel_key != want_channel {
+        return Err(
+            "stored own record's channel key does not match the loaded channel seed; \
+             the store and the identity directory disagree"
+                .into(),
+        );
+    }
+    let envelope_matches = record.envelope_key == identity.xwing_public
+        || identity
+            .retired_xwing
+            .iter()
+            .any(|r| lattice_crypto::xwing_public_key(&r.secret) == record.envelope_key);
+    if !envelope_matches {
+        return Err(
+            "stored own record's envelope key matches neither the loaded envelope key nor any \
+             retired key; the store and the identity directory disagree"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 /// Load and verify the configuration and identity: parse the config, load
 /// the identity, run the key self-test and the record self-test. On failure
 /// the reason is printed and the exit code to return is handed back.
@@ -277,6 +327,12 @@ async fn cmd_run(args: &[String]) -> std::process::ExitCode {
         Ok(v) => v,
         Err(code) => return code,
     };
+    if let Err(e) = verify_stored_own_record(&store, &identity) {
+        eprintln!(
+            "stored own record: {e}. Refusing to start: the store and the identity directory disagree; move node.redb aside or restore the matching identity."
+        );
+        return std::process::ExitCode::from(1);
+    }
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
@@ -398,4 +454,148 @@ async fn cmd_run(args: &[String]) -> std::process::ExitCode {
 
     runtime.run(shutdown).await;
     std::process::ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "latticed-main-{tag}-{}-{nanos}",
+            std::process::id()
+        ))
+    }
+
+    fn own_record_bytes(
+        identity: &lattice_core::Identity,
+        channel_seed: lattice_types::ChannelSeed,
+        envelope_key: lattice_types::XWingPublicKey,
+    ) -> Vec<u8> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let params = lattice_proto::record::RecordParams {
+            kel: identity.kel.clone(),
+            seq: 1,
+            exp: now + 3600,
+            channel_key: lattice_crypto::channel_public(&channel_seed),
+            channel_seed,
+            envelope_key,
+            mode: lattice_proto::record::Mode::Public,
+            scope: lattice_proto::record::Scope::Wan,
+            endpoints: vec![],
+            links: vec![],
+            gateways: vec![],
+            capabilities: 1,
+        };
+        lattice_proto::record::PeerRecord::build(params, &identity.signing_seed)
+            .unwrap()
+            .encode()
+    }
+
+    fn store_own_record(
+        dir: &std::path::Path,
+        identity: &lattice_core::Identity,
+        bytes: &[u8],
+    ) -> lattice_store::RedbStore {
+        use lattice_store::Store;
+        let mut store = lattice_store::RedbStore::open(dir.join("node.redb")).unwrap();
+        store
+            .record_put(&identity.id(), lattice_proto::record::Scope::Wan, bytes, 0)
+            .unwrap();
+        store
+    }
+
+    fn fresh_identity(dir: &std::path::Path) -> lattice_core::Identity {
+        keys::init_identity(dir, None).unwrap();
+        keys::load_identity(dir).unwrap()
+    }
+
+    #[test]
+    fn stored_own_record_absent_is_accepted() {
+        let dir = temp_dir("own-record-absent");
+        std::fs::create_dir_all(&dir).unwrap();
+        let identity = fresh_identity(&dir);
+        let store = lattice_store::RedbStore::open(dir.join("node.redb")).unwrap();
+        verify_stored_own_record(&store, &identity).expect("no stored record is fine");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stored_own_record_matching_identity_is_accepted() {
+        let dir = temp_dir("own-record-ok");
+        std::fs::create_dir_all(&dir).unwrap();
+        let identity = fresh_identity(&dir);
+        let bytes = own_record_bytes(
+            &identity,
+            identity.channel_seed.clone(),
+            identity.xwing_public,
+        );
+        let store = store_own_record(&dir, &identity, &bytes);
+        verify_stored_own_record(&store, &identity).expect("matching record must pass");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stored_own_record_with_foreign_channel_key_is_rejected() {
+        let dir = temp_dir("own-record-channel");
+        std::fs::create_dir_all(&dir).unwrap();
+        let identity = fresh_identity(&dir);
+        let foreign_seed = lattice_types::ChannelSeed::from_bytes([9u8; 32]);
+        let bytes = own_record_bytes(&identity, foreign_seed, identity.xwing_public);
+        let store = store_own_record(&dir, &identity, &bytes);
+        let err = verify_stored_own_record(&store, &identity).unwrap_err();
+        assert!(err.contains("channel key"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stored_own_record_with_foreign_envelope_key_is_rejected() {
+        let dir = temp_dir("own-record-envelope");
+        std::fs::create_dir_all(&dir).unwrap();
+        let identity = fresh_identity(&dir);
+        let foreign = lattice_crypto::generate_keypair();
+        let bytes = own_record_bytes(&identity, identity.channel_seed.clone(), foreign.public);
+        let store = store_own_record(&dir, &identity, &bytes);
+        let err = verify_stored_own_record(&store, &identity).unwrap_err();
+        assert!(err.contains("envelope key"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stored_own_record_with_retired_envelope_key_is_accepted() {
+        // Crash window: envelope rotated on disk, record not yet republished.
+        let dir = temp_dir("own-record-retired");
+        std::fs::create_dir_all(&dir).unwrap();
+        let identity = fresh_identity(&dir);
+        let old_envelope = identity.xwing_public;
+        let bytes = own_record_bytes(&identity, identity.channel_seed.clone(), old_envelope);
+        let store = store_own_record(&dir, &identity, &bytes);
+        drop(store);
+        keys::rotate_envelope_key(&dir, 3600).unwrap();
+        let rotated = keys::load_identity(&dir).unwrap();
+        assert_ne!(rotated.xwing_public, old_envelope);
+        assert_eq!(rotated.retired_xwing.len(), 1);
+        let store = lattice_store::RedbStore::open(dir.join("node.redb")).unwrap();
+        verify_stored_own_record(&store, &rotated)
+            .expect("record carrying the retired envelope key must pass");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stored_own_record_garbage_is_rejected() {
+        let dir = temp_dir("own-record-garbage");
+        std::fs::create_dir_all(&dir).unwrap();
+        let identity = fresh_identity(&dir);
+        let store = store_own_record(&dir, &identity, b"not a record");
+        let err = verify_stored_own_record(&store, &identity).unwrap_err();
+        assert!(err.contains("does not validate"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
