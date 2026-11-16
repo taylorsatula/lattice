@@ -3,12 +3,16 @@
 //! Topology (all on loopback, real daemons, real local API):
 //!
 //! ```text
-//!   wan ── h1 ── h2 ── h3        (h1..h3 + gw are the hive)
-//!             \   \
-//!              gw ─┘             (gw is a hive member and the gateway)
-//!               |
-//!              priv              (private instance; no endpoints, no links)
+//!   h2 ──┐
+//!   h3 ──┤
+//!   wan ─┼── h1                  (h1..h3 + gw are the hive)
+//!   gw ──┘
+//!   |
+//!   priv                         (private instance; no endpoints, no links)
 //! ```
+//!
+//! Every node roots to h1 (priv roots to gw); there is no h2–h3 or
+//! gw–h2 link. gw is a hive member and the gateway.
 //!
 //! Covers: a hive, a WAN link, a private instance behind a gateway, a
 //! partition that heals, a key rotation, and a drain — with applications

@@ -146,7 +146,7 @@ fn split(range: &Range) -> Option<Vec<Range>> {
     Some(out)
 }
 
-/// Count and XOR-sum of the items in a range.
+/// Count and additive sum (mod 2^256) of the items in a range.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Fingerprint {
     pub count: u64,

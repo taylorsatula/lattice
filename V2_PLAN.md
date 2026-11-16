@@ -5,6 +5,11 @@ ordered so that each one is verified before the next depends on it. The
 protocol is proven in a deterministic simulator before any real network code
 exists.
 
+Scope of v2.0: the full design is in scope — neighbor selection (Phase 2),
+the hive/WAN dual-record model, group commit (Phase 3), and the randomized
+seed sweep (Phase 2 exit). Only the items in "Out of scope for v2.0" at the
+end of this document are deferred.
+
 ## Architecture in one paragraph
 
 The protocol logic is a **sans-IO core**: a state machine that takes events
@@ -28,7 +33,7 @@ crates/
   lattice-crypto/         Ed25519, X-Wing seal/open, BLAKE3, key events
   lattice-proto/          deterministic CBOR, every spec object, validation
   lattice-core/           sans-IO state machine: gossip, routing, custody,
-                          receipts, fair shares, gateways, immune system
+                          receipts, fair shares, gateways
   lattice-store/          Store trait; in-memory and redb implementations
   lattice-net/            Noise inside WebSocket, cookies, listener, status,
                           connect-time scope checks
@@ -75,7 +80,7 @@ marks the choices with the most uncertainty.
 | Hashing | `blake3` | Consider the `pure` feature to avoid assembly |
 | CBOR | `minicbor`, with hand-written encode/decode | **Verify** that deterministic encoding and pre-allocation length checks can be enforced; otherwise write a small strict codec for our closed object set |
 | Storage | `redb` | Confirm durability (fsync) semantics on commit |
-| DNS | `hickory-resolver` | Returns every address, for the connect-time scope check |
+| DNS | `hickory-resolver` | Returns every address, for the connect-time scope check; plain resolution only in v2.0 (encrypted DNS deferred, see "Out of scope for v2.0") |
 | Constant time | `subtle` | |
 | Randomness | `rand_core` with `OsRng` / `getrandom` | |
 | Config | `toml` | |
@@ -208,8 +213,8 @@ invariants passing:
    - spreading rotations and abandonments
    - detecting equivocation
    - rotating envelope keys
-10. **Immune system (optional):** the wary list and the *k*-distinct-ranges
-    rule.
+10. **Immune system — deferred past v2.0** (see "Out of scope for v2.0"):
+    the wary list and the *k*-distinct-ranges rule.
 
 **Invariants the simulator checks on every run:**
 - **Convergence:** after any partition heals, every node holds the same
@@ -316,8 +321,9 @@ subset on redb.
    - snow and the optional hold driven by the core
    - the upgrade path derived from the channel key, with a generic 404 for
      anything else
-   - endpoint IP addresses preferred over hostnames, with encrypted DNS
-     (DoH or DoT) and caching when a lookup is needed
+   - endpoint IP addresses preferred over hostnames; when a lookup is
+     unavoidable, the system resolver is used with caching (encrypted DNS —
+     DoH or DoT — is deferred past v2.0; see "Out of scope for v2.0")
 10. Plumb all of this into the core's events and actions.
 
 **Exit:**
@@ -351,7 +357,7 @@ subset on redb.
   | `snow` | Snow level, echo share, hold |
   | `routing` | Sideways probability, waypoint share |
   | `hive_interfaces` | Interfaces where multicast discovery runs; none by default |
-  | `dns` | Encrypted resolver to use when a hostname must be resolved |
+  | `dns` | Deferred past v2.0 — encrypted resolver for hostnames; until then the system resolver is used |
   | `limits` | Overrides for the defaults below |
 
 - **Startup:** load secrets (systemd credentials first, then files with mode
@@ -392,7 +398,6 @@ MIRA can be hooked in without changes to Lattice.
 - **Operator documentation on what Lattice can't hide:** who a node connects
   to (use WARP, Tailscale or similar if that matters), and host-level
   fingerprints such as TCP timestamps.
-- The immune system, if it wasn't finished in Phase 2.
 - **Soak test:** the real mesh runs for days with churn and injected faults,
   watching memory, storage growth and delivery rates.
 - **Review:** an external look at how the cryptography is used, the
@@ -430,7 +435,9 @@ from the soak test.
 
 ## Out of scope for v2.0
 
-These are recorded in the design doc as open or deferred:
+These are recorded in the design doc as open or deferred, plus the two
+items the v2.0 scope decision defers (the immune system and encrypted
+DNS):
 
 - anonymous senders
 - messages over 32 KB and attachments
@@ -439,6 +446,10 @@ These are recorded in the design doc as open or deferred:
 - Spray-and-Wait
 - greedy-tree routing for very large meshes
 - non-IP transports
+- the immune system (the wary list and the *k*-distinct-ranges rule)
+- encrypted DNS (DoH or DoT); a hostname lookup that is unavoidable uses
+  the system resolver, and the connect-time scope check applies to every
+  resolved address
 
 ## Risks
 

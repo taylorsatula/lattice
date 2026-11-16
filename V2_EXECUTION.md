@@ -6,7 +6,14 @@ gates, and the points where the agent stops and asks. It is not a substitute
 for `V2_PLAN.md`; where the two disagree, `V2_PLAN.md` wins on protocol and
 this file wins on process.
 
-Status: Phases 0–6 are implemented locally on `main` (Phase 0 `c9aa169` → Phase 4 `6c24519`, Phase 5 `4d676a1`, the 2026-11-14 review-sweep fixes `c39069f`, `733d4a8`, `ba66051`, the operator-ruling work `83119d8`…`b75830c`, the gateway→private delivery fix `1f388c3`, the six-node gate `49fb0e2`, and the Phase 6 Python client `71929d9`). The full suite, the two-node e2e, the six-node gate, the Python vector + integration suites, clippy (`-D warnings`), fmt, and `cargo deny check` pass locally; GitHub-side CI has not run (nothing has been pushed). Phase 5's gate — the six-node scenario — IS met (`crates/latticed/tests/six_node.rs`). Phase 6 is complete (Python client in `clients/python/`, vectors pass, integration test green). Phase 7 (release/soak) is not started.
+Status: Phases 0–6 are implemented locally on `main` (Phase 0 `c9aa169` → Phase 4 `6c24519`, Phase 5 `4d676a1`, the 2026-11-14 review-sweep fixes `c39069f`, `733d4a8`, `ba66051`, the operator-ruling work `83119d8`…`b75830c`, the gateway→private delivery fix `1f388c3`, the six-node gate `49fb0e2`, and the Phase 6 Python client `71929d9`). Nothing has been pushed; GitHub CI has never run — all evidence is local. Local gates pass (fmt, clippy `-D warnings`, the full test suite, `cargo deny check`), but the phase gates as written are not all met (see the 2026-11-15 implementation review, `V2_IMPLEMENTATION_REVIEW.md`, §5.2): Phase 0 met locally only; Phase 1 partial (fuzz targets don't build; abandonment is not final mesh-wide); Phase 2 not met (no seed sweep, no invariant checker, runs not reproducible; several invariants violated); Phase 3 partial (crash tests pass; group commit measured but not in the production path); Phase 4 partial (loopback only; the connect-time scope check is not wired to a dial path; no network namespaces; no handshake fuzzing); Phase 5 met as written, with caveats (a star topology wired entirely by roots, no hive scope); Phase 6 met, with caveats (the Python client diverges from the Rust implementation). Phase 7 (release/soak) is not started.
+
+**Scope of v2.0 (operator decision, H-20).** v2.0 attempts the full design:
+neighbor selection (Phase 2), the hive/WAN dual-record model, group commit
+(Phase 3), and the randomized seed sweep (Phase 2 exit) are all in scope.
+Only the immune system, encrypted DNS (DoH/DoT), and the items in
+`V2_PLAN.md`'s "Out of scope for v2.0" are deferred. `V2_PLAN.md` is the
+source of truth for the deferral list.
 
 ## Readiness assessment
 
@@ -88,9 +95,11 @@ run clean for an extended session.
 `lattice-sim`).** The largest phase; it is where the design either holds or
 doesn't. Build in the order given in `V2_PLAN.md` (records/gossip → neighbor
 selection → graph and routing → custody → queue and receipts → fair shares →
-snow → gateways → key lifecycle → immune system), each landing with its
-invariants passing. Adversarial nodes and partitions are first-class from
-the start, not bolted on after. Simulator regressions get recorded as seeds.
+snow → gateways → key lifecycle), each landing with its invariants
+passing. The immune system is deferred past v2.0 (see `V2_PLAN.md`,
+"Out of scope for v2.0"). Adversarial nodes and partitions are first-class
+from the start, not bolted on after. Simulator regressions get recorded as
+seeds.
 *Gate:* every invariant in `V2_PLAN.md` (convergence, no duplicate delivery,
 no silent loss, custody durability, flood containment, routing termination,
 reconciliation cost, bounded state, ...) holds across a randomized seed
@@ -106,8 +115,9 @@ redb; group-commit acceptance rate measured and recorded in the docs.
 
 **Phase 4 — transport (`lattice-net`).** WebSocket listener/client with size
 caps before buffering; Noise IK/XX inside WebSocket; cookie path under load;
-connect-time scope check (resolve → check every address against record scope,
-encrypted DNS when resolution is unavoidable); endpoint proving before an
+connect-time scope check (resolve → check every address against record
+scope; encrypted DNS is deferred past v2.0, so resolution uses the system
+resolver when unavoidable); endpoint proving before an
 endpoint counts; padded frames, derived upgrade path, generic 404; optional
 `/status`; endpoint-preference for IPs over hostnames.
 *Gate:* three daemons on loopback and in network namespaces exchange
@@ -131,12 +141,21 @@ guide for MIRA.
 
 **Phase 7 — release.** Hive multicast discovery; snow parameters confirmed
 from soak; operator docs (including what Lattice cannot hide: who you connect
-to, host fingerprints); immune system if not finished in Phase 2; multi-day
-soak with churn and injected faults; external crypto and dependency review;
-`v2.0.0` tag.
+to, host fingerprints); multi-day soak with churn and injected faults;
+external crypto and dependency review; `v2.0.0` tag. The immune system is
+not part of v2.0 (deferred; see `V2_PLAN.md`, "Out of scope for v2.0").
 
 ## Verification log
 
+- 2026-11-16 — Status line corrected after the 2026-11-15 implementation
+  review: GitHub CI has never run, local gates are the only evidence, and
+  several phase gates are not met (see the status line above and the
+  review's §5.2). The group-commit bench
+  (`crates/lattice-store/examples/group_commit.rs`) was corrected to compare
+  like-for-like (`custody_put` one-transaction-each vs `custody_put_batch`,
+  same table and rows); the 2026-11-14 figure above compared a 3-table
+  accept against a 1-table batch insert and overstated the group-commit
+  win. No library behavior changed.
 - 2026-11-14 — Full local gate green: `cargo fmt --check`, `cargo clippy
   --workspace --all-targets --locked -- -D warnings` (also on 1.87.0),
   `cargo test --workspace --all-targets --locked` (30 suites), `cargo deny

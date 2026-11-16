@@ -1,14 +1,20 @@
 # lattice
 
-Lattice is a key-anchored, flat mesh for cross-server messaging.
-A human address such as `mikey@other.network` resolves to a canonical
-`user@lat_…` identity, and messages travel directly between nodes. Bootstrap
-nodes introduce peers but never relay traffic.
+Lattice is a key-anchored mesh for cross-server messaging. Addresses are
+`<service>:<mailbox>@<identifier>`, where the identifier is a BLAKE3 hash of
+the identity's key event log — there are no names on the network; naming is
+the application's address book. Messages cross the mesh hop by hop, and a
+hop guarantees only custody: that it durably stored the message, never that
+it will arrive. Arrival is confirmed only by a receipt from the recipient.
+Roots are introducers, not permanent attachments: a node dials its roots to
+join, then forms its own links from what it learns, and any node can carry
+traffic.
 
 This repository is the v2 rewrite (Rust). The v1 Python implementation lives
 under `old/` for reference only.
 
-**Status: Phases 0–6 complete (through the Python client); Phase 7
+**Status: Phases 0–6 are implemented locally on `main`; several phase gates
+are not met (see `V2_EXECUTION.md`), and GitHub CI has never run. Phase 7
 (release/soak) not started.** Not ready for production use. See `V2_PLAN.md`
 for the full roadmap and `V2_SPEC.md` for the protocol.
 
@@ -37,9 +43,11 @@ cargo build --workspace
 cargo test --workspace
 ```
 
-MSRV is 1.87. CI runs fmt and clippy (`-D warnings`, both pinned to 1.87.0),
-tests (including doc tests), an MSRV check, `cargo deny`, and a check that
-every crate opts into the workspace `unsafe_code = "forbid"` lint.
+MSRV is 1.87. CI is configured to run fmt and clippy (`-D warnings`, both
+pinned to 1.87.0), tests (including doc tests), an MSRV check, `cargo deny`,
+and a check that every crate opts into the workspace `unsafe_code =
+"forbid"` lint — but GitHub has never run it; everything so far is verified
+locally.
 
 ## Running a node
 
