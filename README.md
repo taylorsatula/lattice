@@ -47,8 +47,13 @@ every crate opts into the workspace `unsafe_code = "forbid"` lint.
 cargo build --release
 sudo install -Dm755 target/release/latticed /usr/local/bin/latticed
 sudo install -Dm644 deploy/latticed.service /etc/systemd/system/latticed.service
+sudo install -Dm644 deploy/lattice.sysusers /etc/sysusers.d/lattice.conf
+sudo install -Dm644 deploy/lattice.tmpfiles.conf /etc/tmpfiles.d/lattice.conf
+sudo systemd-sysusers && sudo systemd-tmpfiles --create
 sudo latticed init --dir /var/lib/lattice --next-key-out /secure/offline/next_signing_seed
-sudo install -Dm600 deploy/lattice.example.toml /etc/lattice/lattice.toml
+sudo chown -R lattice:lattice /var/lib/lattice
+sudo install -d -m 0750 -o root -g lattice /etc/lattice
+sudo install -Dm640 -o root -g lattice deploy/lattice.example.toml /etc/lattice/lattice.toml
 sudo $EDITOR /etc/lattice/lattice.toml           # set services, listen, roots
 sudo systemctl daemon-reload && sudo systemctl enable --now latticed
 ```
@@ -72,16 +77,19 @@ through `latticectl` on the admin socket.
 ### Local sockets and access
 
 - The **admin socket** (`admin_socket`, default `/run/lattice/admin.sock`) is
-  mode `0600`, owner-only. It carries node control (drain, link, unlink,
-  rotate, abandon, node info) and is root-only in practice.
+  mode `0600`, owned by the `lattice` user. It carries node control (drain,
+  link, unlink, rotate, abandon, node info). Root can connect (it bypasses
+  file permissions); no one else can.
 - The **application socket** (`app_socket`, default `/run/lattice/app.sock`)
   is mode `0660`, group `lattice`. Members of the `lattice` group may connect;
   everyone else cannot. Create the group with the shipped sysusers.d snippet
   (`deploy/lattice.sysusers`), add application users with
   `usermod -aG lattice <user>`, and let tmpfiles.d manage `/run/lattice`
-  (`deploy/lattice.tmpfiles.conf`). The daemon runs as root with egid
-  `lattice` (`Group=lattice` in the unit), so the socket it creates is
-  group-owned automatically.
+  (`deploy/lattice.tmpfiles.conf`). The daemon runs as the `lattice` user
+  (`User=lattice` in the unit), so the socket it creates is group-owned
+  automatically. The unit grants no capabilities, filters the syscall set
+  to `@system-service`, and limits writes to `/var/lib/lattice` and
+  `/run/lattice`.
 - Delivery to applications is **at least once**: a delivery stays in the
   inbox until acknowledged, and is re-fetched after a crash. Applications
   must dedup by message id (`mid`).
