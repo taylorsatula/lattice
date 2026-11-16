@@ -8,8 +8,11 @@
 //!   link <addr> [--key HEX] [--path STR] [--id HEX]
 //!                              dial a peer (key = channel key for IK, path = upgrade path for XX)
 //!   unlink <id-hex>            drop and demote all links to this peer
-//!   rotate [--next-key-file P] rotate the signing key (uses the pre-committed next key)
-//!   abandon [--next-key-file P] permanently abandon the identity
+//!   rotate --next-key-file P --next-next-commitment HEX
+//!                              rotate the signing key: P is the offline, pre-committed
+//!                              next key; HEX is the BLAKE3 commitment to the following
+//!                              key (generated offline)
+//!   abandon --next-key-file P  permanently abandon the identity
 //!   rotate-envelope            rotate the envelope (X-Wing) key
 
 #![forbid(unsafe_code)]
@@ -239,7 +242,8 @@ async fn cmd_abandon(client: &mut Client, args: &[String]) -> ExitCode {
 }
 
 async fn rotate_or_abandon(client: &mut Client, args: &[String], abandon: bool) -> ExitCode {
-    let mut next_key_file = None;
+    let mut next_key_file: Option<String> = None;
+    let mut next_next_commitment: Option<String> = None;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -251,16 +255,62 @@ async fn rotate_or_abandon(client: &mut Client, args: &[String], abandon: bool) 
                 next_key_file = Some(p.clone());
                 i += 2;
             }
+            "--next-next-commitment" => {
+                if abandon {
+                    eprintln!(
+                        "--next-next-commitment is only valid for rotate; abandon takes no commitment"
+                    );
+                    return ExitCode::from(2);
+                }
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!("--next-next-commitment needs a hex value");
+                    return ExitCode::from(2);
+                };
+                next_next_commitment = Some(v.clone());
+                i += 2;
+            }
             other => {
                 eprintln!("unknown flag {other:?}");
                 return ExitCode::from(2);
             }
         }
     }
+    let cmd = if abandon { "abandon" } else { "rotate" };
+    let Some(path) = next_key_file else {
+        eprintln!("{cmd} requires --next-key-file <path> (the offline, pre-committed next key)");
+        return ExitCode::from(2);
+    };
+    let key_bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("read {path}: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let next_key: [u8; 32] = match key_bytes.as_slice().try_into() {
+        Ok(k) => k,
+        Err(_) => {
+            eprintln!("{path}: expected 32 bytes, got {}", key_bytes.len());
+            return ExitCode::from(2);
+        }
+    };
     let result = if abandon {
-        client.abandon(next_key_file.as_deref()).await
+        client.abandon(&next_key).await
     } else {
-        client.rotate(next_key_file.as_deref()).await
+        let Some(hex) = next_next_commitment else {
+            eprintln!(
+                "rotate requires --next-next-commitment <hex> (BLAKE3 commitment to the following key, generated offline)"
+            );
+            return ExitCode::from(2);
+        };
+        let commitment = match decode_hex32(&hex) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("--next-next-commitment: {e}");
+                return ExitCode::from(2);
+            }
+        };
+        client.rotate(&next_key, &commitment).await
     };
     match result {
         Ok(msg) => {

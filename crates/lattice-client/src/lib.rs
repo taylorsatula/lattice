@@ -398,23 +398,28 @@ impl Client {
         }
     }
 
-    /// Rotate the signing key using the pre-committed next key.
-    /// `next_key_file` overrides the daemon's default location.
-    pub async fn rotate(&mut self, next_key_file: Option<&str>) -> Result<String> {
-        let args = match next_key_file {
-            Some(p) => Value::map(vec![(Value::UInt(0), Value::Text(p.to_string()))]),
-            None => Value::map(vec![]),
-        };
+    /// Rotate the signing key. `next_key` is the offline, pre-committed
+    /// next signing key; `next_next_commitment` is the BLAKE3 commitment to
+    /// the following key, generated offline. The daemon verifies `next_key`
+    /// against the commitment stored in its identity directory and refuses
+    /// the rotation on mismatch.
+    pub async fn rotate(
+        &mut self,
+        next_key: &[u8; 32],
+        next_next_commitment: &[u8; 32],
+    ) -> Result<String> {
+        let args = Value::map(vec![
+            (Value::UInt(0), Value::Bytes(next_key.to_vec())),
+            (Value::UInt(1), Value::Bytes(next_next_commitment.to_vec())),
+        ]);
         let result = self.call(OP_ROTATE, args).await?;
         text_at(&result, 0)
     }
 
     /// Permanently abandon the identity (a rotation with no next-key commitment).
-    pub async fn abandon(&mut self, next_key_file: Option<&str>) -> Result<String> {
-        let args = match next_key_file {
-            Some(p) => Value::map(vec![(Value::UInt(0), Value::Text(p.to_string()))]),
-            None => Value::map(vec![]),
-        };
+    /// `next_key` is the offline, pre-committed next signing key.
+    pub async fn abandon(&mut self, next_key: &[u8; 32]) -> Result<String> {
+        let args = Value::map(vec![(Value::UInt(0), Value::Bytes(next_key.to_vec()))]);
         let result = self.call(OP_ABANDON, args).await?;
         text_at(&result, 0)
     }

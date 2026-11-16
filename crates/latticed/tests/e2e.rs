@@ -95,6 +95,7 @@ async fn two_nodes_deliver_and_drain() {
     let common::NodeKeys {
         id: id_b,
         channel_key: ck_b,
+        ..
     } = common::init_node(&dir_b);
 
     let port_a = free_port();
@@ -278,6 +279,7 @@ struct TestNode {
     admin: std::path::PathBuf,
     id: lattice_types::Identifier,
     channel_key: lattice_types::ChannelPublicKey,
+    next_key: [u8; 32],
     child: Option<Child>,
 }
 
@@ -328,7 +330,11 @@ fn boot_node(
     services: &[(&str, &str)],
 ) -> TestNode {
     let dir = tmp.join(name);
-    let common::NodeKeys { id, channel_key } = common::init_node(&dir);
+    let common::NodeKeys {
+        id,
+        channel_key,
+        next_key,
+    } = common::init_node(&dir);
     let app = tmp.join(format!("{name}.app.sock"));
     let admin = tmp.join(format!("{name}.admin.sock"));
     let mut attempt = 0;
@@ -377,6 +383,7 @@ fn boot_node(
                     admin,
                     id,
                     channel_key,
+                    next_key,
                     child: Some(child),
                 };
             }
@@ -1004,7 +1011,13 @@ async fn rotate_and_abandon_via_admin() {
     let before = admin.node().await.expect("node before");
 
     // Rotate the signing key; the node must stay up and keep its id.
-    let msg = admin.rotate(None).await.expect("rotate");
+    // The following key is generated offline; only its commitment is sent.
+    let following = lattice_crypto::generate_seed();
+    let commitment = lattice_crypto::hash(lattice_crypto::public_key(&following).as_ref());
+    let msg = admin
+        .rotate(&b.next_key, commitment.as_bytes())
+        .await
+        .expect("rotate");
     assert!(msg.contains("rotated"), "unexpected rotate reply: {msg}");
     let after = admin.node().await.expect("node after rotate");
     assert_eq!(before.id, after.id, "rotation must not change the node id");
@@ -1015,8 +1028,9 @@ async fn rotate_and_abandon_via_admin() {
     let after = admin.node().await.expect("node after envelope rotate");
     assert_eq!(before.id, after.id);
 
-    // Abandon: the node drains and the identity is dead.
-    let msg = admin.abandon(None).await.expect("abandon");
+    // Abandon: the node drains and the identity is dead. The current next
+    // key is the following key committed to in the rotation above.
+    let msg = admin.abandon(following.as_bytes()).await.expect("abandon");
     assert!(msg.contains("abandoned"), "unexpected reply: {msg}");
     let after = admin.node().await.expect("node after abandon");
     assert!(after.draining, "abandoned node must be draining");

@@ -643,15 +643,32 @@ async fn handle_link(api: &mpsc::UnboundedSender<ApiCmd>, req: &Request) -> Vec<
 }
 
 async fn handle_rotate(api: &mpsc::UnboundedSender<ApiCmd>, req: &Request) -> Vec<u8> {
-    if deny_unknown_args(&req.args, &[0]).is_err() {
+    let abandon = req.op == OP_ABANDON;
+    // Rotate takes the offline next key (0) and the commitment to the
+    // following key (1); abandon takes only the next key.
+    let allowed: &[u64] = if abandon { &[0] } else { &[0, 1] };
+    if deny_unknown_args(&req.args, allowed).is_err() {
         return resp_err(req.id, ERR_BAD_ARGS);
     }
-    let next_key_file = match args_get(&req.args, 0) {
-        None => None,
-        Some(Value::Text(t)) => Some(t.clone()),
-        Some(_) => return resp_err(req.id, ERR_BAD_ARGS),
+    let next_key: [u8; 32] = match args_get(&req.args, 0)
+        .and_then(Value::as_bytes)
+        .and_then(|b| <[u8; 32]>::try_from(b).ok())
+    {
+        Some(k) => k,
+        None => return resp_err(req.id, ERR_BAD_ARGS),
     };
-    let kind = if req.op == OP_ABANDON {
+    let next_next_commitment: Option<[u8; 32]> = if abandon {
+        None
+    } else {
+        match args_get(&req.args, 1)
+            .and_then(Value::as_bytes)
+            .and_then(|b| <[u8; 32]>::try_from(b).ok())
+        {
+            Some(c) => Some(c),
+            None => return resp_err(req.id, ERR_BAD_ARGS),
+        }
+    };
+    let kind = if abandon {
         RotationKind::Abandon
     } else {
         RotationKind::Rotate
@@ -660,7 +677,8 @@ async fn handle_rotate(api: &mpsc::UnboundedSender<ApiCmd>, req: &Request) -> Ve
         api,
         req.id,
         |tx| ApiCmd::Rotate {
-            next_key_file,
+            next_key,
+            next_next_commitment,
             kind,
             respond: tx,
         },

@@ -47,11 +47,22 @@ every crate opts into the workspace `unsafe_code = "forbid"` lint.
 cargo build --release
 sudo install -Dm755 target/release/latticed /usr/local/bin/latticed
 sudo install -Dm644 deploy/latticed.service /etc/systemd/system/latticed.service
-sudo latticed init --dir /var/lib/lattice        # generates keys; prints node id
+sudo latticed init --dir /var/lib/lattice --next-key-out /secure/offline/next_signing_seed
 sudo install -Dm600 deploy/lattice.example.toml /etc/lattice/lattice.toml
 sudo $EDITOR /etc/lattice/lattice.toml           # set services, listen, roots
 sudo systemctl daemon-reload && sudo systemctl enable --now latticed
 ```
+
+`latticed init` generates the identity and the *next* signing key. The next
+key is the only way to rotate the identity later, so it is never written
+into the identity directory: `--next-key-out` writes it to a path you choose
+(keep it offline, e.g. on removable media); without the flag it is printed
+once to stdout. The identity directory stores only its BLAKE3 commitment
+(`next_key_commitment`). If `next_signing_seed` ever appears inside the
+identity directory, the daemon refuses to start. To rotate later, generate
+the following key offline, then run
+`latticectl rotate --next-key-file <path> --next-next-commitment <hex>`;
+`latticectl abandon --next-key-file <path>` retires the identity for good.
 
 Applications talk to the node over the local API (length-prefixed CBOR over a
 Unix socket, see `V2_SPEC.md` §7) using `lattice-client` (Rust),
@@ -62,7 +73,7 @@ through `latticectl` on the admin socket.
 
 - The **admin socket** (`admin_socket`, default `/run/lattice/admin.sock`) is
   mode `0600`, owner-only. It carries node control (drain, link, unlink,
-  node info) and is root-only in practice.
+  rotate, abandon, node info) and is root-only in practice.
 - The **application socket** (`app_socket`, default `/run/lattice/app.sock`)
   is mode `0660`, group `lattice`. Members of the `lattice` group may connect;
   everyone else cannot. Create the group with the shipped sysusers.d snippet

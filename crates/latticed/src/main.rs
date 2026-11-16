@@ -1,12 +1,17 @@
 //! latticed: the Lattice daemon.
 //!
 //! Usage:
-//!   latticed init [--dir DIR]     create an identity and write a sample config
+//!   latticed init [--dir DIR] [--next-key-out PATH]
+//!                               create an identity and write a sample config
 //!   latticed run [--config PATH]  run the daemon
 //!
 //! Secrets: 32-byte raw files in the identity directory (or systemd
-//! credentials when $CREDENTIALS_DIRECTORY is set). The daemon refuses to
-//! start if key self-tests fail.
+//! credentials when $CREDENTIALS_DIRECTORY is set). The next signing key is
+//! never written into the identity directory: `init` writes it to
+//! `--next-key-out` (outside the identity directory) or prints it once to
+//! stdout, and the directory stores only its BLAKE3 commitment. The daemon
+//! refuses to start if a `next_signing_seed` file is present. The daemon
+//! refuses to start if key self-tests fail.
 
 #![forbid(unsafe_code)]
 
@@ -35,24 +40,57 @@ async fn main() -> std::process::ExitCode {
 
 fn cmd_init(args: &[String]) -> std::process::ExitCode {
     let mut dir = PathBuf::from("/var/lib/lattice");
+    let mut next_key_out: Option<PathBuf> = None;
     let mut i = 0;
     while i < args.len() {
         if args[i] == "--dir" {
-            dir = PathBuf::from(&args[i + 1]);
+            let Some(v) = args.get(i + 1) else {
+                eprintln!("--dir needs a value");
+                return std::process::ExitCode::from(2);
+            };
+            dir = PathBuf::from(v);
+            i += 2;
+        } else if args[i] == "--next-key-out" {
+            let Some(v) = args.get(i + 1) else {
+                eprintln!("--next-key-out needs a value");
+                return std::process::ExitCode::from(2);
+            };
+            next_key_out = Some(PathBuf::from(v));
             i += 2;
         } else {
             eprintln!("unknown flag {}", args[i]);
             return std::process::ExitCode::from(2);
         }
     }
-    match keys::init_identity(&dir) {
-        Ok(()) => {
+    match keys::init_identity(&dir, next_key_out.as_deref()) {
+        Ok(outcome) => {
             println!("identity written to {}", dir.display());
             if let Ok(Ok(id)) =
                 keys::load_identity(&dir).map(|id| lattice_proto::kel::identifier(&id.kel))
             {
                 println!("node id: {}", hex(id.as_ref()));
             }
+            match &outcome.next_key_path {
+                Some(path) => {
+                    println!(
+                        "next signing key written to {} (mode 0600); move it to offline storage. The daemon keeps only its commitment.",
+                        path.display()
+                    );
+                }
+                None => {
+                    println!(
+                        "WARNING: the next signing key is shown below exactly once. Store it offline (e.g. a USB drive or a password manager); the daemon does not keep a copy."
+                    );
+                    println!(
+                        "next signing key (hex): {}",
+                        hex(outcome.next_key.as_bytes())
+                    );
+                }
+            }
+            println!(
+                "next key commitment (hex): {}",
+                hex(outcome.next_key_commitment.as_bytes())
+            );
             println!("next: create a config, e.g. /etc/lattice/lattice.toml");
             std::process::ExitCode::SUCCESS
         }
@@ -133,10 +171,17 @@ fn load_and_verify(
         std::process::ExitCode::from(1)
     })?;
     let identity = keys::load_identity(&cfg.identity_dir).map_err(|e| {
-        eprintln!(
-            "key material: {e}. Run `latticed init --dir {}` first.",
-            cfg.identity_dir.display()
-        );
+        if cfg.identity_dir.join("signing_seed").exists() {
+            // The identity exists but failed to load (e.g. a stray
+            // next_signing_seed, or corrupt key material): re-initializing
+            // would destroy it, so don't suggest that.
+            eprintln!("key material: {e}");
+        } else {
+            eprintln!(
+                "key material: {e}. Run `latticed init --dir {}` first.",
+                cfg.identity_dir.display()
+            );
+        }
         std::process::ExitCode::from(1)
     })?;
     if let Err(e) = keys::self_test(&identity) {

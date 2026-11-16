@@ -95,18 +95,19 @@ impl Identity {
     /// Rotate the signing key using the pre-committed next key.
     ///
     /// `next_seed` must hash to the current head's `next` commitment.
-    /// `new_next_seed` is the next-next key to commit to; `None` abandons
-    /// the identity permanently (a rotation with no next-key commitment).
+    /// `new_next_commitment` is the commitment to the following key, which
+    /// the caller holds but the daemon never sees; `None` abandons the
+    /// identity permanently (a rotation with no next-key commitment).
     pub fn rotate(
         &mut self,
         next_seed: &SigningSeed,
-        new_next_seed: Option<SigningSeed>,
+        new_next_commitment: Option<Commitment>,
     ) -> Result<(), NodeError> {
         let committed = self.kel.head().next.ok_or(NodeError::Abandoned)?;
         if hash_next(next_seed) != committed {
             return Err(NodeError::NextKeyMismatch);
         }
-        let next_hash = new_next_seed.as_ref().map(hash_next);
+        let next_hash = new_next_commitment;
         // The rotation event chains off the last event; the log is
         // non-empty by construction (a validated KEL holds ≥1 event).
         let prev = self.kel.events().last().ok_or(NodeError::EmptyKel)?;
@@ -3426,7 +3427,7 @@ mod tests {
     fn rotate_produces_valid_kel_and_preserves_id() {
         let (mut id, next_seed, next_next) = test_identity();
         let id_before = id.id();
-        id.rotate(&next_seed, Some(next_next)).unwrap();
+        id.rotate(&next_seed, Some(hash_next(&next_next))).unwrap();
         assert_eq!(id.id(), id_before, "identifier must survive rotation");
         assert_eq!(id.kel.len(), 2);
         assert_eq!(id.signing_seed, next_seed);
@@ -3440,7 +3441,10 @@ mod tests {
     fn rotate_rejects_wrong_next_key() {
         let (mut id, _next_seed, next_next) = test_identity();
         let err = id
-            .rotate(&SigningSeed::from_bytes([9u8; 32]), Some(next_next))
+            .rotate(
+                &SigningSeed::from_bytes([9u8; 32]),
+                Some(hash_next(&next_next)),
+            )
             .unwrap_err();
         assert!(
             matches!(err, NodeError::NextKeyMismatch),

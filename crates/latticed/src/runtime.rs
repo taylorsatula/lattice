@@ -79,9 +79,12 @@ pub enum ApiCmd {
         request: DrainRequest,
         respond: tokio::sync::oneshot::Sender<DrainStatus>,
     },
-    /// Rotate the signing key. `next_key_file` overrides the default location.
+    /// Rotate the signing key. `next_key` is the offline pre-committed key
+    /// the operator supplied over the admin socket; `next_next_commitment`
+    /// commits to the following key (`None` for abandon).
     Rotate {
-        next_key_file: Option<String>,
+        next_key: [u8; 32],
+        next_next_commitment: Option<[u8; 32]>,
         kind: RotationKind,
         respond: tokio::sync::oneshot::Sender<Result<String, String>>,
     },
@@ -607,18 +610,18 @@ impl Runtime {
                 }
             }
             ApiCmd::Rotate {
-                next_key_file,
+                next_key,
+                next_next_commitment,
                 kind,
                 respond,
             } => {
                 let result = (|| {
                     let dir = self.identity_dir.clone();
-                    let rotation = crate::keys::rotate_signing_key(
-                        &dir,
-                        next_key_file.as_deref().map(std::path::Path::new),
-                        kind,
-                    )
-                    .map_err(|e| e.to_string())?;
+                    let commitment =
+                        next_next_commitment.map(lattice_types::Commitment::from_bytes);
+                    let rotation =
+                        crate::keys::rotate_signing_key(&dir, &next_key, commitment.as_ref(), kind)
+                            .map_err(|e| e.to_string())?;
                     let now = now_secs();
                     self.with_node(|node| -> Result<(), String> {
                         node.reload_identity(rotation.identity, now, kind)
@@ -635,12 +638,8 @@ impl Runtime {
                     Ok(if kind == RotationKind::Abandon {
                         "identity abandoned".to_string()
                     } else {
-                        format!(
-                            "rotated; next key written to {}",
-                            rotation
-                                .next_key_path
-                                .map_or_else(|| "<none>".into(), |p| p.display().to_string())
-                        )
+                        "rotated; the following key's commitment is stored in the identity directory"
+                            .to_string()
                     })
                 })();
                 let _ = respond.send(result);

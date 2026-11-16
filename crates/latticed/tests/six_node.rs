@@ -207,7 +207,13 @@ async fn six_node_gate() {
     // ---- 5. Rotation: h2 rotates its signing key; the mesh keeps working. ----
     let mut admin_h2 = Client::connect_admin(&h2.admin).await.expect("admin h2");
     let before = admin_h2.node().await.expect("node before rotate");
-    let msg = admin_h2.rotate(None).await.expect("rotate");
+    // The following key is generated offline; only its commitment is sent.
+    let following = lattice_crypto::generate_seed();
+    let commitment = lattice_crypto::hash(lattice_crypto::public_key(&following).as_ref());
+    let msg = admin_h2
+        .rotate(&h2.next_key, commitment.as_bytes())
+        .await
+        .expect("rotate");
     assert!(msg.contains("rotated"), "unexpected rotate reply: {msg}");
     let after = admin_h2.node().await.expect("node after rotate");
     assert_eq!(before.id, after.id, "rotation must not change the node id");

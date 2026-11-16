@@ -593,12 +593,19 @@ Operation, event and error codes are part of the wire contract:
 | Op | Effect |
 |---|---|
 | `node` | Identity, mode, links, queue and custody counts, peer record count |
-| `rotate` | Rotate the signing key using the stored next key, and supply a new next-key hash |
-| `abandon` | Abandon the identity permanently; publishes a tombstone record (§3) before draining |
+| `rotate` | Rotate the signing key: the operator supplies the offline next key (verified against the stored commitment) and the commitment to the following key |
+| `abandon` | Abandon the identity permanently; publishes a tombstone record (§3) before draining (a rotation with no next-key commitment) |
 | `rotate_envelope` | Publish new envelope keys and delete the old private keys |
 | `link` | Connect to an address, with an optional identifier (adds a root) |
 | `unlink` | Drop and demote a link |
 | `drain` | Stop accepting new custody (answer `busy`), keep handing off what's held, and report when empty |
+
+`rotate` takes the 32-byte offline next key (arg 0) and the 32-byte BLAKE3
+commitment to the following key (arg 1); the daemon verifies the key against
+the commitment stored in the identity directory and refuses the rotation on
+mismatch. `abandon` takes only the next key (arg 0) and commits to nothing.
+The daemon never writes a secret key to disk during rotation; the following
+key never leaves the operator's offline storage.
 
 Admin operations are reached through a CLI (`latticectl`). Nothing
 administrative is available on the application socket.
@@ -623,8 +630,11 @@ redb tables, derived from the objects above:
 
 Deliveries are returned oldest-first per service, ties broken by delivery id.
 
-The next signing key's secret is not stored here. It lives in a separate
-file, or offline (§1).
+The next signing key's secret is never stored here. It lives offline with
+the operator; the identity directory stores only its BLAKE3 commitment in
+`next_key_commitment` (32 raw bytes), written at init and rewritten at each
+rotation. Rotation supplies the next key over the admin socket; the daemon
+verifies it against the commitment and never writes it to disk (§1).
 
 **Schema versioning.** The store starts at schema version 1. At startup the
 daemon reads `meta`. If the version is older than the daemon's, it runs the
