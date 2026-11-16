@@ -26,6 +26,7 @@ use lattice_types::{
 };
 
 use crate::error::NodeError;
+use crate::frame_budget;
 use crate::graph::Graph;
 use crate::outbound::{OutboundMessageExt, OutboundStateExt};
 use crate::reconcile::{self, ReconcileSession};
@@ -53,6 +54,23 @@ fn bucket_index(len: usize) -> usize {
         2
     } else {
         3
+    }
+}
+
+/// Short tag for a frame, for diagnostics.
+fn frame_kind(frame: &Frame) -> &'static str {
+    match frame {
+        Frame::Init(_) => "init",
+        Frame::Cookie(_) => "cookie",
+        Frame::Resp(_) => "resp",
+        Frame::Offer(_) => "offer",
+        Frame::Custody(_) => "custody",
+        Frame::Reconcile(_) => "reconcile",
+        Frame::Want(_) => "want",
+        Frame::Records(_) => "records",
+        Frame::Kels(_) => "kels",
+        Frame::Ping(_) => "ping",
+        Frame::Dummy(_) => "dummy",
     }
 }
 
@@ -465,8 +483,31 @@ impl<S: Store> Node<S> {
     /// drops them loses them.
     pub fn handle(&mut self, event: Event) -> (Vec<Action>, Vec<Diagnostic>) {
         let actions = self.handle_inner(event);
+        let actions = self.drop_oversize_frames(actions);
         self.note_outbound_frames(&actions);
         (actions, std::mem::take(&mut self.diagnostics))
+    }
+
+    /// Drop any outbound frame that cannot be encoded into a bucket. An
+    /// unencodable frame is a local bug, not a link failure: log it and
+    /// drop it here so the transport never sees it.
+    fn drop_oversize_frames(&mut self, actions: Vec<Action>) -> Vec<Action> {
+        actions
+            .into_iter()
+            .filter(|action| {
+                let Action::SendFrame { frame, pad_to, .. } = action else {
+                    return true;
+                };
+                if frame_budget::frame_fits(frame, *pad_to) {
+                    return true;
+                }
+                self.diag(
+                    "frame_too_large",
+                    format!("dropping unencodable {} frame", frame_kind(frame)),
+                );
+                false
+            })
+            .collect()
     }
 
     /// Record a non-fatal internal failure. The sans-IO core cannot log;
@@ -783,6 +824,13 @@ impl<S: Store> Node<S> {
     }
 
     fn on_reconcile(&mut self, link: LinkId, frame: &ReconcileFrame) -> Vec<Action> {
+        // A frame that opens a new round (a single unbounded fingerprint
+        // range) invalidates the echo state of any round still in flight
+        // on this link; start the round with a fresh session.
+        if reconcile::opens_new_round(&frame.ranges) {
+            self.reconcile_sessions
+                .insert(link, ReconcileSession::new());
+        }
         // Store unreadable: say nothing rather than claim we hold nothing.
         let Some(items) = self.record_items() else {
             return Vec::new();
@@ -792,19 +840,32 @@ impl<S: Store> Node<S> {
             ranges: reply,
             wants,
         } = reconcile::respond(&items, &frame.ranges, session);
+        // Chunk the reply so every frame fits a bucket and carries at most
+        // MAX_RANGES_PER_MSG ranges; the remainder goes in follow-up frames
+        // rather than being dropped. Per-item sizes come from encoding a
+        // one-element frame, an upper bound on the item's size inside the
+        // real frame.
         let mut actions = Vec::new();
-        if !reply.is_empty() {
+        for chunk in frame_budget::chunk_by_budget(reply, reconcile::MAX_RANGES_PER_MSG, |r| {
+            Frame::Reconcile(ReconcileFrame {
+                ranges: vec![r.clone()],
+            })
+            .encode()
+            .len()
+        }) {
             actions.push(Action::SendFrame {
                 pad_to: None,
                 link,
-                frame: Frame::Reconcile(ReconcileFrame { ranges: reply }),
+                frame: Frame::Reconcile(ReconcileFrame { ranges: chunk }),
             });
         }
-        if !wants.is_empty() {
+        for chunk in frame_budget::chunk_by_budget(wants, usize::MAX, |w| {
+            Frame::Want(WantFrame { wants: vec![*w] }).encode().len()
+        }) {
             actions.push(Action::SendFrame {
                 pad_to: None,
                 link,
-                frame: Frame::Want(WantFrame { wants }),
+                frame: Frame::Want(WantFrame { wants: chunk }),
             });
         }
         actions
@@ -4790,6 +4851,101 @@ mod tests {
         assert!(matches!(result, DispatchResult::Sent));
         let leg_hash = lattice_crypto::hash(leg.as_ref());
         assert!(node.store.seen_contains(&leg_hash, now).unwrap());
+    }
+
+    #[test]
+    fn new_round_frame_resets_reconcile_session() {
+        use lattice_proto::frames::{Range, RangeBound};
+        let peer = Identifier::from_bytes([0xA7; 32]);
+        let mut node = test_node();
+        link_up(&mut node, 100, peer, 1_000);
+        let now = 1_000u64;
+        let own = node.store.record_all().unwrap();
+        assert_eq!(own.len(), 1, "node publishes its own record on link-up");
+        let own_id = own[0].id;
+        let range = Range::Entries {
+            lower: Some(RangeBound {
+                id: own_id,
+                scope: 0,
+            }),
+            upper: None,
+            entries: vec![],
+        };
+        let echoes = |actions: &[Action]| -> usize {
+            actions
+                .iter()
+                .filter_map(|a| match a {
+                    Action::SendFrame {
+                        frame: Frame::Reconcile(r),
+                        ..
+                    } => Some(r),
+                    _ => None,
+                })
+                .flat_map(|r| r.ranges.iter())
+                .filter(|r| matches!(r, Range::Entries { entries, .. } if !entries.is_empty()))
+                .count()
+        };
+        let send = |node: &mut Node<MemStore>, ranges: Vec<Range>| {
+            node.handle(Event::Frame {
+                at: now,
+                link: 100,
+                from: peer,
+                frame: Frame::Reconcile(ReconcileFrame { ranges }),
+            })
+            .0
+        };
+        // First Entries frame: the node echoes its own record.
+        let actions = send(&mut node, vec![range.clone()]);
+        assert_eq!(echoes(&actions), 1, "first Entries frame must be echoed");
+        // Same frame again within the round: the echo is suppressed.
+        let actions = send(&mut node, vec![range.clone()]);
+        assert_eq!(echoes(&actions), 0, "echo is suppressed within a round");
+        // A frame opening a new round (a single unbounded fingerprint
+        // range) resets the session...
+        let _ = send(
+            &mut node,
+            vec![Range::Fingerprint {
+                lower: None,
+                upper: None,
+                count: 0,
+                sum: Hash32::from_bytes([0; 32]),
+            }],
+        );
+        // ...so the same Entries frame is echoed again.
+        let actions = send(&mut node, vec![range]);
+        assert_eq!(
+            echoes(&actions),
+            1,
+            "a new round must reset echo suppression"
+        );
+    }
+
+    #[test]
+    fn oversize_frame_is_dropped_with_diagnostic() {
+        let mut node = test_node();
+        let big = Action::SendFrame {
+            pad_to: None,
+            link: 100,
+            frame: Frame::Records(RecordsFrame {
+                records: vec![vec![7u8; 40_000]],
+            }),
+        };
+        let small = Action::SendFrame {
+            pad_to: None,
+            link: 100,
+            frame: Frame::Ping(PingFrame { nonce: 1 }),
+        };
+        let out = node.drop_oversize_frames(vec![big, small]);
+        assert_eq!(out.len(), 1);
+        assert!(matches!(
+            &out[0],
+            Action::SendFrame {
+                frame: Frame::Ping(_),
+                ..
+            }
+        ));
+        let diags = std::mem::take(&mut node.diagnostics);
+        assert!(diags.iter().any(|d| d.op == "frame_too_large"));
     }
 
     #[test]

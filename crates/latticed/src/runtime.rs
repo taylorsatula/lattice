@@ -418,8 +418,18 @@ async fn link_task(
             f = outbound.recv() => {
                 match f {
                     Some(out) => {
-                        if io.send_frame(&out.frame, out.pad_to).await.is_err() {
-                            break;
+                        match io.send_frame(&out.frame, out.pad_to).await {
+                            Ok(()) => {}
+                            // An unencodable frame is a local bug, not a link
+                            // failure: the core drops oversize frames before
+                            // they get here, so this is a backstop. Log and
+                            // keep the link up.
+                            Err(lattice_net::NetError::FrameTooLarge) => {
+                                eprintln!(
+                                    "lattice: link {id}: dropping unencodable frame (local bug)"
+                                );
+                            }
+                            Err(_) => break,
                         }
                     }
                     None => break,

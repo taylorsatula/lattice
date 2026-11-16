@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 
 mod error;
+mod frame_budget;
 pub mod graph;
 pub mod node;
 mod outbound;
