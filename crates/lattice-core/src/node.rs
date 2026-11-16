@@ -3655,7 +3655,9 @@ mod tests {
 
         // The owner rotates; the rotated record must win despite its lower seq.
         let mut owner = owner;
-        owner.rotate(&next_seed, Some(next_next_seed)).unwrap();
+        owner
+            .rotate(&next_seed, Some(hash_next(&next_next_seed)))
+            .unwrap();
         let rotated = build_record(
             owner.kel.events().to_vec(),
             1,
@@ -3719,7 +3721,9 @@ mod tests {
         // The owner rotates; the rotated WAN record advances the head and
         // the Hive record, now behind the head, is evicted.
         let mut owner = owner;
-        owner.rotate(&next_seed, Some(next_next_seed)).unwrap();
+        owner
+            .rotate(&next_seed, Some(hash_next(&next_next_seed)))
+            .unwrap();
         let rotated = build_record(
             owner.kel.events().to_vec(),
             1,
