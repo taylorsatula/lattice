@@ -159,7 +159,34 @@ const MAX_SNOW_PER_MIN: f64 = 1000.0;
 /// from u64 overflow.
 const MAX_RECONCILE_INTERVAL_SECS: u64 = 86_400;
 
+/// The config file carries service secrets in plaintext, so it must not be
+/// readable by anyone but its owner (and optionally its group, for a
+/// root:lattice 0640 deployment). Anything else is refused before the file
+/// is read. Checked on every load, not just at first install: a later
+/// `chmod` must not silently widen access.
+#[cfg(unix)]
+fn check_config_mode(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    let meta = std::fs::metadata(path).map_err(|e| format!("stat {}: {e}", path.display()))?;
+    let mode = meta.permissions().mode() & 0o777;
+    // Allowed: owner read/write (or read-only), optionally group read,
+    // nothing else. 0600, 0640, 0400, 0440.
+    const ALLOWED: [u32; 4] = [0o600, 0o640, 0o400, 0o440];
+    if !ALLOWED.contains(&mode) {
+        return Err(format!(
+            "{}: config file mode {mode:04o} is too open; it contains service secrets. \
+             Run: chmod 600 {} (owner read/write only) or chmod 640 {} (owner read/write, group read)",
+            path.display(),
+            path.display(),
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
 pub fn load(path: &Path) -> Result<Config, String> {
+    #[cfg(unix)]
+    check_config_mode(path)?;
     let text =
         std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
     let cfg: Config =
@@ -367,11 +394,52 @@ mira = { secret = "change-me-0123456789abcdef" }
 
     #[test]
     fn example_config_is_accepted() {
-        let path = concat!(
+        // The shipped example is world-readable in the repo; the loader
+        // refuses that, so copy it to a private temp file first.
+        let src = concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../deploy/lattice.example.toml"
         );
-        load(Path::new(path)).expect("shipped example config must validate");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lattice.toml");
+        std::fs::copy(src, &path).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        load(&path).expect("shipped example config must validate");
+    }
+
+    #[cfg(unix)]
+    fn load_with_mode(mode: u32) -> Result<Config, String> {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lattice.toml");
+        std::fs::write(&path, BASE).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        load(&path)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_mode_0600_and_0640_are_accepted() {
+        load_with_mode(0o600).expect("0600 must be accepted");
+        load_with_mode(0o640).expect("0640 must be accepted");
+        load_with_mode(0o400).expect("0400 must be accepted");
+        load_with_mode(0o440).expect("0440 must be accepted");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_mode_group_or_world_accessible_is_refused() {
+        for mode in [0o644, 0o604, 0o660, 0o664, 0o666, 0o646, 0o620] {
+            let err = load_with_mode(mode).unwrap_err();
+            assert!(
+                err.contains("chmod 600"),
+                "mode {mode:o}: error must name the chmod to run, got: {err}"
+            );
+        }
     }
 
     #[test]

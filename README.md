@@ -58,6 +58,11 @@ sudo $EDITOR /etc/lattice/lattice.toml           # set services, listen, roots
 sudo systemctl daemon-reload && sudo systemctl enable --now latticed
 ```
 
+The config file contains the service secrets in plaintext, so `latticed`
+refuses to start unless it is mode `0600`/`0400` (owner only) or `0640`/`0440`
+(owner plus group read) — anything more permissive is rejected with the
+`chmod` to run. The shipped example installs as `0640 root:lattice`.
+
 `latticed init` generates the identity and the *next* signing key. The next
 key is the only way to rotate the identity later, so it is never written
 into the identity directory: `--next-key-out` writes it to a path you choose
