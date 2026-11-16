@@ -823,12 +823,17 @@ pub fn is_globally_routable(ip: IpAddr) -> bool {
             if is_ipv4_embedding(&v6) {
                 return false;
             }
+            let s = v6.segments();
             !(v6.is_loopback()
                 || v6.is_unspecified()
                 || v6.is_multicast()
-                || (v6.segments()[0] & 0xffc0) == 0xfe80 // fe80::/10 link-local
-                || (v6.segments()[0] & 0xfe00) == 0xfc00 // fc00::/7 unique-local
-                || (v6.segments()[0] == 0x2001 && v6.segments()[1] == 0x0db8)) // documentation 2001:db8::/32
+                || (s[0] & 0xffc0) == 0xfe80 // fe80::/10 link-local
+                || (s[0] & 0xfe00) == 0xfc00 // fc00::/7 unique-local
+                || (s[0] & 0xffc0) == 0xfec0 // fec0::/10 site-local (deprecated, RFC 3879)
+                || (s[0] == 0x0100 && s[1] == 0 && s[2] == 0 && s[3] == 0) // 100::/64 discard-only (RFC 6666)
+                || (s[0] == 0x2001 && (s[1] & 0xfff0) == 0x0010) // 2001:10::/28 ORCHID (RFC 4843)
+                || (s[0] == 0x2001 && (s[1] & 0xfff0) == 0x0020) // 2001:20::/28 ORCHIDv2 (RFC 7343)
+                || (s[0] == 0x2001 && s[1] == 0x0db8)) // documentation 2001:db8::/32
         }
     }
 }
@@ -845,6 +850,15 @@ fn is_ipv4_embedding(v6: &std::net::Ipv6Addr) -> bool {
     }
     // 64:ff9b::/96 — NAT64 well-known prefix
     if s[0] == 0x0064 && s[1] == 0xff9b && s[2..6].iter().all(|&seg| seg == 0) {
+        return true;
+    }
+    // 64:ff9b:1::/48 — local-use NAT64 (RFC 8215); embeds an IPv4 address
+    // and is only valid inside a translation domain.
+    if s[0] == 0x0064 && s[1] == 0xff9b && s[2] == 0x0001 {
+        return true;
+    }
+    // ::ffff:0:0:0/96 — IPv4-translated addresses (RFC 2765, SIIT)
+    if s[..4].iter().all(|&seg| seg == 0) && s[4] == 0xffff && s[5] == 0 {
         return true;
     }
     // 2002::/16 — 6to4
@@ -880,4 +894,53 @@ fn is_v4_global(ip: Ipv4Addr) -> bool {
             | [224..=255, ..]
     );
     !private
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_globally_routable;
+
+    #[test]
+    fn nat64_local_use_prefix_is_not_globally_routable() {
+        // 64:ff9b:1::/48 — local-use NAT64 (RFC 8215)
+        assert!(!is_globally_routable("64:ff9b:1::".parse().unwrap()));
+        assert!(!is_globally_routable("64:ff9b:1:ffff::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn discard_only_prefix_is_not_globally_routable() {
+        // 100::/64 — discard-only (RFC 6666)
+        assert!(!is_globally_routable("100::".parse().unwrap()));
+        assert!(!is_globally_routable(
+            "100::ffff:ffff:ffff:ffff".parse().unwrap()
+        ));
+    }
+
+    #[test]
+    fn orchid_prefix_is_not_globally_routable() {
+        // 2001:10::/28 — ORCHID (RFC 4843)
+        assert!(!is_globally_routable("2001:10::".parse().unwrap()));
+        assert!(!is_globally_routable("2001:1f:ffff::".parse().unwrap()));
+    }
+
+    #[test]
+    fn orchidv2_prefix_is_not_globally_routable() {
+        // 2001:20::/28 — ORCHIDv2 (RFC 7343)
+        assert!(!is_globally_routable("2001:20::".parse().unwrap()));
+        assert!(!is_globally_routable("2001:2f:ffff::".parse().unwrap()));
+    }
+
+    #[test]
+    fn site_local_prefix_is_not_globally_routable() {
+        // fec0::/10 — site-local (deprecated, RFC 3879)
+        assert!(!is_globally_routable("fec0::".parse().unwrap()));
+        assert!(!is_globally_routable("feff::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn ipv4_translated_prefix_is_not_globally_routable() {
+        // ::ffff:0:0:0/96 — IPv4-translated (RFC 2765, SIIT)
+        assert!(!is_globally_routable("::ffff:0:0:0".parse().unwrap()));
+        assert!(!is_globally_routable("::ffff:0:1.2.3.4".parse().unwrap()));
+    }
 }

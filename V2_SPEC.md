@@ -7,7 +7,9 @@ that document; section references (§n) point back to it.
 
 - **Encoding:** deterministic CBOR (RFC 8949 §4.2): shortest-form integers,
   definite lengths, map keys sorted. Every signature and every hash covers
-  the exact encoded bytes.
+  the exact encoded bytes. The implementation sorts map keys length-first
+  (§4.2.3), which coincides with the bytewise order of §4.2.1 for the
+  integer keys Lattice uses.
 - **Maps use small integer keys,** as COSE does, for compactness. The tables
   below give each key's number.
 - **Every top-level object** carries `0: v` (protocol version, currently 1)
