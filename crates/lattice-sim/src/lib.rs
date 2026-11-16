@@ -437,6 +437,9 @@ impl<S: Store> Sim<S> {
                     self.statuses.push(StatusObservation { mid, status });
                 }
                 Action::Inbox { .. } => {}
+                // The simulator tracks links itself; binding changes are a
+                // runtime concern.
+                Action::LinkBound { .. } => {}
             }
         }
     }

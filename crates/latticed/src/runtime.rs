@@ -339,7 +339,7 @@ impl Runtime {
     }
 
     /// Register an established peer connection.
-    pub fn attach_link(
+    pub async fn attach_link(
         &mut self,
         peer: Option<Identifier>,
         remote_ck: X25519PublicKey,
@@ -362,16 +362,13 @@ impl Runtime {
         );
         // The link is registered, so the actions returned by LinkUp (the
         // attestation frame) can be routed to it.
-        let (actions, diags) = self.with_node(|node| {
-            node.handle(Event::LinkUp {
-                at: now_secs(),
-                link: id,
-                peer,
-                remote_ck,
-            })
-        });
-        report_diagnostics(diags);
-        self.apply_actions(actions);
+        self.apply(Event::LinkUp {
+            at: now_secs(),
+            link: id,
+            peer,
+            remote_ck,
+        })
+        .await;
         id
     }
 
@@ -445,6 +442,9 @@ impl Runtime {
             tokio::time::Instant::now() + std::time::Duration::from_secs(1),
             std::time::Duration::from_secs(1),
         );
+        // After a stall, skip the missed ticks instead of replaying them
+        // back to back; the next tick fires one interval after the last.
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // Consecutive ticks deferred because a dial was in flight. Bounded
         // so a lost dial outcome (e.g. a panicked dial task) cannot stall
         // the loop forever.
@@ -459,21 +459,21 @@ impl Runtime {
                 }
                 Some(peer) = peer_rx.recv() => {
                     let ck = peer.remote_static;
-                    self.attach_link(None, ck, peer, None);
+                    self.attach_link(None, ck, peer, None).await;
                 }
-                Some(outcome) = dial_rx.recv() => self.handle_dial_outcome(outcome),
-                Some(api) = api_rx.recv() => self.handle_api(api),
+                Some(outcome) = dial_rx.recv() => self.handle_dial_outcome(outcome).await,
+                Some(api) = api_rx.recv() => self.handle_api(api).await,
                 Some(cmd) = self.cmd_rx.recv() => match cmd {
                     Cmd::Dial { addr, ik_key, path, peer_id } => self.spawn_dial(addr, ik_key, path, peer_id),
                 },
                 Some(ev) = link_rx.recv() => match ev {
                     LinkEvent::Frame { link, frame } => {
                         let peer = self.links.get(&link).and_then(|l| l.peer);
-                        self.apply(Event::Frame { at: now_secs(), link, from: peer.unwrap_or(Identifier::from_bytes([0u8; 32])), frame });
+                        self.apply(Event::Frame { at: now_secs(), link, from: peer.unwrap_or(Identifier::from_bytes([0u8; 32])), frame }).await;
                     }
                     LinkEvent::Down { link } => {
                         if self.links.remove(&link).is_some() {
-                            self.apply(Event::LinkDown { at: now_secs(), link });
+                            self.apply(Event::LinkDown { at: now_secs(), link }).await;
                         }
                     }
                 },
@@ -483,27 +483,65 @@ impl Runtime {
                     // dispatching now would find no link and park the message
                     // behind a NoRoute backoff.
                     while let Ok(outcome) = dial_rx.try_recv() {
-                        self.handle_dial_outcome(outcome);
+                        self.handle_dial_outcome(outcome).await;
                     }
                     if self.dials_in_flight > 0 && tick_deferrals < 10 {
                         tick_deferrals += 1;
                     } else {
                         tick_deferrals = 0;
                         self.redial_roots();
-                        self.apply(Event::Tick { at: now_secs() });
+                        self.apply(Event::Tick { at: now_secs() }).await;
                     }
                 }
             }
         }
     }
 
-    fn apply(&mut self, event: Event) {
-        let (actions, diags) = self.with_node(|node| node.handle(event));
-        report_diagnostics(diags);
-        self.apply_actions(actions);
+    /// Run one event through the core and apply the resulting actions.
+    /// The core performs synchronous store I/O (redb commits with fsync),
+    /// so `handle` runs on the blocking thread pool and the async loop
+    /// only awaits the outcome; the worker is never blocked on a commit.
+    /// Events are still processed strictly in order: each event's actions
+    /// are applied before the next event is dispatched. A duplicate link
+    /// dropped while applying actions is fed back through the same queue
+    /// as a LinkDown, so the core observes it after the binding change
+    /// that caused it.
+    async fn apply(&mut self, event: Event) {
+        let mut queue = std::collections::VecDeque::from([event]);
+        while let Some(event) = queue.pop_front() {
+            let node = Arc::clone(&self.node);
+            let result = tokio::task::spawn_blocking(move || {
+                let mut node = node
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                node.handle(event)
+            })
+            .await;
+            let (actions, diags) = match result {
+                Ok(out) => out,
+                Err(e) => {
+                    // The core panicked. The mutex is poisoned but
+                    // recoverable (with_node takes the inner value), so
+                    // keep the daemon alive and say so.
+                    eprintln!("lattice: node task failed: {e}");
+                    continue;
+                }
+            };
+            report_diagnostics(diags);
+            for link in self.apply_actions(actions) {
+                queue.push_back(Event::LinkDown {
+                    at: now_secs(),
+                    link,
+                });
+            }
+        }
     }
 
-    fn apply_actions(&mut self, actions: Vec<Action>) {
+    /// Apply the actions returned by the core. Returns the ids of links
+    /// dropped as duplicates (a newer link to the same peer exists); the
+    /// caller feeds `Event::LinkDown` for each back into the core.
+    fn apply_actions(&mut self, actions: Vec<Action>) -> Vec<u64> {
+        let mut dropped = Vec::new();
         for action in actions {
             match action {
                 Action::SendFrame {
@@ -535,11 +573,51 @@ impl Runtime {
                         payload: encode_inbox_event(unread),
                     });
                 }
+                Action::LinkBound { link, peer } => {
+                    if let Some(h) = self.links.get_mut(&link) {
+                        h.peer = peer;
+                    }
+                    if let Some(p) = peer {
+                        // One connection per peer: keep the newest link
+                        // bound to this peer, drop the rest.
+                        let mut bound: Vec<u64> = self
+                            .links
+                            .iter()
+                            .filter(|(_, l)| l.peer == Some(p))
+                            .map(|(id, _)| *id)
+                            .collect();
+                        if bound.len() > 1 {
+                            bound.sort_unstable();
+                            let keep = bound.pop().expect("len > 1");
+                            for dup in bound {
+                                if self.remove_link(dup) {
+                                    eprintln!(
+                                        "lattice: dropping duplicate link {dup} to peer {p:?} (keeping link {keep})"
+                                    );
+                                    dropped.push(dup);
+                                }
+                            }
+                        }
+                    }
+                }
             }
+        }
+        dropped
+    }
+
+    /// Remove a link from the table and abort its writer task. Returns
+    /// true if the link was present.
+    fn remove_link(&mut self, id: u64) -> bool {
+        match self.links.remove(&id) {
+            Some(h) => {
+                h.task.abort();
+                true
+            }
+            None => false,
         }
     }
 
-    fn handle_api(&mut self, api: ApiCmd) {
+    async fn handle_api(&mut self, api: ApiCmd) {
         match api {
             ApiCmd::AppSend { send, respond } => {
                 let mid = send
@@ -549,9 +627,7 @@ impl Runtime {
                     mid_hint: Some(mid),
                     ..send
                 };
-                let (actions, diags) = self.with_node(|node| node.handle(Event::AppSend(send)));
-                report_diagnostics(diags);
-                self.apply_actions(actions);
+                self.apply(Event::AppSend(send)).await;
                 let _ = respond.send(mid);
             }
             ApiCmd::Status { mid, respond } => {
@@ -687,7 +763,7 @@ impl Runtime {
             }
             ApiCmd::UnlinkByPeer { peer, respond } => {
                 let before = self.links.len();
-                self.unlink(peer);
+                self.unlink(peer).await;
                 let _ = respond.send(before - self.links.len());
             }
         }
@@ -744,12 +820,13 @@ impl Runtime {
 
     /// Apply the outcome of a spawned dial: attach the link on success,
     /// log on failure, and release the root's in-flight slot either way.
-    fn handle_dial_outcome(&mut self, outcome: DialOutcome) {
+    async fn handle_dial_outcome(&mut self, outcome: DialOutcome) {
         self.dials_in_flight = self.dials_in_flight.saturating_sub(1);
         match outcome.result {
             Ok(io) => {
                 let remote_ck = io.remote_static;
-                self.attach_link(outcome.pinned, remote_ck, io, Some(outcome.addr));
+                self.attach_link(outcome.pinned, remote_ck, io, Some(outcome.addr))
+                    .await;
                 if let Some(root) = self.roots.iter_mut().find(|r| r.addr == outcome.addr) {
                     root.attempts = 0;
                     root.next_attempt = now_secs() + 60;
@@ -762,7 +839,7 @@ impl Runtime {
         self.clear_root_in_flight(outcome.addr);
     }
 
-    fn unlink(&mut self, peer: Identifier) {
+    async fn unlink(&mut self, peer: Identifier) {
         let dead: Vec<u64> = self
             .links
             .iter()
@@ -770,13 +847,13 @@ impl Runtime {
             .map(|(id, _)| *id)
             .collect();
         for id in dead {
-            if let Some(h) = self.links.remove(&id) {
-                h.task.abort();
+            if self.remove_link(id) {
+                self.apply(Event::LinkDown {
+                    at: now_secs(),
+                    link: id,
+                })
+                .await;
             }
-            self.apply(Event::LinkDown {
-                at: now_secs(),
-                link: id,
-            });
         }
     }
 }

@@ -102,6 +102,15 @@ pub enum Action {
     },
     /// Number of unfetched deliveries for a service changed.
     Inbox { service: String, unread: u64 },
+    /// A link's binding to a peer changed (or was cleared). Emitted when
+    /// the core (re)derives a link's attribution — on link-up, on a new
+    /// attestation, on a record admission or claim sweep — so the runtime
+    /// can keep its link table in sync. `peer: None` means the binding was
+    /// cleared (contested or lost); the link itself is still up.
+    LinkBound {
+        link: LinkId,
+        peer: Option<Identifier>,
+    },
 }
 
 #[derive(Clone, Debug)]
