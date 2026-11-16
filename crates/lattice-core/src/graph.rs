@@ -81,9 +81,11 @@ impl Graph {
     /// Choose the next hop toward `dst` from `from`.
     ///
     /// - progress: uniform among neighbors strictly closer to dst;
-    /// - sideways: with probability `sideways_prob`, uniform among neighbors
-    ///   exactly as close (never farther);
-    /// - returns `None` when there is no non-increasing move (caller holds or drops).
+    /// - sideways: only opportunistically, with probability `sideways_prob`,
+    ///   uniform among neighbors exactly as close (never farther);
+    /// - returns `None` when no progress neighbor is usable, even if a
+    ///   sideways one exists: waiting on a sideways neighbor can cycle, so
+    ///   the caller holds instead (caller retries on the next tick).
     ///
     /// `exclude` skips neighbors that already reported "already have" for
     /// this leg.
@@ -115,9 +117,63 @@ impl Graph {
         if !progress.is_empty() {
             return rng.pick(&progress).copied();
         }
-        if !sideways.is_empty() {
-            return rng.pick(&sideways).copied();
-        }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn id(b: u8) -> Identifier {
+        Identifier::from_bytes([b; 32])
+    }
+
+    /// Destination D with two arms: D—A—F and D—B—S, plus F—S.
+    /// dist from D: A=1, B=1, F=2, S=2. From F, A is progress and S is
+    /// sideways.
+    fn fixture() -> (Graph, Identifier, Identifier, Identifier, Identifier) {
+        let (d, a, b, f, s) = (id(0xD0), id(0xA0), id(0xB0), id(0xF0), id(0x50));
+        let records = [
+            (d, vec![a, b]),
+            (a, vec![d, f]),
+            (b, vec![d, s]),
+            (f, vec![a, s]),
+            (s, vec![b, f]),
+        ];
+        let graph = Graph::build(&f, records.iter().map(|(i, l)| (i, l.as_slice())));
+        (graph, d, a, f, s)
+    }
+
+    #[test]
+    fn sideways_only_returns_none() {
+        let (g, d, a, f, s) = fixture();
+        let dist = g.distances(&d);
+        let up: HashSet<Identifier> = [a, s].into_iter().collect();
+        // The only progress neighbor is excluded (it already answered
+        // "already have"), leaving only the sideways neighbor S.
+        let exclude: HashSet<Identifier> = [a].into_iter().collect();
+        let mut rng = Rng::new(7);
+        assert_eq!(g.next_hop(&f, &dist, 0.0, &exclude, &up, &mut rng), None);
+    }
+
+    #[test]
+    fn sideways_still_allowed_opportunistically() {
+        let (g, d, a, f, s) = fixture();
+        let dist = g.distances(&d);
+        let up: HashSet<Identifier> = [a, s].into_iter().collect();
+        let exclude: HashSet<Identifier> = [a].into_iter().collect();
+        let mut rng = Rng::new(7);
+        assert_eq!(g.next_hop(&f, &dist, 1.0, &exclude, &up, &mut rng), Some(s));
+    }
+
+    #[test]
+    fn progress_neighbor_is_preferred() {
+        let (g, d, a, f, s) = fixture();
+        let dist = g.distances(&d);
+        let up: HashSet<Identifier> = [a, s].into_iter().collect();
+        let exclude = HashSet::new();
+        let mut rng = Rng::new(7);
+        assert_eq!(g.next_hop(&f, &dist, 0.0, &exclude, &up, &mut rng), Some(a));
     }
 }

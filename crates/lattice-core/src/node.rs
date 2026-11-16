@@ -1740,6 +1740,22 @@ impl<S: Store> Node<S> {
 // ──────────── inbound custody offers ────────────
 
 impl<S: Store> Node<S> {
+    /// True when the offer is a receipt (or negative receipt) whose envelope
+    /// opens for this node. Such an offer terminates here and takes no relay
+    /// custody, so a draining node still accepts it.
+    fn offer_is_receipt_for_us(&self, msg: &lattice_proto::message::Message) -> bool {
+        let for_us = msg.header.dst == self.own_id
+            || (msg.hop_layer.is_none()
+                && self.config.gateways.iter().any(|g| g == &msg.header.dst));
+        if !for_us {
+            return false;
+        }
+        match self.identity.open_envelope_any(msg) {
+            Ok(opened) => opened.kind == KIND_RECEIPT || opened.kind == KIND_NEGATIVE_RECEIPT,
+            Err(_) => false,
+        }
+    }
+
     fn on_offer(&mut self, now: u64, link: LinkId, offer: &OfferFrame) -> Vec<Action> {
         let mut actions = Vec::new();
         // Undecodable: no leg to answer to; drop.
@@ -1747,7 +1763,11 @@ impl<S: Store> Node<S> {
             return actions;
         };
         let leg = msg.header.leg;
-        if self.draining.is_draining() {
+        // A draining node refuses new custody, but a receipt addressed to
+        // this node creates none: refusing it would only hide the fact that
+        // an outbound message was delivered. Receipts (and negative
+        // receipts) addressed to us are let through.
+        if self.draining.is_draining() && !self.offer_is_receipt_for_us(&msg) {
             actions.push(self.busy(link, leg));
             return actions;
         }
@@ -2060,19 +2080,13 @@ impl<S: Store> Node<S> {
             return actions;
         };
         if !opened.verify_signature(&key, msg.routing_header_bytes()) {
-            // Well-formed envelope, bad signature: refuse, and tell the
-            // sender if we can authenticate them at all.
+            // Well-formed envelope, bad signature: the claimed sender is
+            // unauthenticated, so a negative receipt would be a reflection
+            // vector. Refuse custody and send nothing.
             if let Err(e) = self.store.seen_add(*leg_hash, msg.header.exp) {
                 self.diag("seen_add", &e);
             }
             actions.push(Self::refuse(link, leg));
-            actions.extend(self.send_negative_receipt(
-                now,
-                opened.from,
-                &opened,
-                lattice_proto::message::REASON_INVALID,
-                &opened.fsvc.clone(),
-            ));
             return actions;
         }
         if opened.kind == KIND_RECEIPT || opened.kind == KIND_NEGATIVE_RECEIPT {
@@ -2295,6 +2309,18 @@ impl<S: Store> Node<S> {
     fn on_custody_reply(&mut self, now: u64, link: LinkId, frame: &CustodyFrame) -> Vec<Action> {
         let mut actions = Vec::new();
         let leg = frame.leg;
+        // A custody reply is only meaningful on the link the offer went
+        // out on. Leg ids are visible to every hop on the path, so a reply
+        // from any other link is ignored and the pending entry kept.
+        if let Some(p) = self.pending.get(&leg) {
+            if p.link != link {
+                self.diag(
+                    "custody_reply_wrong_link",
+                    "custody reply arrived on a different link than the offer",
+                );
+                return actions;
+            }
+        }
         let pending = self.pending.remove(&leg);
         match frame.result {
             CUSTODY_ACCEPTED => self.custody_accepted_reply(pending, &mut actions),
@@ -3078,8 +3104,9 @@ impl<S: Store> Node<S> {
     }
 
     /// Enter or leave draining: while draining, every custody offer is
-    /// answered `busy` and nothing new starts. Existing custody is finished
-    /// and reported via custody count.
+    /// answered `busy` and nothing new starts — except receipts addressed
+    /// to this node, which create no relay custody and are still accepted.
+    /// Existing custody is finished and reported via custody count.
     pub fn set_drain(&mut self, state: local::DrainState) {
         self.draining = state;
     }
@@ -4098,6 +4125,436 @@ mod tests {
                 "custody must be released on result {result}"
             );
         }
+    }
+
+    #[test]
+    fn custody_reply_from_unrelated_link_is_ignored() {
+        let dst = Identifier::from_bytes([0xD5; 32]);
+        let upstream = Identifier::from_bytes([0x01; 32]);
+        let stray = Identifier::from_bytes([0x02; 32]);
+        let mut node = test_node();
+        link_up(&mut node, 100, upstream, 1_000);
+        link_up(&mut node, 200, dst, 1_000);
+        link_up(&mut node, 300, stray, 1_000);
+        let now = 1_000u64;
+        let leg = LegId::from_bytes([0x33; 16]);
+        let exp = now + 10_000;
+        let wire = wire_message(leg, dst, exp);
+        insert_relay_custody(&mut node, leg, wire, 100, dst, exp);
+        node.pending.insert(
+            leg,
+            PendingOffer {
+                origin: PendingOrigin::Relay { custody_leg: leg },
+                sent_at: now,
+                excluded: Vec::new(),
+                link: 200,
+            },
+        );
+        // A reply from a link the offer never went out on is ignored:
+        // custody is kept and the pending entry survives.
+        let (actions, _) = node.handle(Event::Frame {
+            at: now,
+            link: 300,
+            from: stray,
+            frame: custody_frame(leg, CUSTODY_ACCEPTED),
+        });
+        assert!(actions.is_empty());
+        assert!(node.pending.contains_key(&leg));
+        assert!(node.store.custody_get(&leg).unwrap().is_some());
+        // The reply on the link the offer went out on is honored.
+        let (_actions, _) = node.handle(Event::Frame {
+            at: now,
+            link: 200,
+            from: dst,
+            frame: custody_frame(leg, CUSTODY_ACCEPTED),
+        });
+        assert!(!node.pending.contains_key(&leg));
+        assert!(node.store.custody_get(&leg).unwrap().is_none());
+    }
+
+    #[test]
+    fn custody_refused_from_unrelated_link_does_not_fail_outbound() {
+        let dst = Identifier::from_bytes([0xD5; 32]);
+        let stray = Identifier::from_bytes([0x02; 32]);
+        let mut node = test_node();
+        link_up(&mut node, 200, dst, 1_000);
+        link_up(&mut node, 300, stray, 1_000);
+        let now = 1_000u64;
+        let mid = MessageId::from_bytes([0x44; 16]);
+        let mut msg = outbound(mid, dst, OutboundState::InFlight);
+        msg.exp = now + 10_000;
+        node.store.outbound_put(&msg).unwrap();
+        let leg = LegId::from_bytes([0x55; 16]);
+        node.pending.insert(
+            leg,
+            PendingOffer {
+                origin: PendingOrigin::Outbound { mid },
+                sent_at: now,
+                excluded: Vec::new(),
+                link: 200,
+            },
+        );
+        let (actions, _) = node.handle(Event::Frame {
+            at: now,
+            link: 300,
+            from: stray,
+            frame: custody_frame(leg, CUSTODY_REFUSED),
+        });
+        assert!(actions.is_empty());
+        let stored = node.store.outbound_get(&mid).unwrap().unwrap();
+        assert_eq!(stored.state, OutboundState::InFlight);
+        assert!(node.pending.contains_key(&leg));
+        // The reply on the offering link fails the message as before.
+        let (_actions, _) = node.handle(Event::Frame {
+            at: now,
+            link: 200,
+            from: dst,
+            frame: custody_frame(leg, CUSTODY_REFUSED),
+        });
+        let stored = node.store.outbound_get(&mid).unwrap().unwrap();
+        assert_eq!(stored.state, OutboundState::Failed);
+        assert!(!node.pending.contains_key(&leg));
+    }
+
+    /// Build a wire message from `sender` to this node, signed with
+    /// `signing_seed` (which need not match the sender's identity, to
+    /// exercise signature verification).
+    fn sealed_to_node(
+        node: &Node<MemStore>,
+        sender: &Identity,
+        signing_seed: &SigningSeed,
+        kind: u64,
+        reference: Option<MessageId>,
+        leg: LegId,
+        now: u64,
+    ) -> Vec<u8> {
+        Message::build(BuildParams {
+            envelope: Envelope {
+                kind,
+                mid: MessageId::from_bytes([0x77; 16]),
+                from: sender.id(),
+                fsvc: "svc".into(),
+                fmbx: b"out".to_vec(),
+                tsvc: "svc".into(),
+                tmbx: b"in".to_vec(),
+                created: now,
+                body: (kind == KIND_MESSAGE).then(|| b"hi".to_vec()),
+                reference,
+                reason: (kind == KIND_NEGATIVE_RECEIPT)
+                    .then_some(lattice_proto::message::REASON_UNKNOWN_SERVICE),
+                sig: Signature::from_bytes([0; 64]),
+            },
+            sender_seed: signing_seed,
+            recipient_ek: &node.identity.xwing_public,
+            real_dst: node.own_id,
+            leg,
+            exp: now + 10_000,
+            gateway: None,
+            waypoint: None,
+        })
+        .expect("message builds")
+    }
+
+    fn admit_sender(node: &mut Node<MemStore>, sender: &Identity, at: u64) {
+        let record = build_record(
+            sender.kel.events().to_vec(),
+            1,
+            Scope::Wan,
+            &sender.signing_seed,
+            &sender.channel_seed,
+        );
+        node.admit_record(at, &record.encode());
+    }
+
+    #[test]
+    fn bad_signature_gets_refusal_and_no_negative_receipt() {
+        let mut node = test_node();
+        let sender = Identity::from_seed(&[0x5A; 32]);
+        admit_sender(&mut node, &sender, 1_000);
+        link_up(&mut node, 100, sender.id(), 1_000);
+        let now = 1_000u64;
+        // Signed with a key that does not match the sender's record.
+        let wire = sealed_to_node(
+            &node,
+            &sender,
+            &SigningSeed::from_bytes([0x99; 32]),
+            KIND_MESSAGE,
+            None,
+            LegId::from_bytes([0x88; 16]),
+            now,
+        );
+        let (actions, _) = node.handle(Event::Frame {
+            at: now,
+            link: 100,
+            from: sender.id(),
+            frame: Frame::Offer(OfferFrame { message: wire }),
+        });
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::SendFrame {
+                    frame: Frame::Custody(c),
+                    ..
+                } if c.result == CUSTODY_REFUSED
+            )),
+            "a bad signature must be refused"
+        );
+        assert!(
+            !actions.iter().any(|a| matches!(
+                a,
+                Action::SendFrame {
+                    frame: Frame::Offer(_),
+                    ..
+                }
+            )),
+            "no message (in particular no negative receipt) may be sent to an unauthenticated sender"
+        );
+        assert!(
+            node.store.outbound_all().unwrap().is_empty(),
+            "no negative receipt may be queued for an unauthenticated sender"
+        );
+    }
+
+    #[test]
+    fn draining_node_accepts_receipt_addressed_to_it() {
+        let mut node = test_node();
+        let sender = Identity::from_seed(&[0x5B; 32]);
+        admit_sender(&mut node, &sender, 1_000);
+        link_up(&mut node, 100, sender.id(), 1_000);
+        let now = 1_000u64;
+        let mid = MessageId::from_bytes([0x66; 16]);
+        let mut msg = outbound(mid, sender.id(), OutboundState::InFlight);
+        msg.exp = now + 10_000;
+        node.store.outbound_put(&msg).unwrap();
+        let wire = sealed_to_node(
+            &node,
+            &sender,
+            &sender.signing_seed,
+            KIND_RECEIPT,
+            Some(mid),
+            LegId::from_bytes([0x89; 16]),
+            now,
+        );
+        node.set_drain(local::DrainState::Draining);
+        let (actions, _) = node.handle(Event::Frame {
+            at: now,
+            link: 100,
+            from: sender.id(),
+            frame: Frame::Offer(OfferFrame { message: wire }),
+        });
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::SendFrame {
+                    frame: Frame::Custody(c),
+                    ..
+                } if c.result == CUSTODY_ACCEPTED
+            )),
+            "a receipt addressed to a draining node must be accepted, got {actions:?}"
+        );
+        let stored = node.store.outbound_get(&mid).unwrap().unwrap();
+        assert_eq!(stored.state, OutboundState::Delivered);
+    }
+
+    #[test]
+    fn draining_node_accepts_negative_receipt_addressed_to_it() {
+        let mut node = test_node();
+        let sender = Identity::from_seed(&[0x5C; 32]);
+        admit_sender(&mut node, &sender, 1_000);
+        link_up(&mut node, 100, sender.id(), 1_000);
+        let now = 1_000u64;
+        let mid = MessageId::from_bytes([0x67; 16]);
+        let mut msg = outbound(mid, sender.id(), OutboundState::InFlight);
+        msg.exp = now + 10_000;
+        node.store.outbound_put(&msg).unwrap();
+        let wire = sealed_to_node(
+            &node,
+            &sender,
+            &sender.signing_seed,
+            KIND_NEGATIVE_RECEIPT,
+            Some(mid),
+            LegId::from_bytes([0x8A; 16]),
+            now,
+        );
+        node.set_drain(local::DrainState::Draining);
+        let (actions, _) = node.handle(Event::Frame {
+            at: now,
+            link: 100,
+            from: sender.id(),
+            frame: Frame::Offer(OfferFrame { message: wire }),
+        });
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::SendFrame {
+                    frame: Frame::Custody(c),
+                    ..
+                } if c.result == CUSTODY_ACCEPTED
+            )),
+            "a negative receipt addressed to a draining node must be accepted, got {actions:?}"
+        );
+        let stored = node.store.outbound_get(&mid).unwrap().unwrap();
+        assert_eq!(stored.state, OutboundState::Failed);
+    }
+
+    #[test]
+    fn draining_private_node_accepts_receipt_addressed_to_its_gateway() {
+        let gw = Identifier::from_bytes([0x77; 32]);
+        let cfg = Config {
+            snow_per_min: 0.0,
+            mode: Mode::Private,
+            gateways: vec![gw],
+            ..Config::default()
+        };
+        let mut node = Node::new(
+            cfg,
+            Identity::from_seed(&lattice_crypto::os_bytes::<32>()),
+            MemStore::new(),
+            1_000,
+        )
+        .expect("node construction");
+        let sender = Identity::from_seed(&[0x5B; 32]);
+        admit_sender(&mut node, &sender, 1_000);
+        link_up(&mut node, 100, sender.id(), 1_000);
+        let now = 1_000u64;
+        let mid = MessageId::from_bytes([0x68; 16]);
+        let mut msg = outbound(mid, sender.id(), OutboundState::InFlight);
+        msg.exp = now + 10_000;
+        node.store.outbound_put(&msg).unwrap();
+        // Sealed to this node, addressed to its gateway: the gateway strips
+        // the gateway layer and forwards with dst naming the gateway.
+        let wire = Message::build(BuildParams {
+            envelope: Envelope {
+                kind: KIND_RECEIPT,
+                mid: MessageId::from_bytes([0x79; 16]),
+                from: sender.id(),
+                fsvc: "svc".into(),
+                fmbx: b"out".to_vec(),
+                tsvc: "svc".into(),
+                tmbx: b"in".to_vec(),
+                created: now,
+                body: None,
+                reference: Some(mid),
+                reason: None,
+                sig: Signature::from_bytes([0; 64]),
+            },
+            sender_seed: &sender.signing_seed,
+            recipient_ek: &node.identity.xwing_public,
+            real_dst: gw,
+            leg: LegId::from_bytes([0x8D; 16]),
+            exp: now + 10_000,
+            gateway: None,
+            waypoint: None,
+        })
+        .expect("message builds");
+        node.set_drain(local::DrainState::Draining);
+        let (actions, _) = node.handle(Event::Frame {
+            at: now,
+            link: 100,
+            from: sender.id(),
+            frame: Frame::Offer(OfferFrame { message: wire }),
+        });
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::SendFrame {
+                    frame: Frame::Custody(c),
+                    ..
+                } if c.result == CUSTODY_ACCEPTED
+            )),
+            "a receipt forwarded by our gateway must be accepted while draining, got {actions:?}"
+        );
+        let stored = node.store.outbound_get(&mid).unwrap().unwrap();
+        assert_eq!(stored.state, OutboundState::Delivered);
+    }
+
+    #[test]
+    fn draining_node_still_refuses_ordinary_messages() {
+        let mut node = test_node();
+        let sender = Identity::from_seed(&[0x5D; 32]);
+        admit_sender(&mut node, &sender, 1_000);
+        link_up(&mut node, 100, sender.id(), 1_000);
+        let now = 1_000u64;
+        let wire = sealed_to_node(
+            &node,
+            &sender,
+            &sender.signing_seed,
+            KIND_MESSAGE,
+            None,
+            LegId::from_bytes([0x8B; 16]),
+            now,
+        );
+        node.set_drain(local::DrainState::Draining);
+        let (actions, _) = node.handle(Event::Frame {
+            at: now,
+            link: 100,
+            from: sender.id(),
+            frame: Frame::Offer(OfferFrame { message: wire }),
+        });
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::SendFrame {
+                    frame: Frame::Custody(c),
+                    ..
+                } if c.result == CUSTODY_BUSY
+            )),
+            "an ordinary message must still be refused while draining, got {actions:?}"
+        );
+        assert_eq!(node.store.inbox_len_total().unwrap(), 0);
+    }
+
+    #[test]
+    fn draining_node_refuses_receipt_sealed_to_someone_else() {
+        let mut node = test_node();
+        let sender = Identity::from_seed(&[0x5E; 32]);
+        let other = Identity::from_seed(&[0x5F; 32]);
+        admit_sender(&mut node, &sender, 1_000);
+        link_up(&mut node, 100, sender.id(), 1_000);
+        let now = 1_000u64;
+        // A receipt sealed to `other`, not to this node: not ours, so the
+        // drain refusal still applies.
+        let wire = Message::build(BuildParams {
+            envelope: Envelope {
+                kind: KIND_RECEIPT,
+                mid: MessageId::from_bytes([0x78; 16]),
+                from: sender.id(),
+                fsvc: "svc".into(),
+                fmbx: b"out".to_vec(),
+                tsvc: "svc".into(),
+                tmbx: b"in".to_vec(),
+                created: now,
+                body: None,
+                reference: Some(MessageId::from_bytes([0x66; 16])),
+                reason: None,
+                sig: Signature::from_bytes([0; 64]),
+            },
+            sender_seed: &sender.signing_seed,
+            recipient_ek: &other.xwing_public,
+            real_dst: node.own_id,
+            leg: LegId::from_bytes([0x8C; 16]),
+            exp: now + 10_000,
+            gateway: None,
+            waypoint: None,
+        })
+        .expect("message builds");
+        node.set_drain(local::DrainState::Draining);
+        let (actions, _) = node.handle(Event::Frame {
+            at: now,
+            link: 100,
+            from: sender.id(),
+            frame: Frame::Offer(OfferFrame { message: wire }),
+        });
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::SendFrame {
+                    frame: Frame::Custody(c),
+                    ..
+                } if c.result == CUSTODY_BUSY
+            )),
+            "a receipt not sealed to this node must be refused while draining, got {actions:?}"
+        );
     }
 
     #[test]
