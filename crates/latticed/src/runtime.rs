@@ -55,6 +55,7 @@ pub enum ApiCmd {
     },
     Status {
         mid: MessageId,
+        service: String,
         respond: StoreReply<Option<MessageStatus>>,
     },
     Fetch {
@@ -630,8 +631,22 @@ impl Runtime {
                 self.apply(Event::AppSend(send)).await;
                 let _ = respond.send(mid);
             }
-            ApiCmd::Status { mid, respond } => {
-                let value = self.with_node(|node| node.store_ref().status_get(&mid));
+            ApiCmd::Status {
+                mid,
+                service,
+                respond,
+            } => {
+                // Scope to the calling service, like Fetch/Ack: a status is
+                // only visible to the service that sent the message. The
+                // outbound record carries the sender's service; without it
+                // the status cannot be attributed, so fail closed.
+                let value = self.with_node(|node| match node.store_ref().outbound_get(&mid) {
+                    Ok(Some(msg)) if msg.envelope.fsvc == service => {
+                        node.store_ref().status_get(&mid)
+                    }
+                    Ok(Some(_)) | Ok(None) => Ok(None),
+                    Err(e) => Err(e),
+                });
                 let _ = respond.send(value);
             }
             ApiCmd::Fetch {

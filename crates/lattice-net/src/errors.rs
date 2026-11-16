@@ -72,6 +72,9 @@ pub enum NetError {
     Crypto(snow::Error),
     /// A frame arrived that is not valid in the current state.
     UnexpectedFrame,
+    /// The link was torn down after a non-binary frame was received; the
+    /// socket is no longer usable.
+    Closed,
     /// The peer did not respond within the handshake timeout.
     Timeout,
     /// The input or configuration is invalid (bad endpoint, bad path, ...).
@@ -102,6 +105,7 @@ impl core::fmt::Display for NetError {
             NetError::BadFrame(e) => write!(f, "undecodable frame: {e}"),
             NetError::Crypto(e) => write!(f, "cryptographic failure: {e}"),
             NetError::UnexpectedFrame => write!(f, "unexpected frame"),
+            NetError::Closed => write!(f, "link closed after a non-binary frame"),
             NetError::Timeout => write!(f, "operation timed out"),
             NetError::InvalidInput(m) => write!(f, "invalid input: {m}"),
             NetError::NoUsableAddress => write!(f, "no usable address for this endpoint"),
@@ -123,6 +127,7 @@ impl std::error::Error for NetError {
             | NetError::BadCookie
             | NetError::FrameTooLarge
             | NetError::UnexpectedFrame
+            | NetError::Closed
             | NetError::Timeout
             | NetError::InvalidInput(_)
             | NetError::NoUsableAddress => None,
