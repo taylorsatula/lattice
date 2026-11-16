@@ -11,6 +11,7 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+chacha20 = "0.10"
 lattice-types = { version = "0.0.0", path = "../lattice-types" }
 lattice-proto = { version = "0.0.0", path = "../lattice-proto" }
 lattice-store = { version = "0.0.0", path = "../lattice-store" }

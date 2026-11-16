@@ -624,6 +624,7 @@ dependencies = [
 name = "lattice-core"
 version = "0.0.0"
 dependencies = [
+ "chacha20 0.10.2",
  "lattice-crypto",
  "lattice-proto",
  "lattice-store",

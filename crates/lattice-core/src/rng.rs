@@ -1,22 +1,46 @@
-//! Deterministic RNG for the core. Not cryptographic; used for decisions
-//! that must be reproducible in the simulator (route choice, snow timing).
-//! Seeds come from the caller: OS randomness in the daemon, fixed seeds in
-//! tests.
+//! Deterministic RNG for the core: ChaCha20 keyed from a 64-bit seed.
+//!
+//! The daemon seeds from OS entropy, the simulator and tests from fixed
+//! seeds; the same seed always yields the same stream, which is what makes
+//! simulator runs reproducible.
 
-/// SplitMix64. Cheap, deterministic, fine for load-balancing decisions.
-#[derive(Clone, Debug)]
-pub struct Rng(u64);
+use chacha20::ChaCha20;
+use chacha20::cipher::{KeyIvInit, StreamCipher};
+
+/// Domain separator for seed expansion, so a seed never hashes to the same
+/// key as any other BLAKE3 use in the workspace.
+const SEED_CONTEXT: &[u8] = b"lattice-core rng seed v1";
+
+/// ChaCha20 stream keyed from a 64-bit seed.
+///
+/// The seed is not secret material: it selects which stream the node draws
+/// from, and an observer who learns it learns routing and timing jitter, not
+/// keys. Unpredictability against an outside observer comes from the daemon
+/// seeding from OS entropy, not from the seed's width.
+pub struct Rng {
+    cipher: ChaCha20,
+}
+
+impl core::fmt::Debug for Rng {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("Rng(..)")
+    }
+}
 
 impl Rng {
     pub fn new(seed: u64) -> Self {
-        Self(seed)
+        let mut preimage = Vec::with_capacity(SEED_CONTEXT.len() + 8);
+        preimage.extend_from_slice(SEED_CONTEXT);
+        preimage.extend_from_slice(&seed.to_le_bytes());
+        let key = lattice_crypto::hash(&preimage);
+        // Zero nonce: each key drives exactly one stream.
+        let cipher = ChaCha20::new(key.as_bytes().into(), (&[0u8; 12]).into());
+        Self { cipher }
     }
     pub fn next_u64(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9E3779B97F4A7C15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
-        z ^ (z >> 31)
+        let mut out = [0u8; 8];
+        self.cipher.apply_keystream(&mut out);
+        u64::from_le_bytes(out)
     }
     /// Uniform value in [0, n). n must be > 0.
     pub fn below(&mut self, n: u64) -> u64 {
