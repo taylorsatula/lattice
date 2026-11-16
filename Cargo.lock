@@ -691,6 +691,7 @@ version = "0.0.0"
 dependencies = [
  "lattice-core",
  "lattice-crypto",
+ "lattice-net",
  "lattice-proto",
  "lattice-store",
  "lattice-types",

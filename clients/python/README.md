@@ -132,11 +132,28 @@ stashed and returned by the next `next_event()` (or `take_events()`).
 
 ### Identity and verification
 
-`hello` returns the node's own id (`client.node_id`). Applications that want
-to authenticate peers can use `lattice.objects` to parse and verify records
-and messages (KEL validation, both record signatures, envelope decryption
-and signature verification) — the same checks the node itself performs. The
-shared test vectors in `vectors/` exercise exactly these paths.
+`hello` returns the node's own id (`client.node_id`).
+
+The package is the local-API client only; it does not ship object
+verification. The wire-object verifiers (KEL validation, record and message
+checks) live in the test suite (`tests/objects.py`) and are not part of the
+installed package or a supported public API. They perform the same checks
+the node itself performs, and the shared test vectors in `vectors/` exercise
+exactly these paths. If your application needs to verify records or
+messages itself, vendor those helpers or use the Rust implementation.
+
+### X-Wing
+
+The Python test suite implements X-Wing (draft-connolly-cfrg-xwing-kem-06)
+by hand on top of `cryptography`'s ML-KEM-768 and X25519 — there is no
+`x-wing` package dependency. `cryptography>=47` is required for ML-KEM. The
+draft-06 combiner (SHA3-256 over `ss_m ‖ ss_x ‖ ct_x ‖ pk_x ‖ "\.//^\"`) is
+pinned by the shared test vectors. Version-bump plan: when the draft becomes
+an RFC (or `cryptography` ships a native X-Wing), re-check the combiner
+against the new document, regenerate `vectors/vectors.json` from the Rust
+implementation, and bump the `cryptography` floor in `pyproject.toml` in
+lockstep with the Rust `x-wing` crate. Until then, do not downgrade below
+47.
 
 ## Admin operations
 

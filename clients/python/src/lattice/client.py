@@ -58,6 +58,21 @@ MSG_STATUS_EXPIRED = 5
 _READ_TIMEOUT = 30.0
 
 
+def _req_uint(result: dict, key: int, name: str) -> int:
+    value = result.get(key)
+    # bool is a subclass of int; the wire has no booleans in uint fields.
+    if type(value) is not int or value < 0:
+        raise BadResponse(f"node: missing or invalid {name}")
+    return value
+
+
+def _req_bool(result: dict, key: int, name: str) -> bool:
+    value = result.get(key)
+    if not isinstance(value, bool):
+        raise BadResponse(f"node: missing or invalid {name}")
+    return value
+
+
 @dataclass
 class Delivery:
     delivery_id: bytes
@@ -214,13 +229,21 @@ class Client:
 
     def node(self) -> NodeInfo:
         result = self._call(OP_NODE, {})
+        if not isinstance(result, dict):
+            raise BadResponse("node: result is not a map")
+        node_id = result.get(0)
+        if not isinstance(node_id, (bytes, bytearray)) or len(node_id) != 32:
+            raise BadResponse("node: missing or invalid id")
+        mode = result.get(1)
+        if not isinstance(mode, str):
+            raise BadResponse("node: missing mode")
         return NodeInfo(
-            id=bytes(result[0]),
-            mode=result.get(1, ""),
-            links=result.get(2, 0),
-            records=result.get(3, 0),
-            custody_bytes=result.get(4, 0),
-            draining=bool(result.get(5, False)),
+            id=bytes(node_id),
+            mode=mode,
+            links=_req_uint(result, 2, "links"),
+            records=_req_uint(result, 3, "records"),
+            custody_bytes=_req_uint(result, 4, "custody_bytes"),
+            draining=_req_bool(result, 5, "draining"),
         )
 
     def drain(self, draining: bool | None = None):

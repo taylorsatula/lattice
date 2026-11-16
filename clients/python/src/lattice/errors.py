@@ -27,9 +27,10 @@ class Timeout(LatticeError):
     """A read from the daemon timed out."""
 
 
-# Error codes from the local API wire contract.
+# Error codes from the local API wire contract (see crates/lattice-proto/src/local.rs).
 ERR_UNKNOWN_OP = 1
 ERR_BAD_ARGS = 2
 ERR_AUTH = 3
 ERR_NOT_FOUND = 4
-ERR_FAILED = 5
+ERR_INTERNAL = 5
+ERR_FAILED = 6

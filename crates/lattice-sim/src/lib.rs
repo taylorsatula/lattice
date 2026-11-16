@@ -17,6 +17,58 @@ use lattice_types::{Identifier, MessageId, X25519PublicKey};
 
 pub type NodeIndex = usize;
 
+/// Why a frame could not be put on (or taken off) the simulated wire.
+///
+/// The sim treats these as hard errors (panics at the call site): a frame
+/// that fails wire encoding indicates a bug in the node that emitted it,
+/// and a frame that fails wire decoding indicates corruption the
+/// transport would never deliver.
+#[derive(Debug)]
+pub enum WireError {
+    /// The frame does not fit any bucket (or the requested bucket), or the
+    /// wire bytes are not a bucket-sized, zero-padded `[frame, padding]`.
+    Frame(lattice_net::FrameError),
+    /// The frame bytes decoded as CBOR but not as a valid frame.
+    Proto(lattice_proto::ProtoError),
+}
+
+impl std::fmt::Display for WireError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WireError::Frame(e) => write!(f, "{e}"),
+            WireError::Proto(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for WireError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            WireError::Frame(e) => Some(e),
+            WireError::Proto(e) => Some(e),
+        }
+    }
+}
+
+/// Encode a frame exactly as the transport would: frame CBOR, then the
+/// bucket-padded `[frame, padding]` wire payload. `pad_to` selects a
+/// specific bucket (snow dummies), mirroring `Action::SendFrame::pad_to`.
+pub fn encode_frame_wire(frame: &Frame, pad_to: Option<usize>) -> Result<Vec<u8>, WireError> {
+    let inner = frame.encode();
+    match pad_to {
+        Some(bucket) => lattice_net::encode_wire_to_bucket(&inner, bucket),
+        None => lattice_net::encode_wire(&inner),
+    }
+    .map_err(WireError::Frame)
+}
+
+/// Decode a wire payload back into a frame, exactly as the transport would
+/// on receipt: bucket size and zero padding are mandatory.
+pub fn decode_frame_wire(bytes: &[u8]) -> Result<Frame, WireError> {
+    let inner = lattice_net::decode_wire(bytes).map_err(WireError::Frame)?;
+    Frame::from_bytes(&inner).map_err(WireError::Proto)
+}
+
 /// Whether a simulated link is carrying traffic.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LinkState {
@@ -38,7 +90,8 @@ pub enum SimEvent {
         to: NodeIndex,
         link: u64,
         from: NodeIndex,
-        frame: Frame,
+        /// The bucket-padded wire payload, as it would ride the transport.
+        wire: Vec<u8>,
     },
     Tick {
         node: NodeIndex,
@@ -271,7 +324,8 @@ impl<S: Store> Sim<S> {
     }
 
     /// Inject a raw frame into a node as if it arrived from `link`'s peer.
-    /// Test hook for adversarial inputs.
+    /// Test hook for adversarial inputs. The frame is round-tripped through
+    /// the wire encoding first, so an unencodable frame is a hard error.
     pub fn inject_frame(
         &mut self,
         target: NodeIndex,
@@ -280,6 +334,10 @@ impl<S: Store> Sim<S> {
     ) {
         let LinkEndpoints { a, b } = self.link_endpoints(link);
         let from = if a == target { b } else { a };
+        let wire = encode_frame_wire(&frame, None)
+            .unwrap_or_else(|e| panic!("sim: injected frame failed wire encoding: {e}"));
+        let frame = decode_frame_wire(&wire)
+            .unwrap_or_else(|e| panic!("sim: injected frame failed wire decoding: {e}"));
         self.dispatch(
             target,
             Event::Frame {
@@ -370,9 +428,12 @@ impl<S: Store> Sim<S> {
                 to,
                 link,
                 from,
-                frame,
+                wire,
             } => {
                 let from_id = self.ids[from];
+                let frame = decode_frame_wire(&wire).unwrap_or_else(|e| {
+                    panic!("sim: wire frame from node {from} to node {to} failed decoding: {e}")
+                });
                 let (actions, _diags) = self.nodes[to].handle(Event::Frame {
                     at: self.now,
                     link,
@@ -403,7 +464,11 @@ impl<S: Store> Sim<S> {
     fn apply_actions(&mut self, from: NodeIndex, actions: Vec<Action>) {
         for action in actions {
             match action {
-                Action::SendFrame { link, frame, .. } => {
+                Action::SendFrame {
+                    link,
+                    frame,
+                    pad_to,
+                } => {
                     let tag = match &frame {
                         Frame::Offer(_) => "offer",
                         Frame::Custody(_) => "custody",
@@ -415,8 +480,11 @@ impl<S: Store> Sim<S> {
                         Frame::Init(_) | Frame::Cookie(_) | Frame::Resp(_) => "handshake",
                         Frame::Kels(_) => "kels",
                     };
+                    let wire = encode_frame_wire(&frame, pad_to).unwrap_or_else(|e| {
+                        panic!("sim: {tag} frame from node {from} failed wire encoding: {e}")
+                    });
                     *self.frame_counts.entry(tag).or_insert(0) += 1;
-                    self.route_frame(from, link, frame);
+                    self.route_frame(from, link, wire);
                 }
                 Action::Deliver {
                     service,
@@ -444,7 +512,7 @@ impl<S: Store> Sim<S> {
         }
     }
 
-    fn route_frame(&mut self, from: NodeIndex, link_id: u64, frame: Frame) {
+    fn route_frame(&mut self, from: NodeIndex, link_id: u64, wire: Vec<u8>) {
         let Some(link) = self.links.iter().find(|l| l.id == link_id) else {
             return;
         };
@@ -459,7 +527,7 @@ impl<S: Store> Sim<S> {
                 to,
                 link: link_id,
                 from,
-                frame,
+                wire,
             },
         );
     }

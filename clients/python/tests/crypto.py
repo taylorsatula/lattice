@@ -1,8 +1,17 @@
 """Cryptographic primitives used by Lattice's wire format.
 
-Implements the X-Wing KEM (X25519 + ML-KEM-768, draft-connolly-cfrg-xwing-kem)
-as used by the reference Rust implementation, plus the BLAKE3-keyed
+Implements the X-Wing KEM (X25519 + ML-KEM-768, draft-connolly-cfrg-xwing-kem,
+draft-06) as used by the reference Rust implementation, plus the BLAKE3-keyed
 ChaCha20-Poly1305 seal used for hop and envelope layers.
+
+There is no ``x-wing`` package dependency: the draft-06 combiner
+(SHA3-256 over ss_m || ss_x || ct_x || pk_x || "\\.//^\\") is implemented
+here on top of ``cryptography``'s ML-KEM-768 and X25519. The draft-06
+combiner is pinned by the shared test vectors; if the draft advances to an
+RFC, re-check the label and concatenation order against the new document,
+regenerate vectors/vectors.json from the Rust implementation, and bump the
+``cryptography`` floor in pyproject.toml in lockstep with the Rust ``x-wing``
+crate. See the README ("X-Wing") for the full version-bump plan.
 
 Only what the vectors and the local client need is implemented. This is not
 a general-purpose crypto library.
