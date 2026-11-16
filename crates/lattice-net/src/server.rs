@@ -390,7 +390,12 @@ async fn next_binary(
         .map_err(NetError::WebSocket)?;
     match msg {
         Message::Binary(b) => Ok(b.to_vec()),
-        _ => Err(NetError::UnexpectedFrame),
+        // No control frames: drop the socket without further writes so a
+        // queued automatic Pong/Close reply is never flushed.
+        _ => {
+            eprintln!("[lattice-net] handshake: non-binary WebSocket frame received; closing");
+            Err(NetError::UnexpectedFrame)
+        }
     }
 }
 

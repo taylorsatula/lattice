@@ -108,6 +108,9 @@ pub async fn connect(contact: PeerContact, channel_seed: &ChannelSeed) -> Result
             })?
             .map_err(NetError::WebSocket)?;
         let Message::Binary(bytes) = msg else {
+            // No control frames: drop the socket without further writes so a
+            // queued automatic Pong/Close reply is never flushed.
+            eprintln!("[lattice-net] handshake: non-binary WebSocket frame received; closing");
             return Err(NetError::UnexpectedFrame);
         };
         let frame = parse_frame(&bytes)?;

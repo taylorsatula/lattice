@@ -1,4 +1,12 @@
 //! PeerIo: a post-handshake, framed connection to one neighbor.
+//!
+//! Wire posture: no WebSocket control frames in either direction. Every
+//! frame we send is Binary. Any non-binary frame we receive tears the link
+//! down. tungstenite 0.30 cannot be configured to suppress its automatic
+//! Pong (on Ping) or Close reply (on Close) — `WebSocketConfig` has no such
+//! switch, and the reply is queued inside the socket and flushed by the
+//! next read/write/flush — so the guarantee is enforced by never touching
+//! the socket again after a non-binary frame arrives (see `poisoned`).
 
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
@@ -22,6 +30,12 @@ pub struct PeerIo {
     ws: WebSocketStream<BoxedStream>,
     transport: TransportState,
     pub remote_static: X25519PublicKey,
+    /// Set when a non-binary frame is received. tungstenite 0.30 queues an
+    /// automatic Pong (on Ping) or Close reply (on Close) inside the socket
+    /// and flushes it on the next read/write/flush; there is no config to
+    /// disable this. Once poisoned, no further operation may touch the
+    /// socket, so a queued control frame can never reach the wire.
+    poisoned: bool,
 }
 
 impl PeerIo {
@@ -34,6 +48,7 @@ impl PeerIo {
             ws,
             transport,
             remote_static,
+            poisoned: false,
         }
     }
 
@@ -42,6 +57,9 @@ impl PeerIo {
         frame: &Frame,
         pad_to: Option<usize>,
     ) -> Result<(), NetError> {
+        if self.poisoned {
+            return Err(NetError::Closed);
+        }
         let inner = lattice_proto::encode(&frame.to_value());
         let plaintext = match pad_to {
             Some(bucket) => encode_wire_to_bucket(&inner, bucket),
@@ -70,7 +88,16 @@ impl PeerIo {
                 Some(Ok(m)) => m,
             };
             let Message::Binary(bytes) = msg else {
-                // Close frames and control frames end the stream from our side.
+                // No control frames in either direction. Any non-binary
+                // frame (Ping, Pong, Close, Text) tears the link down.
+                // tungstenite 0.30 has no option to disable its automatic
+                // Pong/Close replies (WebSocketConfig carries no such
+                // switch); they are queued inside the socket and flushed by
+                // the next read/write/flush. Poisoning the link here
+                // guarantees no such flush ever happens, so the reply never
+                // reaches the wire.
+                eprintln!("[lattice-net] closing link: non-binary WebSocket frame received");
+                self.poisoned = true;
                 return Ok(None);
             };
             if bytes.len() > MAX_WIRE_BYTES {
@@ -89,6 +116,11 @@ impl PeerIo {
     }
 
     pub async fn close(mut self) {
+        if self.poisoned {
+            // A close handshake would flush any queued Pong/Close reply;
+            // drop the socket instead.
+            return;
+        }
         let _ = self.ws.close(None).await;
     }
 }
