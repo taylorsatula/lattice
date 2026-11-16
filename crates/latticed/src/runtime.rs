@@ -185,9 +185,9 @@ const INBOUND_CAPACITY: usize = 256;
 
 /// Outbound/inbound frame classes for per-peer rate limiting and shedding.
 /// Custody is message custody (offers and custody replies): shed last.
-/// Gossip is record anti-entropy (reconcile/want/records): shed second.
-/// Snow is cover traffic: shed first. Control is ping/attest (and the
-/// handshake frames, which never reach the runtime): shed after gossip.
+/// Gossip is record anti-entropy (reconcile/want/records/kels): shed second.
+/// Snow is cover traffic: shed first. Control is ping (and the handshake
+/// frames, which never reach the runtime): shed after gossip.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum FrameClass {
     Custody,
@@ -200,13 +200,13 @@ impl FrameClass {
     fn of(frame: &Frame) -> Self {
         match frame {
             Frame::Offer(_) | Frame::Custody(_) => Self::Custody,
-            Frame::Reconcile(_) | Frame::Want(_) | Frame::Records(_) => Self::Gossip,
+            Frame::Reconcile(_) | Frame::Want(_) | Frame::Records(_) | Frame::Kels(_) => {
+                Self::Gossip
+            }
             Frame::Dummy(_) => Self::Snow,
-            Frame::Ping(_)
-            | Frame::Attest(_)
-            | Frame::Init(_)
-            | Frame::Cookie(_)
-            | Frame::Resp(_) => Self::Control,
+            Frame::Ping(_) | Frame::Init(_) | Frame::Cookie(_) | Frame::Resp(_) => {
+                Self::Control
+            }
         }
     }
 
