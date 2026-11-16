@@ -1,5 +1,5 @@
 use lattice_crypto::generate_seed;
-use lattice_proto::kel::KeyEvent;
+use lattice_proto::kel::{KeyEvent, ValidatedKel};
 use lattice_proto::record::*;
 use lattice_proto::{CLOCK_SKEW, MAX_RECORD_HORIZON};
 use lattice_types::{
@@ -14,10 +14,39 @@ const NOW: u64 = 1_800_000_000;
 
 struct Fixture {
     seed: SigningSeed,
+    next_seed: SigningSeed,
     kel: Vec<KeyEvent>,
     envelope: XWingPublicKey,
     channel: ChannelPublicKey,
     channel_seed: ChannelSeed,
+}
+
+impl Fixture {
+    fn validated_kel(&self) -> ValidatedKel {
+        ValidatedKel::validate(self.kel.clone()).unwrap()
+    }
+
+    fn params(&self) -> RecordParams {
+        RecordParams {
+            kel: self.validated_kel(),
+            prev_seq: 0,
+            now: 1,
+            exp: NOW + 86_400,
+            channel_key: self.channel,
+            channel_seed: self.channel_seed.clone(),
+            envelope_key: self.envelope,
+            mode: Mode::Public,
+            scope: Scope::Wan,
+            endpoints: vec![Endpoint {
+                url: "ws://mesh.example.com/".into(),
+                ips: vec![],
+            }],
+            links: vec![],
+            gateways: vec![],
+            capabilities: 0,
+            serves: vec![],
+        }
+    }
 }
 
 fn fixture() -> Fixture {
@@ -31,6 +60,7 @@ fn fixture() -> Fixture {
     let channel = lattice_crypto::channel_public(&channel_seed);
     Fixture {
         seed,
+        next_seed,
         kel,
         envelope: XWingPublicKey::from_bytes([7u8; 1216]),
         channel,
@@ -39,27 +69,7 @@ fn fixture() -> Fixture {
 }
 
 fn public_record(f: &Fixture) -> PeerRecord {
-    PeerRecord::build(
-        lattice_proto::record::RecordParams {
-            kel: f.kel.clone(),
-            seq: 1,
-            exp: NOW + 86_400,
-            channel_key: f.channel,
-            channel_seed: f.channel_seed.clone(),
-            envelope_key: f.envelope,
-            mode: Mode::Public,
-            scope: Scope::Wan,
-            endpoints: vec![Endpoint {
-                url: "ws://mesh.example.com/".into(),
-                ips: vec![],
-            }],
-            links: vec![],
-            gateways: vec![],
-            capabilities: 0,
-        },
-        &f.seed,
-    )
-    .unwrap()
+    PeerRecord::build(f.params(), &f.seed).unwrap()
 }
 
 #[test]
@@ -68,11 +78,31 @@ fn public_record_roundtrip() {
     let rec = public_record(&f);
     let bytes = rec.encode();
     assert!(bytes.len() <= 3072);
-    let parsed = PeerRecord::from_bytes(&bytes, NOW, None).unwrap();
+    let kel = f.validated_kel();
+    let parsed = PeerRecord::from_bytes(&bytes, NOW, &kel).unwrap();
     assert_eq!(parsed.id, rec.id);
     assert_eq!(parsed.seq, 1);
-    assert_eq!(parsed.kel.len(), 1);
-    assert_eq!(parsed.kel.head().seq, 0);
+    assert_eq!(parsed.khs, 0);
+    assert_eq!(parsed.khc, kel.head().commitment);
+    assert_eq!(parsed.k, kel.head().current_key);
+    assert_eq!(parsed.kel_head().seq, 0);
+}
+
+#[test]
+fn seq_is_max_of_prev_plus_one_and_now() {
+    let f = fixture();
+    // prev_seq + 1 wins when it exceeds now.
+    let mut params = f.params();
+    params.prev_seq = 41;
+    params.now = 10;
+    let rec = PeerRecord::build(params, &f.seed).unwrap();
+    assert_eq!(rec.seq, 42);
+    // now wins when it exceeds prev_seq + 1.
+    let mut params = f.params();
+    params.prev_seq = 41;
+    params.now = 1_800_000_000;
+    let rec = PeerRecord::build(params, &f.seed).unwrap();
+    assert_eq!(rec.seq, 1_800_000_000);
 }
 
 #[test]
@@ -81,7 +111,8 @@ fn expired_record_rejected() {
     let mut rec = public_record(&f);
     rec.exp = NOW - 10;
     let bytes = rec.encode(); // signature now invalid, but expiry is checked first
-    assert!(PeerRecord::from_bytes(&bytes, NOW, None).is_err());
+    let kel = f.validated_kel();
+    assert!(PeerRecord::from_bytes(&bytes, NOW, &kel).is_err());
 }
 
 #[test]
@@ -90,112 +121,56 @@ fn far_future_expiry_rejected() {
     let mut rec = public_record(&f);
     rec.exp = NOW + MAX_RECORD_HORIZON + CLOCK_SKEW + 100;
     let bytes = rec.encode();
-    assert!(PeerRecord::from_bytes(&bytes, NOW, None).is_err());
+    let kel = f.validated_kel();
+    assert!(PeerRecord::from_bytes(&bytes, NOW, &kel).is_err());
 }
 
 #[test]
 fn private_record_with_private_endpoints_rejected() {
     let f = fixture();
     // Building refuses it outright.
-    assert!(
-        PeerRecord::build(
-            lattice_proto::record::RecordParams {
-                kel: f.kel.clone(),
-                seq: 1,
-                exp: NOW + 86_400,
-                channel_key: f.channel,
-                channel_seed: f.channel_seed.clone(),
-                envelope_key: f.envelope,
-                mode: Mode::Private,
-                scope: Scope::Wan,
-                endpoints: vec![Endpoint {
-                    url: "ws://x.example/".into(),
-                    ips: vec![]
-                }],
-                links: vec![],
-                gateways: vec![Identifier::from_bytes([1u8; 32])],
-                capabilities: 0,
-            },
-            &f.seed
-        )
-        .is_err()
-    );
-    // And a hand-crafted wire record with endpoints on a private record is
-    // rejected at decode time. (Build strips/rejects, so assemble bytes by
-    // hand: sign a private record through build, then verify a decode of it.)
-    let ok = PeerRecord::build(
-        lattice_proto::record::RecordParams {
-            kel: f.kel.clone(),
-            seq: 1,
-            exp: NOW + 86_400,
-            channel_key: f.channel,
-            channel_seed: f.channel_seed.clone(),
-            envelope_key: f.envelope,
-            mode: Mode::Private,
-            scope: Scope::Wan,
-            endpoints: vec![],
-            links: vec![],
-            gateways: vec![Identifier::from_bytes([1u8; 32])],
-            capabilities: 0,
-        },
-        &f.seed,
-    )
-    .unwrap();
-    assert!(PeerRecord::from_bytes(&ok.encode(), NOW, None).is_ok());
+    let mut params = f.params();
+    params.mode = Mode::Private;
+    params.endpoints = vec![Endpoint {
+        url: "ws://x.example/".into(),
+        ips: vec![],
+    }];
+    params.gateways = vec![Identifier::from_bytes([1u8; 32])];
+    assert!(PeerRecord::build(params, &f.seed).is_err());
+    // And a private record with gateways builds and validates.
+    let mut params = f.params();
+    params.mode = Mode::Private;
+    params.endpoints = vec![];
+    params.gateways = vec![Identifier::from_bytes([1u8; 32])];
+    let ok = PeerRecord::build(params, &f.seed).unwrap();
+    let kel = f.validated_kel();
+    assert!(PeerRecord::from_bytes(&ok.encode(), NOW, &kel).is_ok());
 }
 
 #[test]
 fn wan_record_rejects_private_endpoint_ip() {
     let f = fixture();
     // build() now rejects this too (boot-time record self-test relies on it).
-    let built = PeerRecord::build(
-        lattice_proto::record::RecordParams {
-            kel: f.kel.clone(),
-            seq: 1,
-            exp: NOW + 86_400,
-            channel_key: f.channel,
-            channel_seed: f.channel_seed.clone(),
-            envelope_key: f.envelope,
-            mode: Mode::Public,
-            scope: Scope::Wan,
-            endpoints: vec![Endpoint {
-                url: "ws://mesh.example.com/".into(),
-                ips: vec!["192.168.1.10".parse().unwrap()],
-            }],
-            links: vec![],
-            gateways: vec![],
-            capabilities: 0,
-        },
-        &f.seed,
-    );
-    assert!(built.is_err());
+    let mut params = f.params();
+    params.endpoints = vec![Endpoint {
+        url: "ws://mesh.example.com/".into(),
+        ips: vec!["192.168.1.10".parse().unwrap()],
+    }];
+    assert!(PeerRecord::build(params, &f.seed).is_err());
 }
 
 #[test]
 fn hive_record_allows_private_endpoint_ip() {
     let f = fixture();
-    let rec = PeerRecord::build(
-        lattice_proto::record::RecordParams {
-            kel: f.kel.clone(),
-            seq: 1,
-            exp: NOW + 86_400,
-            channel_key: f.channel,
-            channel_seed: f.channel_seed.clone(),
-            envelope_key: f.envelope,
-            mode: Mode::Public,
-            scope: Scope::Hive,
-            endpoints: vec![Endpoint {
-                url: "ws://hive.local/".into(),
-                ips: vec!["192.168.1.10".parse().unwrap()],
-            }],
-            links: vec![],
-            gateways: vec![],
-            capabilities: 0,
-        },
-        &f.seed,
-    )
-    .unwrap();
-    assert!(PeerRecord::from_bytes(&rec.encode(), NOW, None).is_ok());
+    let mut params = f.params();
+    params.scope = Scope::Hive;
+    params.endpoints = vec![Endpoint {
+        url: "ws://hive.local/".into(),
+        ips: vec!["192.168.1.10".parse().unwrap()],
+    }];
+    let rec = PeerRecord::build(params, &f.seed).unwrap();
+    let kel = f.validated_kel();
+    assert!(PeerRecord::from_bytes(&rec.encode(), NOW, &kel).is_ok());
 }
 
 #[test]
@@ -205,36 +180,20 @@ fn signature_tampering_rejected() {
     let mut bytes = rec.encode();
     let n = bytes.len();
     bytes[n - 10] ^= 1; // inside the signature
-    assert!(PeerRecord::from_bytes(&bytes, NOW, None).is_err());
+    let kel = f.validated_kel();
+    assert!(PeerRecord::from_bytes(&bytes, NOW, &kel).is_err());
 }
 
 #[test]
 fn equivocation_detection() {
     let f = fixture();
     let a = public_record(&f);
-    let mut b = a.clone();
-    b.capabilities = 42;
-    // Re-sign b with the same key so both are validly signed.
-    let signed = PeerRecord::build(
-        lattice_proto::record::RecordParams {
-            kel: b.kel.clone(),
-            seq: b.seq,
-            exp: b.exp,
-            channel_key: b.channel_key,
-            channel_seed: f.channel_seed.clone(),
-            envelope_key: b.envelope_key,
-            mode: b.mode,
-            scope: b.scope,
-            endpoints: b.endpoints.clone(),
-            links: b.links.clone(),
-            gateways: b.gateways.clone(),
-            capabilities: 42,
-        },
-        &f.seed,
-    )
-    .unwrap();
-    let a_v = PeerRecord::from_bytes(&a.encode(), NOW, None).unwrap();
-    let signed_v = PeerRecord::from_bytes(&signed.encode(), NOW, None).unwrap();
+    let mut params = f.params();
+    params.capabilities = 42;
+    let signed = PeerRecord::build(params, &f.seed).unwrap();
+    let kel = f.validated_kel();
+    let a_v = PeerRecord::from_bytes(&a.encode(), NOW, &kel).unwrap();
+    let signed_v = PeerRecord::from_bytes(&signed.encode(), NOW, &kel).unwrap();
     assert!(is_equivocation(
         &a_v,
         &a.encode(),
@@ -244,55 +203,64 @@ fn equivocation_detection() {
 }
 
 #[test]
-fn lww_ordering() {
+fn record_order_total_order() {
     use std::cmp::Ordering;
-    let a = vec![1u8; 10];
-    let b = vec![2u8; 10];
-    assert_eq!(compare_lww(&a, 5, &b, 6), Ordering::Less);
-    assert_eq!(compare_lww(&a, 6, &b, 5), Ordering::Greater);
-    // equal seq: the record with the lower BLAKE3 hash wins
-    let x = [0x00u8; 4];
-    let y = [0xffu8; 4];
-    let want = record_hash(&y).cmp(&record_hash(&x));
-    assert_eq!(compare_lww(&x, 7, &y, 7), want);
-    assert_eq!(compare_lww(&y, 7, &x, 7), want.reverse());
+    let f = fixture();
+    let base = public_record(&f);
+    let mut higher_khs = base.clone();
+    higher_khs.khs = base.khs + 1;
+    let mut higher_seq = base.clone();
+    higher_seq.seq = base.seq + 1;
+    // khs dominates seq.
+    assert_eq!(record_order(&higher_khs, &higher_seq), Ordering::Greater);
+    assert_eq!(record_order(&higher_seq, &higher_khs), Ordering::Less);
+    // equal khs: seq decides.
+    assert_eq!(record_order(&higher_seq, &base), Ordering::Greater);
+    assert_eq!(record_order(&base, &higher_seq), Ordering::Less);
+    // equal (khs, seq): the lower hash wins.
+    let a = base.clone();
+    let mut b = base.clone();
+    b.capabilities = 42;
+    let ord_ab = record_order(&a, &b);
+    let ord_ba = record_order(&b, &a);
+    assert_eq!(ord_ab, ord_ba.reverse());
+    assert_ne!(ord_ab, Ordering::Equal);
+    // The winner has the lower hash.
+    let winner = if ord_ab == Ordering::Greater { &a } else { &b };
+    let loser = if ord_ab == Ordering::Greater { &b } else { &a };
+    assert!(record_hash(&winner.encode()) < record_hash(&loser.encode()));
 }
 
 #[test]
-fn known_head_divergence_rejected() {
+fn record_citing_wrong_kel_rejected() {
     let f = fixture();
     let rec = public_record(&f);
     let bytes = rec.encode();
-    assert!(
-        PeerRecord::from_bytes(
-            &bytes,
-            NOW,
-            Some(KnownHead {
-                seq: 0,
-                commitment: Commitment::from_bytes([0xAA; 32]),
-                abandoned: false,
-            }),
-        )
-        .is_err()
-    );
-    let real_commitment = lattice_proto::kel::KeyEvent::validate_chain(&f.kel)
-        .unwrap()
-        .commitment;
-    assert!(
-        PeerRecord::from_bytes(
-            &bytes,
-            NOW,
-            Some(KnownHead {
-                seq: 0,
-                commitment: real_commitment,
-                abandoned: false,
-            }),
-        )
-        .is_ok()
-    );
+    // A different, valid KEL for a different identity.
+    let other_seed = generate_seed();
+    let other_next = generate_seed();
+    let other_kel = ValidatedKel::validate(vec![KeyEvent::inception(
+        &other_seed,
+        commitment(lattice_crypto::public_key(&other_next).as_ref()),
+    )])
+    .unwrap();
+    assert!(PeerRecord::from_bytes(&bytes, NOW, &other_kel).is_err());
 }
 
-fn abandoned_fixture() -> (Fixture, SigningSeed) {
+#[test]
+fn record_citing_older_head_rejected() {
+    // A record citing head sn 0 is rejected once the held KEL has advanced.
+    let f = fixture();
+    let rec = public_record(&f);
+    let bytes = rec.encode();
+    let rotated = KeyEvent::rotation(&f.kel[0], &f.next_seed, None);
+    let mut events = f.kel.clone();
+    events.push(rotated);
+    let advanced = ValidatedKel::validate(events).unwrap();
+    assert!(PeerRecord::from_bytes(&bytes, NOW, &advanced).is_err());
+}
+
+fn abandoned_fixture() -> Fixture {
     // The inception commits to `next_seed`; the abandonment rotation must
     // be signed by that key.
     let seed = generate_seed();
@@ -304,92 +272,62 @@ fn abandoned_fixture() -> (Fixture, SigningSeed) {
     );
     let abandonment = KeyEvent::rotation(&inception, &next_seed, None);
     let channel = lattice_crypto::channel_public(&channel_seed);
-    (
-        Fixture {
-            seed,
-            kel: vec![inception, abandonment],
-            envelope: XWingPublicKey::from_bytes([7u8; 1216]),
-            channel,
-            channel_seed,
-        },
+    Fixture {
+        seed,
         next_seed,
-    )
+        kel: vec![inception, abandonment],
+        envelope: XWingPublicKey::from_bytes([7u8; 1216]),
+        channel,
+        channel_seed,
+    }
 }
 
 #[test]
-fn tombstone_record_validates_and_is_marked() {
-    let (f, abandon_seed) = abandoned_fixture();
-    let rec = PeerRecord::build(
-        lattice_proto::record::RecordParams {
-            kel: f.kel.clone(),
-            seq: 2,
-            exp: NOW + 86_400,
-            channel_key: f.channel,
-            channel_seed: f.channel_seed.clone(),
-            envelope_key: f.envelope,
-            mode: Mode::Public,
-            scope: Scope::Wan,
-            endpoints: vec![],
-            links: vec![],
-            gateways: vec![],
-            capabilities: 0,
-        },
-        &abandon_seed,
-    )
-    .unwrap();
-    assert!(rec.is_tombstone());
-    let parsed = PeerRecord::from_bytes(&rec.encode(), NOW, None).unwrap();
-    assert!(parsed.is_tombstone());
+fn record_citing_abandoned_kel_rejected() {
+    // A record whose KEL head is an abandonment is not accepted (spec §3);
+    // the KEL object is the only carrier of an abandonment.
+    let f = abandoned_fixture();
+    let mut params = f.params();
+    params.prev_seq = 1;
+    let rec = PeerRecord::build(params, &f.next_seed).unwrap();
+    let kel = f.validated_kel();
+    assert!(kel.is_abandoned());
+    assert!(PeerRecord::from_bytes(&rec.encode(), NOW, &kel).is_err());
 }
 
 #[test]
-fn record_rejected_once_known_head_is_abandoned() {
-    let (f, abandon_seed) = abandoned_fixture();
-    let tombstone = PeerRecord::build(
-        lattice_proto::record::RecordParams {
-            kel: f.kel.clone(),
-            seq: 2,
-            exp: NOW + 86_400,
-            channel_key: f.channel,
-            channel_seed: f.channel_seed.clone(),
-            envelope_key: f.envelope,
-            mode: Mode::Public,
-            scope: Scope::Wan,
-            endpoints: vec![],
-            links: vec![],
-            gateways: vec![],
-            capabilities: 0,
-        },
-        &abandon_seed,
-    )
-    .unwrap();
-    let head = KeyEvent::validate_chain(&f.kel).unwrap();
-    // Any record for this identifier is rejected once the stored head is
-    // flagged abandoned — even the tombstone itself.
-    let known = KnownHead {
-        seq: head.seq,
-        commitment: head.commitment,
-        abandoned: true,
-    };
-    assert!(PeerRecord::from_bytes(&tombstone.encode(), NOW, Some(known)).is_err());
-    // And an ordinary pre-abandonment record is rejected too.
-    let stale = PeerRecord::build(
-        lattice_proto::record::RecordParams {
-            kel: f.kel[..1].to_vec(),
-            seq: 3,
-            exp: NOW + 86_400,
-            channel_key: f.channel,
-            channel_seed: f.channel_seed.clone(),
-            envelope_key: f.envelope,
-            mode: Mode::Public,
-            scope: Scope::Wan,
-            endpoints: vec![],
-            links: vec![],
-            gateways: vec![],
-            capabilities: 0,
-        },
-        &f.seed,
-    )
-    .unwrap();
-    assert!(PeerRecord::from_bytes(&stale.encode(), NOW, Some(known)).is_err());
+fn serves_roundtrip_and_limits() {
+    let f = fixture();
+    let mut params = f.params();
+    params.serves = vec![
+        Identifier::from_bytes([1; 32]),
+        Identifier::from_bytes([2; 32]),
+    ];
+    let rec = PeerRecord::build(params, &f.seed).unwrap();
+    let kel = f.validated_kel();
+    let parsed = PeerRecord::from_bytes(&rec.encode(), NOW, &kel).unwrap();
+    assert_eq!(parsed.serves.len(), 2);
+
+    // More than 16 distinct ids is rejected at build time.
+    let mut params = f.params();
+    params.serves = (0..17u8).map(|i| Identifier::from_bytes([i; 32])).collect();
+    assert!(PeerRecord::build(params, &f.seed).is_err());
+
+    // Duplicate ids are rejected.
+    let mut params = f.params();
+    params.serves = vec![Identifier::from_bytes([1; 32]); 2];
+    assert!(PeerRecord::build(params, &f.seed).is_err());
+
+    // Private records may not carry serves.
+    let mut params = f.params();
+    params.mode = Mode::Private;
+    params.endpoints = vec![];
+    params.gateways = vec![Identifier::from_bytes([9; 32])];
+    params.serves = vec![Identifier::from_bytes([1; 32])];
+    assert!(PeerRecord::build(params, &f.seed).is_err());
+}
+
+#[test]
+fn record_size_limit_is_3kb() {
+    assert_eq!(lattice_proto::RECORD_MAX, 3072);
 }

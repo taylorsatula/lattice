@@ -7,7 +7,9 @@
 //! so the outer header of a waypoint-routed message is never signed and never
 //! needs to be secret.
 
-use lattice_crypto::{ENVELOPE_CONTEXT, HOP_CONTEXT, open, seal};
+use lattice_crypto::{
+    ENVELOPE_CONTEXT, HOP_CONTEXT, RECEIPT_CONTEXT, open, seal, signing_preimage,
+};
 use lattice_types::{
     Identifier, KemCiphertext, LegId, MessageId, Signature, SigningPublicKey, SigningSeed,
     XWingPublicKey, XWingSecretKey,
@@ -206,10 +208,21 @@ impl Envelope {
         Value::map(self.unsigned_pairs())
     }
 
+    /// The domain-separation context for this envelope's signature:
+    /// `lattice v1 envelope` for kind 0, `lattice v1 receipt` for kinds 1
+    /// and 2 (spec §1).
+    fn signature_context(&self) -> &'static str {
+        match self.kind {
+            KIND_MESSAGE => ENVELOPE_CONTEXT,
+            _ => RECEIPT_CONTEXT,
+        }
+    }
+
     /// Sign this envelope against `routing_header_bytes`.
     pub fn sign(&mut self, signing_seed: &SigningSeed, routing_header_bytes: &[u8]) {
-        let mut preimage = routing_header_bytes.to_vec();
-        preimage.extend_from_slice(&encode(&self.unsigned_value()));
+        let mut body = routing_header_bytes.to_vec();
+        body.extend_from_slice(&encode(&self.unsigned_value()));
+        let preimage = signing_preimage(self.signature_context(), &body);
         self.sig = lattice_crypto::sign(signing_seed, &preimage);
     }
 
@@ -219,8 +232,9 @@ impl Envelope {
         from_key: &SigningPublicKey,
         routing_header_bytes: &[u8],
     ) -> bool {
-        let mut preimage = routing_header_bytes.to_vec();
-        preimage.extend_from_slice(&encode(&self.unsigned_value()));
+        let mut body = routing_header_bytes.to_vec();
+        body.extend_from_slice(&encode(&self.unsigned_value()));
+        let preimage = signing_preimage(self.signature_context(), &body);
         lattice_crypto::verify(from_key, &preimage, &self.sig)
     }
 

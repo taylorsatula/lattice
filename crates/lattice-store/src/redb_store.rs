@@ -102,16 +102,22 @@ macro_rules! ensure_tables {
 // with its wire padding stripped plus the bucket index. There is no
 // migration from v1: pre-release, no deployed base, so a v1 database fails
 // loudly at open (see `migrate`).
-const SCHEMA_VERSION: u64 = 2;
+// v3: the message bucket ladder gained 4096 (2048/4096/8192/32768), so the
+// bucket index stored in custody rows changed meaning. There is no
+// migration from v2: pre-release, no deployed base, so a v2 database fails
+// loudly at open (see `migrate`).
+const SCHEMA_VERSION: u64 = 3;
 
 const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
 const RECORDS: TableDefinition<[u8; 33], Vec<u8>> = TableDefinition::new("records");
 const RECORD_RECV: TableDefinition<[u8; 33], u64> = TableDefinition::new("record_recv");
 const KEL_HEADS: TableDefinition<[u8; 32], [u8; 49]> = TableDefinition::new("kel_heads");
+const KELS: TableDefinition<[u8; 32], Vec<u8>> = TableDefinition::new("kels");
 const OUTBOUND: TableDefinition<[u8; 16], Vec<u8>> = TableDefinition::new("outbound");
 const CUSTODY: TableDefinition<[u8; 16], Vec<u8>> = TableDefinition::new("custody");
 const SHARES: TableDefinition<[u8; 40], u64> = TableDefinition::new("shares");
 const SEEN: TableDefinition<[u8; 32], u64> = TableDefinition::new("seen");
+const SEEN_UNHELD: TableDefinition<[u8; 32], u64> = TableDefinition::new("seen_unheld");
 const DELIVERED: TableDefinition<[u8; 32], u64> = TableDefinition::new("delivered");
 const INBOX: TableDefinition<&[u8], Vec<u8>> = TableDefinition::new("inbox");
 
@@ -202,11 +208,12 @@ fn sanitize_custody(mut entry: CustodyEntry) -> CustodyEntry {
 }
 
 /// Ordered schema migrations. Each step upgrades the database from version
-/// `n` to `n + 1`. There are no steps: v2 is a clean break from v1 (rows
-/// changed encoding wholesale), and there is no deployed base to migrate.
-/// A v1 database fails loudly here rather than being silently misread.
+/// `n` to `n + 1`. There are no steps: v2 was a clean break from v1 (rows
+/// changed encoding wholesale) and v3 changed the custody bucket index
+/// semantics; there is no deployed base to migrate. A v1 or v2 database
+/// fails loudly here rather than being silently misread.
 fn migrate(from: u64) -> Result<(), StoreError> {
-    // Ordered steps would go here: 2 => migrate_2_to_3(txn)?, etc.
+    // Ordered steps would go here: 3 => migrate_3_to_4(txn)?, etc.
     Err(StoreError::NoMigration { from })
 }
 
@@ -270,10 +277,12 @@ impl RedbStore {
             RECORDS,
             RECORD_RECV,
             KEL_HEADS,
+            KELS,
             OUTBOUND,
             CUSTODY,
             SHARES,
             SEEN,
+            SEEN_UNHELD,
             DELIVERED,
             INBOX,
             STATUS,
@@ -305,11 +314,14 @@ impl RedbStore {
         Ok(out)
     }
 
-    fn bucket_counts(&self) -> Result<[u64; 3], StoreError> {
+    fn bucket_counts(&self) -> Result<[u64; 4], StoreError> {
         self.read("bucket_counts", |txn| {
             let table = txn.open_table(META)?;
-            let mut out = [0u64; 3];
-            for (i, key) in ["bucket_0", "bucket_1", "bucket_2"].iter().enumerate() {
+            let mut out = [0u64; 4];
+            for (i, key) in ["bucket_0", "bucket_1", "bucket_2", "bucket_3"]
+                .iter()
+                .enumerate()
+            {
                 out[i] = table.get(*key)?.map_or(0, |v| v.value());
             }
             Ok(out)
@@ -319,7 +331,7 @@ impl RedbStore {
     fn bucket_bump(&self, bucket: u8) -> Result<(), StoreError> {
         self.write("bucket_bump", |txn| {
             let mut table = txn.open_table(META)?;
-            let key = format!("bucket_{}", bucket.min(2));
+            let key = format!("bucket_{}", bucket.min(3));
             let cur = table.get(key.as_str())?.map_or(0, |v| v.value());
             table.insert(key.as_str(), cur + 1)?;
             Ok(())
@@ -520,12 +532,84 @@ impl Store for RedbStore {
         })
     }
 
-    fn kel_head_sweep(&mut self, older_than: u64) -> Result<usize, StoreError> {
-        self.write("kel_head_sweep", |txn| {
+    fn kel_put(
+        &mut self,
+        id: &Identifier,
+        bytes: &[u8],
+        head: &KelHeadSeen,
+    ) -> Result<(), StoreError> {
+        let mut raw = [0u8; 49];
+        raw[..8].copy_from_slice(&head.seq.to_le_bytes());
+        raw[8..40].copy_from_slice(head.commitment.as_ref());
+        raw[40..48].copy_from_slice(&head.seen.to_le_bytes());
+        raw[48] = u8::from(head.abandoned);
+        self.write("kel_put", |txn| {
+            let mut heads = txn.open_table(KEL_HEADS)?;
+            heads.insert(*id.as_bytes(), raw)?;
+            let mut kels = txn.open_table(KELS)?;
+            kels.insert(*id.as_bytes(), bytes.to_vec())?;
+            Ok(())
+        })
+    }
+
+    fn kel_get(&self, id: &Identifier) -> Result<Option<Vec<u8>>, StoreError> {
+        self.read("kel_get", |txn| {
+            let t = txn.open_table(KELS)?;
+            Ok(t.get(id.as_bytes())?.map(|v| v.value()))
+        })
+    }
+
+    fn kel_heads_all(&self) -> Result<Vec<(Identifier, KelHeadSeen)>, StoreError> {
+        self.read("kel_heads_all", |txn| {
+            let t = txn.open_table(KEL_HEADS)?;
+            let mut out = Vec::new();
+            for entry in t.iter()? {
+                let (k, v) = entry?;
+                let raw = v.value();
+                if raw.len() != 49 {
+                    return Err(StoreError::Corrupt("kel_heads value"));
+                }
+                let seq = u64::from_le_bytes(fixed(&raw[..8], "kel_heads value")?);
+                let commitment = Commitment::from_bytes(fixed(&raw[8..40], "kel_heads value")?);
+                let seen = u64::from_le_bytes(fixed(&raw[40..48], "kel_heads value")?);
+                let abandoned = raw[48] != 0;
+                out.push((
+                    Identifier::from_bytes(k.value()),
+                    KelHeadSeen {
+                        seq,
+                        commitment,
+                        seen,
+                        abandoned,
+                    },
+                ));
+            }
+            Ok(out)
+        })
+    }
+
+    fn kel_touch(&mut self, id: &Identifier, seen: u64) -> Result<(), StoreError> {
+        self.write("kel_touch", |txn| {
             let mut t = txn.open_table(KEL_HEADS)?;
+            let raw = match t.get(id.as_bytes())? {
+                Some(v) => v.value(),
+                None => return Ok(()),
+            };
+            if raw.len() != 49 {
+                return Err(StoreError::Corrupt("kel_heads value"));
+            }
+            let mut raw = raw;
+            raw[40..48].copy_from_slice(&seen.to_le_bytes());
+            t.insert(*id.as_bytes(), raw)?;
+            Ok(())
+        })
+    }
+
+    fn kel_sweep(&mut self, older_than: u64) -> Result<usize, StoreError> {
+        self.write("kel_sweep", |txn| {
+            let mut heads = txn.open_table(KEL_HEADS)?;
             let stale: Vec<[u8; 32]> = {
                 let mut out = Vec::new();
-                for entry in t.iter()? {
+                for entry in heads.iter()? {
                     let (k, v) = entry?;
                     let raw = v.value();
                     if raw.len() != 49 {
@@ -539,30 +623,12 @@ impl Store for RedbStore {
                 out
             };
             let n = stale.len();
+            let mut kels = txn.open_table(KELS)?;
             for k in stale {
-                t.remove(k)?;
+                heads.remove(k)?;
+                kels.remove(k)?;
             }
             Ok(n)
-        })
-    }
-
-    fn kel_head_put(
-        &mut self,
-        id: &Identifier,
-        seq: u64,
-        commitment: Commitment,
-        seen: u64,
-        abandoned: bool,
-    ) -> Result<(), StoreError> {
-        let mut raw = [0u8; 49];
-        raw[..8].copy_from_slice(&seq.to_le_bytes());
-        raw[8..40].copy_from_slice(commitment.as_ref());
-        raw[40..48].copy_from_slice(&seen.to_le_bytes());
-        raw[48] = u8::from(abandoned);
-        self.write("kel_head_put", |txn| {
-            let mut t = txn.open_table(KEL_HEADS)?;
-            t.insert(*id.as_bytes(), raw)?;
-            Ok(())
         })
     }
 
@@ -740,6 +806,23 @@ impl Store for RedbStore {
         self.write("seen_add", |txn| seen_add_txn(txn, hash, exp))
     }
 
+    fn seen_unheld_add(&mut self, hash: Hash32, exp: u64) -> Result<(), StoreError> {
+        self.write("seen_unheld_add", |txn| {
+            let mut t = txn.open_table(SEEN_UNHELD)?;
+            t.insert(*hash.as_bytes(), exp)?;
+            Ok(())
+        })
+    }
+
+    fn seen_unheld_contains(&self, hash: &Hash32, now: u64) -> Result<bool, StoreError> {
+        self.read("seen_unheld_contains", |txn| {
+            let t = txn.open_table(SEEN_UNHELD)?;
+            Ok(t.get(hash.as_bytes())?
+                .map(|v| v.value() > now)
+                .unwrap_or(false))
+        })
+    }
+
     fn delivered_contains(&self, hash: &Hash32, now: u64) -> Result<bool, StoreError> {
         self.read("delivered_contains", |txn| {
             let t = txn.open_table(DELIVERED)?;
@@ -757,7 +840,7 @@ impl Store for RedbStore {
 
     fn sweep_expired(&mut self, now: u64) -> Result<(), StoreError> {
         self.write("sweep_expired", |txn| {
-            for table_def in [SEEN, DELIVERED] {
+            for table_def in [SEEN, SEEN_UNHELD, DELIVERED] {
                 let mut t = txn.open_table(table_def)?;
                 let expired: Vec<[u8; 32]> = t
                     .iter()?
@@ -911,7 +994,7 @@ impl Store for RedbStore {
         self.bucket_bump(bucket)
     }
 
-    fn size_bucket_counts(&self) -> Result<[u64; 3], StoreError> {
+    fn size_bucket_counts(&self) -> Result<[u64; 4], StoreError> {
         self.bucket_counts()
     }
 

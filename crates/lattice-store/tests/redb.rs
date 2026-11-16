@@ -84,8 +84,17 @@ fn exercise<S: Store>(s: &mut S) -> String {
     );
     assert_eq!(s.record_get(&id(1), Scope::Hive).unwrap(), None);
 
-    s.kel_head_put(&id(1), 3, Commitment::from_bytes([0xAB; 32]), 500, true)
-        .unwrap();
+    s.kel_put(
+        &id(1),
+        b"kel-object-bytes",
+        &KelHeadSeen {
+            seq: 3,
+            commitment: Commitment::from_bytes([0xAB; 32]),
+            seen: 500,
+            abandoned: true,
+        },
+    )
+    .unwrap();
     assert_eq!(
         s.kel_head(&id(1)).unwrap(),
         Some(KelHeadSeen {
@@ -95,6 +104,11 @@ fn exercise<S: Store>(s: &mut S) -> String {
             abandoned: true,
         })
     );
+    assert_eq!(
+        s.kel_get(&id(1)).unwrap().as_deref(),
+        Some(&b"kel-object-bytes"[..])
+    );
+    assert_eq!(s.kel_heads_all().unwrap().len(), 1);
 
     s.outbound_push(&outbound(1)).unwrap();
     s.outbound_push(&outbound(2)).unwrap();
@@ -182,8 +196,17 @@ fn redb_persists_across_reopen() {
         s.record_put(&id(7), Scope::Wan, b"persistent-record", 777)
             .unwrap();
         s.custody_put(custody(9)).unwrap();
-        s.kel_head_put(&id(7), 11, Commitment::from_bytes([0xCD; 32]), 4242, false)
-            .unwrap();
+        s.kel_put(
+            &id(7),
+            b"kel-object-bytes-7",
+            &KelHeadSeen {
+                seq: 11,
+                commitment: Commitment::from_bytes([0xCD; 32]),
+                seen: 4242,
+                abandoned: false,
+            },
+        )
+        .unwrap();
     }
     let s = RedbStore::open(&path).unwrap();
     assert_eq!(
@@ -199,6 +222,10 @@ fn redb_persists_across_reopen() {
             seen: 4242,
             abandoned: false,
         })
+    );
+    assert_eq!(
+        s.kel_get(&id(7)).unwrap().as_deref(),
+        Some(&b"kel-object-bytes-7"[..])
     );
 }
 
@@ -283,6 +310,30 @@ fn schema_v1_database_fails_loudly() {
     assert!(
         matches!(err, lattice_store::StoreError::NoMigration { from: 1 }),
         "expected NoMigration {{ from: 1 }}, got {err}"
+    );
+}
+
+#[test]
+fn schema_v2_database_fails_loudly() {
+    // v3 changed the custody bucket index semantics (the 4096 bucket was
+    // inserted at index 1); a v2 database must not open silently.
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("v2.redb");
+    {
+        let db = redb::Database::create(&path).unwrap();
+        let txn = db.begin_write().unwrap();
+        {
+            let mut meta = txn
+                .open_table(redb::TableDefinition::<&str, u64>::new("meta"))
+                .unwrap();
+            meta.insert("schema_version", 2).unwrap();
+        }
+        txn.commit().unwrap();
+    }
+    let err = RedbStore::open(&path).map(|_| ()).unwrap_err();
+    assert!(
+        matches!(err, lattice_store::StoreError::NoMigration { from: 2 }),
+        "expected NoMigration {{ from: 2 }}, got {err}"
     );
 }
 

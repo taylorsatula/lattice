@@ -373,8 +373,8 @@ impl Runtime {
                 task: task.abort_handle(),
             },
         );
-        // The link is registered, so the actions returned by LinkUp (the
-        // attestation frame) can be routed to it.
+        // The link is registered, so the actions returned by LinkUp can be
+        // routed to it.
         self.apply(Event::LinkUp {
             at: now_secs(),
             link: id,

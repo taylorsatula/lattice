@@ -200,18 +200,30 @@ pub trait Store {
     fn record_all(&self) -> Result<Vec<StoredRecord>, StoreError>;
     fn record_count(&self) -> Result<usize, StoreError>;
 
-    // KEL heads (kept one year beyond last sighting by the caller)
+    // KEL objects and their heads (kept one year beyond last sighting by
+    // the caller). The object bytes are stored so the node can serve the
+    // KEL to peers (the `kels` frame) and re-validate records after a
+    // restart; the head row is the fast index for monotonicity checks,
+    // reconciliation items and the abandonment flag.
     fn kel_head(&self, id: &Identifier) -> Result<Option<KelHeadSeen>, StoreError>;
-    fn kel_head_put(
+    /// Store a validated KEL object and its head row, atomically.
+    fn kel_put(
         &mut self,
         id: &Identifier,
-        seq: u64,
-        commitment: Commitment,
-        seen: u64,
-        abandoned: bool,
+        bytes: &[u8],
+        head: &KelHeadSeen,
     ) -> Result<(), StoreError>;
-    /// Drop KEL heads last seen before `older_than`. Returns how many were removed.
-    fn kel_head_sweep(&mut self, older_than: u64) -> Result<usize, StoreError>;
+    /// The stored KEL object bytes for `id`, if any.
+    fn kel_get(&self, id: &Identifier) -> Result<Option<Vec<u8>>, StoreError>;
+    /// All stored KEL heads (for reconciliation and sweeps).
+    fn kel_heads_all(&self) -> Result<Vec<(Identifier, KelHeadSeen)>, StoreError>;
+    /// Drop KEL heads (and their objects) last seen before `older_than`.
+    /// Returns how many heads were removed.
+    fn kel_sweep(&mut self, older_than: u64) -> Result<usize, StoreError>;
+    /// Refresh the `seen` timestamp on a stored KEL head without touching
+    /// the object. Called when a record citing the KEL is admitted, so the
+    /// retention clock tracks "last record seen", not "last KEL fetched".
+    fn kel_touch(&mut self, id: &Identifier, seen: u64) -> Result<(), StoreError>;
 
     // outbound queue
     fn outbound_push(&mut self, msg: &OutboundMessage) -> Result<(), StoreError>;
@@ -243,6 +255,11 @@ pub trait Store {
     // dedup
     fn seen_contains(&self, hash: &Hash32, now: u64) -> Result<bool, StoreError>;
     fn seen_add(&mut self, hash: Hash32, exp: u64) -> Result<(), StoreError>;
+    /// Mark a leg as seen but *not* held (refused or dropped). Kept apart
+    /// from `seen_add` so the custody reply can distinguish ALREADY_HAVE
+    /// (held) from SEEN (seen, not held).
+    fn seen_unheld_add(&mut self, hash: Hash32, exp: u64) -> Result<(), StoreError>;
+    fn seen_unheld_contains(&self, hash: &Hash32, now: u64) -> Result<bool, StoreError>;
     fn delivered_contains(&self, hash: &Hash32, now: u64) -> Result<bool, StoreError>;
     fn delivered_add(&mut self, hash: Hash32, exp: u64) -> Result<(), StoreError>;
     fn sweep_expired(&mut self, now: u64) -> Result<(), StoreError>;
@@ -273,7 +290,7 @@ pub trait Store {
 
     // transmission counters used for snow sizing
     fn size_bucket_sample(&mut self, bucket: u8) -> Result<(), StoreError>;
-    fn size_bucket_counts(&self) -> Result<[u64; 3], StoreError>;
+    fn size_bucket_counts(&self) -> Result<[u64; 4], StoreError>;
 
     // drain flag: persisted so a restart does not silently accept new work.
     // Backends store it as 0/1; the enum is the in-memory form.

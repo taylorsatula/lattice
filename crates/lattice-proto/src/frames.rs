@@ -2,7 +2,7 @@
 //! Noise transport message, itself a CBOR array `[frame, padding]`.
 //! lattice-net owns padding and the Noise layer; this module owns shapes.
 
-use lattice_types::{Cookie, Hash32, Identifier, LegId, Mac16, Signature};
+use lattice_types::{Cookie, Hash32, Identifier, LegId, Mac16};
 
 use crate::cbor::{Value, encode};
 use crate::error::ProtoError;
@@ -16,9 +16,14 @@ pub const T_CUSTODY: u64 = 51;
 pub const T_RECONCILE: u64 = 20;
 pub const T_WANT: u64 = 21;
 pub const T_RECORDS: u64 = 22;
+pub const T_KELS: u64 = 24;
 pub const T_PING: u64 = 60;
 pub const T_DUMMY: u64 = 61;
-pub const T_ATTEST: u64 = 62;
+// 62 was `attest` in early drafts; reserved, never sent, never accepted.
+
+/// Scope value for KEL entries in the reconciliation set (spec §6). Never
+/// valid in a record.
+pub const SCOPE_KEL: u8 = 255;
 
 /// Maximum ranges in a single reconcile frame; anything larger is rejected
 /// at decode. Mirrors lattice-core's responder cap.
@@ -31,6 +36,7 @@ pub const CUSTODY_ACCEPTED: u64 = 0;
 pub const CUSTODY_ALREADY_HAVE: u64 = 1;
 pub const CUSTODY_BUSY: u64 = 2;
 pub const CUSTODY_REFUSED: u64 = 3;
+pub const CUSTODY_SEEN: u64 = 4;
 
 fn mac_bytes(v: &Value, key: u64) -> Result<Mac16, ProtoError> {
     Ok(Mac16::from_bytes(fixed_bytes(v, key)?))
@@ -46,6 +52,17 @@ fn padding_pair(padding: &[u8]) -> (Value, Value) {
 
 fn req_padding(v: &Value) -> Result<Vec<u8>, ProtoError> {
     Ok(v.req_bytes(5)?.to_vec())
+}
+
+/// Parse a scope byte: 0 (WAN), 1 (hive) or 255 (KEL reconciliation
+/// entries). Anything else is rejected.
+fn parse_scope(v: &Value) -> Result<u8, ProtoError> {
+    let scope = u8::try_from(v.as_uint().ok_or(ProtoError::WrongType(0, "uint scope"))?)
+        .map_err(|_| ProtoError::Invalid("scope out of range"))?;
+    match scope {
+        0 | 1 | SCOPE_KEL => Ok(scope),
+        _ => Err(ProtoError::Invalid("scope out of range")),
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -89,12 +106,17 @@ pub struct RecordRef {
     pub scope: u8,
 }
 
-/// An entry in a range's explicit list: the record's id, scope and seq.
+/// An entry in a range's explicit list (spec §6): the record's (or KEL's)
+/// id, scope, `khs`, `seq` and the first 8 bytes of its hash. For a KEL
+/// entry, `khs` and `seq` are both the head sn and the hash prefix is the
+/// first 8 bytes of the head event's event hash.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RecordEntry {
     pub id: Identifier,
     pub scope: u8,
+    pub khs: u64,
     pub seq: u64,
+    pub hash_prefix: [u8; 8],
 }
 
 impl RecordEntry {
@@ -157,6 +179,12 @@ pub struct RecordsFrame {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KelsFrame {
+    /// Raw KEL object encodings (spec §2), exactly as received.
+    pub kels: Vec<Vec<u8>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PingFrame {
     pub nonce: u64,
 }
@@ -164,17 +192,6 @@ pub struct PingFrame {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DummyFrame {
     pub echo: bool,
-}
-
-/// Proof that the sender holds the KEL signing key for `id`, bound to this
-/// channel: `sig` signs H("lattice attestation v1" || signer_channel_key ||
-/// verifier_channel_key), where the signer's key is the Ed25519 channel key
-/// in its record and the verifier's key is the X25519 key from the Noise
-/// handshake. Lets a peer attribute a link without trusting record claims.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AttestFrame {
-    pub id: Identifier,
-    pub sig: Signature,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -187,9 +204,9 @@ pub enum Frame {
     Reconcile(ReconcileFrame),
     Want(WantFrame),
     Records(RecordsFrame),
+    Kels(KelsFrame),
     Ping(PingFrame),
     Dummy(DummyFrame),
-    Attest(AttestFrame),
 }
 
 fn bound_value(b: &RangeBound) -> Value {
@@ -203,13 +220,8 @@ fn parse_bound(v: &Value) -> Result<RangeBound, ProtoError> {
     v.deny_unknown_keys(&[0, 1])?;
     let id = Identifier::from_bytes(fixed_bytes(v, 0)?);
     let scope = v.req_uint(1)?;
-    if scope > 1 {
-        return Err(ProtoError::Invalid("scope out of range"));
-    }
-    Ok(RangeBound {
-        id,
-        scope: scope as u8,
-    })
+    let scope = u8::try_from(scope).map_err(|_| ProtoError::Invalid("scope out of range"))?;
+    Ok(RangeBound { id, scope })
 }
 
 impl Range {
@@ -266,7 +278,9 @@ impl Range {
                                 Value::Array(vec![
                                     Value::Bytes(e.id.to_vec()),
                                     Value::UInt(e.scope as u64),
-                                    Value::UInt(e.seq),
+                                    Value::Bytes(e.khs.to_le_bytes().to_vec()),
+                                    Value::Bytes(e.seq.to_le_bytes().to_vec()),
+                                    Value::Bytes(e.hash_prefix.to_vec()),
                                 ])
                             })
                             .collect(),
@@ -320,24 +334,38 @@ impl Range {
                 .iter()
                 .map(|e| {
                     let a = e.as_array().ok_or(ProtoError::WrongType(3, "array"))?;
-                    if a.len() != 3 {
-                        return Err(ProtoError::Invalid("entry must be [id, scope, seq]"));
+                    if a.len() != 5 {
+                        return Err(ProtoError::Invalid(
+                            "entry must be [id, scope, khs, seq, hash-prefix]",
+                        ));
                     }
                     let id = Identifier::from_bytes(
                         a[0].as_bytes()
                             .and_then(|b| <[u8; 32]>::try_from(b).ok())
                             .ok_or(ProtoError::WrongType(3, "32-byte id"))?,
                     );
-                    let scope = u8::try_from(
-                        a[1].as_uint()
-                            .ok_or(ProtoError::WrongType(3, "uint scope"))?,
-                    )
-                    .map_err(|_| ProtoError::Invalid("scope out of range"))?;
-                    if scope > 1 {
-                        return Err(ProtoError::Invalid("scope out of range"));
-                    }
-                    let seq = a[2].as_uint().ok_or(ProtoError::WrongType(3, "uint seq"))?;
-                    Ok(RecordEntry { id, scope, seq })
+                    let scope = parse_scope(&a[1])?;
+                    let khs = a[2]
+                        .as_bytes()
+                        .and_then(|b| <[u8; 8]>::try_from(b).ok())
+                        .map(u64::from_le_bytes)
+                        .ok_or(ProtoError::WrongType(3, "8-byte khs"))?;
+                    let seq = a[3]
+                        .as_bytes()
+                        .and_then(|b| <[u8; 8]>::try_from(b).ok())
+                        .map(u64::from_le_bytes)
+                        .ok_or(ProtoError::WrongType(3, "8-byte seq"))?;
+                    let hash_prefix: [u8; 8] = a[4]
+                        .as_bytes()
+                        .and_then(|b| <[u8; 8]>::try_from(b).ok())
+                        .ok_or(ProtoError::WrongType(3, "8-byte hash-prefix"))?;
+                    Ok(RecordEntry {
+                        id,
+                        scope,
+                        khs,
+                        seq,
+                        hash_prefix,
+                    })
                 })
                 .collect::<Result<Vec<_>, ProtoError>>()?;
             return Ok(Range::Entries {
@@ -440,6 +468,16 @@ fn encode_records(f: &RecordsFrame) -> Value {
     ])
 }
 
+fn encode_kels(f: &KelsFrame) -> Value {
+    Value::map(vec![
+        kind_pair(T_KELS),
+        (
+            Value::UInt(2),
+            Value::Array(f.kels.iter().map(|k| Value::Bytes(k.clone())).collect()),
+        ),
+    ])
+}
+
 fn encode_ping(f: &PingFrame) -> Value {
     Value::map(vec![
         kind_pair(T_PING),
@@ -451,14 +489,6 @@ fn encode_dummy(f: &DummyFrame) -> Value {
     Value::map(vec![
         kind_pair(T_DUMMY),
         (Value::UInt(2), Value::Bool(f.echo)),
-    ])
-}
-
-fn encode_attest(f: &AttestFrame) -> Value {
-    Value::map(vec![
-        kind_pair(T_ATTEST),
-        (Value::UInt(2), Value::Bytes(f.id.to_vec())),
-        (Value::UInt(3), Value::Bytes(f.sig.to_vec())),
     ])
 }
 
@@ -501,7 +531,7 @@ fn decode_offer(v: &Value) -> Result<Frame, ProtoError> {
 fn decode_custody(v: &Value) -> Result<Frame, ProtoError> {
     v.deny_unknown_keys(&[0, 2, 3, 4])?;
     let result = v.req_uint(3)?;
-    if result > CUSTODY_REFUSED {
+    if result > CUSTODY_SEEN {
         return Err(ProtoError::Invalid("unknown custody result"));
     }
     Ok(Frame::Custody(CustodyFrame {
@@ -542,14 +572,7 @@ fn decode_want(v: &Value) -> Result<Frame, ProtoError> {
                     .and_then(|b| <[u8; 32]>::try_from(b).ok())
                     .ok_or(ProtoError::WrongType(2, "32-byte id"))?,
             );
-            let scope = u8::try_from(
-                a[1].as_uint()
-                    .ok_or(ProtoError::WrongType(2, "uint scope"))?,
-            )
-            .map_err(|_| ProtoError::Invalid("scope out of range"))?;
-            if scope > 1 {
-                return Err(ProtoError::Invalid("scope out of range"));
-            }
+            let scope = parse_scope(&a[1])?;
             Ok(RecordRef { id, scope })
         })
         .collect::<Result<Vec<_>, ProtoError>>()?;
@@ -570,6 +593,20 @@ fn decode_records(v: &Value) -> Result<Frame, ProtoError> {
     Ok(Frame::Records(RecordsFrame { records }))
 }
 
+fn decode_kels(v: &Value) -> Result<Frame, ProtoError> {
+    v.deny_unknown_keys(&[0, 2])?;
+    let kels = v
+        .req_array(2)?
+        .iter()
+        .map(|e| {
+            e.as_bytes()
+                .map(<[u8]>::to_vec)
+                .ok_or(ProtoError::WrongType(2, "bytes"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Frame::Kels(KelsFrame { kels }))
+}
+
 fn decode_ping(v: &Value) -> Result<Frame, ProtoError> {
     v.deny_unknown_keys(&[0, 2])?;
     Ok(Frame::Ping(PingFrame {
@@ -584,14 +621,6 @@ fn decode_dummy(v: &Value) -> Result<Frame, ProtoError> {
     }))
 }
 
-fn decode_attest(v: &Value) -> Result<Frame, ProtoError> {
-    v.deny_unknown_keys(&[0, 2, 3])?;
-    Ok(Frame::Attest(AttestFrame {
-        id: Identifier::from_bytes(fixed_bytes(v, 2)?),
-        sig: Signature::from_bytes(fixed_bytes(v, 3)?),
-    }))
-}
-
 impl Frame {
     pub fn kind(&self) -> u64 {
         match self {
@@ -603,9 +632,9 @@ impl Frame {
             Frame::Reconcile(_) => T_RECONCILE,
             Frame::Want(_) => T_WANT,
             Frame::Records(_) => T_RECORDS,
+            Frame::Kels(_) => T_KELS,
             Frame::Ping(_) => T_PING,
             Frame::Dummy(_) => T_DUMMY,
-            Frame::Attest(_) => T_ATTEST,
         }
     }
 
@@ -619,9 +648,9 @@ impl Frame {
             Frame::Reconcile(f) => encode_reconcile(f),
             Frame::Want(f) => encode_want(f),
             Frame::Records(f) => encode_records(f),
+            Frame::Kels(f) => encode_kels(f),
             Frame::Ping(f) => encode_ping(f),
             Frame::Dummy(f) => encode_dummy(f),
-            Frame::Attest(f) => encode_attest(f),
         }
     }
 
@@ -640,9 +669,9 @@ impl Frame {
             T_RECONCILE => decode_reconcile(v),
             T_WANT => decode_want(v),
             T_RECORDS => decode_records(v),
+            T_KELS => decode_kels(v),
             T_PING => decode_ping(v),
             T_DUMMY => decode_dummy(v),
-            T_ATTEST => decode_attest(v),
             _ => Err(ProtoError::Invalid("unknown frame type")),
         }
     }

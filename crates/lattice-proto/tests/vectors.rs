@@ -6,7 +6,7 @@
 
 use lattice_crypto::XWingSecretKey;
 use lattice_proto::frames::Frame;
-use lattice_proto::kel::KeyEvent;
+use lattice_proto::kel::{KeyEvent, ValidatedKel};
 use lattice_proto::message::{Envelope, KIND_MESSAGE, Message};
 use lattice_proto::record::PeerRecord;
 
@@ -48,7 +48,10 @@ fn all_vectors() {
             }
             "peer_record" => {
                 let now = v["now"].as_u64().unwrap();
-                let parsed = PeerRecord::from_bytes(&bytes, now, None)
+                let kel_bytes = bhex(v["kel"].as_str().unwrap());
+                let kel = ValidatedKel::from_object_bytes(&kel_bytes)
+                    .unwrap_or_else(|e| panic!("{name}: kel: {e}"));
+                let parsed = PeerRecord::from_bytes(&bytes, now, &kel)
                     .unwrap_or_else(|e| panic!("{name}: {e}"));
                 let rec = parsed.into_inner();
                 assert_eq!(
@@ -57,7 +60,33 @@ fn all_vectors() {
                     "{name}"
                 );
                 assert_eq!(rec.seq, v["expect"]["seq"].as_u64().unwrap());
+                assert_eq!(rec.khs, v["expect"]["khs"].as_u64().unwrap());
                 assert_eq!(rec.encode(), bytes, "{name}: re-encode mismatch");
+            }
+            "kel_object" => {
+                let kel = ValidatedKel::from_object_bytes(&bytes)
+                    .unwrap_or_else(|e| panic!("{name}: {e}"));
+                assert_eq!(
+                    hex(kel.identifier().as_ref()),
+                    v["expect"]["id"].as_str().unwrap(),
+                    "{name}"
+                );
+                assert_eq!(kel.head().seq, v["expect"]["head_seq"].as_u64().unwrap());
+                assert_eq!(
+                    hex(kel.head().commitment.as_ref()),
+                    v["expect"]["head_commitment"].as_str().unwrap(),
+                    "{name}"
+                );
+                assert_eq!(
+                    kel.is_abandoned(),
+                    v["expect"]["abandoned"].as_bool().unwrap(),
+                    "{name}"
+                );
+                assert_eq!(
+                    kel.to_object_bytes().unwrap(),
+                    bytes,
+                    "{name}: re-encode mismatch"
+                );
             }
             "frame" => {
                 let f = Frame::from_bytes(&bytes).unwrap_or_else(|e| panic!("{name}: {e}"));
@@ -125,8 +154,11 @@ fn single_byte_flips_are_rejected() {
             bad[i] ^= 0x01;
             let parsed = match v["kind"].as_str().unwrap() {
                 "peer_record" => {
-                    PeerRecord::from_bytes(&bad, v["now"].as_u64().unwrap(), None).map(|_| ())
+                    let kel_bytes = bhex(v["kel"].as_str().unwrap());
+                    let kel = ValidatedKel::from_object_bytes(&kel_bytes).unwrap();
+                    PeerRecord::from_bytes(&bad, v["now"].as_u64().unwrap(), &kel).map(|_| ())
                 }
+                "kel_object" => ValidatedKel::from_object_bytes(&bad).map(|_| ()),
                 "key_event" => KeyEvent::from_bytes(&bad).and_then(|ev| {
                     if ev.verify_signature() {
                         Ok(())

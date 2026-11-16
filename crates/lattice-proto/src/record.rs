@@ -8,9 +8,11 @@ use lattice_types::{
     SigningSeed, XWingPublicKey,
 };
 
+use lattice_crypto::RECORD_CONTEXT;
+
 use crate::cbor::{Value, encode};
 use crate::error::ProtoError;
-use crate::kel::{KelRelation, KeyEvent, ValidatedKel, classify};
+use crate::kel::{KelHead, ValidatedKel};
 use crate::obj::{decode_limited, fixed_bytes};
 use crate::{CLOCK_SKEW, MAX_RECORD_HORIZON, RECORD_MAX};
 
@@ -23,6 +25,8 @@ pub const MODE_PRIVATE: u64 = 1;
 const MAX_LINKS: usize = 32;
 const MAX_GATEWAYS: usize = 3;
 const MAX_ENDPOINTS: usize = 16;
+/// Most ids a public record may name in `serves` (spec §3).
+pub const MAX_SERVES: usize = 16;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Scope {
@@ -121,8 +125,12 @@ pub struct PeerRecord {
     pub scope: Scope,
     pub seq: u64,
     pub exp: u64,
-    /// The record's key event log, validated at decode (or build) time.
-    pub kel: ValidatedKel,
+    /// sn of the KEL head this record cites.
+    pub khs: u64,
+    /// Event hash of the KEL head this record cites.
+    pub khc: Commitment,
+    /// Current signing key; must equal the KEL head event's `k`.
+    pub k: SigningPublicKey,
     pub channel_key: ChannelPublicKey,
     pub envelope_key: XWingPublicKey,
     pub mode: Mode,
@@ -130,6 +138,8 @@ pub struct PeerRecord {
     pub links: Vec<Identifier>,
     pub gateways: Vec<Identifier>,
     pub capabilities: u64,
+    /// Private ids this gateway serves; public records only, ≤ 16 distinct.
+    pub serves: Vec<Identifier>,
     pub sig: Signature,
     /// Signature by the channel key over the same preimage as `sig`.
     /// Proves the channel-key holder endorsed this record; a record claiming
@@ -139,12 +149,18 @@ pub struct PeerRecord {
 
 /// Parameters for [`PeerRecord::build`].
 ///
-/// `kel` accepts anything that converts into the chain's events: a
-/// `Vec<KeyEvent>` (validated here before signing) or an already-validated
-/// [`ValidatedKel`].
-pub struct RecordParams<K = Vec<KeyEvent>> {
-    pub kel: K,
-    pub seq: u64,
+/// `seq` is assigned by the builder as `max(prev_seq + 1, now)` (spec §3),
+/// so callers pass the previously published seq and the current time, not a
+/// seq of their choosing.
+pub struct RecordParams {
+    /// The validated KEL this record cites. The record's `khs`/`khc`/`k`
+    /// and its `id` are derived from the KEL head; the KEL itself is not
+    /// embedded in the record.
+    pub kel: ValidatedKel,
+    /// The seq of the caller's previously published record (0 if none).
+    pub prev_seq: u64,
+    /// Current time, used for the `max(prev_seq + 1, now)` seq assignment.
+    pub now: u64,
     pub exp: u64,
     pub channel_key: ChannelPublicKey,
     /// The channel private key, used to sign the record (cross-signature).
@@ -156,9 +172,13 @@ pub struct RecordParams<K = Vec<KeyEvent>> {
     pub links: Vec<Identifier>,
     pub gateways: Vec<Identifier>,
     pub capabilities: u64,
+    /// Private ids this gateway serves (public records only, ≤ 16 distinct).
+    pub serves: Vec<Identifier>,
 }
 
-const RECORD_KEYS: [u64; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+const RECORD_KEYS: [u64; 19] = [
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18,
+];
 
 impl PeerRecord {
     /// The unsigned portion, as a CBOR map.
@@ -170,10 +190,7 @@ impl PeerRecord {
             (Value::UInt(3), Value::UInt(self.scope.as_u64())),
             (Value::UInt(4), Value::UInt(self.seq)),
             (Value::UInt(5), Value::UInt(self.exp)),
-            (
-                Value::UInt(6),
-                Value::Array(self.kel.iter().map(|e| e.to_value()).collect()),
-            ),
+            (Value::UInt(6), Value::UInt(self.khs)),
             (Value::UInt(7), Value::Bytes(self.channel_key.to_vec())),
             (Value::UInt(8), Value::Bytes(self.envelope_key.to_vec())),
             (Value::UInt(9), Value::UInt(self.mode.as_u64())),
@@ -204,6 +221,19 @@ impl PeerRecord {
             ));
         }
         pairs.push((Value::UInt(13), Value::UInt(self.capabilities)));
+        pairs.push((Value::UInt(16), Value::Bytes(self.khc.to_vec())));
+        pairs.push((Value::UInt(17), Value::Bytes(self.k.to_vec())));
+        if !self.serves.is_empty() {
+            pairs.push((
+                Value::UInt(18),
+                Value::Array(
+                    self.serves
+                        .iter()
+                        .map(|s| Value::Bytes(s.to_vec()))
+                        .collect(),
+                ),
+            ));
+        }
         Value::map(pairs)
     }
 
@@ -224,13 +254,14 @@ impl PeerRecord {
     ///
     /// The KEL is validated before anything is signed; a record is never
     /// produced from an unverifiable chain.
-    pub fn build<K: Into<Vec<KeyEvent>>>(
-        params: RecordParams<K>,
+    pub fn build(
+        params: RecordParams,
         signing_seed: &SigningSeed,
     ) -> Result<PeerRecord, ProtoError> {
         let RecordParams {
             kel,
-            seq,
+            prev_seq,
+            now,
             exp,
             channel_key,
             channel_seed,
@@ -241,6 +272,7 @@ impl PeerRecord {
             links,
             gateways,
             capabilities,
+            serves,
         } = params;
         // Refuse to sign structurally invalid records; validation also runs on the wire.
         match mode {
@@ -258,19 +290,33 @@ impl PeerRecord {
                 if gateways.is_empty() || gateways.len() > MAX_GATEWAYS {
                     return Err(ProtoError::Invalid("private record needs 1-3 gateways"));
                 }
+                if !serves.is_empty() {
+                    return Err(ProtoError::Invalid("private record carries serves"));
+                }
             }
         }
+        validate_serves(&serves, mode)?;
         for ep in &endpoints {
             validate_endpoint(ep, scope)?;
         }
-        let kel = ValidatedKel::validate(kel.into())?;
+        // The signing seed must match the KEL head's key, or every peer will
+        // reject the record at validation.
+        if lattice_crypto::public_key(signing_seed) != kel.head().current_key {
+            return Err(ProtoError::Invalid(
+                "signing seed does not match the KEL head key",
+            ));
+        }
+        let seq = prev_seq.saturating_add(1).max(now);
+        let head = kel.head();
         let id = kel.identifier();
         let mut rec = PeerRecord {
             id,
             scope,
             seq,
             exp,
-            kel,
+            khs: head.seq,
+            khc: head.commitment,
+            k: head.current_key,
             channel_key,
             envelope_key,
             mode,
@@ -278,43 +324,32 @@ impl PeerRecord {
             links,
             gateways,
             capabilities,
+            serves,
             sig: Signature::from_bytes([0; 64]),
             channel_sig: Signature::from_bytes([0; 64]),
         };
-        let preimage = encode(&rec.unsigned_value());
+        let preimage =
+            lattice_crypto::signing_preimage(RECORD_CONTEXT, &encode(&rec.unsigned_value()));
         rec.sig = sign(signing_seed, &preimage);
         rec.channel_sig = sign(&channel_seed, &preimage);
         Ok(rec)
     }
 }
 
-/// The KEL head this node already holds for an identity, passed to
-/// validation so a record whose chain is behind or divergent can be
-/// rejected.
-///
-/// `abandoned` is set once the head's event ends the identity (a rotation
-/// with no next-key commitment). No record for the identifier is accepted
-/// afterwards: the KEL cannot extend past an abandonment, so anything
-/// presented later is either stale or forged.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct KnownHead {
-    pub seq: u64,
-    pub commitment: Commitment,
-    pub abandoned: bool,
-}
-
 /// A record decoded from the wire, before any validation.
 ///
 /// Carries no trust: every field is attacker-controlled until
 /// [`ParsedRecord::validate`] succeeds. Exists so callers can learn the
-/// record's claimed id (e.g. to look up a known KEL head) without paying
-/// for full validation, then validate exactly once.
+/// record's claimed id and KEL head (e.g. to look up the KEL to validate
+/// against) without paying for full validation, then validate exactly once.
 pub struct ParsedRecord {
     id: Identifier,
     scope: Scope,
     seq: u64,
     exp: u64,
-    kel: Vec<KeyEvent>,
+    khs: u64,
+    khc: Commitment,
+    k: SigningPublicKey,
     channel_key: ChannelPublicKey,
     envelope_key: XWingPublicKey,
     mode: Mode,
@@ -322,22 +357,39 @@ pub struct ParsedRecord {
     links: Vec<Identifier>,
     gateways: Vec<Identifier>,
     capabilities: u64,
+    serves: Vec<Identifier>,
     sig: Signature,
     channel_sig: Signature,
 }
 
-/// A record that passed full validation: structure, KEL chain, identifier
-/// binding, known-head monotonicity, and both signatures.
+/// A record that passed full validation: structure, expiry, the KEL head it
+/// cites (matched against the caller-supplied KEL), identifier binding, and
+/// both signatures.
+///
+/// Validation is *not* self-contained: the caller must supply the KEL the
+/// record cites (see [`ParsedRecord::validate`]). The caller — the core —
+/// holds KEL state and is responsible for monotonicity: it stores only the
+/// newest KEL it has validated per identifier, so a record citing an older
+/// head fails the `khs`/`khc` check, and a record citing a newer head cannot
+/// be validated until that KEL arrives.
 ///
 /// Derefs to [`PeerRecord`]; call [`ValidatedRecord::into_inner`] to
 /// consume the wrapper.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ValidatedRecord(PeerRecord);
+pub struct ValidatedRecord {
+    record: PeerRecord,
+    head: KelHead,
+}
 
 impl ValidatedRecord {
     /// Consume the wrapper and return the inner record.
     pub fn into_inner(self) -> PeerRecord {
-        self.0
+        self.record
+    }
+
+    /// The KEL head the record cites (and was validated against).
+    pub fn kel_head(&self) -> KelHead {
+        self.head
     }
 }
 
@@ -345,7 +397,7 @@ impl std::ops::Deref for ValidatedRecord {
     type Target = PeerRecord;
 
     fn deref(&self) -> &PeerRecord {
-        &self.0
+        &self.record
     }
 }
 
@@ -354,6 +406,24 @@ impl ParsedRecord {
     /// only meaningful for lookups, never for trust decisions.
     pub fn id(&self) -> Identifier {
         self.id
+    }
+
+    /// The record's seq. Only meaningful for ordering; never for trust
+    /// decisions.
+    pub fn seq(&self) -> u64 {
+        self.seq
+    }
+
+    /// The KEL head sn the record cites. Only meaningful for deciding
+    /// whether to fetch a newer KEL; never for trust decisions.
+    pub fn khs(&self) -> u64 {
+        self.khs
+    }
+
+    /// The KEL head event hash the record cites. Only meaningful for
+    /// deciding whether to fetch a newer KEL; never for trust decisions.
+    pub fn khc(&self) -> Commitment {
+        self.khc
     }
 }
 
@@ -375,17 +445,15 @@ impl PeerRecord {
         let scope = Scope::from_u64(value.req_uint(3)?)?;
         let seq = value.req_uint(4)?;
         let exp = value.req_uint(5)?;
-        let kel: Vec<KeyEvent> = value
-            .req_array(6)?
-            .iter()
-            .map(KeyEvent::from_value)
-            .collect::<Result<_, _>>()?;
+        let khs = value.req_uint(6)?;
         let channel_key = ChannelPublicKey::from_bytes(fixed_bytes(&value, 7)?);
         let envelope_key = XWingPublicKey::from_bytes(fixed_bytes(&value, 8)?);
         let mode = Mode::from_u64(value.req_uint(9)?)?;
         let capabilities = value.req_uint(13)?;
         let sig = Signature::from_bytes(fixed_bytes::<64>(&value, 14)?);
         let channel_sig = Signature::from_bytes(fixed_bytes::<64>(&value, 15)?);
+        let khc = Commitment::from_bytes(fixed_bytes(&value, 16)?);
+        let k = SigningPublicKey::from_bytes(fixed_bytes(&value, 17)?);
 
         let endpoints = match value.get_key(10)? {
             None => Vec::new(),
@@ -424,13 +492,29 @@ impl PeerRecord {
                 })
                 .collect::<Result<_, _>>()?,
         };
+        let serves = match value.get_key(18)? {
+            None => Vec::new(),
+            Some(v) => v
+                .as_array()
+                .ok_or(ProtoError::WrongType(18, "array"))?
+                .iter()
+                .map(|x| {
+                    x.as_bytes()
+                        .and_then(|b| <[u8; 32]>::try_from(b).ok())
+                        .map(Identifier::from_bytes)
+                        .ok_or(ProtoError::WrongType(18, "32-byte id"))
+                })
+                .collect::<Result<_, _>>()?,
+        };
 
         Ok(ParsedRecord {
             id,
             scope,
             seq,
             exp,
-            kel,
+            khs,
+            khc,
+            k,
             channel_key,
             envelope_key,
             mode,
@@ -438,55 +522,60 @@ impl PeerRecord {
             links,
             gateways,
             capabilities,
+            serves,
             sig,
             channel_sig,
         })
     }
 
-    /// Parse and fully validate a record from the wire.
+    /// Parse and fully validate a record from the wire against `kel`.
     ///
     /// `now` is injected so the same code runs in the simulator and the
-    /// daemon. `known_head`, when supplied, is the head this node already
-    /// holds for the record's identifier; a record whose KEL is behind or
-    /// divergent is rejected, as is any record once the known head is
-    /// abandoned. A record whose KEL ends in an abandonment validates as a
-    /// tombstone; see [`PeerRecord::is_tombstone`].
+    /// daemon. `kel` is the KEL the caller holds for the record's
+    /// identifier; the record is accepted only if it cites exactly this
+    /// KEL's head. A record whose KEL head is an abandonment is rejected
+    /// (spec §3: the KEL object is the only carrier of an abandonment).
     pub fn from_bytes(
         bytes: &[u8],
         now: u64,
-        known_head: Option<KnownHead>,
+        kel: &ValidatedKel,
     ) -> Result<ValidatedRecord, ProtoError> {
-        Self::parse(bytes)?.validate(Some(now), known_head)
+        Self::parse(bytes)?.validate(Some(now), kel)
     }
 
     /// Parse and validate a record without checking the expiry horizon.
     /// Retention sweeps need to read records whose `exp` has already passed;
-    /// every other check (structure, KEL chain, signatures) is identical.
+    /// every other check (structure, KEL binding, signatures) is identical.
     pub fn from_bytes_unchecked_time(
         bytes: &[u8],
-        known_head: Option<KnownHead>,
+        kel: &ValidatedKel,
     ) -> Result<ValidatedRecord, ProtoError> {
-        Self::parse(bytes)?.validate(None, known_head)
+        Self::parse(bytes)?.validate(None, kel)
     }
 }
 
 impl ParsedRecord {
-    /// Validate the parsed record: expiry horizon, structure, KEL chain,
-    /// identifier binding, known-head monotonicity, and both signatures.
-    /// A record whose KEL ends in an abandonment is valid (a tombstone);
-    /// it is never usable for routing, delivery, waypoint selection or
-    /// link binding — see [`PeerRecord::is_tombstone`].
+    /// Validate the parsed record against the caller-supplied KEL: expiry
+    /// horizon, structure, the KEL head binding (`khs`/`khc`/`k` must match
+    /// the supplied KEL's head), identifier binding, and both signatures.
+    ///
+    /// The caller is responsible for holding the right KEL: it must be the
+    /// newest KEL the caller has validated for this identifier. A record
+    /// citing any other head is rejected here, which is what makes a stale
+    /// or forked record unacceptable without further checks.
     pub fn validate(
         self,
         now: Option<u64>,
-        known_head: Option<KnownHead>,
+        kel: &ValidatedKel,
     ) -> Result<ValidatedRecord, ProtoError> {
         let Self {
             id,
             scope,
             seq,
             exp,
-            kel,
+            khs,
+            khc,
+            k,
             channel_key,
             envelope_key,
             mode,
@@ -494,6 +583,7 @@ impl ParsedRecord {
             links,
             gateways,
             capabilities,
+            serves,
             sig,
             channel_sig,
         } = self;
@@ -528,35 +618,43 @@ impl ParsedRecord {
                 if gateways.is_empty() || gateways.len() > MAX_GATEWAYS {
                     return Err(ProtoError::Invalid("private record needs 1-3 gateways"));
                 }
+                if !serves.is_empty() {
+                    return Err(ProtoError::Invalid("private record carries serves"));
+                }
             }
         }
+        validate_serves(&serves, mode)?;
         for ep in &endpoints {
             validate_endpoint(ep, scope)?;
         }
 
-        // KEL validation and monotonicity. A KEL ending in an abandonment
-        // is valid: the record is a tombstone (see `PeerRecord::is_tombstone`)
-        // and callers decide how to treat it. What is never valid is a
-        // record for an identifier whose known head is already abandoned.
-        let kel = ValidatedKel::validate(kel)?;
+        // KEL binding. The caller holds the KEL; the record must cite its
+        // exact head, and the head must not be an abandonment.
+        let head = kel.head();
         if kel.identifier() != id {
             return Err(ProtoError::BadKeyLog(
                 "identifier does not match inception event",
             ));
         }
-        if let Some(known) = known_head {
-            if known.abandoned {
-                return Err(ProtoError::BadKeyLog("identity abandoned"));
-            }
-            match classify(known.seq, &known.commitment, kel.events()) {
-                KelRelation::Extends | KelRelation::Same => {}
-                KelRelation::Behind => {
-                    return Err(ProtoError::BadKeyLog("KEL is behind the known head"));
-                }
-                KelRelation::Divergent => {
-                    return Err(ProtoError::BadKeyLog("KEL diverges from the known head"));
-                }
-            }
+        if khs != head.seq {
+            return Err(ProtoError::BadKeyLog(
+                "record cites a different KEL head sn than the held KEL",
+            ));
+        }
+        if khc != head.commitment {
+            return Err(ProtoError::BadKeyLog(
+                "record cites a different KEL head event than the held KEL",
+            ));
+        }
+        if k != head.current_key {
+            return Err(ProtoError::BadKeyLog(
+                "record key does not match the KEL head event's key",
+            ));
+        }
+        if head.is_abandoned() {
+            // The KEL object is the only carrier of an abandonment; a record
+            // citing an abandoned head is not accepted (spec §3).
+            return Err(ProtoError::BadKeyLog("KEL head is an abandonment"));
         }
 
         let record = PeerRecord {
@@ -564,7 +662,9 @@ impl ParsedRecord {
             scope,
             seq,
             exp,
-            kel,
+            khs,
+            khc,
+            k,
             channel_key,
             envelope_key,
             mode,
@@ -572,11 +672,13 @@ impl ParsedRecord {
             links,
             gateways,
             capabilities,
+            serves,
             sig,
             channel_sig,
         };
-        let preimage = encode(&record.unsigned_value());
-        if !verify(&record.kel.current_key(), &preimage, &record.sig) {
+        let preimage =
+            lattice_crypto::signing_preimage(RECORD_CONTEXT, &encode(&record.unsigned_value()));
+        if !verify(&record.k, &preimage, &record.sig) {
             return Err(ProtoError::BadSignature);
         }
         // The channel key must endorse the record too: without this, anyone
@@ -584,26 +686,33 @@ impl ParsedRecord {
         if !verify(&channel_key, &preimage, &record.channel_sig) {
             return Err(ProtoError::BadSignature);
         }
-        Ok(ValidatedRecord(record))
+        Ok(ValidatedRecord { record, head })
     }
 }
 
 impl PeerRecord {
-    /// The current signing key (head of the validated KEL).
+    /// The current signing key (the KEL head event's key).
     pub fn current_signing_key(&self) -> SigningPublicKey {
-        self.kel.current_key()
+        self.k
     }
+}
 
-    /// True if this record's KEL ends in an abandonment. A tombstone is a
-    /// full, validly signed record; it exists so the abandonment can
-    /// propagate. It is never used for routing, delivery, waypoint
-    /// selection or link binding, it replaces the identity's stored
-    /// records, and it is retained for the KEL-head retention period like
-    /// any record.
-    #[must_use]
-    pub fn is_tombstone(&self) -> bool {
-        self.kel.is_abandoned()
+/// Validate the `serves` field: at most [`MAX_SERVES`] distinct ids, and
+/// only on public records.
+fn validate_serves(serves: &[Identifier], mode: Mode) -> Result<(), ProtoError> {
+    if serves.len() > MAX_SERVES {
+        return Err(ProtoError::Invalid("too many serves entries"));
     }
+    if mode == Mode::Private && !serves.is_empty() {
+        return Err(ProtoError::Invalid("private record carries serves"));
+    }
+    let mut seen = std::collections::HashSet::with_capacity(serves.len());
+    for id in serves {
+        if !seen.insert(*id) {
+            return Err(ProtoError::Invalid("duplicate serves entry"));
+        }
+    }
+    Ok(())
 }
 
 pub fn record_hash(bytes: &[u8]) -> Hash32 {
@@ -622,15 +731,42 @@ pub fn is_equivocation(
     a.id == b.id && a.scope == b.scope && a.seq == b.seq && a_bytes != b_bytes
 }
 
-/// Last-writer-wins comparison: higher seq wins; equal seq, lower hash wins.
-/// Returns Ordering of `a` vs `b` (Greater means a wins).
+/// The total order on records for the same (id, scope) (spec §3):
+/// `(khs, seq, record hash)`. A record supersedes another when its `khs` is
+/// higher, or its `khs` is equal and its `seq` is higher, or both are equal
+/// and its hash (BLAKE3 of its exact encoding) is lower. Returns `Greater`
+/// when `a` supersedes `b`.
+///
+/// Hashing is done on the encoded bytes, so this is O(record size); callers
+/// on hot paths should compare `(khs, seq)` first and only fall back to
+/// this when both are equal.
 #[must_use]
-pub fn compare_lww(a_bytes: &[u8], a_seq: u64, b_bytes: &[u8], b_seq: u64) -> std::cmp::Ordering {
-    match a_seq.cmp(&b_seq) {
-        // Equal seq: the record with the lower BLAKE3 hash wins.
-        std::cmp::Ordering::Equal => record_hash(b_bytes).cmp(&record_hash(a_bytes)),
-        other => other,
-    }
+pub fn record_order(a: &PeerRecord, b: &PeerRecord) -> std::cmp::Ordering {
+    record_order_parts(
+        a.khs,
+        a.seq,
+        &record_hash(&a.encode()),
+        b.khs,
+        b.seq,
+        &record_hash(&b.encode()),
+    )
+}
+
+/// The order, over precomputed parts. See [`record_order`].
+#[must_use]
+pub fn record_order_parts(
+    a_khs: u64,
+    a_seq: u64,
+    a_hash: &Hash32,
+    b_khs: u64,
+    b_seq: u64,
+    b_hash: &Hash32,
+) -> std::cmp::Ordering {
+    a_khs
+        .cmp(&b_khs)
+        .then(a_seq.cmp(&b_seq))
+        // Lower hash wins at equal (khs, seq): invert the comparison.
+        .then_with(|| b_hash.cmp(a_hash))
 }
 
 fn validate_endpoint(ep: &Endpoint, scope: Scope) -> Result<(), ProtoError> {

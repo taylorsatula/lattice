@@ -1,14 +1,15 @@
 //! Range-based set reconciliation (V2_SPEC §6; after Meyer 2022 and Negentropy).
 //!
-//! Each side holds (id, scope, seq) triples for every known record.
-//! They exchange count+sum fingerprints over half-open ranges of the id
-//! space, split 16-way per round, until differing leaves hold at most
-//! `LEAF_LIMIT` entries, which are listed explicitly. An unchanged network
-//! converges in one small frame each way.
+//! Each side holds (id, scope, khs, seq, hash-prefix) entries for every
+//! known record and KEL (KELs are scope 255). They exchange count+sum
+//! fingerprints over half-open ranges of the id space, split 16-way per
+//! round, until differing leaves hold at most `LEAF_LIMIT` entries, which
+//! are listed explicitly. An unchanged network converges in one small frame
+//! each way.
 //!
 //! Both sides run `respond` symmetrically per received ranges block. Entries
 //! are echoed at most once per range per session, which is what terminates
-//! the exchange; wants then drive a Records exchange.
+//! the exchange; wants then drive a Records/Kels exchange.
 
 use std::collections::HashSet;
 
@@ -20,16 +21,23 @@ pub const LEAF_LIMIT: usize = 32;
 const SPLIT: u64 = 16;
 const MAX_RANGES_PER_MSG: usize = 64;
 
-/// A reconcile item: a record's (id, scope, seq). Alias for the wire
-/// type so the reconcile code and the frames share one definition.
+/// A reconcile item: a record's or KEL's (id, scope, khs, seq, hash-prefix).
+/// Alias for the wire type so the reconcile code and the frames share one
+/// definition. For a KEL entry, `khs` and `seq` are both the head sn and
+/// `hash_prefix` is the first 8 bytes of the head event's event hash.
 pub type Item = RecordEntry;
 
 impl ItemExt for RecordEntry {
+    /// The item hash (spec §6): BLAKE3(id ‖ scope ‖ khs ‖ seq ‖ hash-prefix),
+    /// with `scope` a single byte, `khs` and `seq` as 8 little-endian bytes
+    /// each, and `hash-prefix` the 8 bytes carried in the entry.
     fn hash(&self) -> crate::u256::U256 {
-        let mut h = Vec::with_capacity(41);
+        let mut h = Vec::with_capacity(57);
         h.extend_from_slice(self.id.as_ref());
         h.push(self.scope);
+        h.extend_from_slice(&self.khs.to_le_bytes());
         h.extend_from_slice(&self.seq.to_le_bytes());
+        h.extend_from_slice(&self.hash_prefix);
         crate::u256::U256::from_bytes(hash(&h).as_bytes())
     }
 }
@@ -290,7 +298,16 @@ pub fn respond(
                 for entry in entries {
                     let key = entry.key();
                     let want = match items.binary_search_by(|i| i.key().cmp(&key)) {
-                        Ok(idx) => items[idx].seq < entry.seq,
+                        // Want the peer's entry when it is newer than ours:
+                        // a higher (khs, seq), or an equal (khs, seq) with a
+                        // lower hash-prefix (the lower hash wins). Equal
+                        // prefixes are treated as identical.
+                        Ok(idx) => {
+                            let mine = &items[idx];
+                            (mine.khs, mine.seq) < (entry.khs, entry.seq)
+                                || ((mine.khs, mine.seq) == (entry.khs, entry.seq)
+                                    && mine.hash_prefix > entry.hash_prefix)
+                        }
                         Err(_) => true,
                     };
                     if want && wants.len() < MAX_RANGES_PER_MSG && !wants.contains(&key) {
@@ -324,7 +341,9 @@ mod tests {
         Item {
             id: Identifier::from_bytes([n; 32]),
             scope: 0,
+            khs: 0,
             seq: n as u64,
+            hash_prefix: [n; 8],
         }
     }
 
@@ -422,7 +441,9 @@ mod tests {
                 Item {
                     id: Identifier::from_bytes(id),
                     scope: 0,
+                    khs: 0,
                     seq: 1,
+                    hash_prefix: [i as u8; 8],
                 }
             })
             .collect();
@@ -430,13 +451,17 @@ mod tests {
         a.push(Item {
             id: Identifier::from_bytes([0xde; 32]),
             scope: 0,
+            khs: 0,
             seq: 1,
+            hash_prefix: [0xde; 8],
         });
         let mut b = base;
         b.push(Item {
             id: Identifier::from_bytes([0xad; 32]),
             scope: 0,
+            khs: 0,
             seq: 1,
+            hash_prefix: [0xad; 8],
         });
         a.sort();
         b.sort();
@@ -460,7 +485,9 @@ mod adversarial_tests {
         Item {
             id: Identifier::from_bytes([n; 32]),
             scope: 0,
+            khs: 0,
             seq: n as u64,
+            hash_prefix: [n; 8],
         }
     }
 
@@ -487,14 +514,7 @@ mod adversarial_tests {
         // Peer sends an Entries range covering 100 of our items; we must
         // echo at most LEAF_LIMIT of them.
         let items: Vec<Item> = (0..100u8).map(item).collect();
-        let entries: Vec<RecordEntry> = items
-            .iter()
-            .map(|i| RecordEntry {
-                id: i.id,
-                scope: i.scope,
-                seq: i.seq,
-            })
-            .collect();
+        let entries: Vec<RecordEntry> = items.to_vec();
         let msgs = vec![Range::Entries {
             lower: None,
             upper: None,
@@ -523,7 +543,9 @@ mod adversarial_tests {
                 RecordEntry {
                     id: Identifier::from_bytes(id),
                     scope: 0,
+                    khs: 0,
                     seq: 1,
+                    hash_prefix: [0; 8],
                 }
             })
             .collect();

@@ -1,8 +1,8 @@
 use lattice_proto::CLOCK_SKEW;
 use lattice_proto::frames::{
-    CUSTODY_ACCEPTED, CUSTODY_BUSY, CookieFrame, CustodyFrame, DummyFrame, Frame, InitFrame,
-    OfferFrame, PingFrame, Range, RangeBound, ReconcileFrame, RecordEntry, RecordRef, RecordsFrame,
-    RespFrame, WantFrame,
+    CUSTODY_ACCEPTED, CUSTODY_BUSY, CUSTODY_SEEN, CookieFrame, CustodyFrame, DummyFrame, Frame,
+    InitFrame, KelsFrame, OfferFrame, PingFrame, Range, RangeBound, ReconcileFrame, RecordEntry,
+    RecordRef, RecordsFrame, RespFrame, SCOPE_KEL, WantFrame,
 };
 use lattice_types::{Cookie, Hash32, Identifier, LegId, Mac16};
 
@@ -79,12 +79,16 @@ fn reconcile_roundtrip_both_range_kinds() {
                     RecordEntry {
                         id: Identifier::from_bytes([8; 32]),
                         scope: 1,
+                        khs: 3,
                         seq: 42,
+                        hash_prefix: [0xAA; 8],
                     },
                     RecordEntry {
                         id: Identifier::from_bytes([9; 32]),
-                        scope: 0,
+                        scope: SCOPE_KEL,
+                        khs: 7,
                         seq: 7,
+                        hash_prefix: [0xBB; 8],
                     },
                 ],
             },
@@ -158,4 +162,62 @@ fn unknown_frame_type_rejected() {
 #[test]
 fn clock_skew_constant_is_six_hours() {
     assert_eq!(CLOCK_SKEW, 6 * 3600);
+}
+
+#[test]
+fn kels_roundtrip() {
+    let f = Frame::Kels(KelsFrame {
+        kels: vec![vec![0xA1; 100], vec![0xB2; 200]],
+    });
+    assert_eq!(Frame::from_bytes(&f.encode()).unwrap(), f);
+}
+
+#[test]
+fn custody_seen_roundtrip() {
+    let f = Frame::Custody(CustodyFrame {
+        leg: LegId::from_bytes([7; 16]),
+        result: CUSTODY_SEEN,
+        retry_after: None,
+    });
+    assert_eq!(Frame::from_bytes(&f.encode()).unwrap(), f);
+}
+
+#[test]
+fn custody_result_5_rejected() {
+    let bytes = Frame::Custody(CustodyFrame {
+        leg: LegId::from_bytes([7; 16]),
+        result: 4,
+        retry_after: None,
+    })
+    .encode();
+    let v = lattice_proto::decode(&bytes).unwrap();
+    let mut m: Vec<(lattice_proto::Value, lattice_proto::Value)> = v.as_map().unwrap().to_vec();
+    for (k, v) in m.iter_mut() {
+        if k.as_uint() == Some(3) {
+            *v = lattice_proto::Value::UInt(5);
+        }
+    }
+    let bad = lattice_proto::encode(&lattice_proto::Value::map(m));
+    assert!(Frame::from_bytes(&bad).is_err());
+}
+
+#[test]
+fn want_accepts_kel_scope() {
+    let f = Frame::Want(WantFrame {
+        wants: vec![RecordRef {
+            id: Identifier::from_bytes([3; 32]),
+            scope: SCOPE_KEL,
+        }],
+    });
+    assert_eq!(Frame::from_bytes(&f.encode()).unwrap(), f);
+    // Unknown scopes are rejected.
+    let bad = Frame::Want(WantFrame {
+        wants: vec![RecordRef {
+            id: Identifier::from_bytes([3; 32]),
+            scope: 7,
+        }],
+    });
+    // scope 7 is rejected at decode time, so decode of a hand-built value fails.
+    let bytes = bad.encode();
+    assert!(Frame::from_bytes(&bytes).is_err());
 }

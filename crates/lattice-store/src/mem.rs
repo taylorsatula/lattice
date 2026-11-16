@@ -6,20 +6,22 @@ use std::collections::HashMap;
 
 use crate::*;
 use lattice_proto::local::DrainState;
-use lattice_types::{Commitment, DeliveryId, Hash32, Identifier, LegId, MessageId};
+use lattice_types::{DeliveryId, Hash32, Identifier, LegId, MessageId};
 
 #[derive(Default)]
 pub struct MemStore {
     records: HashMap<(Identifier, u8), RecordBytes>,
     kel_heads: HashMap<Identifier, KelHeadSeen>,
+    kels: HashMap<Identifier, Vec<u8>>,
     outbound: HashMap<MessageId, OutboundMessage>,
     custody: HashMap<LegId, CustodyEntry>,
     shares: HashMap<(Identifier, u64), u64>,
     seen: HashMap<Hash32, u64>,
+    seen_unheld: HashMap<Hash32, u64>,
     delivered: HashMap<Hash32, u64>,
     inbox: HashMap<String, Vec<InboxEntry>>,
     status: HashMap<MessageId, MessageStatus>,
-    buckets: [u64; 3],
+    buckets: [u64; 4],
     custody_bytes: u64,
     custody_class_bytes: [u64; 16],
     drain: DrainState,
@@ -86,28 +88,40 @@ impl Store for MemStore {
     fn kel_head(&self, id: &Identifier) -> Result<Option<KelHeadSeen>, StoreError> {
         Ok(self.kel_heads.get(id).copied())
     }
-    fn kel_head_put(
+    fn kel_put(
         &mut self,
         id: &Identifier,
-        seq: u64,
-        commitment: Commitment,
-        seen: u64,
-        abandoned: bool,
+        bytes: &[u8],
+        head: &KelHeadSeen,
     ) -> Result<(), StoreError> {
-        self.kel_heads.insert(
-            *id,
-            KelHeadSeen {
-                seq,
-                commitment,
-                seen,
-                abandoned,
-            },
-        );
+        self.kels.insert(*id, bytes.to_vec());
+        self.kel_heads.insert(*id, *head);
         Ok(())
     }
-    fn kel_head_sweep(&mut self, older_than: u64) -> Result<usize, StoreError> {
+    fn kel_get(&self, id: &Identifier) -> Result<Option<Vec<u8>>, StoreError> {
+        Ok(self.kels.get(id).cloned())
+    }
+    fn kel_heads_all(&self) -> Result<Vec<(Identifier, KelHeadSeen)>, StoreError> {
+        Ok(self.kel_heads.iter().map(|(k, v)| (*k, *v)).collect())
+    }
+    fn kel_touch(&mut self, id: &Identifier, seen: u64) -> Result<(), StoreError> {
+        if let Some(h) = self.kel_heads.get_mut(id) {
+            h.seen = seen;
+        }
+        Ok(())
+    }
+    fn kel_sweep(&mut self, older_than: u64) -> Result<usize, StoreError> {
         let before = self.kel_heads.len();
-        self.kel_heads.retain(|_, h| h.seen >= older_than);
+        let stale: Vec<Identifier> = self
+            .kel_heads
+            .iter()
+            .filter(|(_, h)| h.seen < older_than)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in &stale {
+            self.kel_heads.remove(id);
+            self.kels.remove(id);
+        }
         Ok(before - self.kel_heads.len())
     }
 
@@ -221,6 +235,13 @@ impl Store for MemStore {
         self.seen.insert(hash, exp);
         Ok(())
     }
+    fn seen_unheld_add(&mut self, hash: Hash32, exp: u64) -> Result<(), StoreError> {
+        self.seen_unheld.insert(hash, exp);
+        Ok(())
+    }
+    fn seen_unheld_contains(&self, hash: &Hash32, now: u64) -> Result<bool, StoreError> {
+        Ok(self.seen_unheld.get(hash).is_some_and(|exp| *exp > now))
+    }
     fn delivered_contains(&self, hash: &Hash32, now: u64) -> Result<bool, StoreError> {
         Ok(self.delivered.get(hash).is_some_and(|exp| *exp > now))
     }
@@ -230,6 +251,7 @@ impl Store for MemStore {
     }
     fn sweep_expired(&mut self, now: u64) -> Result<(), StoreError> {
         self.seen.retain(|_, exp| *exp > now);
+        self.seen_unheld.retain(|_, exp| *exp > now);
         self.delivered.retain(|_, exp| *exp > now);
         Ok(())
     }
@@ -302,10 +324,10 @@ impl Store for MemStore {
     }
 
     fn size_bucket_sample(&mut self, bucket: u8) -> Result<(), StoreError> {
-        self.buckets[bucket.min(2) as usize] += 1;
+        self.buckets[bucket.min(3) as usize] += 1;
         Ok(())
     }
-    fn size_bucket_counts(&self) -> Result<[u64; 3], StoreError> {
+    fn size_bucket_counts(&self) -> Result<[u64; 4], StoreError> {
         Ok(self.buckets)
     }
 

@@ -209,7 +209,7 @@ fn oversized_message_refused() {
     let from_seed = generate_seed();
     let kp = generate_keypair();
     let mut env = envelope_for(&from_seed, b"sink");
-    env.body = Some(vec![0u8; MESSAGE_BUCKETS[2]]); // way beyond the largest bucket once base64... plain bytes + overhead
+    env.body = Some(vec![0u8; MESSAGE_BUCKETS[3]]); // beyond the largest bucket once sealed
     let result = Message::build(BuildParams {
         envelope: env,
         sender_seed: &from_seed,
@@ -353,7 +353,7 @@ fn waypoint_repack_preserves_bucket() {
     })
     .unwrap();
     let bucket = built.len();
-    assert_eq!(bucket, lattice_proto::MESSAGE_BUCKETS[1]);
+    assert_eq!(bucket, lattice_proto::MESSAGE_BUCKETS[2]);
 
     let msg = Message::parse(&built, NOW).unwrap();
     let inner = msg.open_hop_layer(&wp_kp.secret).unwrap();

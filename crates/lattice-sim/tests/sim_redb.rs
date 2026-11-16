@@ -74,6 +74,9 @@ fn redb_message_delivers_end_to_end_and_sender_sees_receipt() {
     }
     full_mesh(&mut sim, 4);
     wait_for_path(&mut sim, 0, 3);
+    // The recipient must hold the sender's record (and KEL) before the
+    // message arrives, or it cannot verify the envelope.
+    wait_for_path(&mut sim, 3, 0);
     let mid = sim.app_send(0, 3, b"hello mesh");
     sim.run_for(20);
     let got: Vec<_> = sim.deliveries.iter().filter(|d| d.mid == mid).collect();
@@ -200,7 +203,8 @@ fn redb_contested_channel_key_claim_unbinds_link() {
     let forged = PeerRecord::build(
         RecordParams {
             kel: attacker.kel.clone(),
-            seq: 1,
+            prev_seq: 0,
+            now: 1,
             exp: 1_000_000,
             channel_key: b_ck,
             channel_seed: attacker_channel_seed.clone(),
@@ -211,6 +215,7 @@ fn redb_contested_channel_key_claim_unbinds_link() {
             links: vec![],
             gateways: vec![],
             capabilities: 0,
+            serves: vec![],
         },
         &attacker.signing_seed,
     )

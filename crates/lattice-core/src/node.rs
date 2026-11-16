@@ -5,21 +5,24 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use lattice_proto::frames::{
-    CUSTODY_ACCEPTED, CUSTODY_ALREADY_HAVE, CUSTODY_BUSY, CUSTODY_REFUSED, CustodyFrame,
-    DummyFrame, Frame, OfferFrame, PingFrame, ReconcileFrame, RecordsFrame, WantFrame,
+    CUSTODY_ACCEPTED, CUSTODY_ALREADY_HAVE, CUSTODY_BUSY, CUSTODY_REFUSED, CUSTODY_SEEN,
+    CustodyFrame, DummyFrame, Frame, KelsFrame, OfferFrame, PingFrame, ReconcileFrame,
+    RecordsFrame, SCOPE_KEL, WantFrame,
 };
-use lattice_proto::kel::{KelHead, KelRelation, KeyEvent, ValidatedKel, classify};
+use lattice_proto::kel::{KeyEvent, ValidatedKel};
 use lattice_proto::local;
 use lattice_proto::message::{
     BuildParams, Envelope, GatewaySeal, HopLayerPlain, KIND_MESSAGE, KIND_NEGATIVE_RECEIPT,
     KIND_RECEIPT, Message, WaypointSeal,
 };
-use lattice_proto::record::{KnownHead, Mode, PeerRecord, Scope, compare_lww};
-use lattice_store::{CustodyAccept, CustodyEntry, Exclusion, InboxEntry, OutboundState, Store};
+use lattice_proto::record::{Mode, PeerRecord, Scope, record_order_parts};
+use lattice_store::{
+    CustodyAccept, CustodyEntry, Exclusion, InboxEntry, KelHeadSeen, OutboundState, Store,
+};
 
 use lattice_types::{
-    ChannelPublicKey, ChannelSeed, Commitment, DeliveryId, Hash32, Identifier, LegId, MessageId,
-    Signature, SigningPublicKey, SigningSeed, X25519PublicKey, XWingPublicKey, XWingSecretKey,
+    ChannelSeed, Commitment, DeliveryId, Hash32, Identifier, LegId, MessageId, Signature,
+    SigningPublicKey, SigningSeed, X25519PublicKey, XWingPublicKey, XWingSecretKey,
 };
 
 use crate::error::NodeError;
@@ -32,12 +35,34 @@ use crate::types::{
     ERR_REFUSED, Event, LinkId,
 };
 
+/// First 8 bytes of the record's hash; the `hash-prefix` used by
+/// reconciliation entries (spec §6).
+fn record_hash_prefix(bytes: &[u8]) -> [u8; 8] {
+    lattice_proto::record::record_hash(bytes).as_bytes()[..8]
+        .try_into()
+        .expect("hash is 32 bytes")
+}
+
+/// Map a payload size to its frame bucket index (2048/4096/8192/32768).
+fn bucket_index(len: usize) -> usize {
+    if len <= 2048 {
+        0
+    } else if len <= 4096 {
+        1
+    } else if len <= 8192 {
+        2
+    } else {
+        3
+    }
+}
+
 /// Which kind of rotation an identity reload represents.
 ///
 /// `Rotate` publishes the updated record. `Abandon` is a rotation with no
-/// next-key commitment: it publishes the tombstone record (a record whose
-/// KEL ends in the abandonment) so peers learn the identity is dead, and
-/// the caller then drains. Peers never route on a tombstone.
+/// next-key commitment: the abandoned KEL is stored and gossiped like any
+/// other KEL (it is the only carrier of the abandonment), no further record
+/// is published, and the caller then drains. Peers drop the identity's
+/// records once they hold the abandoned KEL.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RotationKind {
     Rotate,
@@ -118,8 +143,8 @@ impl Identity {
     }
 
     /// True if the KEL ends in an abandonment (a rotation with no next-key
-    /// commitment). An abandoned identity must not sign or publish, except
-    /// for the tombstone record published by the abandon path.
+    /// commitment). An abandoned identity must not sign or publish; the
+    /// abandoned KEL is the only carrier of the abandonment.
     #[must_use]
     pub fn is_abandoned(&self) -> bool {
         self.kel.is_abandoned()
@@ -206,21 +231,6 @@ fn hash_next(seed: &SigningSeed) -> Commitment {
     )
 }
 
-/// Preimage for a channel attestation: binds the signer's Ed25519 channel
-/// key and the verifier's X25519 channel key. Both sides can compute it:
-/// the signer knows both keys, the verifier knows the signer's (from the
-/// record) and its own (from its seed).
-fn attestation_preimage(
-    signer_ed_ck: &ChannelPublicKey,
-    verifier_x_ck: &X25519PublicKey,
-) -> Hash32 {
-    let mut h = Vec::with_capacity(22 + 64);
-    h.extend_from_slice(b"lattice attestation v1");
-    h.extend_from_slice(signer_ed_ck.as_ref());
-    h.extend_from_slice(verifier_x_ck.as_ref());
-    lattice_crypto::hash(&h)
-}
-
 struct PendingOffer {
     origin: PendingOrigin,
     sent_at: u64,
@@ -258,17 +268,6 @@ struct LinkState {
     /// True when the peer id was pinned by operator config (root `id`); pinned
     /// bindings are never re-derived from records or revoked by contest.
     pinned: bool,
-    /// The peer's attestation (id, signature), received on this link.
-    /// Verified against our records in `reevaluate_link_bindings`.
-    attestation: Option<Attestation>,
-}
-
-/// A peer's channel attestation: proof that the peer holds the KEL signing
-/// key for `id`, bound to this channel.
-#[derive(Clone, Copy)]
-struct Attestation {
-    id: Identifier,
-    sig: Signature,
 }
 
 /// A dummy frame scheduled to be sent after a short random delay.
@@ -276,6 +275,37 @@ struct Attestation {
 struct PendingEcho {
     due: u64,
     link: LinkId,
+}
+
+/// Outcome of validating a stored record against the KEL we hold.
+enum StoredRecord {
+    /// The record is valid (and, if requested, unexpired). Boxed to keep
+    /// the enum small.
+    Valid(Box<lattice_proto::record::ValidatedRecord>),
+    /// The record is unusable: undecodable, unverifiable, or no KEL held.
+    Invalid,
+    /// The store could not be read; validity is unknown. Callers must not
+    /// destroy data on this verdict.
+    Unknown,
+}
+
+impl StoredRecord {
+    /// The validated record, if valid.
+    fn valid(self) -> Option<lattice_proto::record::ValidatedRecord> {
+        match self {
+            StoredRecord::Valid(v) => Some(*v),
+            _ => None,
+        }
+    }
+}
+
+/// Outcome of admitting a KEL object from the wire.
+enum KelAdmission {
+    /// The KEL was stored (or refreshed).
+    Stored,
+    /// The KEL was rejected: invalid, behind the stored head, or a losing
+    /// fork at the same sn.
+    Dropped,
 }
 
 pub struct Node<S: Store> {
@@ -292,7 +322,7 @@ pub struct Node<S: Store> {
     outbound_exclusions: HashMap<MessageId, Vec<Exclusion>>,
     snow_next: u64,
     frames_since_snow_tick: u32,
-    snow_history: [u64; 3],
+    snow_history: [u64; 4],
     inner_pending_echo: Vec<PendingEcho>,
     record_refresh_at: u64,
     next_reconcile_at: u64,
@@ -358,7 +388,7 @@ impl<S: Store> Node<S> {
             store,
             own_id: id,
             scope: Scope::Wan,
-            own_seq: 1,
+            own_seq: 0,
             links: HashMap::new(),
             next_link_order: Vec::new(),
             reconcile_sessions: HashMap::new(),
@@ -366,7 +396,7 @@ impl<S: Store> Node<S> {
             outbound_exclusions: HashMap::new(),
             snow_next: now,
             frames_since_snow_tick: 0,
-            snow_history: [0; 3],
+            snow_history: [0; 4],
             inner_pending_echo: Vec::new(),
             record_refresh_at: now + 3600,
             next_reconcile_at: now + 1,
@@ -391,10 +421,7 @@ impl<S: Store> Node<S> {
         match node.store.record_all() {
             Ok(records) => {
                 for record in records {
-                    if let Ok(parsed) = PeerRecord::from_bytes(&record.bytes, now, None) {
-                        if parsed.is_tombstone() {
-                            continue;
-                        }
+                    if let Some(parsed) = node.validate_stored(&record.bytes, now, true).valid() {
                         if let Some(k) = Self::claim_key(&parsed) {
                             node.ck_claims.entry(k).or_default().insert(parsed.id);
                         }
@@ -406,9 +433,14 @@ impl<S: Store> Node<S> {
         if !own_exists {
             node.publish_record(now)?;
         } else if let Some(stored) = node.store.record_get(&id, Scope::Wan)? {
-            node.own_seq = lattice_proto::record::PeerRecord::from_bytes(&stored.bytes, now, None)
-                .map_or(1, |p| p.seq);
+            node.own_seq = lattice_proto::record::PeerRecord::parse(&stored.bytes)
+                .map(|p| p.seq())
+                .unwrap_or(0);
         }
+        // Serve our own KEL to peers: store it so the `kels` frame can
+        // carry it. Unconditional — cheap, and covers stores written by
+        // older builds that never kept the object.
+        node.store_own_kel(now)?;
         // Crash recovery: anything InFlight at boot may or may not have
         // reached the next hop. Requeue it now; the recipient dedups by mid,
         // so at-least-once survives a restart.
@@ -455,25 +487,9 @@ impl<S: Store> Node<S> {
                 }
                 self.frames_since_snow_tick += 1;
                 let bucket = match frame {
-                    Frame::Offer(o) => {
-                        if o.message.len() <= 2048 {
-                            0
-                        } else if o.message.len() <= 8192 {
-                            1
-                        } else {
-                            2
-                        }
-                    }
-                    Frame::Records(r) => {
-                        let n: usize = r.records.iter().map(|r| r.len()).sum();
-                        if n <= 2048 {
-                            0
-                        } else if n <= 8192 {
-                            1
-                        } else {
-                            2
-                        }
-                    }
+                    Frame::Offer(o) => bucket_index(o.message.len()),
+                    Frame::Records(r) => bucket_index(r.records.iter().map(|r| r.len()).sum()),
+                    Frame::Kels(k) => bucket_index(k.kels.iter().map(|k| k.len()).sum()),
                     Frame::Init(_)
                     | Frame::Cookie(_)
                     | Frame::Resp(_)
@@ -481,14 +497,13 @@ impl<S: Store> Node<S> {
                     | Frame::Reconcile(_)
                     | Frame::Want(_)
                     | Frame::Ping(_)
-                    | Frame::Dummy(_)
-                    | Frame::Attest(_) => 0,
+                    | Frame::Dummy(_) => 0,
                 };
                 // Snow telemetry is best-effort: a failed counter write must
                 // not stall frame handling, and a persistent store failure is
                 // surfaced by every other store path, so this drop is
                 // deliberate.
-                let _ = self.store.size_bucket_sample(bucket);
+                let _ = self.store.size_bucket_sample(bucket as u8);
             }
         }
     }
@@ -523,7 +538,7 @@ impl<S: Store> Node<S> {
 
     // ---------- records ----------
 
-    fn build_own_record(&self, seq: u64, now: u64) -> Result<Vec<u8>, NodeError> {
+    fn build_own_record(&self, prev_seq: u64, now: u64) -> Result<Vec<u8>, NodeError> {
         let exp = now + 7 * 24 * 3600;
         let private = self.config.mode == Mode::Private;
         let links: Vec<Identifier> = if private {
@@ -551,7 +566,8 @@ impl<S: Store> Node<S> {
         let rec = PeerRecord::build(
             lattice_proto::record::RecordParams {
                 kel: self.identity.kel.clone(),
-                seq,
+                prev_seq,
+                now,
                 exp,
                 channel_key: lattice_crypto::channel_public(&self.identity.channel_seed),
                 channel_seed: self.identity.channel_seed.clone(),
@@ -562,15 +578,35 @@ impl<S: Store> Node<S> {
                 links,
                 gateways,
                 capabilities: 1,
+                serves: Vec::new(),
             },
             &self.identity.signing_seed,
         )?;
         Ok(rec.encode())
     }
 
+    /// Store our own KEL object so peers can fetch it with a `want` for
+    /// scope 255. Called at startup and on every identity reload.
+    fn store_own_kel(&mut self, now: u64) -> Result<(), NodeError> {
+        let bytes = self.identity.kel.to_object_bytes()?;
+        let head = self.identity.kel.head();
+        let seen = KelHeadSeen {
+            seq: head.seq,
+            commitment: head.commitment,
+            seen: now,
+            abandoned: head.is_abandoned(),
+        };
+        self.store.kel_put(&self.own_id, &bytes, &seen)?;
+        Ok(())
+    }
+
     fn publish_record(&mut self, now: u64) -> Result<(), NodeError> {
         let bytes = self.build_own_record(self.own_seq, now)?;
         let id = self.own_id;
+        // Adopt the seq the builder assigned (max(prev + 1, now)).
+        if let Ok(parsed) = PeerRecord::parse(&bytes) {
+            self.own_seq = parsed.seq();
+        }
         self.store.record_put(&id, self.scope, &bytes, now)?;
         self.records_version += 1;
         Ok(())
@@ -590,7 +626,6 @@ impl<S: Store> Node<S> {
                 peer,
                 remote_ck,
                 pinned: peer.is_some(),
-                attestation: None,
             },
         );
         self.next_link_order.push(link);
@@ -600,32 +635,10 @@ impl<S: Store> Node<S> {
         // for routing to work at all; waiting a full interval stalls delivery.
         self.next_reconcile_at = self.next_reconcile_at.min(at + 1);
         // Publish the new link set immediately so peers can route via us.
-        self.own_seq += 1;
         if let Err(e) = self.publish_record(at) {
             self.diag("publish_record", &e);
         }
-        let mut actions = self.reevaluate_link_bindings(at);
-        // Prove possession of our KEL key to the peer, bound to this
-        // channel. The peer folds this into its link binding; without it
-        // the link is attributed only from record claims.
-        actions.push(self.attestation_frame(link, &remote_ck));
-        actions
-    }
-
-    /// Build the attestation frame for a link: proof that we hold the KEL
-    /// signing key for our id, bound to this channel.
-    fn attestation_frame(&self, link: LinkId, remote_ck: &X25519PublicKey) -> Action {
-        let own_ck = lattice_crypto::channel_public(&self.identity.channel_seed);
-        let preimage = attestation_preimage(&own_ck, remote_ck);
-        let sig = lattice_crypto::sign(&self.identity.signing_seed, preimage.as_ref());
-        Action::SendFrame {
-            pad_to: None,
-            link,
-            frame: Frame::Attest(lattice_proto::frames::AttestFrame {
-                id: self.own_id,
-                sig,
-            }),
-        }
+        self.reevaluate_link_bindings(at)
     }
 
     fn on_link_down(&mut self, at: u64, link: LinkId) -> Vec<Action> {
@@ -633,7 +646,6 @@ impl<S: Store> Node<S> {
         self.links.remove(&link);
         self.next_link_order.retain(|l| *l != link);
         self.reconcile_sessions.remove(&link);
-        self.own_seq += 1;
         if let Err(e) = self.publish_record(at) {
             self.diag("publish_record", &e);
         }
@@ -665,18 +677,13 @@ impl<S: Store> Node<S> {
                 Vec::new()
             }
         };
-        let records: Vec<RecordParts> = stored
-            .iter()
-            .filter_map(|record| {
-                PeerRecord::from_bytes(&record.bytes, self.now, None)
-                    .ok()
-                    .filter(|p| !p.is_tombstone())
-                    .map(|p| {
-                        let r = p.into_inner();
-                        (record.id, r.links, r.gateways)
-                    })
-            })
-            .collect();
+        let mut records: Vec<RecordParts> = Vec::with_capacity(stored.len());
+        for record in &stored {
+            if let Some(p) = self.validate_stored(&record.bytes, self.now, true).valid() {
+                let r = p.into_inner();
+                records.push((record.id, r.links, r.gateways));
+            }
+        }
         let mut graph = Graph::build(
             &self.own_id,
             records.iter().map(|(i, l, _)| (i, l.as_slice())),
@@ -715,22 +722,41 @@ impl<S: Store> Node<S> {
         let mut items: Vec<reconcile::Item> = stored
             .iter()
             .filter_map(|record| {
-                // Expired tombstones stay in the record set for the KEL-head
-                // retention period so the abandonment keeps propagating;
-                // everything else must be unexpired to be advertised.
-                let parsed = match PeerRecord::from_bytes(&record.bytes, self.now, None) {
-                    Ok(p) => p,
-                    Err(_) => PeerRecord::from_bytes_unchecked_time(&record.bytes, None)
-                        .ok()
-                        .filter(|p| p.is_tombstone())?,
-                };
+                // Only unexpired, currently-valid records are advertised.
+                let validated = self
+                    .validate_stored(&record.bytes, self.now, true)
+                    .valid()?;
                 Some(reconcile::Item {
                     id: record.id,
                     scope: scope_as_u8(record.scope),
-                    seq: parsed.seq,
+                    khs: validated.khs,
+                    seq: validated.seq,
+                    hash_prefix: record_hash_prefix(&record.bytes),
                 })
             })
             .collect();
+        // KELs reconcile in the same set as records (spec §6): scope 255,
+        // khs == seq == head sn, hash-prefix = first 8 bytes of the head
+        // event's event hash.
+        match self.store.kel_heads_all() {
+            Ok(heads) => {
+                for (id, head) in heads {
+                    items.push(reconcile::Item {
+                        id,
+                        scope: SCOPE_KEL,
+                        khs: head.seq,
+                        seq: head.seq,
+                        hash_prefix: head.commitment.as_bytes()[..8]
+                            .try_into()
+                            .expect("commitment is 32 bytes"),
+                    });
+                }
+            }
+            Err(e) => {
+                self.diag("kel_heads_all", &e);
+                return None;
+            }
+        }
         items.sort();
         items.dedup();
         self.items_cache = Some((key.0, key.1, items.clone()));
@@ -785,31 +811,264 @@ impl<S: Store> Node<S> {
     }
 
     fn on_want(&mut self, link: LinkId, frame: &WantFrame) -> Vec<Action> {
-        let mut records = Vec::new();
+        // Collect the wanted payloads, then emit frames that fit a bucket;
+        // a frame that does not fit cannot be sent at all.
+        const MAX_FRAME_PAYLOAD: usize = 30 * 1024;
+        let mut records: Vec<Vec<u8>> = Vec::new();
+        let mut kels: Vec<Vec<u8>> = Vec::new();
         for want in &frame.wants {
-            let scope = scope_from_u8(want.scope);
-            match self.store.record_get(&want.id, scope) {
-                Ok(Some(stored)) => records.push(stored.bytes),
-                Ok(None) => {}
-                Err(e) => self.diag("record_get", &e),
+            if want.scope == SCOPE_KEL {
+                match self.store.kel_get(&want.id) {
+                    Ok(Some(bytes)) => kels.push(bytes),
+                    Ok(None) => {}
+                    Err(e) => self.diag("kel_get", &e),
+                }
+            } else {
+                let scope = scope_from_u8(want.scope);
+                match self.store.record_get(&want.id, scope) {
+                    Ok(Some(stored)) => records.push(stored.bytes),
+                    Ok(None) => {}
+                    Err(e) => self.diag("record_get", &e),
+                }
             }
         }
-        if records.is_empty() {
-            return Vec::new();
+        let mut actions = Vec::new();
+        let mut chunk: Vec<Vec<u8>> = Vec::new();
+        let mut chunk_len = 0usize;
+        for r in records {
+            if !chunk.is_empty() && chunk_len + r.len() > MAX_FRAME_PAYLOAD {
+                actions.push(Self::records_frame(link, std::mem::take(&mut chunk)));
+                chunk_len = 0;
+            }
+            chunk_len += r.len();
+            chunk.push(r);
         }
-        vec![Action::SendFrame {
+        if !chunk.is_empty() {
+            actions.push(Self::records_frame(link, chunk));
+        }
+        let mut chunk: Vec<Vec<u8>> = Vec::new();
+        let mut chunk_len = 0usize;
+        for k in kels {
+            if !chunk.is_empty() && chunk_len + k.len() > MAX_FRAME_PAYLOAD {
+                actions.push(Self::kels_frame(link, std::mem::take(&mut chunk)));
+                chunk_len = 0;
+            }
+            chunk_len += k.len();
+            chunk.push(k);
+        }
+        if !chunk.is_empty() {
+            actions.push(Self::kels_frame(link, chunk));
+        }
+        actions
+    }
+
+    fn records_frame(link: LinkId, records: Vec<Vec<u8>>) -> Action {
+        Action::SendFrame {
             pad_to: None,
             link,
             frame: Frame::Records(RecordsFrame { records }),
+        }
+    }
+
+    fn kels_frame(link: LinkId, kels: Vec<Vec<u8>>) -> Action {
+        Action::SendFrame {
+            pad_to: None,
+            link,
+            frame: Frame::Kels(KelsFrame { kels }),
+        }
+    }
+
+    /// Ask the peer for the KEL for `id` (scope 255). Sent when a record
+    /// arrives whose KEL we do not hold or whose head is ahead of ours.
+    fn want_kel(&self, link: LinkId, id: Identifier) -> Vec<Action> {
+        vec![Action::SendFrame {
+            pad_to: None,
+            link,
+            frame: Frame::Want(WantFrame {
+                wants: vec![lattice_proto::frames::RecordRef {
+                    id,
+                    scope: SCOPE_KEL,
+                }],
+            }),
         }]
     }
 
-    fn on_records(&mut self, at: u64, records: Vec<Vec<u8>>) -> Vec<Action> {
+    fn on_records(&mut self, at: u64, link: LinkId, records: Vec<Vec<u8>>) -> Vec<Action> {
         let mut actions = Vec::new();
         for bytes in records {
-            actions.extend(self.admit_record(at, &bytes));
+            actions.extend(self.admit_record(at, link, &bytes));
         }
         actions
+    }
+
+    /// Handle a `kels` frame: validate and store each KEL object. A KEL is
+    /// stored only if it extends the stored chain, is identical to it, or
+    /// diverges at the same sn with a lower head event hash (spec §2);
+    /// anything else is dropped. Storing a KEL whose head moved drops the
+    /// stored records that cite the old head.
+    fn on_kels(&mut self, at: u64, _link: LinkId, frame: &KelsFrame) -> Vec<Action> {
+        let mut actions = Vec::new();
+        let mut changed = false;
+        let mut abandoned: Vec<Identifier> = Vec::new();
+        for bytes in &frame.kels {
+            let kel = match ValidatedKel::from_object_bytes(bytes) {
+                Ok(k) => k,
+                Err(e) => {
+                    self.diag("kel_decode", &e);
+                    continue;
+                }
+            };
+            match self.admit_kel(at, &kel, bytes) {
+                KelAdmission::Stored => {
+                    changed = true;
+                    if kel.is_abandoned() {
+                        abandoned.push(kel.identifier());
+                    }
+                }
+                KelAdmission::Dropped => {}
+            }
+        }
+        if changed {
+            self.records_version += 1;
+            // The records that cite these KELs can now be validated; ask
+            // for them on the next round rather than waiting a full interval.
+            self.next_reconcile_at = self.next_reconcile_at.min(at + 1);
+        }
+        for id in abandoned {
+            actions.extend(self.drop_records_for(at, &id));
+        }
+        actions
+    }
+
+    /// Validate a KEL object against what we hold and store it if it wins.
+    fn admit_kel(&mut self, at: u64, kel: &ValidatedKel, bytes: &[u8]) -> KelAdmission {
+        let id = kel.identifier();
+        let head = kel.head();
+        let stored = match self.store.kel_head(&id) {
+            Ok(s) => s,
+            Err(e) => {
+                self.diag("kel_head", &e);
+                return KelAdmission::Dropped;
+            }
+        };
+        let accept = match &stored {
+            None => true,
+            Some(s) => {
+                if head.seq > s.seq {
+                    // Accept only a candidate that extends the stored chain:
+                    // its event at the stored head's position must hash to
+                    // the stored commitment.
+                    kel.events()
+                        .get(s.seq as usize)
+                        .is_some_and(|e| e.commitment() == s.commitment)
+                } else if head.seq == s.seq {
+                    if head.commitment == s.commitment {
+                        true // the same KEL; refresh `seen`
+                    } else {
+                        // Divergent at the same sn: the lower head event
+                        // hash wins (spec §2).
+                        lattice_proto::kel::compare_heads(
+                            head.seq,
+                            &head.commitment,
+                            s.seq,
+                            &s.commitment,
+                        ) == std::cmp::Ordering::Less
+                    }
+                } else {
+                    // A prefix of, or divergent from, a longer known KEL.
+                    false
+                }
+            }
+        };
+        if !accept {
+            return KelAdmission::Dropped;
+        }
+        let head_seen = lattice_store::KelHeadSeen {
+            seq: head.seq,
+            commitment: head.commitment,
+            seen: at,
+            abandoned: head.is_abandoned(),
+        };
+        let head_changed = stored.as_ref().map(|s| s.commitment) != Some(head.commitment);
+        match self.store.kel_put(&id, bytes, &head_seen) {
+            Ok(()) => {
+                if head_changed {
+                    // Records citing the old head are stale now.
+                    self.drop_records_for(at, &id);
+                }
+                KelAdmission::Stored
+            }
+            Err(e) => {
+                self.diag("kel_put", &e);
+                KelAdmission::Dropped
+            }
+        }
+    }
+
+    /// Load and validate the KEL stored for `id`. The stored KEL was
+    /// validated when it was admitted; it is re-validated here so a corrupt
+    /// store fails closed rather than vouching for a bad chain.
+    ///
+    /// `Ok(None)` means the store definitively holds no KEL for `id`;
+    /// `Err(())` means the store could not be read (transient).
+    fn load_kel(&mut self, id: &Identifier) -> Result<Option<ValidatedKel>, ()> {
+        let bytes = match self.store.kel_get(id) {
+            Ok(Some(b)) => b,
+            Ok(None) => return Ok(None),
+            Err(e) => {
+                self.diag("kel_get", &e);
+                return Err(());
+            }
+        };
+        match ValidatedKel::from_object_bytes(&bytes) {
+            Ok(k) => Ok(Some(k)),
+            Err(e) => {
+                self.diag("kel_decode", &e);
+                // A corrupt stored KEL is treated as absent: the record can
+                // never be validated against it.
+                Ok(None)
+            }
+        }
+    }
+
+    /// Validate stored record bytes against the KEL we hold.
+    fn validate_stored(&mut self, bytes: &[u8], now: u64, check_time: bool) -> StoredRecord {
+        let parsed = match PeerRecord::parse(bytes) {
+            Ok(p) => p,
+            Err(_) => return StoredRecord::Invalid,
+        };
+        let kel = match self.load_kel(&parsed.id()) {
+            Ok(Some(k)) => k,
+            // No KEL: the record can never be validated.
+            Ok(None) => return StoredRecord::Invalid,
+            // Store error: unknown, not invalid.
+            Err(()) => return StoredRecord::Unknown,
+        };
+        let result = if check_time {
+            parsed.validate(Some(now), &kel)
+        } else {
+            parsed.validate(None, &kel)
+        };
+        match result {
+            Ok(v) => StoredRecord::Valid(Box::new(v)),
+            Err(_) => StoredRecord::Invalid,
+        }
+    }
+
+    /// Drop every stored record for `id` (both scopes) and any channel-key
+    /// claims it held. Used when the KEL head moves or the identity is
+    /// abandoned: records citing the old head can never validate again.
+    fn drop_records_for(&mut self, at: u64, id: &Identifier) -> Vec<Action> {
+        for scope in [Scope::Wan, Scope::Hive] {
+            match self.store.record_remove(id, scope) {
+                Ok(()) => self.records_version += 1,
+                Err(e) => self.diag("record_remove", &e),
+            }
+        }
+        for claims in self.ck_claims.values_mut() {
+            claims.remove(id);
+        }
+        self.reevaluate_link_bindings(at)
     }
 
     /// Drop claims whose backing record is gone or no longer valid
@@ -822,10 +1081,7 @@ impl<S: Store> Node<S> {
         match self.store.record_all() {
             Ok(records) => {
                 for record in records {
-                    if let Ok(parsed) = PeerRecord::from_bytes(&record.bytes, now, None) {
-                        if parsed.is_tombstone() {
-                            continue;
-                        }
+                    if let Some(parsed) = self.validate_stored(&record.bytes, now, true).valid() {
                         if let Some(k) = Self::claim_key(&parsed) {
                             fresh.entry(k).or_default().insert(parsed.id);
                         }
@@ -857,30 +1113,18 @@ impl<S: Store> Node<S> {
                     if record.id == self.own_id {
                         continue;
                     }
-                    // Skip the time check: expired records must still decode so
-                    // the grace period can elapse; undecodable records are dropped.
-                    let parsed = PeerRecord::from_bytes_unchecked_time(&record.bytes, None).ok();
-                    if parsed.as_ref().is_some_and(|p| p.is_tombstone()) {
-                        // Tombstones live for the KEL-head retention period,
-                        // not the record grace period: they are the only
-                        // carrier of the abandonment to peers that were
-                        // offline. Drop one only once its head is gone or
-                        // stale (the head sweep below uses the same horizon).
-                        let keep = match self.store.kel_head(&record.id) {
-                            Ok(Some(h)) => now.saturating_sub(h.seen) < KEL_HEAD_MAX_AGE_SECS,
-                            Ok(None) | Err(_) => false,
-                        };
-                        if keep {
-                            continue;
-                        }
-                    } else {
-                        let expired = match &parsed {
-                            Some(p) => p.exp.saturating_add(RETENTION_GRACE_SECS) < now,
-                            None => true,
-                        };
-                        if !expired {
-                            continue;
-                        }
+                    // Keep records that still validate and are within the
+                    // grace period past expiry. Records that no longer
+                    // validate (stale KEL, undecodable, KEL swept) are
+                    // dropped: they can never be used again. A record we
+                    // could not check (store error) is kept.
+                    let keep = match self.validate_stored(&record.bytes, now, false) {
+                        StoredRecord::Valid(p) => p.exp.saturating_add(RETENTION_GRACE_SECS) >= now,
+                        StoredRecord::Invalid => false,
+                        StoredRecord::Unknown => true,
+                    };
+                    if keep {
+                        continue;
                     }
                     match self.store.record_remove(&record.id, record.scope) {
                         Ok(()) => self.records_version += 1,
@@ -906,11 +1150,17 @@ impl<S: Store> Node<S> {
             }
             Err(e) => self.diag("outbound_all", &e),
         }
-        if let Err(e) = self
+        match self
             .store
-            .kel_head_sweep(now.saturating_sub(KEL_HEAD_MAX_AGE_SECS))
+            .kel_sweep(now.saturating_sub(KEL_HEAD_MAX_AGE_SECS))
         {
-            self.diag("kel_head_sweep", &e);
+            Ok(n) => {
+                if n > 0 {
+                    // The reconcile set changed (KEL entries are gone).
+                    self.records_version += 1;
+                }
+            }
+            Err(e) => self.diag("kel_sweep", &e),
         }
         self.identity.sweep_retired_envelope_keys(now);
     }
@@ -922,12 +1172,7 @@ impl<S: Store> Node<S> {
     }
 
     /// Fold a record's (channel_key, id) claim into the claim set.
-    /// Tombstones claim nothing: the identity is dead and must not be
-    /// attributed to links.
     fn note_ck_claim(&mut self, rec: &PeerRecord) {
-        if rec.is_tombstone() {
-            return;
-        }
         if let Some(k) = Self::claim_key(rec) {
             self.ck_claims.entry(k).or_default().insert(rec.id);
         }
@@ -938,75 +1183,16 @@ impl<S: Store> Node<S> {
     /// A link is attributed to an id only when exactly one id claims the
     /// link's channel key. Zero claims: unbound. More than one: contested —
     /// unbound, and our own record drops the link. Attribution comes only
-    /// from signed records and can still be poisoned by forged claims, so
-    /// this fails closed: misattribution is never published in our record.
-    /// The cryptographic fix (attestation over the handshake) is tracked
-    /// separately; until then, contested links are dead weight, not
-    /// misrouted traffic.
-    /// Verify a peer's attestation against our records. The record for
-    /// `id` must claim this link's channel key, and the signature must
-    /// verify under that record's KEL key.
-    #[must_use]
-    fn attestation_valid(
-        &mut self,
-        remote_ck: &X25519PublicKey,
-        id: &Identifier,
-        sig: &Signature,
-    ) -> bool {
-        let own_x = lattice_crypto::channel_x25519_public(&self.identity.channel_seed);
-        for scope in [Scope::Wan, Scope::Hive] {
-            let Some(rec) = self.validated_record(id, scope) else {
-                continue;
-            };
-            let Some(x) = lattice_crypto::channel_x25519_public_from_ed25519(&rec.channel_key)
-            else {
-                continue;
-            };
-            if &x != remote_ck {
-                continue;
-            }
-            let preimage = attestation_preimage(&rec.channel_key, &own_x);
-            if lattice_crypto::verify(&rec.current_signing_key(), preimage.as_ref(), sig) {
-                return true;
-            }
-        }
-        false
-    }
-
+    /// from signed records (the record's `csig` proves the channel key
+    /// endorsed the record) together with the post-handshake check that the
+    /// peer's Noise static key equals the channel key in that record; it can
+    /// still be poisoned by forged claims, so this fails closed:
+    /// misattribution is never published in our record.
     fn reevaluate_link_bindings(&mut self, at: u64) -> Vec<Action> {
         let mut actions = Vec::new();
-        // Pass 1: attestation wins over record claims — it is direct proof
-        // of KEL possession, not a third-party claim about a channel key.
-        let pending: Vec<(LinkId, X25519PublicKey, Identifier, Signature)> = self
-            .links
-            .iter()
-            .filter(|(_, link)| !link.pinned)
-            .filter_map(|(link_id, link)| {
-                link.attestation
-                    .as_ref()
-                    .map(|a| (*link_id, link.remote_ck, a.id, a.sig))
-            })
-            .collect();
-        let mut attested: HashMap<LinkId, Identifier> = HashMap::new();
-        for (link_id, remote_ck, id, sig) in pending {
-            if self.attestation_valid(&remote_ck, &id, &sig) {
-                attested.insert(link_id, id);
-            }
-        }
         let mut changed = false;
         for (link_id, link) in self.links.iter_mut() {
             if link.pinned {
-                continue;
-            }
-            if let Some(id) = attested.get(link_id) {
-                if link.peer != Some(*id) {
-                    link.peer = Some(*id);
-                    changed = true;
-                    actions.push(Action::LinkBound {
-                        link: *link_id,
-                        peer: Some(*id),
-                    });
-                }
                 continue;
             }
             let binding = match self.ck_claims.get(&link.remote_ck).map(|s| s.len()) {
@@ -1044,7 +1230,6 @@ impl<S: Store> Node<S> {
             }
         }
         if changed {
-            self.own_seq += 1;
             if let Err(e) = self.publish_record(at) {
                 self.diag("publish_record", &e);
             }
@@ -1056,168 +1241,79 @@ impl<S: Store> Node<S> {
     /// Admit a record into the store. Rejections are silent by design:
     /// the caller (`on_records`) cannot act on them, and store failures
     /// are logged.
-    fn admit_record(&mut self, at: u64, bytes: &[u8]) -> Vec<Action> {
-        // Parse once to learn the claimed id, look up the known head,
-        // then validate exactly once. Validating the bytes twice (the old
-        // behavior) doubled the KEL signature checks on every admission.
+    fn admit_record(&mut self, at: u64, link: LinkId, bytes: &[u8]) -> Vec<Action> {
+        // Parse once to learn the claimed id and KEL head, then validate
+        // exactly once against the KEL we hold.
         let Ok(parsed) = PeerRecord::parse(bytes) else {
             return Vec::new();
         };
-        let known = match self.store.kel_head(&parsed.id()) {
-            Ok(k) => k.map(|h| KnownHead {
-                seq: h.seq,
-                commitment: h.commitment,
-                abandoned: h.abandoned,
-            }),
-            // Fail closed: without the known head we cannot rule out
-            // equivocation, so refuse the record.
-            Err(e) => {
-                self.diag("kel_head", &e);
-                return Vec::new();
-            }
+        let id = parsed.id();
+        let kel = match self.load_kel(&id) {
+            Ok(Some(k)) => k,
+            // We hold no KEL for this identifier: ask the peer for it and
+            // drop the record. Reconciliation re-delivers the record once
+            // the KEL arrives.
+            Ok(None) => return self.want_kel(link, id),
+            // Store error: drop the record; asking for the KEL would not
+            // help while the store is unreadable.
+            Err(()) => return Vec::new(),
         };
-        let Ok(validated) = parsed.validate(Some(at), known) else {
+        let head = kel.head();
+        if parsed.khs() > head.seq || (parsed.khs() == head.seq && parsed.khc() != head.commitment)
+        {
+            // The record cites a KEL head we do not hold (ahead of ours, or
+            // a fork at the same sn). Ask for the KEL; drop the record.
+            return self.want_kel(link, id);
+        }
+        let Ok(validated) = parsed.validate(Some(at), &kel) else {
+            // Stale (cites a head behind ours), malformed, or badly signed.
             return Vec::new();
         };
-        let head = validated.kel.head();
+        // A validated record is evidence the identity is alive; keep its
+        // KEL from aging out of the retention sweep.
+        if let Err(e) = self.store.kel_touch(&id, at) {
+            self.diag("kel_touch", &e);
+        }
         let rec = validated.into_inner();
         let scope = rec.scope;
-        let tombstone = rec.is_tombstone();
         let existing = match self.store.record_get(&rec.id, scope) {
             Ok(e) => e,
-            // Fail closed: without the current row we cannot apply
-            // last-writer-wins, so keep what we have.
+            // Fail closed: without the current row we cannot apply the
+            // record order, so keep what we have.
             Err(e) => {
                 self.diag("record_get", &e);
                 return Vec::new();
             }
         };
-        // KEL order dominates last-writer-wins. A record whose chain
-        // extends the stored record's chain is accepted regardless of
-        // `seq`; one whose chain is behind is rejected regardless of
-        // `seq`. Only equal chains fall through to seq LWW (lower hash
-        // wins at equal seq, the equivocation rule). This compares against
-        // the stored *record*; the stored *head* is handled separately
-        // below and advances even when this record loses the LWW race.
+        // Total order (khs, seq, record hash): a record supersedes the
+        // stored one when it compares greater. Equal (khs, seq) falls back
+        // to the lower hash winning (the equivocation rule).
         let mut admit = true;
         if let Some(existing) = &existing {
-            // The stored bytes may be expired; the KEL relation does not
-            // depend on wall-clock time, so read them without the expiry
-            // check. Undecodable stored bytes are treated as absent below.
-            let old = PeerRecord::from_bytes_unchecked_time(&existing.bytes, None).ok();
-            let relation = old
-                .as_ref()
-                .map(|o| classify(o.kel.head().seq, &o.kel.head().commitment, rec.kel.events()));
-            match relation {
-                // Extends the stored chain: wins regardless of seq.
-                Some(KelRelation::Extends) => {}
-                // Behind the stored chain: rejected regardless of seq.
-                Some(KelRelation::Behind) => admit = false,
-                // Equal chains or divergent chains: the existing
-                // last-writer-wins rule (lower hash wins at equal seq).
-                // Divergent chains are rejected at validation against the
-                // known head, so this arm is a fallback, not a new rule.
-                Some(KelRelation::Same | KelRelation::Divergent) => {
-                    let old_seq = old.as_ref().map_or(0, |o| o.seq);
-                    if compare_lww(bytes, rec.seq, &existing.bytes, old_seq)
-                        != std::cmp::Ordering::Greater
-                    {
-                        admit = false; // keep ours
-                    }
+            // Stored bytes undecodable: admit; the put overwrites them.
+            if let Ok(old) = PeerRecord::parse(&existing.bytes) {
+                let ord = record_order_parts(
+                    rec.khs,
+                    rec.seq,
+                    &lattice_proto::record::record_hash(bytes),
+                    old.khs(),
+                    old.seq(),
+                    &lattice_proto::record::record_hash(&existing.bytes),
+                );
+                if ord == std::cmp::Ordering::Less {
+                    admit = false; // keep ours
                 }
-                // Stored bytes undecodable: admit; the put overwrites them.
-                None => {}
             }
         }
         if admit {
-            if tombstone {
-                // A tombstone replaces the identity's records in both
-                // scopes; it is the only record of the identity left, and
-                // it is never used for routing.
-                for s in [Scope::Wan, Scope::Hive] {
-                    if let Err(e) = self.store.record_remove(&rec.id, s) {
-                        self.diag("record_remove", &e);
-                    }
-                }
-                self.records_version += 1;
-            }
             match self.store.record_put(&rec.id, scope, bytes, at) {
                 Ok(()) => self.records_version += 1,
                 Err(e) => self.diag("record_put", &e),
-            }
-        }
-        // Advance the stored head for every validated record whose KEL
-        // extends it — even one that lost the LWW comparison — and flag it
-        // abandoned once a tombstone is seen. The flag is never cleared.
-        let stored_abandoned = known.as_ref().is_some_and(|k| k.abandoned);
-        let head_relation = known.as_ref().map_or(KelRelation::Extends, |k| {
-            classify(k.seq, &k.commitment, rec.kel.events())
-        });
-        let advance = match head_relation {
-            KelRelation::Extends => true,
-            // Head unchanged, but a tombstone just proved it abandoned.
-            KelRelation::Same => head.is_abandoned() && !stored_abandoned,
-            KelRelation::Behind | KelRelation::Divergent => false,
-        };
-        if advance {
-            let abandoned = head.is_abandoned() || stored_abandoned;
-            match self
-                .store
-                .kel_head_put(&rec.id, head.seq, head.commitment, at, abandoned)
-            {
-                Ok(()) => {
-                    if matches!(head_relation, KelRelation::Extends) {
-                        // The head moved: drop stored records whose KEL is
-                        // now behind it (both scopes). The admitted record
-                        // carries the head itself, so it survives.
-                        self.evict_records_behind(&rec.id, &head);
-                    }
-                }
-                Err(e) => self.diag("kel_head_put", &e),
-            }
-        }
-        if admit {
-            if tombstone {
-                // The identity is dead: drop its channel-key claims so no
-                // link stays attributed to it.
-                for claims in self.ck_claims.values_mut() {
-                    claims.remove(&rec.id);
-                }
             }
             self.note_ck_claim(&rec);
             return self.reevaluate_link_bindings(at);
         }
         Vec::new()
-    }
-
-    /// Drop stored records (both scopes) whose KEL is behind `head`.
-    /// Called when the stored KEL head advances. The record carrying the
-    /// head itself classifies as `Same` and survives; undecodable rows are
-    /// dropped.
-    fn evict_records_behind(&mut self, id: &Identifier, head: &KelHead) {
-        for scope in [Scope::Wan, Scope::Hive] {
-            let stored = match self.store.record_get(id, scope) {
-                Ok(s) => s,
-                Err(e) => {
-                    self.diag("record_get", &e);
-                    continue;
-                }
-            };
-            let Some(stored) = stored else { continue };
-            let behind = match PeerRecord::from_bytes_unchecked_time(&stored.bytes, None) {
-                Ok(p) => matches!(
-                    classify(head.seq, &head.commitment, p.kel.events()),
-                    KelRelation::Behind
-                ),
-                Err(_) => true,
-            };
-            if behind {
-                match self.store.record_remove(id, scope) {
-                    Ok(()) => self.records_version += 1,
-                    Err(e) => self.diag("record_remove", &e),
-                }
-            }
-        }
     }
 }
 
@@ -1356,8 +1452,8 @@ impl<S: Store> Node<S> {
         actions
     }
 
-    /// Presence check for a usable record: a tombstone is held but is not
-    /// a route. Validation happens (and is memoized) downstream.
+    /// Presence check for a usable record. Validation happens (and is
+    /// memoized) downstream.
     #[must_use]
     fn has_record(&mut self, id: &Identifier) -> bool {
         self.lookup_validated(id).is_some()
@@ -1376,10 +1472,10 @@ impl<S: Store> Node<S> {
             }
         }
         let rec = match self.store.record_get(id, scope) {
-            Ok(Some(stored)) => PeerRecord::from_bytes(&stored.bytes, self.now, None)
-                .ok()
-                .map(|p| p.into_inner())
-                .filter(|r| !r.is_tombstone()),
+            Ok(Some(stored)) => self
+                .validate_stored(&stored.bytes, self.now, true)
+                .valid()
+                .map(|v| v.into_inner()),
             Ok(None) => None,
             // Store error: treat as missing (callers fail closed), but say so.
             Err(e) => {
@@ -1539,16 +1635,17 @@ impl<S: Store> Node<S> {
                 return None;
             }
         };
-        let candidates: WaypointCandidates = stored
-            .into_iter()
-            .filter_map(|record| {
-                let parsed = PeerRecord::from_bytes(&record.bytes, self.now, None).ok()?;
-                (parsed.mode == Mode::Public && !parsed.is_tombstone()).then(|| WaypointChoice {
-                    id: record.id,
-                    envelope_key: parsed.into_inner().envelope_key,
-                })
-            })
-            .collect();
+        let mut candidates: WaypointCandidates = Vec::new();
+        for record in &stored {
+            if let Some(parsed) = self.validate_stored(&record.bytes, self.now, true).valid() {
+                if parsed.mode == Mode::Public {
+                    candidates.push(WaypointChoice {
+                        id: record.id,
+                        envelope_key: parsed.envelope_key,
+                    });
+                }
+            }
+        }
         let candidates = Arc::new(candidates);
         self.waypoint_cache = Some((key.0, key.1, Arc::clone(&candidates)));
         Some(candidates)
@@ -1801,15 +1898,22 @@ impl<S: Store> Node<S> {
             }
         };
         if seen {
-            actions.push(Action::SendFrame {
-                pad_to: None,
-                link,
-                frame: Frame::Custody(CustodyFrame {
-                    leg,
-                    result: CUSTODY_ALREADY_HAVE,
-                    retry_after: None,
-                }),
-            });
+            // The message is held (custody, inbox, or our own outbound).
+            actions.push(Self::already_have(link, leg));
+            return actions;
+        }
+        // Seen but not held (refused or dropped earlier): SEEN. On store
+        // error, fail toward SEEN: never reprocess a leg we cannot account
+        // for.
+        let unheld = match self.store.seen_unheld_contains(&leg_hash, now) {
+            Ok(v) => v,
+            Err(e) => {
+                self.diag("seen_unheld_contains", &e);
+                true
+            }
+        };
+        if unheld {
+            actions.push(Self::seen(link, leg));
             return actions;
         }
         let dst = msg.header.dst;
@@ -1916,6 +2020,20 @@ impl<S: Store> Node<S> {
             frame: Frame::Custody(CustodyFrame {
                 leg,
                 result: CUSTODY_ALREADY_HAVE,
+                retry_after: None,
+            }),
+        }
+    }
+
+    /// The custody-seen frame for `leg`: the leg was seen but the message
+    /// is not held (it was refused or dropped). The sender tries elsewhere.
+    fn seen(link: LinkId, leg: LegId) -> Action {
+        Action::SendFrame {
+            pad_to: None,
+            link,
+            frame: Frame::Custody(CustodyFrame {
+                leg,
+                result: CUSTODY_SEEN,
                 retry_after: None,
             }),
         }
@@ -2102,8 +2220,8 @@ impl<S: Store> Node<S> {
             // Well-formed envelope, bad signature: the claimed sender is
             // unauthenticated, so a negative receipt would be a reflection
             // vector. Refuse custody and send nothing.
-            if let Err(e) = self.store.seen_add(*leg_hash, msg.header.exp) {
-                self.diag("seen_add", &e);
+            if let Err(e) = self.store.seen_unheld_add(*leg_hash, msg.header.exp) {
+                self.diag("seen_unheld_add", &e);
             }
             actions.push(Self::refuse(link, leg));
             return actions;
@@ -2137,8 +2255,8 @@ impl<S: Store> Node<S> {
                     self.diag("delivered_add", &e);
                 }
             }
-            if let Err(e) = self.store.seen_add(*leg_hash, msg.header.exp) {
-                self.diag("seen_add", &e);
+            if let Err(e) = self.store.seen_unheld_add(*leg_hash, msg.header.exp) {
+                self.diag("seen_unheld_add", &e);
             }
             actions.push(if already_delivered {
                 Self::already_have(link, leg)
@@ -2343,7 +2461,9 @@ impl<S: Store> Node<S> {
         let pending = self.pending.remove(&leg);
         match frame.result {
             CUSTODY_ACCEPTED => self.custody_accepted_reply(pending, &mut actions),
-            CUSTODY_ALREADY_HAVE | CUSTODY_BUSY => {
+            // SEEN behaves like ALREADY_HAVE for the sender: exclude the
+            // link for this leg and choose again; custody is kept.
+            CUSTODY_ALREADY_HAVE | CUSTODY_SEEN | CUSTODY_BUSY => {
                 self.custody_busy_reply(now, link, frame, pending, &mut actions)
             }
             CUSTODY_REFUSED => self.custody_refused_reply(pending, &mut actions),
@@ -2462,10 +2582,10 @@ impl<S: Store> Node<S> {
                     }
                     self.forward_custody(now, custody_leg, actions);
                 } else {
-                    // The downstream already holds it (or saw this leg): keep
-                    // custody, exclude that link for this leg, and re-forward
-                    // via another candidate. Custody is released only on
-                    // ACCEPTED or REFUSED.
+                    // ALREADY_HAVE or SEEN: the downstream holds the message
+                    // or saw the leg. Keep custody, exclude that link for
+                    // this leg, and re-forward via another candidate.
+                    // Custody is released only on ACCEPTED or REFUSED.
                     match self.store.custody_get(&custody_leg) {
                         Ok(Some(mut e)) => {
                             add_exclusion(&mut e.excluded, link, e.exp);
@@ -2696,7 +2816,6 @@ impl<S: Store> Node<S> {
         if now < self.record_refresh_at {
             return;
         }
-        self.own_seq += 1;
         if let Err(e) = self.publish_record(now) {
             self.diag("publish_record", &e);
         }
@@ -2986,11 +3105,11 @@ impl<S: Store> Node<S> {
     }
 
     fn note_snow_send(&mut self, bucket: usize) {
-        self.snow_history[bucket.min(2)] += 1;
+        self.snow_history[bucket.min(3)] += 1;
         // Snow telemetry is best-effort: a failed counter write must not
         // stall sending, and a persistent store failure is surfaced by every
         // other store path, so this drop is deliberate.
-        let _ = self.store.size_bucket_sample(bucket.min(2) as u8);
+        let _ = self.store.size_bucket_sample(bucket.min(3) as u8);
     }
 
     fn sample_snow_bucket(&mut self) -> usize {
@@ -2999,12 +3118,12 @@ impl<S: Store> Node<S> {
         let counts = self.store.size_bucket_counts().unwrap_or(self.snow_history);
         let min_share = 0.10f64;
         let total: f64 = counts.iter().map(|&c| c as f64).sum();
-        let mut weights = [0.0f64; 3];
-        for b in 0..3 {
+        let mut weights = [0.0f64; 4];
+        for b in 0..4 {
             let base = if total > 0.0 {
                 counts[b] as f64 / total
             } else {
-                1.0 / 3.0
+                1.0 / 4.0
             };
             weights[b] = base.max(min_share);
         }
@@ -3016,7 +3135,7 @@ impl<S: Store> Node<S> {
             }
             r -= w;
         }
-        2
+        3
     }
 
     fn rng_float(&mut self) -> f64 {
@@ -3030,7 +3149,7 @@ impl<S: Store> Node<S> {
             Frame::Custody(custody) => self.on_custody_reply(at, link, &custody),
             Frame::Reconcile(rec) => self.on_reconcile(link, &rec),
             Frame::Want(want) => self.on_want(link, &want),
-            Frame::Records(recs) => self.on_records(at, recs.records),
+            Frame::Records(recs) => self.on_records(at, link, recs.records),
             Frame::Ping(p) => vec![Action::SendFrame {
                 pad_to: None,
                 link,
@@ -3050,34 +3169,9 @@ impl<S: Store> Node<S> {
                 }
                 Vec::new()
             }
-            Frame::Attest(a) => self.on_attest(at, link, &a),
+            Frame::Kels(k) => self.on_kels(at, link, &k),
             Frame::Init(_) | Frame::Cookie(_) | Frame::Resp(_) => Vec::new(),
         }
-    }
-
-    fn on_attest(
-        &mut self,
-        now: u64,
-        link: LinkId,
-        a: &lattice_proto::frames::AttestFrame,
-    ) -> Vec<Action> {
-        // Never let an invalid attestation displace a valid one: a peer
-        // that already proved itself keeps its binding even if the peer
-        // (or a MITM replaying on the link) sends garbage afterwards.
-        let existing = self.links.get(&link).map(|l| (l.remote_ck, l.attestation));
-        let keep_old = match existing {
-            Some((remote_ck, Some(att))) => self.attestation_valid(&remote_ck, &att.id, &att.sig),
-            _ => false,
-        };
-        if !keep_old {
-            if let Some(l) = self.links.get_mut(&link) {
-                l.attestation = Some(Attestation {
-                    id: a.id,
-                    sig: a.sig,
-                });
-            }
-        }
-        self.reevaluate_link_bindings(now)
     }
 
     /// Split into identity and store, for crash/restart simulation.
@@ -3099,10 +3193,10 @@ impl<S: Store> Node<S> {
 
     /// Swap in a new identity (after a rotation) and republish the record.
     /// The identifier is unchanged by rotation, so the record keeps its id.
-    /// `kind` is [`RotationKind::Abandon`] for abandonment: the published
-    /// record is a tombstone — valid, signed, and carried by reconciliation
-    /// like any record — which peers store in place of the identity's
-    /// records and never route on. Callers drain after this returns.
+    /// `kind` is [`RotationKind::Abandon`] for abandonment: no record is
+    /// published; the abandoned KEL is stored and gossiped instead, and
+    /// peers drop the identity's records once they hold it. Callers drain
+    /// after this returns.
     pub fn reload_identity(
         &mut self,
         identity: Identity,
@@ -3118,7 +3212,18 @@ impl<S: Store> Node<S> {
         // case a caller reloads a different identity.
         self.own_id = identity.id();
         self.identity = identity;
-        self.own_seq += 1;
+        // The KEL is the only carrier of a rotation or an abandonment;
+        // store it so peers can fetch it via the `kels` frame.
+        self.store_own_kel(now)?;
+        if kind == RotationKind::Abandon {
+            // No record is published: one citing the abandoned head would be
+            // rejected by every peer. Drop our stored records; the abandoned
+            // KEL does the talking from here.
+            let id = self.own_id;
+            self.drop_records_for(now, &id);
+            self.next_reconcile_at = self.next_reconcile_at.min(now + 1);
+            return Ok(());
+        }
         self.publish_record(now)
     }
 
@@ -3237,7 +3342,7 @@ impl<S: Store> Node<S> {
     }
 
     /// Whether we hold a usable record for `id`, and its mode if so.
-    /// A tombstone is held but not usable, so it reports `Absent`.
+    /// A record that fails validation is not usable, so it reports `Absent`.
     pub fn lookup(&mut self, id: &Identifier) -> LookupResult {
         for scope in [
             lattice_proto::record::Scope::Wan,
@@ -3245,16 +3350,10 @@ impl<S: Store> Node<S> {
         ] {
             match self.store.record_get(id, scope) {
                 Ok(Some(stored)) => {
-                    return match lattice_proto::record::PeerRecord::from_bytes(
-                        &stored.bytes,
-                        self.now,
-                        None,
-                    ) {
-                        // A tombstone is held but not usable: report absent.
-                        Ok(p) if p.is_tombstone() => LookupResult::Absent,
-                        Ok(p) => LookupResult::Present { mode: Some(p.mode) },
-                        // Held but undecodable: still reported as held.
-                        Err(_) => LookupResult::Present { mode: None },
+                    return match self.validate_stored(&stored.bytes, self.now, true) {
+                        StoredRecord::Valid(p) => LookupResult::Present { mode: Some(p.mode) },
+                        // Held but not valid: report absent.
+                        _ => LookupResult::Absent,
                     };
                 }
                 Ok(None) => {}
@@ -3306,7 +3405,7 @@ fn scope_from_u8(v: u8) -> Scope {
 mod tests {
     use super::*;
     use crate::Identity;
-    use lattice_store::{MemStore, OutboundMessage, OutboundState};
+    use lattice_store::{KelHeadSeen, MemStore, OutboundMessage, OutboundState};
 
     fn test_node() -> Node<MemStore> {
         let cfg = Config {
@@ -3588,10 +3687,14 @@ mod tests {
         )];
         let channel_seed = ChannelSeed::from_bytes(lattice_crypto::os_bytes::<32>());
         let exp = 10_000u64;
+        let kel = ValidatedKel::validate(kel).unwrap();
+        let head = kel.head();
+        let kel_bytes = kel.to_object_bytes().unwrap();
         let rec = PeerRecord::build(
             RecordParams {
                 kel,
-                seq: 1,
+                prev_seq: 0,
+                now: 1,
                 exp,
                 channel_key: lattice_crypto::channel_public(&channel_seed),
                 channel_seed,
@@ -3605,11 +3708,26 @@ mod tests {
                 links: vec![],
                 gateways: vec![],
                 capabilities: 0,
+                serves: vec![],
             },
             &seed,
         )
         .unwrap();
         let id = rec.id;
+        // The record can only be validated (and so retained) if the node
+        // holds the KEL; store it as admission would.
+        node.store
+            .kel_put(
+                &id,
+                &kel_bytes,
+                &KelHeadSeen {
+                    seq: head.seq,
+                    commitment: head.commitment,
+                    seen: 0,
+                    abandoned: false,
+                },
+            )
+            .unwrap();
         node.store
             .record_put(&id, Scope::Wan, &rec.encode(), 0)
             .unwrap();
@@ -3644,10 +3762,12 @@ mod tests {
         signing_seed: &SigningSeed,
         channel_seed: &ChannelSeed,
     ) -> lattice_proto::record::PeerRecord {
+        let kel = ValidatedKel::validate(kel).unwrap();
         lattice_proto::record::PeerRecord::build(
             lattice_proto::record::RecordParams {
                 kel,
-                seq,
+                prev_seq: seq.saturating_sub(1),
+                now: 1,
                 exp: 1_000 + 86_400,
                 channel_key: lattice_crypto::channel_public(channel_seed),
                 channel_seed: channel_seed.clone(),
@@ -3661,10 +3781,24 @@ mod tests {
                 links: vec![],
                 gateways: vec![],
                 capabilities: 0,
+                serves: vec![],
             },
             signing_seed,
         )
         .unwrap()
+    }
+
+    /// Feed a KEL to the node through the `kels` frame path.
+    fn admit_kel(node: &mut Node<MemStore>, kel: &ValidatedKel, at: u64) {
+        let frame = Frame::Kels(lattice_proto::frames::KelsFrame {
+            kels: vec![kel.to_object_bytes().unwrap()],
+        });
+        let _ = node.handle(Event::Frame {
+            at,
+            link: 999,
+            from: kel.identifier(),
+            frame,
+        });
     }
 
     fn stored_record(
@@ -3672,11 +3806,12 @@ mod tests {
         id: &Identifier,
         scope: Scope,
     ) -> Option<lattice_proto::record::PeerRecord> {
-        node.store.record_get(id, scope).unwrap().map(|r| {
-            lattice_proto::record::PeerRecord::from_bytes_unchecked_time(&r.bytes, None)
-                .unwrap()
-                .into_inner()
-        })
+        let stored = node.store.record_get(id, scope).unwrap()?;
+        let kel_bytes = node.store.kel_get(id).unwrap()?;
+        let kel = ValidatedKel::from_object_bytes(&kel_bytes).unwrap();
+        lattice_proto::record::PeerRecord::from_bytes_unchecked_time(&stored.bytes, &kel)
+            .ok()
+            .map(|v| v.into_inner())
     }
 
     #[test]
@@ -3688,7 +3823,8 @@ mod tests {
         let inception_seed = owner.signing_seed.clone();
         let mut node = test_node();
 
-        // Attacker holds the current signing key and publishes seq = u64::MAX.
+        // A record whose KEL we do not hold is dropped, and the node asks
+        // for the KEL.
         let attacker = build_record(
             inception.clone(),
             u64::MAX,
@@ -3696,14 +3832,28 @@ mod tests {
             &inception_seed,
             &channel_seed,
         );
-        node.admit_record(1_000, &attacker.encode());
+        node.admit_record(1_000, 999, &attacker.encode());
+        assert!(stored_record(&node, &id, Scope::Wan).is_none());
+
+        // The inception KEL arrives; the attacker's record is admitted.
+        admit_kel(
+            &mut node,
+            &ValidatedKel::validate(inception.clone()).unwrap(),
+            1_000,
+        );
+        node.admit_record(1_001, 999, &attacker.encode());
         assert_eq!(stored_record(&node, &id, Scope::Wan).unwrap().seq, u64::MAX);
 
-        // The owner rotates; the rotated record must win despite its lower seq.
+        // The owner rotates; the rotated KEL arrives and the head advances.
+        // The attacker's record (citing the old head) is dropped.
         let mut owner = owner;
         owner
             .rotate(&next_seed, Some(hash_next(&next_next_seed)))
             .unwrap();
+        admit_kel(&mut node, &owner.kel, 1_002);
+        assert!(stored_record(&node, &id, Scope::Wan).is_none());
+
+        // The rotated record must win despite its lower seq.
         let rotated = build_record(
             owner.kel.events().to_vec(),
             1,
@@ -3711,13 +3861,13 @@ mod tests {
             &owner.signing_seed,
             &channel_seed,
         );
-        node.admit_record(1_001, &rotated.encode());
+        node.admit_record(1_003, 999, &rotated.encode());
         let stored = stored_record(&node, &id, Scope::Wan).unwrap();
         assert_eq!(
             stored.seq, 1,
             "owner's rotation must displace the attacker's record"
         );
-        assert_eq!(stored.kel.head().seq, 1);
+        assert_eq!(stored.khs, 1);
         let head = node.store.kel_head(&id).unwrap().unwrap();
         assert_eq!(head.seq, 1);
         assert!(!head.abandoned);
@@ -3730,10 +3880,10 @@ mod tests {
             &inception_seed,
             &channel_seed,
         );
-        node.admit_record(1_002, &stale.encode());
+        node.admit_record(1_004, 999, &stale.encode());
         let stored = stored_record(&node, &id, Scope::Wan).unwrap();
         assert_eq!(stored.seq, 1);
-        assert_eq!(stored.kel.head().seq, 1);
+        assert_eq!(stored.khs, 1);
         assert_eq!(node.store.kel_head(&id).unwrap().unwrap().seq, 1);
     }
 
@@ -3746,6 +3896,11 @@ mod tests {
         let mut node = test_node();
 
         // The identity is present in both scopes with the pre-rotation KEL.
+        admit_kel(
+            &mut node,
+            &ValidatedKel::validate(inception.clone()).unwrap(),
+            1_000,
+        );
         let wan = build_record(
             inception.clone(),
             7,
@@ -3760,16 +3915,21 @@ mod tests {
             &owner.signing_seed,
             &channel_seed,
         );
-        node.admit_record(1_000, &wan.encode());
-        node.admit_record(1_000, &hive.encode());
+        node.admit_record(1_000, 999, &wan.encode());
+        node.admit_record(1_000, 999, &hive.encode());
         assert!(node.store.record_get(&id, Scope::Hive).unwrap().is_some());
 
-        // The owner rotates; the rotated WAN record advances the head and
-        // the Hive record, now behind the head, is evicted.
+        // The owner rotates; the rotated KEL arrives, the head advances,
+        // and both pre-rotation records are dropped.
         let mut owner = owner;
         owner
             .rotate(&next_seed, Some(hash_next(&next_next_seed)))
             .unwrap();
+        admit_kel(&mut node, &owner.kel, 1_001);
+        assert!(node.store.record_get(&id, Scope::Wan).unwrap().is_none());
+        assert!(node.store.record_get(&id, Scope::Hive).unwrap().is_none());
+
+        // The rotated WAN record is admitted against the new head.
         let rotated = build_record(
             owner.kel.events().to_vec(),
             1,
@@ -3777,20 +3937,25 @@ mod tests {
             &owner.signing_seed,
             &channel_seed,
         );
-        node.admit_record(1_001, &rotated.encode());
+        node.admit_record(1_002, 999, &rotated.encode());
         let wan_stored = stored_record(&node, &id, Scope::Wan).unwrap();
-        assert_eq!(wan_stored.kel.head().seq, 1);
+        assert_eq!(wan_stored.khs, 1);
         assert!(node.store.record_get(&id, Scope::Hive).unwrap().is_none());
     }
 
     #[test]
-    fn r02_tombstone_replaces_records_and_stops_routing() {
+    fn r02_abandoned_kel_drops_records_and_stops_routing() {
         let (owner, next_seed, _) = test_identity();
         let id = owner.id();
         let channel_seed = owner.channel_seed.clone();
         let inception = owner.kel.events().to_vec();
         let mut node = test_node();
 
+        admit_kel(
+            &mut node,
+            &ValidatedKel::validate(inception.clone()).unwrap(),
+            1_000,
+        );
         let wan = build_record(
             inception.clone(),
             1,
@@ -3805,29 +3970,20 @@ mod tests {
             &owner.signing_seed,
             &channel_seed,
         );
-        node.admit_record(1_000, &wan.encode());
-        node.admit_record(1_000, &hive.encode());
+        node.admit_record(1_000, 999, &wan.encode());
+        node.admit_record(1_000, 999, &hive.encode());
         assert!(node.has_record(&id));
 
-        // The owner abandons the identity; the tombstone is admitted.
+        // The owner abandons the identity; the abandoned KEL is the only
+        // carrier of the abandonment.
         let mut owner = owner;
         owner.rotate(&next_seed, None).unwrap();
         assert!(owner.is_abandoned());
-        let tombstone = build_record(
-            owner.kel.events().to_vec(),
-            2,
-            Scope::Wan,
-            &owner.signing_seed,
-            &channel_seed,
-        );
-        assert!(tombstone.is_tombstone());
-        node.admit_record(1_001, &tombstone.encode());
+        admit_kel(&mut node, &owner.kel, 1_001);
 
-        // The tombstone replaced both scopes' records.
-        let stored = stored_record(&node, &id, Scope::Wan).unwrap();
-        assert!(stored.is_tombstone());
+        // Both records are dropped; the node holds only the abandoned KEL.
+        assert!(node.store.record_get(&id, Scope::Wan).unwrap().is_none());
         assert!(node.store.record_get(&id, Scope::Hive).unwrap().is_none());
-        // The stored head is flagged abandoned.
         let head = node.store.kel_head(&id).unwrap().unwrap();
         assert!(head.abandoned);
         assert_eq!(head.seq, 1);
@@ -3836,12 +3992,15 @@ mod tests {
         assert!(matches!(node.lookup(&id), LookupResult::Absent));
         let graph = node.build_graph();
         assert!(!graph.distances(&node.own_id).contains_key(&id));
-        // The tombstone stays in the record set for reconciliation.
-        assert!(node.record_items().unwrap().iter().any(|i| i.id == id));
+        // The KEL stays in the reconciliation set (scope 255) so the
+        // abandonment propagates; no record for the id is advertised.
+        let items = node.record_items().unwrap();
+        assert!(items.iter().any(|i| i.id == id && i.scope == 255));
+        assert!(!items.iter().any(|i| i.id == id && i.scope != 255));
     }
 
     #[test]
-    fn r02_after_tombstone_every_record_for_id_is_rejected() {
+    fn r02_after_abandonment_every_record_for_id_is_rejected() {
         let (owner, next_seed, _) = test_identity();
         let id = owner.id();
         let channel_seed = owner.channel_seed.clone();
@@ -3851,14 +4010,7 @@ mod tests {
 
         let mut owner = owner;
         owner.rotate(&next_seed, None).unwrap();
-        let tombstone = build_record(
-            owner.kel.events().to_vec(),
-            2,
-            Scope::Wan,
-            &owner.signing_seed,
-            &channel_seed,
-        );
-        node.admit_record(1_000, &tombstone.encode());
+        admit_kel(&mut node, &owner.kel, 1_000);
 
         // Attacker with the superseded (pre-abandonment) key, max seq.
         let stale = build_record(
@@ -3868,10 +4020,8 @@ mod tests {
             &inception_seed,
             &channel_seed,
         );
-        node.admit_record(1_001, &stale.encode());
-        let stored = stored_record(&node, &id, Scope::Wan).unwrap();
-        assert!(stored.is_tombstone());
-        assert_eq!(stored.seq, 2);
+        node.admit_record(1_001, 999, &stale.encode());
+        assert!(node.store.record_get(&id, Scope::Wan).unwrap().is_none());
 
         // Attacker with the abandonment key itself, same KEL, max seq.
         let same_kel = build_record(
@@ -3881,50 +4031,52 @@ mod tests {
             &owner.signing_seed,
             &channel_seed,
         );
-        node.admit_record(1_002, &same_kel.encode());
-        let stored = stored_record(&node, &id, Scope::Wan).unwrap();
-        assert_eq!(stored.seq, 2, "the tombstone must survive later records");
+        node.admit_record(1_002, 999, &same_kel.encode());
+        assert!(node.store.record_get(&id, Scope::Wan).unwrap().is_none());
         assert!(node.store.kel_head(&id).unwrap().unwrap().abandoned);
     }
 
     #[test]
-    fn r02_tombstone_outlives_record_grace_until_head_ages_out() {
+    fn r02_abandoned_kel_outlives_record_grace_until_head_ages_out() {
         let (owner, next_seed, _) = test_identity();
         let id = owner.id();
-        let channel_seed = owner.channel_seed.clone();
         let mut node = test_node();
 
         let mut owner = owner;
         owner.rotate(&next_seed, None).unwrap();
-        let tombstone = build_record(
-            owner.kel.events().to_vec(),
-            2,
-            Scope::Wan,
-            &owner.signing_seed,
-            &channel_seed,
-        );
-        node.admit_record(1_000, &tombstone.encode());
-        let exp = 1_000 + 86_400;
+        admit_kel(&mut node, &owner.kel, 1_000);
 
-        // Past the record grace period the tombstone is still held: the
-        // KEL head is fresh, and the tombstone is the only carrier of the
-        // abandonment for peers that were offline.
-        node.sweep_expired_data(exp + RETENTION_GRACE_SECS + 1);
-        assert!(node.store.record_get(&id, Scope::Wan).unwrap().is_some());
+        // Past the record grace period the KEL is still held: the head is
+        // fresh, and the KEL is the only carrier of the abandonment for
+        // peers that were offline.
+        node.sweep_expired_data(1_000 + RETENTION_GRACE_SECS + 1);
+        assert!(node.store.kel_head(&id).unwrap().is_some());
+        assert!(node.store.kel_get(&id).unwrap().is_some());
         assert!(node.record_items().unwrap().iter().any(|i| i.id == id));
 
-        // Once the head itself is stale, both are swept.
+        // Once the head itself is stale, the KEL (and its head row) is swept.
         let head = node.store.kel_head(&id).unwrap().unwrap();
+        let kel_bytes = node.store.kel_get(&id).unwrap().unwrap();
         node.store
-            .kel_head_put(&id, head.seq, head.commitment, 0, true)
+            .kel_put(
+                &id,
+                &kel_bytes,
+                &KelHeadSeen {
+                    seq: head.seq,
+                    commitment: head.commitment,
+                    seen: 0,
+                    abandoned: true,
+                },
+            )
             .unwrap();
         node.sweep_expired_data(KEL_HEAD_MAX_AGE_SECS + 1);
-        assert!(node.store.record_get(&id, Scope::Wan).unwrap().is_none());
         assert!(node.store.kel_head(&id).unwrap().is_none());
+        assert!(node.store.kel_get(&id).unwrap().is_none());
+        assert!(!node.record_items().unwrap().iter().any(|i| i.id == id));
     }
 
     #[test]
-    fn r02_abandon_publishes_tombstone() {
+    fn r02_abandon_publishes_kel_not_record() {
         let (owner, next_seed, _) = test_identity();
         let id = owner.id();
         let mut node = test_node();
@@ -3932,10 +4084,15 @@ mod tests {
         owner.rotate(&next_seed, None).unwrap();
         node.reload_identity(owner, 1_001, RotationKind::Abandon)
             .unwrap();
-        // The abandon path published the tombstone as the node's own record.
-        let stored = stored_record(&node, &id, Scope::Wan).unwrap();
-        assert!(stored.is_tombstone());
+        // The abandon path publishes no record: one citing the abandoned
+        // head would be rejected by every peer. The KEL is stored and
+        // served instead.
+        assert!(node.store.record_get(&id, Scope::Wan).unwrap().is_none());
         assert!(!node.has_record(&id));
+        let head = node.store.kel_head(&id).unwrap().unwrap();
+        assert!(head.abandoned);
+        assert_eq!(head.seq, 1);
+        assert!(node.store.kel_get(&id).unwrap().is_some());
     }
 
     fn wire_message(leg: LegId, dst: Identifier, exp: u64) -> Vec<u8> {
@@ -4275,6 +4432,7 @@ mod tests {
     }
 
     fn admit_sender(node: &mut Node<MemStore>, sender: &Identity, at: u64) {
+        admit_kel(node, &sender.kel, at);
         let record = build_record(
             sender.kel.events().to_vec(),
             1,
@@ -4282,7 +4440,7 @@ mod tests {
             &sender.signing_seed,
             &sender.channel_seed,
         );
-        node.admit_record(at, &record.encode());
+        node.admit_record(at, 999, &record.encode());
     }
 
     #[test]

@@ -676,6 +676,7 @@ dependencies = [
 name = "lattice-proto"
 version = "0.0.0"
 dependencies = [
+ "base32ct",
  "hex",
  "lattice-crypto",
  "lattice-types",

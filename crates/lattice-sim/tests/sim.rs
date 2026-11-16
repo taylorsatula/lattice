@@ -37,8 +37,8 @@ fn wait_for_path(sim: &mut Sim, from: usize, to: usize) {
     panic!("node {from} never learned a path to node {to}");
 }
 
-/// Run the sim until `node`'s link is bound to `id` (attestation or record
-/// claims, whichever lands first), or panic.
+/// Run the sim until `node`'s link is bound to `id` (via record claims),
+/// or panic.
 fn wait_for_binding(sim: &mut Sim, node: usize, link: u64, id: Identifier) {
     for _ in 0..30 {
         if sim.nodes[node].debug_link_peer(link) == Some(Some(id)) {
@@ -72,6 +72,9 @@ fn message_delivers_end_to_end_and_sender_sees_receipt() {
     }
     full_mesh(&mut sim, 4);
     wait_for_path(&mut sim, 0, 3);
+    // The recipient must hold the sender's record (and KEL) before the
+    // message arrives, or it cannot verify the envelope.
+    wait_for_path(&mut sim, 3, 0);
     let mid = sim.app_send(0, 3, b"hello mesh");
     sim.run_for(20);
     let got: Vec<_> = sim.deliveries.iter().filter(|d| d.mid == mid).collect();
@@ -415,7 +418,8 @@ fn equivocating_records_converge_to_lower_hash() {
         PeerRecord::build(
             RecordParams {
                 kel: kel.clone(),
-                seq: 7,
+                prev_seq: 6,
+                now: 1,
                 exp: 1_000_000,
                 channel_key: attacker_channel,
                 channel_seed: attacker_channel_seed.clone(),
@@ -426,6 +430,7 @@ fn equivocating_records_converge_to_lower_hash() {
                 links: vec![],
                 gateways: vec![],
                 capabilities: caps,
+                serves: vec![],
             },
             &attacker.signing_seed,
         )
@@ -441,6 +446,20 @@ fn equivocating_records_converge_to_lower_hash() {
     } else {
         (b2.clone(), b1.clone())
     };
+
+    // The attacker's KEL must be in place before its records can validate;
+    // inject it the way a peer would serve it.
+    let kel_bytes = attacker.kel.to_object_bytes().unwrap();
+    for victim_node in [a, b] {
+        let attacker_link = sim.link_between(victim_node, victim).unwrap();
+        sim.inject_frame(
+            victim_node,
+            attacker_link,
+            lattice_proto::frames::Frame::Kels(lattice_proto::frames::KelsFrame {
+                kels: vec![kel_bytes.clone()],
+            }),
+        );
+    }
 
     let _ = sim.link_between(a, b);
     for victim_node in [a, b] {
@@ -525,7 +544,14 @@ fn forged_envelope_is_not_delivered() {
         .unwrap()
         .unwrap()
         .bytes;
-    let target_rec = PeerRecord::from_bytes(&target_rec, 0, None)
+    let target_kel_bytes = sim.nodes[1]
+        .store_ref()
+        .kel_get(&target_id)
+        .unwrap()
+        .expect("target's KEL is stored");
+    let target_kel =
+        lattice_proto::kel::ValidatedKel::from_object_bytes(&target_kel_bytes).unwrap();
+    let target_rec = PeerRecord::from_bytes(&target_rec, 0, &target_kel)
         .unwrap()
         .into_inner();
 
@@ -581,6 +607,7 @@ fn custody_drains_after_delivery() {
     }
     full_mesh(&mut sim, 4);
     wait_for_path(&mut sim, 0, 3);
+    wait_for_path(&mut sim, 3, 0);
     let to = sim.ids[3];
     let send = lattice_core::AppSend {
         service: "test".into(),
@@ -641,7 +668,8 @@ fn contested_channel_key_claim_unbinds_link() {
     let forged = PeerRecord::build(
         RecordParams {
             kel: attacker.kel.clone(),
-            seq: 1,
+            prev_seq: 0,
+            now: 1,
             exp: 1_000_000,
             channel_key: b_ck, // the theft: b's channel key under a foreign id
             channel_seed: attacker_channel_seed.clone(), // ...but not b's channel key
@@ -652,6 +680,7 @@ fn contested_channel_key_claim_unbinds_link() {
             links: vec![],
             gateways: vec![],
             capabilities: 0,
+            serves: vec![],
         },
         &attacker.signing_seed,
     );
@@ -799,10 +828,11 @@ fn buffer_class_isolates_full_classes() {
 }
 
 #[test]
-fn attestation_binds_unpinned_link() {
-    // Two nodes connect without pinning each other's id. After the link-up
-    // attestation exchange, each side must bind the link to the peer's id
-    // without any configured peer id.
+fn record_binds_unpinned_link() {
+    // Two nodes connect without pinning each other's id. Once their records
+    // propagate, each side must bind the link to the peer's id without any
+    // configured peer id.
+
     let mut sim = Sim::new(fast_config());
     let a = sim.add_node();
     let b = sim.add_node();
@@ -819,38 +849,6 @@ fn attestation_binds_unpinned_link() {
         sim.nodes[b].debug_link_peer(link),
         Some(Some(sim.ids[a])),
         "b must bind the link to a's id"
-    );
-}
-
-#[test]
-fn forged_attestation_does_not_bind() {
-    // A forged attestation — an id with no record, and a garbage signature —
-    // must never bind the link to the forged id. The honest attestation (or
-    // failing that, record claims) binds it to the real peer.
-    let mut sim = Sim::new(fast_config());
-    let a = sim.add_node();
-    let b = sim.add_node();
-    let link = sim.connect_unpinned(a, b);
-    let id_b = sim.ids[b];
-    let forged_id = Identifier::from_bytes([0xEE; 32]);
-    sim.inject_frame(
-        a,
-        link,
-        lattice_proto::frames::Frame::Attest(lattice_proto::frames::AttestFrame {
-            id: forged_id,
-            sig: Signature::from_bytes([0u8; 64]),
-        }),
-    );
-    wait_for_binding(&mut sim, a, link, id_b);
-    assert_ne!(
-        sim.nodes[a].debug_link_peer(link),
-        Some(Some(forged_id)),
-        "forged attestation must not bind the link"
-    );
-    assert_eq!(
-        sim.nodes[a].debug_link_peer(link),
-        Some(Some(sim.ids[b])),
-        "link must bind to the real peer"
     );
 }
 

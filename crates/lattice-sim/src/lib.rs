@@ -197,9 +197,9 @@ impl<S: Store> Sim<S> {
         id
     }
 
-    /// Fire a LinkUp at a node and apply the actions it returns (the
-    /// attestation frame, in particular). LinkUp's return value carries the
-    /// attestation; dropping it would leave the link unattested.
+    /// Fire a LinkUp at a node and apply the actions it returns. LinkUp's
+    /// return value carries any frames the node wants on the wire; dropping
+    /// them would leave the peer without them.
     fn link_up(
         &mut self,
         node: NodeIndex,
@@ -413,7 +413,7 @@ impl<S: Store> Sim<S> {
                         Frame::Ping(_) => "ping",
                         Frame::Dummy(_) => "dummy",
                         Frame::Init(_) | Frame::Cookie(_) | Frame::Resp(_) => "handshake",
-                        Frame::Attest(_) => "attest",
+                        Frame::Kels(_) => "kels",
                     };
                     *self.frame_counts.entry(tag).or_insert(0) += 1;
                     self.route_frame(from, link, frame);
@@ -515,7 +515,14 @@ impl<S: Store> Sim<S> {
             .record_get(&id, lattice_proto::record::Scope::Wan)
             .expect("record read")
             .expect("own record present");
-        lattice_proto::record::PeerRecord::from_bytes(&stored.bytes, self.now, None)
+        let kel_bytes = self.nodes[node]
+            .store_ref()
+            .kel_get(&id)
+            .expect("kel read")
+            .expect("own kel present");
+        let kel = lattice_proto::kel::ValidatedKel::from_object_bytes(&kel_bytes)
+            .expect("own kel validates");
+        lattice_proto::record::PeerRecord::from_bytes(&stored.bytes, self.now, &kel)
             .expect("own record parses")
             .into_inner()
             .channel_key

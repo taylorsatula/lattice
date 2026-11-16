@@ -16,14 +16,17 @@ pub mod local;
 pub mod message;
 mod obj;
 pub mod record;
+pub mod text;
 
 pub use cbor::{DecodeError, Value, decode, encode};
 pub use error::ProtoError;
 pub use message::Message;
 
-/// Largest message on the wire (bucket 3) and the derived message buckets.
-pub const MESSAGE_BUCKETS: [usize; 3] = [2048 - 64, 8192 - 64, 32768 - 64];
-pub const RECORD_MAX: usize = 3200;
+/// Message buckets (spec §1): the frame bucket minus the 64-byte AEAD tag,
+/// so an `offer` frame fits exactly.
+pub const MESSAGE_BUCKETS: [usize; 4] = [2048 - 64, 4096 - 64, 8192 - 64, 32768 - 64];
+/// Peer record size limit (spec §1: 3 KB).
+pub const RECORD_MAX: usize = 3072;
 /// Longest a message may live, from minting.
 pub const MAX_MESSAGE_HORIZON: u64 = 14 * 24 * 3600;
 /// Longest a record may live, from issue.

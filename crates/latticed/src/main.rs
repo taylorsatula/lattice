@@ -143,7 +143,8 @@ fn record_self_test(cfg: &config::Config, identity: &lattice_core::Identity) -> 
     };
     let params = lattice_proto::record::RecordParams {
         kel: identity.kel.clone(),
-        seq: 1,
+        prev_seq: 0,
+        now,
         exp: now + 3600,
         channel_key: lattice_crypto::channel_public(&identity.channel_seed),
         channel_seed: identity.channel_seed.clone(),
@@ -154,6 +155,7 @@ fn record_self_test(cfg: &config::Config, identity: &lattice_core::Identity) -> 
         links: vec![],
         gateways,
         capabilities: 1,
+        serves: vec![],
     };
     lattice_proto::record::PeerRecord::build(params, &identity.signing_seed)
         .map(|_| ())
@@ -185,8 +187,9 @@ fn verify_stored_own_record(
     };
     // Expiry is not checked: an expired own record is still evidence about
     // which keys the store holds, and the node republishes on refresh.
-    let record = lattice_proto::record::PeerRecord::from_bytes_unchecked_time(&stored.bytes, None)
-        .map_err(|e| format!("stored own record does not validate: {e}"))?;
+    let record =
+        lattice_proto::record::PeerRecord::from_bytes_unchecked_time(&stored.bytes, &identity.kel)
+            .map_err(|e| format!("stored own record does not validate: {e}"))?;
     let want_channel = lattice_crypto::channel_public(&identity.channel_seed);
     if record.channel_key != want_channel {
         return Err(
@@ -486,7 +489,8 @@ mod tests {
             .as_secs();
         let params = lattice_proto::record::RecordParams {
             kel: identity.kel.clone(),
-            seq: 1,
+            prev_seq: 0,
+            now,
             exp: now + 3600,
             channel_key: lattice_crypto::channel_public(&channel_seed),
             channel_seed,
@@ -497,6 +501,7 @@ mod tests {
             links: vec![],
             gateways: vec![],
             capabilities: 1,
+            serves: vec![],
         };
         lattice_proto::record::PeerRecord::build(params, &identity.signing_seed)
             .unwrap()

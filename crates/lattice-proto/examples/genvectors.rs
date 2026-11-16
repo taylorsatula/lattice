@@ -5,10 +5,11 @@
 
 use lattice_crypto::{hash, public_key};
 use lattice_proto::frames::{
-    CUSTODY_ACCEPTED, CookieFrame, CustodyFrame, DummyFrame, Frame, InitFrame, PingFrame, Range,
-    RangeBound, ReconcileFrame, RecordEntry, RecordRef, RecordsFrame, RespFrame, WantFrame,
+    CUSTODY_ACCEPTED, CUSTODY_SEEN, CookieFrame, CustodyFrame, DummyFrame, Frame, InitFrame,
+    KelsFrame, PingFrame, Range, RangeBound, ReconcileFrame, RecordEntry, RecordRef, RecordsFrame,
+    RespFrame, WantFrame,
 };
-use lattice_proto::kel::KeyEvent;
+use lattice_proto::kel::{KeyEvent, ValidatedKel};
 use lattice_proto::message::{BuildParams, Envelope, KIND_MESSAGE, Message};
 use lattice_proto::record::{Endpoint, Mode, PeerRecord, Scope};
 use lattice_types::{
@@ -42,16 +43,34 @@ fn main() {
         "expect": { "seq": 1, "kind": "rotation", "prev": hex_of(inception.commitment()) },
     }));
 
+    // --- KEL object ---
+    let kel_events = vec![inception.clone(), rotation.clone()];
+    let kel = ValidatedKel::validate(kel_events).unwrap();
+    let kel_bytes = kel.to_object_bytes().unwrap();
+    vectors.push(serde_json::json!({
+        "name": "kel_object",
+        "kind": "kel_object",
+        "hex": hex_of(&kel_bytes),
+        "expect": {
+            "id": hex_of(kel.identifier()),
+            "head_seq": kel.head().seq,
+            "head_commitment": hex_of(kel.head().commitment),
+            "abandoned": true,
+        },
+    }));
+
     // --- peer record (public, WAN) ---
     let envelope_ek = XWingPublicKey::from_bytes([7u8; 1216]);
     let channel_seed = ChannelSeed::from_bytes([9u8; 32]);
     let channel = lattice_crypto::channel_public(&channel_seed);
-    let kel = vec![inception.clone()];
-    let id = lattice_proto::kel::identifier(&kel).unwrap();
+    let record_kel = ValidatedKel::validate(vec![inception.clone()]).unwrap();
+    let record_kel_bytes = record_kel.to_object_bytes().unwrap();
+    let id = record_kel.identifier();
     let rec = PeerRecord::build(
         lattice_proto::record::RecordParams {
-            kel,
-            seq: 7,
+            kel: record_kel,
+            prev_seq: 6,
+            now: 7,
             exp: NOW + 86_400,
             channel_key: channel,
             channel_seed,
@@ -65,6 +84,7 @@ fn main() {
             links: vec![],
             gateways: vec![],
             capabilities: 1,
+            serves: vec![],
         },
         &seed0,
     )
@@ -73,8 +93,9 @@ fn main() {
         "name": "peer_record_public_wan",
         "kind": "peer_record",
         "hex": hex_of(rec.encode()),
+        "kel": hex_of(&record_kel_bytes),
         "now": NOW,
-        "expect": { "id": hex_of(id), "seq": 7, "scope": 0, "mode": 0 },
+        "expect": { "id": hex_of(id), "seq": 7, "scope": 0, "mode": 0, "khs": 0 },
     }));
 
     // --- frames ---
@@ -88,6 +109,17 @@ fn main() {
         "kind": "frame",
         "hex": hex_of(custody.encode()),
         "expect": { "type": "custody", "result": CUSTODY_ACCEPTED },
+    }));
+    let seen = Frame::Custody(CustodyFrame {
+        leg: LegId::from_bytes([0xAB; 16]),
+        result: CUSTODY_SEEN,
+        retry_after: None,
+    });
+    vectors.push(serde_json::json!({
+        "name": "custody_seen",
+        "kind": "frame",
+        "hex": hex_of(seen.encode()),
+        "expect": { "type": "custody", "result": CUSTODY_SEEN },
     }));
     let dummy = Frame::Dummy(DummyFrame { echo: true });
     vectors.push(serde_json::json!({
@@ -173,7 +205,9 @@ fn main() {
                 entries: vec![RecordEntry {
                     id: Identifier::from_bytes([0x90; 32]),
                     scope: 0,
+                    khs: 3,
                     seq: 7,
+                    hash_prefix: [0x5A; 8],
                 }],
             },
         ],
@@ -210,6 +244,15 @@ fn main() {
         "kind": "frame",
         "hex": hex_of(records.encode()),
         "expect": { "type": "records" },
+    }));
+    let kels = Frame::Kels(KelsFrame {
+        kels: vec![kel_bytes.clone()],
+    });
+    vectors.push(serde_json::json!({
+        "name": "kels",
+        "kind": "frame",
+        "hex": hex_of(kels.encode()),
+        "expect": { "type": "kels" },
     }));
 
     // --- end-to-end message (sealed; KEM randomness captured here) ---

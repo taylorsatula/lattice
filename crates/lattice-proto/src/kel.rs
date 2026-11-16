@@ -8,16 +8,20 @@
 //! The commitment of an event is `BLAKE3(encode(event without sig))` — the
 //! same rule used for the identifier — and it is what `prev` refers to.
 
-use lattice_crypto::{hash, sign, verify};
+use lattice_crypto::{KEY_EVENT_CONTEXT, hash, sign, signing_preimage, verify};
 use lattice_types::{Commitment, Identifier, Signature, SigningPublicKey, SigningSeed};
 
 use crate::cbor::{Value, encode};
 use crate::error::ProtoError;
-use crate::obj::fixed_bytes;
+use crate::obj::{decode_limited, fixed_bytes};
 
 pub const PROTOCOL_VERSION: u64 = 1;
 pub const EVENT_INCEPTION: u64 = 1;
 pub const EVENT_ROTATION: u64 = 2;
+/// Object type of the key event log object (V2_SPEC §2).
+pub const KEL_OBJECT_TYPE: u64 = 11;
+/// Largest encoded KEL object, in bytes (spec §1: 16 KB).
+pub const MAX_KEL_BYTES: usize = 16 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KeyEventKind {
@@ -125,7 +129,8 @@ impl KeyEvent {
     /// Signature check for this single event against its own key.
     #[must_use]
     pub fn verify_signature(&self) -> bool {
-        verify(&self.key, &encode(&self.unsigned_value()), &self.sig)
+        let preimage = signing_preimage(KEY_EVENT_CONTEXT, &encode(&self.unsigned_value()));
+        verify(&self.key, &preimage, &self.sig)
     }
 
     /// Create and sign an inception event.
@@ -172,7 +177,8 @@ impl KeyEvent {
             next,
             sig: Signature::from_bytes([0u8; 64]),
         };
-        ev.sig = sign(signing_seed, &encode(&ev.unsigned_value()));
+        let preimage = signing_preimage(KEY_EVENT_CONTEXT, &encode(&ev.unsigned_value()));
+        ev.sig = sign(signing_seed, &preimage);
         ev
     }
 }
@@ -348,6 +354,78 @@ impl From<ValidatedKel> for Vec<KeyEvent> {
     fn from(kel: ValidatedKel) -> Self {
         kel.events
     }
+}
+
+impl ValidatedKel {
+    /// The KEL object (V2_SPEC §2): `{0: 1, 1: 11, 2: id, 3: [events]}`.
+    /// The object carries no signature of its own; authenticity comes from
+    /// the event chain.
+    pub fn to_object_value(&self) -> Value {
+        Value::map(vec![
+            (Value::UInt(0), Value::UInt(PROTOCOL_VERSION)),
+            (Value::UInt(1), Value::UInt(KEL_OBJECT_TYPE)),
+            (Value::UInt(2), Value::Bytes(self.id.to_vec())),
+            (
+                Value::UInt(3),
+                Value::Array(self.events.iter().map(KeyEvent::to_value).collect()),
+            ),
+        ])
+    }
+
+    /// Encode the KEL object. Fails if the encoding exceeds the 16 KB
+    /// object limit (spec §1); such a chain cannot be published.
+    pub fn to_object_bytes(&self) -> Result<Vec<u8>, ProtoError> {
+        let bytes = encode(&self.to_object_value());
+        if bytes.len() > MAX_KEL_BYTES {
+            return Err(ProtoError::TooBig(bytes.len()));
+        }
+        Ok(bytes)
+    }
+
+    /// Decode and validate a KEL object. Enforces the 16 KB size limit, the
+    /// object shape, the id binding (the id must equal the inception event's
+    /// hash), contiguity from sn 0, and the full chain rules.
+    pub fn from_object_bytes(bytes: &[u8]) -> Result<Self, ProtoError> {
+        if bytes.len() > MAX_KEL_BYTES {
+            return Err(ProtoError::TooBig(bytes.len()));
+        }
+        let value = decode_limited(bytes, MAX_KEL_BYTES)?;
+        value.deny_unknown_keys(&[0, 1, 2, 3])?;
+        if value.req_uint(0)? != PROTOCOL_VERSION {
+            return Err(ProtoError::Invalid("unsupported protocol version"));
+        }
+        if value.req_uint(1)? != KEL_OBJECT_TYPE {
+            return Err(ProtoError::Invalid("not a KEL object"));
+        }
+        let id = Identifier::from_bytes(fixed_bytes(&value, 2)?);
+        let events: Vec<KeyEvent> = value
+            .req_array(3)?
+            .iter()
+            .map(KeyEvent::from_value)
+            .collect::<Result<_, _>>()?;
+        let kel = Self::validate(events)?;
+        if kel.identifier() != id {
+            return Err(ProtoError::BadKeyLog(
+                "KEL object id does not match its inception event",
+            ));
+        }
+        Ok(kel)
+    }
+}
+
+/// Order two KEL heads by (sn, event hash): the order the spec uses to
+/// pick between divergent chains of the same length (the lower head event
+/// hash wins). Takes the head's sn and event hash directly so it works for
+/// both full heads and stored head rows.
+pub fn compare_heads(
+    a_seq: u64,
+    a_commitment: &Commitment,
+    b_seq: u64,
+    b_commitment: &Commitment,
+) -> std::cmp::Ordering {
+    a_seq
+        .cmp(&b_seq)
+        .then_with(|| a_commitment.as_bytes().cmp(b_commitment.as_bytes()))
 }
 
 /// How a candidate chain relates to a locally known head.

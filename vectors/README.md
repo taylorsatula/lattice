@@ -7,7 +7,11 @@ Intended for sharing across implementations; consumers may vendor this file as-i
   format against accidental drift; they are regression anchors, not
   independent ground truth. Each entry carries the expected fields; sealed
   layers are covered by round-trip tests instead of byte-exact vectors
-  because their KEM randomness is per-encapsulation.
+  because their KEM randomness is per-encapsulation. The `peer_record`
+  vector carries the KEL object it cites in a `kel` field (hex), since a
+  record is only validatable against its KEL; the `kel_object` vector pins
+  the KEL object encoding itself, and the `kels` frame vector pins the
+  frame that carries KEL objects.
 - `xwing-kat.json` — a byte-copy of the known-answer tests published with
   the RustCrypto `x-wing` crate (draft-06). It is the anchor for the KEM
   itself, but it is not independent of the implementation: both come from
