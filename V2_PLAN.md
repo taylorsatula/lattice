@@ -339,7 +339,7 @@ subset on redb.
 
   | Setting | Purpose |
   |---|---|
-  | `identity_dir`, `next_key_path` | Where keys live; the next key separately |
+  | `identity_dir` | Where keys live; the next key stays offline with the operator, the directory holds only its commitment |
   | `mode` | `public` or `private` |
   | `listen` | Listen addresses; hive-only by default |
   | `advertise` | Endpoints to publish (public mode) |

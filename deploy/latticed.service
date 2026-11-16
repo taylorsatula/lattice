@@ -35,7 +35,11 @@ RuntimeDirectoryGroup=lattice
 # LoadCredential=signing_seed:/etc/lattice/keys/signing_seed
 # LoadCredential=channel_seed:/etc/lattice/keys/channel_seed
 # LoadCredential=envelope_seed:/etc/lattice/keys/envelope_seed
-# LoadCredential=next_signing_seed:/etc/lattice/keys/next_signing_seed
+#
+# The next signing key never lives on this host: `latticed init` writes it to
+# an operator-chosen path outside the identity directory (or prints it once),
+# and rotation takes it over the admin socket. The identity directory stores
+# only its BLAKE3 commitment (next_key_commitment).
 
 ExecStart=/usr/local/bin/latticed run --config /etc/lattice/lattice.toml
 Restart=on-failure

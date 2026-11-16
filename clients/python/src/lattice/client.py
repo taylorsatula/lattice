@@ -247,15 +247,28 @@ class Client:
         result = self._call(OP_UNLINK, {0: id})
         return bool(result[0])
 
-    def rotate(self, next_key_file: str | None = None) -> str:
-        """Rotate the signing key using the pre-committed next key."""
-        args = {} if next_key_file is None else {0: next_key_file}
-        return self._call(OP_ROTATE, args)[0]
+    def rotate(self, next_key: bytes, next_next_commitment: bytes) -> str:
+        """Rotate the signing key.
 
-    def abandon(self, next_key_file: str | None = None) -> str:
-        """Permanently abandon the identity."""
-        args = {} if next_key_file is None else {0: next_key_file}
-        return self._call(OP_ABANDON, args)[0]
+        ``next_key`` is the 32-byte pre-committed next signing key, kept
+        offline by the operator. ``next_next_commitment`` is the 32-byte
+        BLAKE3 commitment to the following key, generated offline. The
+        daemon verifies ``next_key`` against the commitment stored in its
+        identity directory and refuses the rotation on mismatch.
+        """
+        if len(next_key) != 32 or len(next_next_commitment) != 32:
+            raise ValueError("next_key and next_next_commitment must be 32 bytes each")
+        return self._call(OP_ROTATE, {0: next_key, 1: next_next_commitment})[0]
+
+    def abandon(self, next_key: bytes) -> str:
+        """Permanently abandon the identity (a rotation with no next-key commitment).
+
+        ``next_key`` is the 32-byte pre-committed next signing key, kept
+        offline by the operator.
+        """
+        if len(next_key) != 32:
+            raise ValueError("next_key must be 32 bytes")
+        return self._call(OP_ABANDON, {0: next_key})[0]
 
     def rotate_envelope(self) -> str:
         """Rotate the envelope key; the old key is kept decrypt-only for a grace period."""

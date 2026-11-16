@@ -875,8 +875,12 @@ principle).
   per-destination custody allowance, the transit storage cap, push caps,
   rate limits, the *k* threshold for the wary rule, wary list size, neighbor
   count.
-- **Keeping the next key offline in practice:** where it lives and how a
-  rotation is performed.
+- **Keeping the next key offline in practice:** resolved — the next key is
+  generated at init and written to an operator-chosen path outside the
+  identity directory (or printed once); the identity directory stores only
+  its BLAKE3 commitment. Rotation supplies the key over the admin socket
+  (`latticectl rotate --next-key-file … --next-next-commitment …`) and the
+  daemon never writes a secret key to disk.
 - **Envelope key rotation cadence,** which limits exposure from the lack of
   forward secrecy.
 - **Post-quantum protection for the channel:** whether to add a hybrid KEM to

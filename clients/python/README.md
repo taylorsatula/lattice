@@ -141,8 +141,10 @@ shared test vectors in `vectors/` exercise exactly these paths.
 ## Admin operations
 
 On the admin socket (owner-only): `node()`, `drain(draining)`, `link(...)`,
-`unlink(id)`, `rotate()`, `abandon()`, `rotate_envelope()`. These mirror
-`latticectl`; prefer `latticectl` for operator use.
+`unlink(id)`, `rotate(next_key, next_next_commitment)`, `abandon(next_key)`,
+`rotate_envelope()`. These mirror `latticectl`; prefer `latticectl` for
+operator use. `next_key` is the offline pre-committed signing key;
+`next_next_commitment` is the BLAKE3 commitment to the following key.
 
 ## Running the tests
 

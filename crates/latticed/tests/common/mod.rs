@@ -13,6 +13,8 @@ use lattice_types::{ChannelPublicKey, Identifier};
 pub struct NodeKeys {
     pub id: Identifier,
     pub channel_key: ChannelPublicKey,
+    /// The offline next signing key, printed once by `latticed init`.
+    pub next_key: [u8; 32],
 }
 
 /// A peer to dial at boot: address, channel key, and expected id.
@@ -70,13 +72,26 @@ pub fn init_node(dir: &Path) -> NodeKeys {
         .trim()
         .to_string();
     let id = Identifier::from_bytes(hex_decode(&id_hex).try_into().unwrap());
+    let next_key_hex = stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("next signing key (hex): "))
+        .expect("init prints the next signing key exactly once")
+        .trim()
+        .to_string();
+    let next_key: [u8; 32] = hex_decode(&next_key_hex)
+        .try_into()
+        .expect("next key is 32 bytes");
     let channel_key = ChannelPublicKey::from_bytes(
         std::fs::read(dir.join("channel_key.pub"))
             .unwrap()
             .try_into()
             .unwrap(),
     );
-    NodeKeys { id, channel_key }
+    NodeKeys {
+        id,
+        channel_key,
+        next_key,
+    }
 }
 
 /// Config knobs for a test node. `private` switches the node to private
@@ -161,6 +176,7 @@ pub struct TestNode {
     pub admin: PathBuf,
     pub id: Identifier,
     pub channel_key: ChannelPublicKey,
+    pub next_key: [u8; 32],
     pub child: Option<Child>,
 }
 
@@ -181,7 +197,11 @@ pub fn boot_node_full(
     private_gateways: Option<Vec<Identifier>>,
 ) -> TestNode {
     let dir = tmp.join(name);
-    let NodeKeys { id, channel_key } = init_node(&dir);
+    let NodeKeys {
+        id,
+        channel_key,
+        next_key,
+    } = init_node(&dir);
     let app = tmp.join(format!("{name}.app.sock"));
     let admin = tmp.join(format!("{name}.admin.sock"));
     let mut attempt = 0;
@@ -238,6 +258,7 @@ pub fn boot_node_full(
                     admin,
                     id,
                     channel_key,
+                    next_key,
                     child: Some(child),
                 };
             }
