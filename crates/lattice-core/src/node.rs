@@ -1709,6 +1709,13 @@ impl<S: Store> Node<S> {
         let Some(NextHop { link, peer: _peer }) = self.pick_next_hop(&dst, &exclusion, now) else {
             return DispatchResult::NoRoute;
         };
+        // Mark the leg seen as it goes on the wire, so the leg cannot
+        // bounce back to us and be mistaken for a fresh offer (or delete
+        // state on an `already have` answer).
+        let leg_hash = lattice_crypto::hash(leg.as_ref());
+        if let Err(e) = self.store.seen_add(leg_hash, parsed.header.exp) {
+            self.diag("seen_add", &e);
+        }
         self.pending.insert(
             leg,
             PendingOffer {
@@ -1909,7 +1916,8 @@ impl<S: Store> Node<S> {
             destination,
             class,
             exp,
-            excluded: Vec::new(),
+            // Never hand the message back to the link it arrived on.
+            excluded: vec![Exclusion { link, until: exp }],
         };
         let accept = CustodyAccept {
             entry,
@@ -2287,8 +2295,9 @@ impl<S: Store> Node<S> {
     }
 
     /// Drop a relay custody entry and release its share of the upstream's
-    /// allowance. Used when the downstream side resolves (accepted, refused,
-    /// or already holds the message).
+    /// allowance. Used when the downstream side resolves (accepted or
+    /// refused). `ALREADY_HAVE` does not release: the downstream may only
+    /// have seen the leg, not hold the message.
     fn release_relay_custody(&mut self, custody_leg: LegId) {
         match self.store.custody_remove(&custody_leg) {
             Ok(Some(e)) => {
@@ -2376,8 +2385,21 @@ impl<S: Store> Node<S> {
                     }
                     self.forward_custody(now, custody_leg, actions);
                 } else {
-                    // The downstream already holds it: drop ours and release the share.
-                    self.release_relay_custody(custody_leg);
+                    // The downstream already holds it (or saw this leg): keep
+                    // custody, exclude that link for this leg, and re-forward
+                    // via another candidate. Custody is released only on
+                    // ACCEPTED or REFUSED.
+                    match self.store.custody_get(&custody_leg) {
+                        Ok(Some(mut e)) => {
+                            add_exclusion(&mut e.excluded, link, e.exp);
+                            if let Err(e) = self.store.custody_put(e) {
+                                self.diag("custody_put", &e);
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(e) => self.diag("custody_get", &e),
+                    }
+                    self.forward_custody(now, custody_leg, actions);
                 }
             }
         }
@@ -3829,5 +3851,310 @@ mod tests {
         let stored = stored_record(&node, &id, Scope::Wan).unwrap();
         assert!(stored.is_tombstone());
         assert!(!node.has_record(&id));
+    }
+
+    fn wire_message(leg: LegId, dst: Identifier, exp: u64) -> Vec<u8> {
+        Message::build(BuildParams {
+            envelope: Envelope {
+                kind: KIND_MESSAGE,
+                mid: MessageId::from_bytes([0x42; 16]),
+                from: Identifier::from_bytes([0xAA; 32]),
+                fsvc: "svc".into(),
+                fmbx: b"out".to_vec(),
+                tsvc: "svc".into(),
+                tmbx: b"in".to_vec(),
+                created: 1,
+                body: Some(b"hi".to_vec()),
+                reference: None,
+                reason: None,
+                sig: Signature::from_bytes([0; 64]),
+            },
+            sender_seed: &SigningSeed::from_bytes([0xBB; 32]),
+            recipient_ek: &XWingPublicKey::from_bytes([7u8; 1216]),
+            real_dst: dst,
+            leg,
+            exp,
+            gateway: None,
+            waypoint: None,
+        })
+        .expect("wire message builds")
+    }
+
+    fn link_up(node: &mut Node<MemStore>, link: u64, peer: Identifier, at: u64) {
+        let remote_ck = lattice_crypto::channel_x25519_public(&ChannelSeed::from_bytes([0x77; 32]));
+        node.handle(Event::LinkUp {
+            at,
+            link,
+            peer: Some(peer),
+            remote_ck,
+        });
+    }
+
+    fn custody_frame(leg: LegId, result: u64) -> Frame {
+        Frame::Custody(CustodyFrame {
+            leg,
+            result,
+            retry_after: None,
+        })
+    }
+
+    fn insert_relay_custody(
+        node: &mut Node<MemStore>,
+        leg: LegId,
+        message: Vec<u8>,
+        upstream: u64,
+        destination: Identifier,
+        exp: u64,
+    ) {
+        node.store
+            .custody_put(CustodyEntry {
+                leg,
+                message,
+                upstream,
+                destination,
+                class: 0,
+                exp,
+                excluded: Vec::new(),
+            })
+            .unwrap();
+    }
+
+    fn offer_links(actions: &[Action]) -> Vec<u64> {
+        actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::SendFrame {
+                    link,
+                    frame: Frame::Offer(_),
+                    ..
+                } => Some(*link),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn already_have_on_relayed_entry_keeps_custody_and_excludes_link() {
+        let dst = Identifier::from_bytes([0xD5; 32]);
+        let upstream = Identifier::from_bytes([0x01; 32]);
+        let mut node = test_node();
+        link_up(&mut node, 100, upstream, 1_000);
+        link_up(&mut node, 200, dst, 1_000);
+        link_up(&mut node, 201, dst, 1_000);
+        let now = 1_000u64;
+        let leg = LegId::from_bytes([0x11; 16]);
+        let exp = now + 10_000;
+        let wire = wire_message(leg, dst, exp);
+        insert_relay_custody(&mut node, leg, wire, 100, dst, exp);
+        node.pending.insert(
+            leg,
+            PendingOffer {
+                origin: PendingOrigin::Relay { custody_leg: leg },
+                sent_at: now,
+                excluded: Vec::new(),
+                link: 200,
+            },
+        );
+        let (actions, _) = node.handle(Event::Frame {
+            at: now,
+            link: 200,
+            from: dst,
+            frame: custody_frame(leg, CUSTODY_ALREADY_HAVE),
+        });
+        // Custody is kept, not released.
+        let entry = node
+            .store
+            .custody_get(&leg)
+            .unwrap()
+            .expect("custody entry must survive ALREADY_HAVE");
+        // The answering link is excluded for this leg's remaining life.
+        assert!(
+            entry
+                .excluded
+                .iter()
+                .any(|e| e.link == 200 && e.until == exp),
+            "link 200 must be excluded for the leg's remaining life: {:?}",
+            entry.excluded
+        );
+        // The message is re-offered on another candidate, never back on 200.
+        let offered = offer_links(&actions);
+        assert!(
+            offered.contains(&201),
+            "expected re-offer on link 201, got {offered:?}"
+        );
+        assert!(!offered.contains(&200));
+    }
+
+    #[test]
+    fn already_have_on_originated_entry_keeps_outbound_copy() {
+        let dst = Identifier::from_bytes([0xD5; 32]);
+        let mut node = test_node();
+        link_up(&mut node, 200, dst, 1_000);
+        let now = 1_000u64;
+        let mid = MessageId::from_bytes([0x11; 16]);
+        let mut msg = outbound(mid, dst, OutboundState::InFlight);
+        msg.exp = now + 10_000;
+        node.store.outbound_put(&msg).unwrap();
+        let leg = LegId::from_bytes([0x22; 16]);
+        node.pending.insert(
+            leg,
+            PendingOffer {
+                origin: PendingOrigin::Outbound { mid },
+                sent_at: now,
+                excluded: Vec::new(),
+                link: 200,
+            },
+        );
+        let (_actions, _) = node.handle(Event::Frame {
+            at: now,
+            link: 200,
+            from: dst,
+            frame: custody_frame(leg, CUSTODY_ALREADY_HAVE),
+        });
+        // Our copy is kept and requeued, not deleted or failed.
+        let stored = node
+            .store
+            .outbound_get(&mid)
+            .unwrap()
+            .expect("outbound message must survive ALREADY_HAVE");
+        assert_eq!(stored.state, OutboundState::Queued);
+        assert!(
+            node.outbound_exclusions
+                .get(&mid)
+                .is_some_and(|v| v.iter().any(|e| e.link == 200)),
+            "answering link must be excluded for this mid"
+        );
+    }
+
+    #[test]
+    fn accepted_and_refused_release_relay_custody() {
+        for result in [CUSTODY_ACCEPTED, CUSTODY_REFUSED] {
+            let dst = Identifier::from_bytes([0xD5; 32]);
+            let upstream = Identifier::from_bytes([0x01; 32]);
+            let mut node = test_node();
+            link_up(&mut node, 100, upstream, 1_000);
+            link_up(&mut node, 200, dst, 1_000);
+            let now = 1_000u64;
+            let leg = LegId::from_bytes([0x33; 16]);
+            let exp = now + 10_000;
+            let wire = wire_message(leg, dst, exp);
+            insert_relay_custody(&mut node, leg, wire, 100, dst, exp);
+            node.pending.insert(
+                leg,
+                PendingOffer {
+                    origin: PendingOrigin::Relay { custody_leg: leg },
+                    sent_at: now,
+                    excluded: Vec::new(),
+                    link: 200,
+                },
+            );
+            let (_actions, _) = node.handle(Event::Frame {
+                at: now,
+                link: 200,
+                from: dst,
+                frame: custody_frame(leg, result),
+            });
+            assert!(
+                node.store.custody_get(&leg).unwrap().is_none(),
+                "custody must be released on result {result}"
+            );
+        }
+    }
+
+    #[test]
+    fn accepted_custody_excludes_the_upstream_link() {
+        let dst = Identifier::from_bytes([0xD5; 32]);
+        let upstream = Identifier::from_bytes([0x01; 32]);
+        let mut node = test_node();
+        link_up(&mut node, 100, upstream, 1_000);
+        let now = 1_000u64;
+        let leg = LegId::from_bytes([0x44; 16]);
+        let exp = now + 10_000;
+        let wire = wire_message(leg, dst, exp);
+        let (actions, _) = node.handle(Event::Frame {
+            at: now,
+            link: 100,
+            from: upstream,
+            frame: Frame::Offer(OfferFrame { message: wire }),
+        });
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::SendFrame {
+                    frame: Frame::Custody(c),
+                    ..
+                } if c.result == CUSTODY_ACCEPTED
+            )),
+            "offer must be accepted"
+        );
+        let entry = node
+            .store
+            .custody_get(&leg)
+            .unwrap()
+            .expect("custody entry must be stored");
+        assert!(
+            entry.excluded.iter().any(|e| e.link == 100),
+            "upstream link must be excluded for this leg: {:?}",
+            entry.excluded
+        );
+        // With no other route, nothing is offered back to the upstream.
+        assert!(!offer_links(&actions).contains(&100));
+    }
+
+    #[test]
+    fn dispatch_marks_originated_leg_seen() {
+        let dst = Identifier::from_bytes([0xD5; 32]);
+        let mut node = test_node();
+        link_up(&mut node, 200, dst, 1_000);
+        let now = 1_000u64;
+        let leg = LegId::from_bytes([0x55; 16]);
+        let exp = now + 10_000;
+        let wire = wire_message(leg, dst, exp);
+        let mid = MessageId::from_bytes([0x66; 16]);
+        let msg = outbound(mid, dst, OutboundState::Queued);
+        let mut actions = Vec::new();
+        let result = node.dispatch_wire(now, &wire, &msg, &mut actions);
+        assert!(matches!(result, DispatchResult::Sent));
+        let leg_hash = lattice_crypto::hash(leg.as_ref());
+        assert!(node.store.seen_contains(&leg_hash, now).unwrap());
+    }
+
+    #[test]
+    fn originated_leg_bouncing_back_gets_already_have() {
+        let dst = Identifier::from_bytes([0xD5; 32]);
+        let stray = Identifier::from_bytes([0x01; 32]);
+        let mut node = test_node();
+        link_up(&mut node, 200, dst, 1_000);
+        link_up(&mut node, 300, stray, 1_000);
+        let now = 1_000u64;
+        let leg = LegId::from_bytes([0x55; 16]);
+        let exp = now + 10_000;
+        let wire = wire_message(leg, dst, exp);
+        let mid = MessageId::from_bytes([0x66; 16]);
+        let msg = outbound(mid, dst, OutboundState::Queued);
+        let mut actions = Vec::new();
+        assert!(matches!(
+            node.dispatch_wire(now, &wire, &msg, &mut actions),
+            DispatchResult::Sent
+        ));
+        // The same leg comes back to us as an offer from another link.
+        let (actions, _) = node.handle(Event::Frame {
+            at: now,
+            link: 300,
+            from: stray,
+            frame: Frame::Offer(OfferFrame { message: wire }),
+        });
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::SendFrame {
+                    frame: Frame::Custody(c),
+                    ..
+                } if c.result == CUSTODY_ALREADY_HAVE
+            )),
+            "a bounced-back originated leg must be answered ALREADY_HAVE"
+        );
+        // We must not take custody of our own message.
+        assert!(node.store.custody_get(&leg).unwrap().is_none());
     }
 }
