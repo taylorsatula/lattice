@@ -3,8 +3,9 @@
 # install -Dm644 deploy/latticed.service /etc/systemd/system/latticed.service
 # install -Dm644 deploy/lattice.sysusers /etc/sysusers.d/lattice.conf
 # install -Dm644 deploy/lattice.tmpfiles.conf /etc/tmpfiles.d/lattice.conf
+# install -d -m 0750 -o root -g lattice /etc/lattice
+# install -Dm640 -o root -g lattice deploy/lattice.example.toml /etc/lattice/lattice.toml
 # systemd-sysusers && systemd-tmpfiles --create
-# install -Dm600 deploy/lattice.example.toml /etc/lattice/lattice.toml
 # systemctl daemon-reload && systemctl enable --now latticed
 [Unit]
 Description=Lattice node daemon
@@ -14,23 +15,23 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-# Runs as root with egid=lattice (see deploy/lattice.sysusers). Files the
-# daemon creates — including the application socket — are group lattice;
-# the app socket is 0660 so group members can connect, the admin socket is
-# 0600 root-only. The sandbox below (ProtectSystem, ProtectHome, no new
-# privileges, restricted address families) limits what root can do.
+# Runs as the dedicated unprivileged `lattice` user (see deploy/lattice.sysusers).
+# Files the daemon creates — including the application socket — are group lattice;
+# the app socket is 0660 so group members can connect, the admin socket is 0600
+# owner-only. The config is 0640 root:lattice: readable by the daemon, writable
+# only by root. The sandbox below (no capabilities, syscall filter, no new
+# privileges, restricted address families, write access limited to the state
+# and runtime directories) limits what the lattice user can do.
+User=lattice
 Group=lattice
 StateDirectory=lattice
 StateDirectoryMode=0750
 StateDirectoryGroup=lattice
-ConfigurationDirectory=lattice
-ConfigurationDirectoryMode=0750
-ConfigurationDirectoryGroup=lattice
 RuntimeDirectory=lattice
 RuntimeDirectoryMode=0770
 RuntimeDirectoryGroup=lattice
 
-# Option A (default): encrypted/seeded identity in /var/lib/lattice (0700).
+# Option A (default): encrypted/seeded identity in /var/lib/lattice (0750).
 # Option B: systemd credentials instead of files — uncomment and remove the files:
 # LoadCredential=signing_seed:/etc/lattice/keys/signing_seed
 # LoadCredential=channel_seed:/etc/lattice/keys/channel_seed
@@ -50,16 +51,20 @@ TimeoutStopSec=15
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
+ReadWritePaths=/var/lib/lattice /run/lattice
 ProtectHome=true
 PrivateDevices=true
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
+ProtectProc=invisible
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 RestrictNamespaces=true
 LockPersonality=true
 MemoryDenyWriteExecute=true
 SystemCallArchitectures=native
+SystemCallFilter=@system-service
+CapabilityBoundingSet=
 RestrictRealtime=true
 UMask=0077
 LimitNOFILE=65536

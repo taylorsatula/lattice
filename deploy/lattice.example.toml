@@ -1,5 +1,7 @@
 # latticed configuration. Everything except identity_dir, listen and services
 # has a default; unknown keys are rejected.
+# This file contains service secrets: latticed refuses to start unless the
+# file is mode 0600/0400 (owner only) or 0640/0440 (owner plus group read).
 
 # Where the node's secret keys and identity live. Created by `latticed init`.
 identity_dir = "/var/lib/lattice"
