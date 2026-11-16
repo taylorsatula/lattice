@@ -296,7 +296,7 @@ async fn dispatch_app(
 ) -> Vec<u8> {
     match req.op {
         OP_SEND => handle_send(api, service, req).await,
-        OP_STATUS => handle_status(api, req).await,
+        OP_STATUS => handle_status(api, service, req).await,
         OP_FETCH => handle_fetch(api, service, req).await,
         OP_ACK => handle_ack(api, service, req).await,
         OP_LOOKUP => handle_lookup(api, req).await,
@@ -336,7 +336,11 @@ async fn handle_send(api: &mpsc::UnboundedSender<ApiCmd>, service: &str, req: &R
     .await
 }
 
-async fn handle_status(api: &mpsc::UnboundedSender<ApiCmd>, req: &Request) -> Vec<u8> {
+async fn handle_status(
+    api: &mpsc::UnboundedSender<ApiCmd>,
+    service: &str,
+    req: &Request,
+) -> Vec<u8> {
     if deny_unknown_args(&req.args, &[0]).is_err() {
         return resp_err(req.id, ERR_BAD_ARGS);
     }
@@ -349,7 +353,11 @@ async fn handle_status(api: &mpsc::UnboundedSender<ApiCmd>, req: &Request) -> Ve
     call_api(
         api,
         req.id,
-        |tx| ApiCmd::Status { mid, respond: tx },
+        |tx| ApiCmd::Status {
+            mid,
+            service: service.to_string(),
+            respond: tx,
+        },
         |resp| match resp {
             Ok(Some(status)) => {
                 let mut pairs = vec![(Value::UInt(0), Value::UInt(status.status))];
