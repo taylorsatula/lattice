@@ -262,7 +262,11 @@ async fn cmd_run(args: &[String]) -> std::process::ExitCode {
     let mut i = 0;
     while i < args.len() {
         if args[i] == "--config" {
-            config_path = PathBuf::from(&args[i + 1]);
+            let Some(v) = args.get(i + 1) else {
+                eprintln!("--config needs a value");
+                return std::process::ExitCode::from(2);
+            };
+            config_path = PathBuf::from(v);
             i += 2;
         } else {
             eprintln!("unknown flag {}", args[i]);
