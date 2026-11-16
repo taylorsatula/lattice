@@ -256,11 +256,34 @@ fn crash_leaves_no_partial_state() {
 }
 
 #[test]
-fn schema_v1_is_created_fresh() {
+fn schema_is_created_fresh() {
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("fresh.redb");
     let s = RedbStore::open(&path).unwrap();
     assert_eq!(s.record_count().unwrap(), 0);
+}
+
+#[test]
+fn schema_v1_database_fails_loudly() {
+    // v2 rows are CBOR; a v1 (serde_json) database must not open silently.
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("v1.redb");
+    {
+        let db = redb::Database::create(&path).unwrap();
+        let txn = db.begin_write().unwrap();
+        {
+            let mut meta = txn
+                .open_table(redb::TableDefinition::<&str, u64>::new("meta"))
+                .unwrap();
+            meta.insert("schema_version", 1).unwrap();
+        }
+        txn.commit().unwrap();
+    }
+    let err = RedbStore::open(&path).map(|_| ()).unwrap_err();
+    assert!(
+        matches!(err, lattice_store::StoreError::NoMigration { from: 1 }),
+        "expected NoMigration {{ from: 1 }}, got {err}"
+    );
 }
 
 // --- Crash-kill consistency (B3) -------------------------------------------
@@ -433,58 +456,164 @@ fn custody_class_bytes_track_accept_and_remove() {
     assert_eq!(s.custody_bytes().unwrap(), 290);
 }
 
-/// The on-disk JSON shapes must stay byte-identical to the pre-struct
-/// format: STATUS rows are `[status, detail]`, custody `excluded` entries
-/// are `[link, until]`. These pin the serde shims.
-#[test]
-fn serde_shapes_match_legacy_format() {
-    use lattice_store::Exclusion;
-    assert_eq!(
-        serde_json::to_vec(&MessageStatus {
-            status: 3,
-            detail: None,
-        })
-        .unwrap(),
-        b"[3,null]"
-    );
-    assert_eq!(
-        serde_json::to_vec(&MessageStatus {
-            status: 4,
-            detail: Some(7),
-        })
-        .unwrap(),
-        b"[4,7]"
-    );
-    assert_eq!(
-        serde_json::from_slice::<MessageStatus>(b"[3,null]").unwrap(),
-        MessageStatus {
-            status: 3,
-            detail: None,
+/// Build a bucket-sized, zero-padded wire-shaped message: a 4-element CBOR
+/// array whose last element is all-zero bytes, sized exactly to `bucket`.
+/// The store only inspects the shape, so the header/envelope contents are
+/// placeholders.
+fn padded_wire_message(bucket: usize) -> Vec<u8> {
+    use lattice_proto::cbor::{self, Value};
+    let header = Value::map(vec![
+        (Value::UInt(0), Value::UInt(2)),
+        (Value::UInt(1), Value::UInt(30)),
+    ]);
+    let envelope = Value::map(vec![(Value::UInt(0), Value::UInt(0))]);
+    for pad in 0..=bucket {
+        let msg = cbor::encode(&Value::Array(vec![
+            header.clone(),
+            Value::Null,
+            envelope.clone(),
+            Value::Bytes(vec![0u8; pad]),
+        ]));
+        if msg.len() == bucket {
+            return msg;
         }
-    );
-    assert_eq!(
-        serde_json::to_vec(&Exclusion {
-            link: 42,
-            until: 1700
-        })
-        .unwrap(),
-        b"[42,1700]"
-    );
-    assert_eq!(
-        serde_json::from_slice::<Exclusion>(b"[42,1700]").unwrap(),
+    }
+    panic!("no padding length lands on bucket {bucket}");
+}
+
+fn raw_row(path: &std::path::Path, table: &'static str, key: &[u8]) -> Vec<u8> {
+    let db = redb::Database::create(path).unwrap();
+    let txn = db.begin_read().unwrap();
+    let t = txn
+        .open_table(redb::TableDefinition::<&[u8], Vec<u8>>::new(table))
+        .unwrap();
+    t.get(key).unwrap().unwrap().value()
+}
+
+fn raw_row_fixed(path: &std::path::Path, table: &'static str, key: &[u8; 16]) -> Vec<u8> {
+    let db = redb::Database::create(path).unwrap();
+    let txn = db.begin_read().unwrap();
+    let t = txn
+        .open_table(redb::TableDefinition::<[u8; 16], Vec<u8>>::new(table))
+        .unwrap();
+    t.get(key).unwrap().unwrap().value()
+}
+
+#[test]
+fn rows_roundtrip_through_cbor() {
+    use lattice_store::Exclusion;
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("roundtrip.redb");
+    let mut s = RedbStore::open(&path).unwrap();
+
+    // Outbound: every field populated, including waypoints and no deadline.
+    let mut msg = outbound(7);
+    msg.waypoints_tried = vec![id(0xA1), id(0xB2)];
+    msg.receipt_deadline = None;
+    msg.attempts = 7;
+    msg.route = 2;
+    s.outbound_push(&msg).unwrap();
+    assert_eq!(s.outbound_get(&mid(7)).unwrap().unwrap(), msg);
+
+    // Custody: with exclusions; message is not bucket-sized, so it is stored verbatim.
+    let mut entry = custody(7);
+    entry.excluded = vec![
         Exclusion {
             link: 42,
-            until: 1700
-        }
+            until: 1700,
+        },
+        Exclusion {
+            link: 43,
+            until: 1800,
+        },
+    ];
+    s.custody_put(entry.clone()).unwrap();
+    assert_eq!(s.custody_get(&leg(7)).unwrap().unwrap(), entry);
+
+    // Inbox.
+    let inbox = inbox_entry(0x42, 1234, "svc");
+    s.inbox_push(inbox.clone()).unwrap();
+    let got = s.inbox_fetch("svc", 1).unwrap().pop().unwrap();
+    assert_eq!(got, inbox);
+
+    // Status: with and without detail.
+    s.status_set(&mid(7), 4, Some(77)).unwrap();
+    assert_eq!(
+        s.status_get(&mid(7)).unwrap(),
+        Some(MessageStatus {
+            status: 4,
+            detail: Some(77),
+        })
     );
-    let entry = custody(1);
-    let mut with_exclusions = entry.clone();
-    with_exclusions.excluded = vec![Exclusion {
-        link: 9,
-        until: 123,
-    }];
-    let json = serde_json::to_value(&with_exclusions).unwrap();
-    assert_eq!(json["excluded"], serde_json::json!([[9, 123]]));
+    s.status_set(&mid(7), 3, None).unwrap();
+    assert_eq!(
+        s.status_get(&mid(7)).unwrap(),
+        Some(MessageStatus {
+            status: 3,
+            detail: None,
+        })
+    );
+
+    // Rows are CBOR maps, not JSON objects.
+    drop(s);
+    let out_row = raw_row_fixed(&path, "outbound", mid(7).as_bytes());
+    assert_eq!(out_row[0] & 0xe0, 0xa0, "outbound row is not a CBOR map");
+    let custody_row = raw_row_fixed(&path, "custody", leg(7).as_bytes());
+    assert_eq!(custody_row[0] & 0xe0, 0xa0, "custody row is not a CBOR map");
+    // Inbox key: u16be(service_len) || service || received:u64be || delivery_id.
+    let mut inbox_key = Vec::new();
+    inbox_key.extend_from_slice(&3u16.to_be_bytes());
+    inbox_key.extend_from_slice(b"svc");
+    inbox_key.extend_from_slice(&1234u64.to_be_bytes());
+    inbox_key.extend_from_slice(did(0x42).as_bytes());
+    let inbox_row = raw_row(&path, "inbox", &inbox_key);
+    assert_eq!(inbox_row[0] & 0xe0, 0xa0, "inbox row is not a CBOR map");
+}
+
+#[test]
+fn outbound_row_with_2kb_body_stays_under_3kb() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("size.redb");
+    let mut s = RedbStore::open(&path).unwrap();
+    let mut msg = outbound(1);
+    msg.envelope.body = Some(vec![0xAB; 2048]);
+    s.outbound_push(&msg).unwrap();
+    drop(s);
+    let raw = raw_row_fixed(&path, "outbound", mid(1).as_bytes());
+    assert!(
+        raw.len() < 3 * 1024,
+        "outbound row with a 2048-byte body is {} bytes",
+        raw.len()
+    );
+}
+
+#[test]
+fn custody_row_strips_wire_padding() {
+    for (bucket_idx, &bucket) in lattice_proto::MESSAGE_BUCKETS.iter().enumerate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("strip.redb");
+        let wire = padded_wire_message(bucket);
+        let mut s = RedbStore::open(&path).unwrap();
+        let mut entry = custody(1);
+        entry.message = wire.clone();
+        s.custody_put(entry).unwrap();
+        drop(s);
+        // The stored row holds the unpadded message plus the bucket index,
+        // so it is far smaller than the bucket.
+        let raw = raw_row_fixed(&path, "custody", leg(1).as_bytes());
+        assert!(
+            raw.len() < 1024,
+            "bucket {bucket_idx}: custody row for a {}-byte wire message is {} bytes",
+            wire.len(),
+            raw.len()
+        );
+        // The full padded message is re-assembled on read, byte for byte.
+        let s = RedbStore::open(&path).unwrap();
+        let got = s.custody_get(&leg(1)).unwrap().unwrap();
+        assert_eq!(got.message, wire, "bucket {bucket_idx} round-trip");
+        // Byte accounting still tracks the full wire message.
+        assert_eq!(s.custody_bytes().unwrap(), wire.len() as u64);
+    }
 }
 
 fn inbox_entry(delivery: u8, received: u64, tsvc: &str) -> InboxEntry {
@@ -511,6 +640,7 @@ fn outbound_row_with_invalid_envelope_fails_read() {
     }
     // Hand-corrupt the stored row: envelope kind 99 fails Envelope::from_value.
     {
+        use lattice_proto::cbor::{self, Value};
         let db = redb::Database::create(&path).unwrap();
         let txn = db.begin_write().unwrap();
         {
@@ -518,10 +648,23 @@ fn outbound_row_with_invalid_envelope_fails_read() {
                 .open_table(redb::TableDefinition::<[u8; 16], Vec<u8>>::new("outbound"))
                 .unwrap();
             let raw = t.get(mid(1).as_bytes()).unwrap().unwrap().value();
-            let mut v: serde_json::Value = serde_json::from_slice(&raw).unwrap();
-            v["envelope"]["kind"] = serde_json::json!(99);
-            t.insert(mid(1).as_bytes(), serde_json::to_vec(&v).unwrap())
-                .unwrap();
+            let mut v = cbor::decode(&raw).unwrap();
+            // The outbound row is a map; the envelope is key 2, and the
+            // envelope kind is key 0 of the nested map.
+            if let Value::Map(pairs) = &mut v {
+                for (k, val) in pairs.iter_mut() {
+                    if k.as_uint() == Some(2) {
+                        if let Value::Map(envelope) = val {
+                            for (ek, ev) in envelope.iter_mut() {
+                                if ek.as_uint() == Some(0) {
+                                    *ev = Value::UInt(99);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            t.insert(mid(1).as_bytes(), cbor::encode(&v)).unwrap();
         }
         txn.commit().unwrap();
     }
