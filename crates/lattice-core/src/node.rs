@@ -604,11 +604,12 @@ impl<S: Store> Node<S> {
         if let Err(e) = self.publish_record(at) {
             self.diag("publish_record", &e);
         }
-        self.reevaluate_link_bindings(at);
+        let mut actions = self.reevaluate_link_bindings(at);
         // Prove possession of our KEL key to the peer, bound to this
         // channel. The peer folds this into its link binding; without it
         // the link is attributed only from record claims.
-        vec![self.attestation_frame(link, &remote_ck)]
+        actions.push(self.attestation_frame(link, &remote_ck));
+        actions
     }
 
     /// Build the attestation frame for a link: proof that we hold the KEL
@@ -804,17 +805,18 @@ impl<S: Store> Node<S> {
     }
 
     fn on_records(&mut self, at: u64, records: Vec<Vec<u8>>) -> Vec<Action> {
+        let mut actions = Vec::new();
         for bytes in records {
-            self.admit_record(at, &bytes);
+            actions.extend(self.admit_record(at, &bytes));
         }
-        Vec::new()
+        actions
     }
 
     /// Drop claims whose backing record is gone or no longer valid
     /// (expired). Records are never removed from the store today (record
     /// lifecycle is a separate decision), so this keys off validity at
     /// `now`; when a record-expiry sweep lands it will plug in here.
-    fn sweep_ck_claims(&mut self, now: u64) {
+    fn sweep_ck_claims(&mut self, now: u64) -> Vec<Action> {
         let mut fresh: HashMap<X25519PublicKey, std::collections::HashSet<Identifier>> =
             HashMap::new();
         match self.store.record_all() {
@@ -834,13 +836,14 @@ impl<S: Store> Node<S> {
             // transient read failure; report it.
             Err(e) => {
                 self.diag("record_all", &e);
-                return;
+                return Vec::new();
             }
         }
         if fresh != self.ck_claims {
             self.ck_claims = fresh;
-            self.reevaluate_link_bindings(now);
+            return self.reevaluate_link_bindings(now);
         }
+        Vec::new()
     }
 
     /// Retention sweep: drop records and terminal outbound messages past
@@ -970,7 +973,8 @@ impl<S: Store> Node<S> {
         false
     }
 
-    fn reevaluate_link_bindings(&mut self, at: u64) {
+    fn reevaluate_link_bindings(&mut self, at: u64) -> Vec<Action> {
+        let mut actions = Vec::new();
         // Pass 1: attestation wins over record claims — it is direct proof
         // of KEL possession, not a third-party claim about a channel key.
         let pending: Vec<(LinkId, X25519PublicKey, Identifier, Signature)> = self
@@ -998,6 +1002,10 @@ impl<S: Store> Node<S> {
                 if link.peer != Some(*id) {
                     link.peer = Some(*id);
                     changed = true;
+                    actions.push(Action::LinkBound {
+                        link: *link_id,
+                        peer: Some(*id),
+                    });
                 }
                 continue;
             }
@@ -1020,10 +1028,18 @@ impl<S: Store> Node<S> {
                 (false, Some(id)) => {
                     link.peer = Some(id);
                     changed = true;
+                    actions.push(Action::LinkBound {
+                        link: *link_id,
+                        peer: Some(id),
+                    });
                 }
                 (false, None) => {
                     link.peer = None;
                     changed = true;
+                    actions.push(Action::LinkBound {
+                        link: *link_id,
+                        peer: None,
+                    });
                 }
             }
         }
@@ -1034,16 +1050,18 @@ impl<S: Store> Node<S> {
             }
             self.next_reconcile_at = self.next_reconcile_at.min(at + 1);
         }
+        actions
     }
+
     /// Admit a record into the store. Rejections are silent by design:
     /// the caller (`on_records`) cannot act on them, and store failures
     /// are logged.
-    fn admit_record(&mut self, at: u64, bytes: &[u8]) {
+    fn admit_record(&mut self, at: u64, bytes: &[u8]) -> Vec<Action> {
         // Parse once to learn the claimed id, look up the known head,
         // then validate exactly once. Validating the bytes twice (the old
         // behavior) doubled the KEL signature checks on every admission.
         let Ok(parsed) = PeerRecord::parse(bytes) else {
-            return;
+            return Vec::new();
         };
         let known = match self.store.kel_head(&parsed.id()) {
             Ok(k) => k.map(|h| KnownHead {
@@ -1055,11 +1073,11 @@ impl<S: Store> Node<S> {
             // equivocation, so refuse the record.
             Err(e) => {
                 self.diag("kel_head", &e);
-                return;
+                return Vec::new();
             }
         };
         let Ok(validated) = parsed.validate(Some(at), known) else {
-            return;
+            return Vec::new();
         };
         let head = validated.kel.head();
         let rec = validated.into_inner();
@@ -1071,7 +1089,7 @@ impl<S: Store> Node<S> {
             // last-writer-wins, so keep what we have.
             Err(e) => {
                 self.diag("record_get", &e);
-                return;
+                return Vec::new();
             }
         };
         // KEL order dominates last-writer-wins. A record whose chain
@@ -1167,8 +1185,9 @@ impl<S: Store> Node<S> {
                 }
             }
             self.note_ck_claim(&rec);
-            self.reevaluate_link_bindings(at);
+            return self.reevaluate_link_bindings(at);
         }
+        Vec::new()
     }
 
     /// Drop stored records (both scopes) whose KEL is behind `head`.
@@ -2621,7 +2640,7 @@ impl<S: Store> Node<S> {
         actions.extend(self.snow_tick(now));
         actions.extend(self.reconcile_if_due(now));
         self.refresh_record_if_due(now);
-        self.sweep_claims_if_due(now);
+        actions.extend(self.sweep_claims_if_due(now));
         self.sweep_data_if_due(now);
         actions.extend(self.expire_outbound(now));
         actions.extend(self.sweep_receipt_deadlines(now));
@@ -2658,12 +2677,13 @@ impl<S: Store> Node<S> {
         self.record_refresh_at = now + self.config.record_refresh_secs;
     }
 
-    fn sweep_claims_if_due(&mut self, now: u64) {
+    fn sweep_claims_if_due(&mut self, now: u64) -> Vec<Action> {
         if now < self.next_claim_sweep_at {
-            return;
+            return Vec::new();
         }
-        self.sweep_ck_claims(now);
+        let actions = self.sweep_ck_claims(now);
         self.next_claim_sweep_at = now + CLAIM_SWEEP_SECS;
+        actions
     }
 
     fn sweep_data_if_due(&mut self, now: u64) {
@@ -3031,8 +3051,7 @@ impl<S: Store> Node<S> {
                 });
             }
         }
-        self.reevaluate_link_bindings(now);
-        Vec::new()
+        self.reevaluate_link_bindings(now)
     }
 
     /// Split into identity and store, for crash/restart simulation.
