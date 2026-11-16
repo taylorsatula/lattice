@@ -30,6 +30,9 @@ use crate::handshake::{Pending, encode_handshake_frame};
 use crate::peer::PeerIo;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+// A black-holed peer must not hold the dial for the OS connect timeout
+// (~75-130s); fail fast so the caller can retry on its own schedule.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub enum PeerContact {
     Ik {
@@ -61,7 +64,10 @@ pub async fn connect(contact: PeerContact, channel_seed: &ChannelSeed) -> Result
     };
 
     crate::path::validate_upgrade_path(&path)?;
-    let tcp = TcpStream::connect(addr).await.map_err(NetError::Io)?;
+    let tcp = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr))
+        .await
+        .map_err(|_| NetError::Timeout)?
+        .map_err(NetError::Io)?;
     let _ = crate::set_tcp_keepalive(&tcp);
     let boxed: crate::peer::BoxedStream = Box::pin(tcp);
     let request = Request::builder()

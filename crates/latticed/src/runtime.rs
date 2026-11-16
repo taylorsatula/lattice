@@ -25,11 +25,20 @@ pub enum LinkEvent {
 
 pub enum Cmd {
     Dial {
-        addr: String,
+        addr: std::net::SocketAddr,
         ik_key: Option<ChannelPublicKey>,
         path: Option<String>,
         peer_id: Option<Identifier>,
     },
+}
+
+/// Outcome of a dial spawned off the event loop, delivered back over a
+/// channel the loop selects on. `pinned` is the peer id to attribute the
+/// link to (IK dials only), resolved before the dial was spawned.
+pub struct DialOutcome {
+    addr: std::net::SocketAddr,
+    pinned: Option<Identifier>,
+    result: Result<lattice_net::PeerIo, lattice_net::NetError>,
 }
 
 /// Oneshot reply channel for store-backed queries; the socket layer maps
@@ -145,6 +154,12 @@ struct RootDial {
     in_flight: bool,
 }
 
+/// Overall deadline for one dial (connect, WebSocket upgrade, handshake).
+/// The TCP connect itself has its own 5s timeout in lattice-net; this
+/// bounds everything else so a spawned dial cannot hang forever and pin a
+/// root's `in_flight` slot.
+const DIAL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15);
+
 struct LinkHandle {
     peer: Option<Identifier>,
     addr: Option<std::net::SocketAddr>,
@@ -160,6 +175,8 @@ pub struct Runtime {
     channel_seed: ChannelSeed,
     links: HashMap<u64, LinkHandle>,
     peer_rx: Option<mpsc::UnboundedReceiver<lattice_net::PeerIo>>,
+    dial_rx: Option<mpsc::UnboundedReceiver<DialOutcome>>,
+    dial_tx: mpsc::UnboundedSender<DialOutcome>,
     link_rx: Option<mpsc::UnboundedReceiver<LinkEvent>>,
     link_tx: mpsc::UnboundedSender<LinkEvent>,
     cmd_rx: mpsc::UnboundedReceiver<Cmd>,
@@ -267,6 +284,7 @@ impl Runtime {
             node.set_drain(DrainState::Draining);
         }
         let (link_tx, link_rx) = mpsc::unbounded_channel();
+        let (dial_tx, dial_rx) = mpsc::unbounded_channel();
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (api_tx, api_rx) = mpsc::unbounded_channel();
         let (app_broadcast, _) = broadcast::channel(256);
@@ -284,6 +302,8 @@ impl Runtime {
             link_rx: Some(link_rx),
             link_tx,
             peer_rx: Some(peer_rx),
+            dial_rx: Some(dial_rx),
+            dial_tx,
             cmd_rx,
             cmd_tx,
             roots: Vec::new(),
@@ -384,7 +404,7 @@ impl Runtime {
             root.attempts += 1;
             root.next_attempt = now + backoff;
             let _ = self.cmd_tx.send(Cmd::Dial {
-                addr: root.addr.to_string(),
+                addr: root.addr,
                 ik_key: root.ik_key,
                 path: root.path.clone(),
                 peer_id: root.peer_id,
@@ -409,6 +429,7 @@ impl Runtime {
         let mut link_rx = self.link_rx.take().expect("run once");
         let mut api_rx = self.api_rx.take().expect("run once");
         let mut peer_rx = self.peer_rx.take().expect("run once");
+        let mut dial_rx = self.dial_rx.take().expect("run once");
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
         tokio::pin!(shutdown);
         loop {
@@ -422,9 +443,10 @@ impl Runtime {
                     let ck = peer.remote_static;
                     self.attach_link(None, ck, peer, None);
                 }
+                Some(outcome) = dial_rx.recv() => self.handle_dial_outcome(outcome),
                 Some(api) = api_rx.recv() => self.handle_api(api),
                 Some(cmd) = self.cmd_rx.recv() => match cmd {
-                    Cmd::Dial { addr, ik_key, path, peer_id } => self.handle_dial(addr, ik_key, path, peer_id).await,
+                    Cmd::Dial { addr, ik_key, path, peer_id } => self.spawn_dial(addr, ik_key, path, peer_id),
                 },
                 Some(ev) = link_rx.recv() => match ev {
                     LinkEvent::Frame { link, frame } => {
@@ -568,21 +590,21 @@ impl Runtime {
                 peer_id,
                 respond,
             } => {
-                let ok = addr.parse::<std::net::SocketAddr>().is_ok()
-                    && (ik_key.is_some() || path.is_some());
-                if ok {
-                    let _ = self.cmd_tx.send(Cmd::Dial {
-                        addr,
-                        ik_key,
-                        path,
-                        peer_id,
-                    });
+                let parsed = addr.parse::<std::net::SocketAddr>();
+                match parsed {
+                    Ok(addr) if ik_key.is_some() || path.is_some() => {
+                        let _ = self.cmd_tx.send(Cmd::Dial {
+                            addr,
+                            ik_key,
+                            path,
+                            peer_id,
+                        });
+                        let _ = respond.send(LinkOutcome::Queued);
+                    }
+                    _ => {
+                        let _ = respond.send(LinkOutcome::Rejected);
+                    }
                 }
-                let _ = respond.send(if ok {
-                    LinkOutcome::Queued
-                } else {
-                    LinkOutcome::Rejected
-                });
             }
             ApiCmd::Rotate {
                 next_key_file,
@@ -645,17 +667,16 @@ impl Runtime {
         }
     }
 
-    async fn handle_dial(
+    /// Spawn the dial as a task; the outcome comes back through `dial_rx`.
+    /// The event loop never awaits a dial, so an unreachable peer cannot
+    /// stall frame processing, ticks or the local API.
+    fn spawn_dial(
         &mut self,
-        addr: String,
+        addr: std::net::SocketAddr,
         ik_key: Option<ChannelPublicKey>,
         path: Option<String>,
         peer_id: Option<Identifier>,
     ) {
-        let addr: std::net::SocketAddr = match addr.parse() {
-            Ok(a) => a,
-            Err(_) => return,
-        };
         let pinned = pinned_peer(ik_key.as_ref(), peer_id);
         if peer_id.is_some() && pinned.is_none() {
             eprintln!(
@@ -669,24 +690,48 @@ impl Runtime {
                 channel_key: ck,
             },
             (None, Some(p)) => lattice_net::PeerContact::Xx { addr, path: p },
-            (None, None) => return,
+            (None, None) => {
+                self.clear_root_in_flight(addr);
+                return;
+            }
         };
-        match lattice_net::connect(contact, &self.channel_seed).await {
+        let seed = self.channel_seed.clone();
+        let tx = self.dial_tx.clone();
+        tokio::spawn(async move {
+            let result = tokio::time::timeout(DIAL_DEADLINE, lattice_net::connect(contact, &seed))
+                .await
+                .unwrap_or(Err(lattice_net::NetError::Timeout));
+            let _ = tx.send(DialOutcome {
+                addr,
+                pinned,
+                result,
+            });
+        });
+    }
+
+    fn clear_root_in_flight(&mut self, addr: std::net::SocketAddr) {
+        if let Some(root) = self.roots.iter_mut().find(|r| r.addr == addr) {
+            root.in_flight = false;
+        }
+    }
+
+    /// Apply the outcome of a spawned dial: attach the link on success,
+    /// log on failure, and release the root's in-flight slot either way.
+    fn handle_dial_outcome(&mut self, outcome: DialOutcome) {
+        match outcome.result {
             Ok(io) => {
                 let remote_ck = io.remote_static;
-                self.attach_link(pinned, remote_ck, io, Some(addr));
-                if let Some(root) = self.roots.iter_mut().find(|r| r.addr == addr) {
+                self.attach_link(outcome.pinned, remote_ck, io, Some(outcome.addr));
+                if let Some(root) = self.roots.iter_mut().find(|r| r.addr == outcome.addr) {
                     root.attempts = 0;
                     root.next_attempt = now_secs() + 60;
                 }
             }
             Err(e) => {
-                eprintln!("lattice: dial {addr} failed: {e}");
+                eprintln!("lattice: dial {} failed: {e}", outcome.addr);
             }
         }
-        if let Some(root) = self.roots.iter_mut().find(|r| r.addr == addr) {
-            root.in_flight = false;
-        }
+        self.clear_root_in_flight(outcome.addr);
     }
 
     fn unlink(&mut self, peer: Identifier) {
