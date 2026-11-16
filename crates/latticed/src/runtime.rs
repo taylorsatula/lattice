@@ -262,16 +262,18 @@ impl TokenBucket {
 
 /// Per-link (capacity, refill/sec) for outbound classes. Custody is sized
 /// for a relay pushing offers; gossip covers a reconcile round (~3 frames
-/// per interval) with headroom; snow caps even a misconfigured snow_per_min.
+/// per interval, plus KEL nudges during bootstrap, which can fire once per
+/// second) with headroom — 1/sec starved bootstrap sync in the six-node
+/// gate; snow caps even a misconfigured snow_per_min.
 const OUT_CUSTODY: (f64, f64) = (64.0, 16.0);
-const OUT_GOSSIP: (f64, f64) = (16.0, 1.0);
+const OUT_GOSSIP: (f64, f64) = (64.0, 8.0);
 const OUT_SNOW: (f64, f64) = (4.0, 0.25);
 const OUT_CONTROL: (f64, f64) = (16.0, 2.0);
 /// Per-link (capacity, refill/sec) for inbound classes. Gossip inbound is a
 /// touch more generous than outbound: a peer answering our wants may push a
 /// burst of records.
 const IN_CUSTODY: (f64, f64) = (64.0, 16.0);
-const IN_GOSSIP: (f64, f64) = (16.0, 2.0);
+const IN_GOSSIP: (f64, f64) = (64.0, 16.0);
 const IN_SNOW: (f64, f64) = (4.0, 0.5);
 const IN_CONTROL: (f64, f64) = (16.0, 2.0);
 
