@@ -3,6 +3,8 @@
 Companion to `V2_DESIGN.md`. Every object here is derived from a decision in
 that document; section references (§n) point back to it.
 
+Wire version 2; see §9 for the revision.
+
 ## 1. Conventions
 
 - **Encoding:** deterministic CBOR (RFC 8949 §4.2): shortest-form integers,
@@ -10,7 +12,7 @@ that document; section references (§n) point back to it.
   the exact encoded bytes.
 - **Maps use small integer keys,** as COSE does, for compactness. The tables
   below give each key's number.
-- **Every top-level object** carries `0: v` (protocol version, currently 1)
+- **Every top-level object** carries `0: v` (protocol version, currently 2)
   and `1: t` (object type).
 - **Unknown keys are rejected,** not ignored. Within a version the format is
   closed; extensions come with a new version number. A node refuses objects
@@ -21,7 +23,8 @@ that document; section references (§n) point back to it.
   | Object | Limit |
   |---|---|
   | Peer record | 3 KB |
-  | Frame after the handshake | Exactly one frame bucket: 2, 8 or 32 KB of plaintext (§6) |
+  | KEL object | 16 KB |
+  | Frame after the handshake | Exactly one frame bucket: 2, 4, 8 or 32 KB of plaintext (§6) |
   | Message | Exactly one message bucket: its frame bucket minus 64 bytes, so an `offer` frame fits exactly |
   | Channel frame on the wire | 32784 bytes (32 KiB bucket + 16-byte AEAD tag), enforced by the WebSocket layer before the frame is assembled |
   | Local API frame | 64 KB |
@@ -65,18 +68,41 @@ that document; section references (§n) point back to it.
 
 ### Signing rule
 
-A signed object is signed over its own encoding with the `sig` key omitted.
-To verify, remove `sig`, re-encode deterministically, and check the
-signature. Deterministic encoding makes that re-encoding exact.
+Every signature preimage is prefixed with a context string naming the object
+type, so a signature made for one object type is never valid for another.
+The preimage is `context ‖ 0x00 ‖ body`, where `context` is the ASCII context
+string from the table below and `body` is the object's own encoding with the
+`sig` key omitted. The context string is never part of the encoded object;
+it prefixes only the bytes fed to the signing function, so object encodings,
+identifiers and event hashes are unchanged by this rule. To verify,
+re-encode the body, prepend the context and the `0x00` separator, and check
+the signature. Deterministic encoding makes the re-encoding exact.
+
+| Object | Context string |
+|---|---|
+| Key event (inception or rotation) | `lattice v1 key event` |
+| Record (`sig` and `csig`) | `lattice v1 record` |
+| Envelope, message (kind 0) | `lattice v1 envelope` |
+| Envelope, receipt or negative receipt (kind 1 or 2) | `lattice v1 receipt` |
+
+The envelope's `body` is the encoded routing header (the real one, never an
+outer header) followed by the envelope map without `sig`; see §5. The former
+attestation context is gone with the attest frame (§6).
 
 ### Text forms
 
-- **Identifier:** lowercase base32 without padding, 52 characters.
+- **Identifier:** lowercase base32 (RFC 4648, no padding), 52 characters.
+- **Hex:** lowercase hexadecimal (64 characters) is accepted everywhere an
+  identifier is accepted, for compatibility. Implementations must emit
+  base32.
 - **Address:** `<service>:<mailbox>@<identifier>`, for example
-  `mira:taylor@k7f3…`. Lattice routes on the identifier and delivers on the
-  service. The mailbox is opaque to Lattice and belongs to the service.
+  `mira:taylor@k7f3…`, where the identifier is in either form. Lattice
+  routes on the identifier and delivers on the service. The mailbox is
+  opaque to Lattice and belongs to the service. `service` and `mailbox`
+  are non-empty and contain no `:`, `@` or whitespace; the identifier is
+  the part after the `@`.
 
-## 2. Key events (§1)
+## 2. Key events and the key event log (§1)
 
 Each event is a signed map.
 
@@ -85,25 +111,57 @@ Each event is a signed map.
 | 0 | v | uint | |
 | 1 | t | uint | 1 = inception, 2 = rotation |
 | 2 | sn | uint | Event number; inception is 0 |
-| 3 | prev | hash | BLAKE3 of the previous event. Absent in inception |
+| 3 | prev | hash | Event hash of the previous event. Absent in inception |
 | 4 | k | sigkey | The signing key this event establishes |
 | 5 | n | hash | BLAKE3 of the next signing key. **Absent means abandonment** |
-| 6 | sig | sig | By `k` |
+| 6 | sig | sig | By `k`, over `lattice v1 key event ‖ 0x00 ‖` the event encoding without `sig` (§1) |
+
+**Event hash.** The event hash of an event is BLAKE3 of its encoding without
+`sig`. The identifier, `prev` and the KEL-head commitment in records (§3)
+are all defined in terms of it.
 
 **Rules:**
-- **Identifier** = BLAKE3 of the inception event's encoding without `sig`.
+- **Identifier** = event hash of the inception event.
 - **A rotation is valid only if** `BLAKE3(k)` equals the previous event's
-  `n`, `prev` matches, `sn` is the previous event's plus one, and `sig`
-  verifies under the new `k`. A stolen current key can't produce a valid
-  rotation.
+  `n`, `prev` matches the previous event's event hash, `sn` is the previous
+  event's plus one, and `sig` verifies under the new `k`. A stolen current
+  key can't produce a valid rotation.
 - **Abandonment.** A rotation without `n` ends the identity permanently. No
   later record or event for that identifier is accepted.
-- **Monotonic history.** A node keeps the latest KEL head (sn and event hash)
-  for every identifier for one year after the last record it saw. A record
-  whose KEL is a prefix of, or diverges from, a longer valid KEL already
-  known is invalid, whatever its `seq`.
-- **Key event log (KEL):** the array of events from inception to the
-  current one.
+- **Monotonic history.** A node keeps the KEL object (or at least its head)
+  for every identifier for one year after the last record it saw. A KEL
+  that is a prefix of, or diverges from, a longer valid KEL already known
+  is not accepted, and neither is a record citing it, whatever its `seq`.
+  Two valid KELs for the same identifier that diverge at the same `sn`: the
+  one with the lower head event hash wins.
+
+### The key event log object
+
+The KEL travels as its own object, not embedded in records.
+
+| Key | Name | Type | Notes |
+|---|---|---|---|
+| 0 | v | uint | |
+| 1 | t | uint | 11 |
+| 2 | id | id | The identifier: event hash of the inception event |
+| 3 | events | array of key events | Inception (sn 0) through the current head, contiguous |
+
+- The object carries no signature of its own; its authenticity derives from
+  the event chain.
+- `id` must equal the event hash of `events[0]`. Each event must satisfy the
+  rules above, and the array must be contiguous from sn 0.
+- The encoded object is at most 16 KB and always fits in a single frame.
+- **Retention.** KEL objects are retained for the KEL-head retention period
+  (one year after the last record seen for the identifier), the same period
+  that applies to the KEL head. A KEL whose head event is an abandonment is
+  a *tombstone*: it is never used for routing or link binding, and once
+  held, no record for the identifier is accepted and all stored records for
+  it are dropped. The KEL object is the only carrier of an abandonment. The
+  `abandon` admin operation (§7) publishes it before draining.
+- **Reconciliation.** KEL objects are reconciled in the same set as records
+  (§6), as entries with scope 255 (reserved; never valid in a record), `seq`
+  equal to the head sn, and hash-prefix equal to the first 8 bytes of the
+  head event's event hash.
 
 ## 3. Peer record (§2)
 
@@ -113,9 +171,9 @@ Each event is a signed map.
 | 1 | t | uint | All | 10 |
 | 2 | id | id | All | |
 | 3 | scope | uint | All | 0 = WAN, 1 = hive |
-| 4 | seq | uint | All | Last-writer-wins per (id, scope) |
+| 4 | seq | uint | All | Last-writer-wins per (id, scope); see Record order below |
 | 5 | exp | time | All | Coarse expiry, days out |
-| 6 | kel | array of key events | All | Full KEL |
+| 6 | khs | uint | All | KEL head sn |
 | 7 | ck | ed25519 | All | Channel key: Ed25519 public key; the Noise static key is the derived X25519 key (below) |
 | 8 | ek | xwing_pk | All | Envelope key (§4) |
 | 9 | mode | uint | All | 0 = public, 1 = private |
@@ -123,8 +181,11 @@ Each event is a signed map.
 | 11 | ln | array of id | Public | Current links, at most 32 |
 | 12 | gw | array of id | Private | One to three gateways |
 | 13 | cap | uint | All | Capability bitset |
-| 14 | sig | sig | All | By the current signing key in `kel` |
+| 14 | sig | sig | All | By the current signing key (§1) |
 | 15 | csig | sig | All | By the channel key over the same preimage as `sig` |
+| 16 | khc | hash | All | KEL head commitment: event hash of the head event |
+| 17 | k | sigkey | All | Current signing key; must equal the KEL head event's `k` |
+| 18 | serves | array of id | Public, optional | Private ids this gateway serves; at most 16 distinct ids |
 
 **Channel key and Noise key.** The channel key is an Ed25519 public key.
 The Noise handshake runs on the matching X25519 key, derived from the same
@@ -145,33 +206,52 @@ record and a hive record. The hive record is gossiped only inside the hive.
 Each is last-writer-wins on its own (id, scope) pair. Hive-only instances
 publish only a hive record.
 
+**Gateway consent.** A public record MAY carry `serves`: the private ids
+the gateway agrees to serve, at most 16 distinct ids. The private↔gateway
+pseudo-edge exists only when both records name each other: the private
+record's `gw` lists the gateway, and the gateway's `serves` lists the
+private id. If either side does not name the other, there is no edge, and
+the gateway does not carry traffic for the private id. A gateway that
+serves no private ids omits the field.
+
 **Validation:**
-- The KEL is valid (§2) and not behind the KEL head already known for this
-  identifier (§2, monotonic history). A record whose KEL ends in an
-  abandonment is valid: it is a *tombstone*. A tombstone is never used for
-  routing, delivery, waypoint selection or link binding. It replaces the
-  identity's stored records, and it is retained for the KEL-head retention
-  period (it is the only carrier of the abandonment to peers that were
-  offline). Once its KEL head is known, no further record for that
-  identifier is accepted. The `abandon` admin operation (§7) publishes the
-  tombstone before draining.
-- `sig` verifies under the current key in the KEL.
+- The KEL head named by `khs` and `khc` matches the head of a KEL held for
+  this identifier, and that KEL is valid (§2) and not behind the KEL head
+  already known (§2, monotonic history). If no such KEL is held, or the
+  record's head is ahead of the held KEL, the record is not accepted: the
+  node wants the KEL (§6) and drops the record; reconciliation re-delivers
+  the record once the KEL arrives. If the record's head is behind the held
+  KEL, the record is stale and is dropped. A record whose KEL head is an
+  abandonment is not accepted.
+- `k` equals the KEL head event's `k`.
+- `sig` verifies under `k` (§1).
 - `csig` verifies under the channel key, over the same preimage as `sig`.
 - `id` matches the KEL's inception.
 - `exp` is in the future and within the record horizon (§1).
 - Fields match the mode: no `ep` or `ln` on a private record, no `gw` on a
-  public one.
+  public one, no `serves` on a private record.
+- `serves`, if present, carries at most 16 distinct ids.
 - Every `ep` URL is consistent with the record's scope (§2 scope rule).
 - The encoded record is within 3 KB.
 
 **Equivocation:** two records with the same (id, scope, seq) and different
 bytes, both validly signed. Every node keeps the one whose encoding has the
 lower BLAKE3 hash, so all nodes converge, and treats the pair as an
-equivocation proof.
+equivocation proof. Reconciliation detects the pair (§6).
 
-**Republishing:** an instance publishes a new record (seq + 1) at most once
-per *republish interval* (default 2 minutes), batching link changes. A link
-stays in `ln` through disconnections shorter than the *link grace* (default
+**Record order.** Records for the same (id, scope) are totally ordered by
+(`khs`, `seq`, record hash): a record supersedes another when its `khs` is
+higher, or its `khs` is equal and its `seq` is higher, or both are equal and
+its hash (BLAKE3 of its exact encoding) is lower. Admission and
+last-writer-wins use this order: a stored record is replaced only by a
+superseding record. `seq` is assigned as `max(previous seq + 1, unix
+seconds)`, so it does not decrease across rotations or store loss while the
+clock is sane.
+
+**Republishing:** an instance publishes a new record at most once per
+*republish interval* (default 2 minutes), batching link changes; each
+record's `seq` is `max(previous seq + 1, unix seconds)`. A link stays in
+`ln` through disconnections shorter than the *link grace* (default
 5 minutes).
 
 ## 4. Sealed layers (§1, §6)
@@ -226,7 +306,7 @@ Used for both the routing header and the outer header.
 **Leg ids, not message ids, in headers.** Every leg of every attempt carries
 a fresh random leg id. A node can be on both legs of a waypoint route, or on
 the routes of two attempts, and with a shared id it would answer
-`already have` and block the later one. The message id lives in the envelope
+`ALREADY_HAVE` and block the later one. The message id lives in the envelope
 (below), where the recipient dedups on it.
 
 ### Hop layer plaintext
@@ -261,14 +341,20 @@ traffic (§6 buffer classes).
 | 6 | created | time | |
 | 7 | body | bstr | Kind 0: the application payload, opaque to Lattice |
 | 8 | ref | mid | Kinds 1 and 2: the message being answered |
-| 9 | reason | uint | Kind 2: 1 = unknown service, 2 = invalid |
-| 10 | sig | sig | By `from`'s current signing key, over the encoded routing header (the real one, never an outer header) followed by this map without `sig` |
+| 9 | reason | uint | Kind 2: 1 = unknown service, 2 = invalid (the signature verifies but the envelope is otherwise invalid) |
+| 10 | sig | sig | By `from`'s current signing key, over `context ‖ 0x00 ‖` the encoded routing header (the real one, never an outer header) followed by this map without `sig`, where `context` is `lattice v1 envelope` for kind 0 and `lattice v1 receipt` for kinds 1 and 2 (§1) |
+
+**Negative receipts.** A negative receipt (kind 2) is sent only when the
+envelope signature verifies but the envelope is otherwise invalid (reason 2),
+or when the recipient has no such service (reason 1). If the signature does
+not verify, the recipient refuses custody and sends no receipt of any kind:
+an unauthenticated sender must not be able to elicit a signed response.
 
 **Padding:** zero bytes filling the encoded message to the smallest bucket
 that fits it. A message that fits no bucket is refused at send.
 
 **Sender's record:** a recipient that doesn't hold `from`'s record requests
-it through gossip (§7 below) and holds the message until the record arrives
+it through gossip (§6) and holds the message until the record arrives
 or the message expires.
 
 ## 6. Channel (§3)
@@ -322,72 +408,69 @@ Each WebSocket binary frame carries one CBOR value.
   channel key is known, `Noise_XX_25519_ChaChaPoly_BLAKE2s` otherwise. BLAKE2s
   is used inside Noise because that's what Noise implementations support;
   everywhere else uses BLAKE3.
+- **Prologue.** The Noise prologue is `"lattice v1" ‖ 0x00 ‖` the upgrade
+  path exactly as it appears in the request line, including the leading `/`,
+  as ASCII bytes (for example `lattice v1\0/k7f3…`). Both patterns use the
+  same prologue. Binding the protocol name and the path into the handshake
+  hash keeps a handshake from one path from being replayed on another, and
+  separates this protocol's handshakes from any other Noise protocol that
+  shares the pattern.
 - **After the handshake,** each side checks that the peer's Noise static key
   equals the `ck` in that peer's record. With XX, it first obtains the
-  record through gossip.
+  record through gossip. This check is the only binding between a link and
+  an identity; there is no attestation frame (removed in wire version 2).
+  The cross-signed record (§3) plus the Noise static key are the whole
+  binding.
 
 ### After the handshake
 
 Every frame is a Noise transport message whose plaintext is the CBOR array
 `[frame, padding]`. The padding is a byte string that brings the plaintext to
-exactly one frame bucket (2, 8 or 32 KB). A frame whose plaintext isn't
+exactly one frame bucket (2, 4, 8 or 32 KB). A frame whose plaintext isn't
 exactly a bucket size is refused. Frame types:
 
 | t | Frame | Contents |
 |---|---|---|
 | 50 | offer | `{2: message}` (the encoded message, §5) |
-| 51 | custody | `{2: leg, 3: result, 4: retry_after or absent}`. Result: 0 = accepted, 1 = already have, 2 = busy, 3 = refused |
+| 51 | custody | `{2: leg, 3: result, 4: retry_after or absent}`. Result: 0 = accepted, 1 = ALREADY_HAVE, 2 = busy, 3 = refused, 4 = SEEN |
 | 20 | reconcile | `{2: [range, …]}`. Range-based set reconciliation, below |
 | 21 | want | `{2: [[id, scope], …]}` |
 | 22 | records | `{2: [peer record, …]}` |
 | 23 | reserved | Reserved for the wary list (see V2_DESIGN.md); not implemented in v2.0 |
+| 24 | kels | `{2: [kel, …]}`. KEL objects (§2) |
 | 60 | ping | `{2: nonce}`, answered with the same frame. Replaces WebSocket ping/pong, which is not used |
 | 61 | dummy | `{2: echo}` (bool). Discarded on receipt; if `echo` is true, answered with a dummy (§ Snow) |
-| 62 | attest | `{2: id, 3: sig}`. Channel attestation, below |
+| 62 | reserved | Removed in wire version 2 (was `attest`); not sent, not accepted |
 
 - **Large gossip** that doesn't fit one 32 KB frame is split across several
-  `reconcile` or `records` frames.
-
-### Attestation
-
-Attribution of a link to an identity must not rest on a third party's
-record claim alone: anyone can gossip a record claiming any channel key,
-and the cross-signed record (§3) stops a *forged* claim, but a node still
-has no proof that the peer on a given link is the key holder it claims to
-be. The `attest` frame closes that gap for connected peers.
-
-On link-up, each side sends an `attest` frame:
-
-- `id` is the sender's KEL identifier.
-- `sig` is an Ed25519 signature by the sender's current KEL signing key over
-  `H("lattice attestation v1" ‖ signer_channel_key ‖ verifier_channel_key)`,
-  where `signer_channel_key` is the sender's Ed25519 channel key from its
-  record and `verifier_channel_key` is the verifier's X25519 channel key
-  (the Noise static key of this channel). Binding the verifier's key makes
-  the attestation single-channel: it cannot be replayed onto another link.
-
-The receiver verifies, in order:
-
-1. A record for `id` exists in either scope.
-2. The record's channel key, converted Edwards→Montgomery, equals this
-   link's remote channel key.
-3. `sig` verifies under the record's current KEL signing key.
-
-If all three hold, the link is bound to `id` for routing and attribution,
-and this binding takes precedence over record-claim binding. If any check
-fails, the attestation is discarded and the link falls back to record-claim
-binding. An attestation that fails verification never displaces a valid one
-already stored for the link. Attestations are per-link and are not
-transferable; a new link requires a new attestation.
+  `reconcile`, `records` or `kels` frames.
+- **Custody replies.** `ALREADY_HAVE` (1) means the receiver holds custody
+  of this leg: the message is stored, or the leg id is in its seen set with
+  the message held. `SEEN` (4) means the receiver has seen this leg but
+  does not hold it (it refused or dropped it earlier); the sender should
+  try elsewhere. Neither is a delivery signal, and neither releases the
+  sender's custody. On `ALREADY_HAVE` the sender keeps custody and excludes
+  the link for this leg, then chooses again. On `SEEN` the sender excludes
+  the link for this leg and chooses again.
 
 ### Reconciliation (design §5)
 
-Records are ordered by (id, scope). Each entry's item hash is
-BLAKE3(id ‖ scope ‖ seq), with `scope` a single byte and `seq` as 8
-little-endian bytes. A range's fingerprint is the count of entries and
-the sum of their item hashes modulo 2²⁵⁶. The sum is carried as a 32-byte
-big-endian integer. Sums can be maintained incrementally as records change,
-and the order of addition doesn't matter.
+The reconciliation set holds two kinds of entries: records (scope 0 or 1)
+and KELs (scope 255, reserved; never valid in a record). Entries are
+ordered by (id, scope). Each entry's item hash is
+BLAKE3(id ‖ scope ‖ seq ‖ hash-prefix), with `scope` a single byte, `seq`
+as 8 little-endian bytes (the record's seq, or the KEL head's sn), and
+`hash-prefix` the first 8 bytes of the record's hash (BLAKE3 of its exact
+encoding) or, for a KEL entry, the first 8 bytes of the head event's event
+hash. A range's fingerprint is the count of entries and the sum of their
+item hashes modulo 2²⁵⁶. The sum is carried as a 32-byte big-endian
+integer. Sums can be maintained incrementally as entries change, and the
+order of addition doesn't matter.
+
+KELs are reconciled in the same set as records — one set, one fingerprint,
+one round — rather than in a parallel domain, so a single round converges
+both and the steady-state cost stays one small frame each way. The `kels`
+frame carries KEL objects.
 
 - **A bound** (`lower`/`upper`) is `{0: id (32 bytes), 1: scope (uint)}`.
 - **Limits:** at most 64 ranges per reconcile message, at most 32 entries
@@ -396,8 +479,8 @@ and the order of addition doesn't matter.
   beyond the per-range limit.
 
 - **A range** is `{0: lower bound, 1: upper bound, 2: [count, sum]}` or
-  `{0: lower, 1: upper, 3: [[id, scope, seq], …]}` (an explicit list,
-  used for small ranges).
+  `{0: lower, 1: upper, 3: [[id, scope, seq, hash-prefix], …]}` (an explicit
+  list, used for small ranges; `hash-prefix` is 8 bytes).
 - **A round** starts with one range covering everything. The receiver
   compares fingerprints:
   - **Equal:** done.
@@ -405,10 +488,18 @@ and the order of addition doesn't matter.
     with their fingerprints.
   - **Different and small** (32 entries or fewer): reply with the explicit
     list.
-- **Fetching:** each side sends `want` for entries it lacks or holds at a
-  lower seq, and the other answers with `records`.
+- **Fetching:** each side sends `want` for entries it lacks, holds at a
+  lower seq than the peer's, or holds at an equal seq whose hash-prefix is
+  higher than the peer's (the lower hash wins; equal prefixes are treated
+  as identical). For a KEL entry the
+  same rule applies with the head sn and the head event hash prefix. The
+  other side answers with `records`, or with `kels` for KEL entries (a KEL
+  entry is wanted as `[id, 255]`). A node
+  that receives a record whose KEL it does not hold, or whose head is ahead
+  of the held KEL, drops the record and wants the KEL; when the KEL arrives
+  it is validated and stored, and the next round delivers the record.
 - **Cost:** a round on an unchanged set is one small frame each way,
-  regardless of the number of records. (Meyer, "Range-Based Set
+  regardless of the number of entries. (Meyer, "Range-Based Set
   Reconciliation"; Negentropy.)
 
 - **Custody rule:** a receiver answers `accepted` only after durably storing
@@ -418,7 +509,8 @@ and the order of addition doesn't matter.
   the message is malformed, expired, beyond the message horizon, or the
   wrong size for its bucket.
 - **Check order for an offer,** cheapest first: frame and bucket size, then
-  expiry and horizon, then dedup on the leg id (answer `already have`), then
+  expiry and horizon, then dedup on the leg id (answer `ALREADY_HAVE` if the
+  message is held, `SEEN` if the leg was seen but is not held), then
   buffer class and fair share (answer `busy`), then durable storage (answer
   `accepted`).
 - **Buffer classes.** Transit storage is divided into classes 0 to *D*
@@ -433,13 +525,14 @@ and the order of addition doesn't matter.
   destination *d*, with *dist* the hop count to *d* over the current graph:
   - With probability *p_side* (default 15%), choose uniformly among links to
     neighbors with *dist* exactly equal to this node's own that haven't
-    answered `already have` for this leg. If that neighbor answers `busy` or
-    `already have`, fall through to a progress step at once; never wait on a
-    sideways neighbor.
+    answered `ALREADY_HAVE` or `SEEN` for this leg. If that neighbor answers
+    `busy`, `ALREADY_HAVE` or `SEEN`, fall through to a progress step at
+    once; never wait on a sideways neighbor.
   - Otherwise, choose uniformly among links to neighbors with *dist* less
-    than this node's own. On `already have`, exclude that link for this leg
-    and choose again. On `busy`, try another progress neighbor, or wait with
-    backoff if all are busy.
+    than this node's own. On `ALREADY_HAVE` or `SEEN`, exclude that link for
+    this leg and choose again; the sender keeps custody either way. On
+    `busy`, try another progress neighbor, or wait with backoff if all are
+    busy.
   - Never choose a neighbor with *dist* greater than this node's own.
 - **Waypoint choice** at the sender: uniformly among public instances with a
   valid record, excluding the sender's own links and the recipient (and its
@@ -448,8 +541,8 @@ and the order of addition doesn't matter.
 - **Receipt timeout:** 15 minutes for a public recipient, 12 hours for a
   private one (known from its record), before a retry.
 - **Equivocation proofs** need no frame of their own. Conflicting records
-  travel in an ordinary `records` frame, and the receiver detects the
-  conflict.
+  travel in an ordinary `records` frame, and conflicting KELs in a `kels`
+  frame; the receiver detects the conflict.
 
 ### Snow (design §7)
 
@@ -581,9 +674,11 @@ Operation, event and error codes are part of the wire contract:
 - **Terminal states are sticky.** `delivered`, `failed` and `expired` are
   final; a late receipt never moves a message out of a terminal state.
 - **A negative receipt is sent only for things Lattice itself knows:** no
-  such service on this instance (reason 1), or a message that fails
-  verification (reason 2). Lattice has no concept of users; mailboxes are
-  the service's business.
+  such service on this instance (reason 1), or a message whose signature
+  verifies but which is otherwise invalid (reason 2). If the signature does
+  not verify, the node refuses custody and sends no receipt of any kind:
+  an unauthenticated sender must not be able to elicit a signed response.
+  Lattice has no concept of users; mailboxes are the service's business.
 - **Each service's inbox is capped.** When it is full, the recipient answers
   `busy` to offers for that service (§6), so an application that stops
   fetching creates backpressure instead of unbounded growth.
@@ -594,7 +689,7 @@ Operation, event and error codes are part of the wire contract:
 |---|---|
 | `node` | Identity, mode, links, queue and custody counts, peer record count |
 | `rotate` | Rotate the signing key: the operator supplies the offline next key (verified against the stored commitment) and the commitment to the following key |
-| `abandon` | Abandon the identity permanently; publishes a tombstone record (§3) before draining (a rotation with no next-key commitment) |
+| `abandon` | Abandon the identity permanently; publishes the final KEL (a rotation with no next-key commitment) before draining; the KEL object is the tombstone (§2) |
 | `rotate_envelope` | Publish new envelope keys and delete the old private keys |
 | `link` | Connect to an address, with an optional identifier (adds a root) |
 | `unlink` | Drop and demote a link |
@@ -618,13 +713,13 @@ redb tables, derived from the objects above:
 |---|---|---|
 | `meta` | singleton | Schema version |
 | `identity` | singleton | Own KEL, current secret keys, configuration hash |
-| `records` | (id, scope) | Peer record bytes, received time, plus range fingerprints maintained for reconciliation |
+| `records` | (id, scope) | Peer record bytes, received time, plus range fingerprints maintained for reconciliation (records and KELs) |
 | `outbound` | mid | Message bytes, priority, state, attempt, next attempt, receipt deadline, waypoints used |
 | `custody` | leg | Message bytes, upstream link, current destination, buffer class |
 | `shares` | (destination, upstream link) | Count held, for fair-share custody |
 | `seen` | BLAKE3(leg) | Expiry. Hop-level dedup |
 | `delivered` | BLAKE3(mid) | Expiry. Recipient-level dedup |
-| `kel_heads` | id | Latest KEL sn and event hash, last-seen time, abandoned flag (kept one year) |
+| `kels` | id | KEL object bytes, last-seen time (kept one year). The KEL head (sn, event hash) and the abandoned flag are derived from the object |
 | `inbox` | (service, received, delivery_id) | Service, delivery fields, received |
 | `status` | mid | Latest status, for the API |
 
@@ -641,3 +736,63 @@ daemon reads `meta`. If the version is older than the daemon's, it runs the
 explicit migrations for each step in order before serving. If it is newer,
 the daemon refuses to start. There is no migration from v1's SQLite
 database.
+
+## 9. Wire revision 2
+
+This revision is wire version 2. Every object that carries `v` carries 2.
+The test vectors and the Python client are regenerated in the same change.
+This section, together with the revised §1–§8, supersedes the corresponding
+parts of the previous text (wire version 1); where they differ, this
+revision governs. The changes, all part of wire version 2:
+
+1. **KEL object (H-01).** The key event log is a separate gossiped object
+   (§2), not embedded in records. Records carry only the KEL head (`khs`,
+   `khc`) and the current signing key (`k`); the full KEL is no longer in
+   the record. A receiver that lacks the KEL, or holds one behind the
+   record's head, drops the record and wants the KEL; reconciliation
+   delivers it. KEL objects are reconciled in the same set as records
+   (scope 255), are retained for the KEL-head retention period, and are the
+   carrier of abandonment tombstones.
+2. **Record order and `seq` (H-02).** `seq` is `max(previous seq + 1, unix
+   seconds)`. Records for the same (id, scope) are totally ordered by
+   (`khs`, `seq`, record hash); admission and last-writer-wins use this
+   order (§3).
+3. **Buckets (H-05).** The frame bucket ladder is 2048 / 4096 / 8192 /
+   32768 bytes (§1, §6).
+4. **Custody reply codes (H-11).** `ALREADY_HAVE` (1) means the receiver
+   holds custody of the leg; `SEEN` (4) means the receiver has seen the leg
+   but does not hold it and wants the sender to try elsewhere. Neither
+   releases the sender's custody; both exclude the link for that leg
+   (§6).
+5. **Reconcile item hash (R-25).** The item hash covers
+   (id, scope, seq, hash-prefix), where hash-prefix is the first 8 bytes of
+   the record's hash (or, for a KEL entry, of the head event's event hash).
+   Explicit lists carry the prefix; a node wants an entry when the peer's
+   seq is higher, or equal with a lower hash-prefix (§6).
+6. **Noise prologue (R-57).** The handshake prologue is `"lattice v1" ‖ 0x00
+   ‖` the upgrade path as it appears in the request line (§6).
+7. **Domain-separated preimages (R-58).** Every signature preimage is
+   prefixed with a context string naming the object type (§1).
+8. **Attestation removed (H-08).** The `attest` frame (62) and the
+   attestation exchange are removed; this is a wire change. The `csig` on
+   the record is the sole binding between a record and its channel key, and
+   the Noise static key check after the handshake is the sole binding
+   between a link and an identity (§3, §6).
+9. **Gateway consent (H-21).** A public record may carry `serves`, the
+   private ids the gateway agrees to serve (at most 16). The
+   private↔gateway pseudo-edge exists only when both records name each
+   other (§3).
+10. **Negative receipt reason 2 (H-12).** Reason 2 is sent only when the
+    signature verifies but the envelope is otherwise invalid. On signature
+    failure the node refuses custody and sends no receipt of any kind
+    (§5, §7).
+11. **Text forms (R-47).** Identifiers are lowercase base32 (RFC 4648, no
+    padding), 52 characters; lowercase hex (64 characters) is accepted
+    everywhere an identifier is accepted; the address form is
+    `service:mailbox@identifier` (§1).
+12. **Wire version.** Objects carry `v = 2`; the vectors and the Python
+    client are regenerated in the same change.
+
+Note on naming: `lattice v1` in the context strings and the Noise prologue
+is the protocol name and is unchanged by this revision; the wire version is
+carried in object key 0.
