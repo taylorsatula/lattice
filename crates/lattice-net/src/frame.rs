@@ -99,6 +99,12 @@ pub fn encode_wire_to_bucket(frame_bytes: &[u8], bucket: usize) -> Result<Vec<u8
     Err(FrameError::TooLarge)
 }
 
+/// The bucket index of a wire payload, or `None` if `len` is not a bucket
+/// size. `decode_wire` guarantees the length is a bucket size on success.
+pub fn bucket_index(len: usize) -> Option<usize> {
+    FRAME_BUCKETS.iter().position(|&b| b == len)
+}
+
 /// Decode a wire payload back into the frame bytes. Exact bucket size and
 /// all-zero padding are mandatory.
 pub fn decode_wire(bytes: &[u8]) -> Result<Vec<u8>, FrameError> {

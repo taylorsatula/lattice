@@ -17,7 +17,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 use lattice_types::X25519PublicKey;
 
-use crate::frame::{decode_wire, encode_wire, encode_wire_to_bucket};
+use crate::frame::{bucket_index, decode_wire, encode_wire, encode_wire_to_bucket};
 use crate::{MAX_WIRE_BYTES, errors::NetError};
 
 /// Type-erased async stream so server-side (peeked) and client-side
@@ -80,7 +80,10 @@ impl PeerIo {
         Ok(())
     }
 
-    pub async fn recv_frame(&mut self) -> Result<Option<Frame>, NetError> {
+    /// Receive one frame. Returns the frame and the index of the bucket
+    /// its wire payload occupied (the transport knows the wire length; the
+    /// core cannot recover it from the decoded frame).
+    pub async fn recv_frame(&mut self) -> Result<Option<(Frame, usize)>, NetError> {
         {
             let msg = match self.ws.next().await {
                 None => return Ok(None),
@@ -109,9 +112,11 @@ impl PeerIo {
                 .read_message(&bytes, &mut plaintext)
                 .map_err(NetError::Crypto)?;
             plaintext.truncate(n);
+            let bucket = bucket_index(plaintext.len())
+                .ok_or(NetError::BadWire(crate::FrameError::TooLarge))?;
             let inner = decode_wire(&plaintext).map_err(NetError::BadWire)?;
             let frame = Frame::from_bytes(&inner).map_err(NetError::BadFrame)?;
-            Ok(Some(frame))
+            Ok(Some((frame, bucket)))
         }
     }
 

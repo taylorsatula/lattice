@@ -181,7 +181,7 @@ fn expired_message_is_not_delivered() {
     let link_bc = sim.link_between(1, 2).unwrap();
     sim.run_for(6);
     // Slow the B->C hop so custody dwells at B, then cut it.
-    sim.set_latency(link_bc, 100);
+    sim.set_latency(link_bc, 100_000); // 100 s: the hop is effectively frozen
     let start = 7; // after the 6s convergence below
     let send = lattice_core::AppSend {
         service: "test".into(),

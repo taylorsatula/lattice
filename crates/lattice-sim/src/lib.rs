@@ -81,7 +81,7 @@ struct Link {
     a: NodeIndex,
     b: NodeIndex,
     state: LinkState,
-    latency_ticks: u64,
+    latency_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,9 +93,10 @@ pub enum SimEvent {
         /// The bucket-padded wire payload, as it would ride the transport.
         wire: Vec<u8>,
     },
-    Tick {
-        node: NodeIndex,
-    },
+    /// Wake a node whose deadline (as reported by `Node::next_deadline`)
+    /// has arrived. `gen` invalidates stale wakes scheduled before the
+    /// node's deadline moved.
+    Wake { node: NodeIndex, generation: u64 },
 }
 
 pub struct Delivery {
@@ -142,6 +143,12 @@ pub struct Sim<S: Store = MemStore> {
     configs: Vec<Config>,
     prototype: Config,
     store_factory: Box<dyn FnMut(usize) -> S>,
+    /// Per-node generation for wake events; bumped on every (re)arm so a
+    /// stale queued wake is ignored.
+    wake_gen: Vec<u64>,
+    /// The deadline the currently pending wake is for, per node. Avoids
+    /// queueing a duplicate wake when the deadline has not moved.
+    wake_armed: Vec<Option<u64>>,
 }
 
 impl Sim<MemStore> {
@@ -160,7 +167,7 @@ impl<S: Store> Sim<S> {
             ids: Vec::new(),
             links: Vec::new(),
             next_link: 1,
-            now: 1,
+            now: 1_000,
             queue: VecDeque::new(),
             seq: 0,
             deliveries: Vec::new(),
@@ -170,6 +177,8 @@ impl<S: Store> Sim<S> {
             configs: Vec::new(),
             prototype,
             store_factory: Box::new(factory),
+            wake_gen: Vec::new(),
+            wake_armed: Vec::new(),
         }
     }
 
@@ -198,13 +207,26 @@ impl<S: Store> Sim<S> {
         self.ids.push(id);
         let node_idx = self.nodes.len() - 1;
         self.configs.push(cfg);
-        let seq = self.next_seq();
-        self.queue.push_back(ScheduledEvent {
-            at: self.now + 1,
-            seq,
-            event: SimEvent::Tick { node: node_idx },
-        });
+        self.wake_gen.push(0);
+        self.wake_armed.push(None);
+        self.arm_wake(node_idx);
         node_idx
+    }
+
+    /// Schedule a wake for the node's current core-reported deadline.
+    /// Any previously queued wake for this node is invalidated. If a wake
+    /// for the same deadline is already pending, does nothing.
+    fn arm_wake(&mut self, node: NodeIndex) {
+        let deadline = self.nodes[node].next_deadline();
+        if self.wake_armed[node] == deadline {
+            return;
+        }
+        self.wake_gen[node] += 1;
+        let generation = self.wake_gen[node];
+        self.wake_armed[node] = deadline;
+        if let Some(at) = deadline {
+            self.push_event(at, SimEvent::Wake { node, generation });
+        }
     }
 
     fn next_seq(&mut self) -> u64 {
@@ -225,7 +247,7 @@ impl<S: Store> Sim<S> {
             a,
             b,
             state: LinkState::Up,
-            latency_ticks: 0,
+            latency_ms: 0,
         });
         self.link_up(a, id, Some(self.ids[b]), self.channel_keys[&self.ids[b]]);
         self.link_up(b, id, Some(self.ids[a]), self.channel_keys[&self.ids[a]]);
@@ -242,7 +264,7 @@ impl<S: Store> Sim<S> {
             a,
             b,
             state: LinkState::Up,
-            latency_ticks: 0,
+            latency_ms: 0,
         });
         for (from, to) in [(a, b), (b, a)] {
             self.link_up(from, id, None, self.channel_keys[&self.ids[to]]);
@@ -267,6 +289,7 @@ impl<S: Store> Sim<S> {
             remote_ck,
         });
         self.apply_actions(node, actions);
+        self.arm_wake(node);
     }
 
     pub fn set_link(&mut self, link_id: u64, state: LinkState) {
@@ -302,12 +325,15 @@ impl<S: Store> Sim<S> {
                 at: self.now,
                 link: link_id,
             });
+            self.arm_wake(a);
+            self.arm_wake(b);
         }
     }
 
-    pub fn set_latency(&mut self, link: u64, ticks: u64) {
+    /// Set the one-way latency of a link, in milliseconds.
+    pub fn set_latency(&mut self, link: u64, ms: u64) {
         if let Some(l) = self.links.iter_mut().find(|l| l.id == link) {
-            l.latency_ticks = ticks;
+            l.latency_ms = ms;
         }
     }
 
@@ -336,6 +362,9 @@ impl<S: Store> Sim<S> {
         let from = if a == target { b } else { a };
         let wire = encode_frame_wire(&frame, None)
             .unwrap_or_else(|e| panic!("sim: injected frame failed wire encoding: {e}"));
+        let bucket = lattice_net::FRAME_BUCKETS
+            .iter()
+            .position(|&b| b == wire.len());
         let frame = decode_frame_wire(&wire)
             .unwrap_or_else(|e| panic!("sim: injected frame failed wire decoding: {e}"));
         self.dispatch(
@@ -345,6 +374,7 @@ impl<S: Store> Sim<S> {
                 link,
                 from: self.ids[from],
                 frame,
+                bucket,
             },
         );
     }
@@ -389,7 +419,7 @@ impl<S: Store> Sim<S> {
 
     /// Run the simulation for `secs` virtual seconds.
     pub fn run_for(&mut self, secs: u64) {
-        let end = self.now + secs;
+        let end = self.now + secs.saturating_mul(1000);
         while let Some(ev) = self.pop_event() {
             if ev.at > end {
                 let seq = self.next_seq();
@@ -431,6 +461,9 @@ impl<S: Store> Sim<S> {
                 wire,
             } => {
                 let from_id = self.ids[from];
+                let bucket = lattice_net::FRAME_BUCKETS
+                    .iter()
+                    .position(|&b| b == wire.len());
                 let frame = decode_frame_wire(&wire).unwrap_or_else(|e| {
                     panic!("sim: wire frame from node {from} to node {to} failed decoding: {e}")
                 });
@@ -439,19 +472,20 @@ impl<S: Store> Sim<S> {
                     link,
                     from: from_id,
                     frame,
+                    bucket,
                 });
                 self.apply_actions(to, actions);
+                self.arm_wake(to);
             }
-            SimEvent::Tick { node } => {
+            SimEvent::Wake { node, generation } => {
+                // A newer wake was armed after this one was queued; skip.
+                if generation != self.wake_gen[node] {
+                    return;
+                }
+                self.wake_armed[node] = None;
                 let (actions, _diags) = self.nodes[node].handle(Event::Tick { at: self.now });
                 self.apply_actions(node, actions);
-                // re-arm the tick
-                let seq = self.next_seq();
-                self.queue.push_back(ScheduledEvent {
-                    at: self.now + 1,
-                    seq,
-                    event: SimEvent::Tick { node },
-                });
+                self.arm_wake(node);
             }
         }
     }
@@ -459,6 +493,7 @@ impl<S: Store> Sim<S> {
     fn dispatch(&mut self, node: NodeIndex, ev: Event) {
         let (actions, _diags) = self.nodes[node].handle(ev);
         self.apply_actions(node, actions);
+        self.arm_wake(node);
     }
 
     fn apply_actions(&mut self, from: NodeIndex, actions: Vec<Action>) {
@@ -520,7 +555,7 @@ impl<S: Store> Sim<S> {
             return; // dropped: link down
         }
         let to = if link.a == from { link.b } else { link.a };
-        let at = self.now + link.latency_ticks;
+        let at = self.now + link.latency_ms;
         self.push_event(
             at,
             SimEvent::Deliver {
@@ -556,6 +591,7 @@ impl<S: Store> Sim<S> {
                 self.link_up(a, lid, Some(self.ids[b]), self.channel_keys[&self.ids[b]]);
             }
         }
+        self.arm_wake(idx);
     }
 
     fn placeholder_node(&mut self) -> Node<S> {

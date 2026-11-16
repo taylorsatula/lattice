@@ -4,6 +4,13 @@
 //! something), actions out (send a frame, deliver to the app, update status).
 //! Time, randomness, sockets and disk are injected by the caller — the
 //! simulator or the daemon.
+//!
+//! Time base: milliseconds since the Unix epoch, everywhere in the public
+//! API (`Event` timestamps, `Node::new`, `Node::next_deadline`). The wire
+//! format and the store keep Unix seconds; conversions happen at those
+//! boundaries. Callers drive the core by arming a timer for the instant
+//! returned by [`Node::next_deadline`] and delivering [`Event::Tick`] then;
+//! there is no periodic tick.
 
 #![forbid(unsafe_code)]
 

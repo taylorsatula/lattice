@@ -81,7 +81,7 @@ async fn ik_handshake_and_ping_pong() {
         .send_frame(&Frame::Ping(PingFrame { nonce: 1234 }), None)
         .await
         .unwrap();
-    let got = server_side.recv_frame().await.unwrap().unwrap();
+    let (got, _bucket) = server_side.recv_frame().await.unwrap().unwrap();
     match got {
         Frame::Ping(p) => assert_eq!(p.nonce, 1234),
         other => panic!("expected ping, got {other:?}"),
@@ -91,7 +91,7 @@ async fn ik_handshake_and_ping_pong() {
         .send_frame(&Frame::Ping(PingFrame { nonce: 1234 }), None)
         .await
         .unwrap();
-    let got = client_side.recv_frame().await.unwrap().unwrap();
+    let (got, _bucket) = client_side.recv_frame().await.unwrap().unwrap();
     assert!(matches!(got, Frame::Ping(p) if p.nonce == 1234));
 }
 
@@ -124,7 +124,7 @@ async fn xx_handshake_works() {
         .send_frame(&Frame::Ping(PingFrame { nonce: 77 }), None)
         .await
         .unwrap();
-    let got = server_side.recv_frame().await.unwrap().unwrap();
+    let (got, _bucket) = server_side.recv_frame().await.unwrap().unwrap();
     assert!(matches!(got, Frame::Ping(p) if p.nonce == 77));
 }
 
@@ -160,7 +160,7 @@ async fn cookie_flow_enforced_under_load() {
         .send_frame(&Frame::Ping(PingFrame { nonce: 55 }), None)
         .await
         .unwrap();
-    let got = server_side.recv_frame().await.unwrap().unwrap();
+    let (got, _bucket) = server_side.recv_frame().await.unwrap().unwrap();
     assert!(matches!(got, Frame::Ping(p) if p.nonce == 55));
 }
 

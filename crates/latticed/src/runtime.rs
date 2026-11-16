@@ -19,8 +19,15 @@ use crate::config::Config;
 
 /// Events coming up from links into the node.
 pub enum LinkEvent {
-    Frame { link: u64, frame: Frame },
-    Down { link: u64 },
+    Frame {
+        link: u64,
+        frame: Frame,
+        /// Bucket index of the wire frame, as reported by the transport.
+        bucket: usize,
+    },
+    Down {
+        link: u64,
+    },
 }
 
 pub enum Cmd {
@@ -179,6 +186,11 @@ const OUTBOUND_HIGH_WATER: usize = 48;
 /// the link is closed. A peer that cannot drain its queue is worse than a
 /// reconnect; TCP keepalive (~90s) is the backstop when no frames flow.
 const OVER_MARK_SECS: u64 = 10;
+/// Consecutive core wakes deferred because a dial was in flight before the
+/// wake is forced through anyway.
+const MAX_WAKE_DEFERRALS: u32 = 10;
+/// Delay before re-checking after a deferred wake.
+const WAKE_DEFER_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
 /// Inbound (socket -> event loop) channel capacity, in frames. A peer that
 /// floods past this is disconnected by `link_task` rather than buffered.
 const INBOUND_CAPACITY: usize = 256;
@@ -387,10 +399,23 @@ pub struct Runtime {
     next_retired_key_sweep: u64,
 }
 
-fn now_secs() -> u64 {
+/// Milliseconds since the Unix epoch — the core's time base.
+fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
+/// Whole seconds since the Unix epoch, for the daemon's own second-granularity
+/// timers (dial backoff, token buckets, the retired-key sweep).
+fn now_secs() -> u64 {
+    now_ms() / 1000
+}
+
+/// Convert a Unix-millisecond deadline to a tokio instant.
+fn instant_from_unix_ms(ms: u64) -> tokio::time::Instant {
+    let now = now_ms();
+    tokio::time::Instant::now() + std::time::Duration::from_millis(ms.saturating_sub(now))
 }
 
 /// Surface non-fatal internal failures reported by the sans-IO core.
@@ -437,8 +462,8 @@ async fn link_task(
             }
             res = io.recv_frame() => {
                 match res {
-                    Ok(Some(frame)) => {
-                        match inbound.try_send(LinkEvent::Frame { link: id, frame }) {
+                    Ok(Some((frame, bucket))) => {
+                        match inbound.try_send(LinkEvent::Frame { link: id, frame, bucket }) {
                             Ok(()) => {}
                             Err(mpsc::error::TrySendError::Full(_)) => {
                                 eprintln!(
@@ -459,6 +484,7 @@ async fn link_task(
 }
 
 impl Runtime {
+    /// `now` is milliseconds since the Unix epoch (the core's time base).
     pub fn new(
         cfg: &Config,
         identity: lattice_core::Identity,
@@ -536,8 +562,9 @@ impl Runtime {
             app_broadcast,
             next_link: 1,
             // The startup load already deleted expired files; first sweep an
-            // hour from now.
-            next_retired_key_sweep: now + RETIRED_KEY_SWEEP_SECS,
+            // hour from now. (`now` is milliseconds; the sweep is tracked
+            // in seconds.)
+            next_retired_key_sweep: now / 1000 + RETIRED_KEY_SWEEP_SECS,
         })
     }
 
@@ -587,7 +614,7 @@ impl Runtime {
         // The link is registered, so the actions returned by LinkUp can be
         // routed to it.
         self.apply(Event::LinkUp {
-            at: now_secs(),
+            at: now_ms(),
             link: id,
             peer,
             remote_ck,
@@ -659,22 +686,24 @@ impl Runtime {
         let mut api_rx = self.api_rx.take().expect("run once");
         let mut peer_rx = self.peer_rx.take().expect("run once");
         let mut dial_rx = self.dial_rx.take().expect("run once");
-        // First tick after 1s, not immediately: the initial dials are
-        // spawned before the loop starts, and an immediate tick could
-        // dispatch queued messages before any link exists.
-        let mut tick = tokio::time::interval_at(
-            tokio::time::Instant::now() + std::time::Duration::from_secs(1),
-            std::time::Duration::from_secs(1),
-        );
-        // After a stall, skip the missed ticks instead of replaying them
-        // back to back; the next tick fires one interval after the last.
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        // Consecutive ticks deferred because a dial was in flight. Bounded
+        // The core reports the next instant it wants to be woken
+        // (`Node::next_deadline`); the daemon arms a timer for exactly that
+        // instant — there is no periodic tick. The wake also covers the
+        // daemon's own deadlines (root redials, the retired-key sweep).
+        // `None` means nothing is pending: sleep until the next event.
+        let mut wake_at = self.next_wake_instant();
+        // Consecutive wakes deferred because a dial was in flight. Bounded
         // so a lost dial outcome (e.g. a panicked dial task) cannot stall
         // the loop forever.
         let mut tick_deferrals = 0u32;
         tokio::pin!(shutdown);
         loop {
+            let wake = async {
+                match wake_at {
+                    Some(t) => tokio::time::sleep_until(t).await,
+                    None => std::future::pending().await,
+                }
+            };
             tokio::select! {
                 biased;
                 _ = &mut shutdown => {
@@ -691,15 +720,15 @@ impl Runtime {
                     Cmd::Dial { addr, ik_key, path, peer_id } => self.spawn_dial(addr, ik_key, path, peer_id),
                 },
                 Some(ev) = link_rx.recv() => match ev {
-                    LinkEvent::Frame { link, frame } => {
-                        let now = now_secs();
+                    LinkEvent::Frame { link, frame, bucket } => {
+                        let now = now_ms();
                         // Per-link inbound rate limit, applied at the core
                         // boundary. Frames from a link we already tore down
                         // are dropped: the core has been told LinkDown.
                         let admitted = match self.links.get_mut(&link) {
                             Some(h) => {
                                 let class = FrameClass::of(&frame);
-                                if h.in_buckets[class.index()].allow(now) {
+                                if h.in_buckets[class.index()].allow(now / 1000) {
                                     Some(h.peer)
                                 } else {
                                     h.stats.inbound_dropped += 1;
@@ -716,41 +745,79 @@ impl Runtime {
                             None => None,
                         };
                         if let Some(peer) = admitted {
-                            self.apply(Event::Frame { at: now, link, from: peer.unwrap_or(Identifier::from_bytes([0u8; 32])), frame }).await;
+                            self.apply(Event::Frame { at: now, link, from: peer.unwrap_or(Identifier::from_bytes([0u8; 32])), frame, bucket: Some(bucket) }).await;
                         }
                     }
                     LinkEvent::Down { link } => {
                         if self.remove_link(link) {
-                            self.apply(Event::LinkDown { at: now_secs(), link }).await;
+                            self.apply(Event::LinkDown { at: now_ms(), link }).await;
                         }
                     }
                 },
-                _ = tick.tick() => {
+                _ = wake => {
                     // Attach any dials that completed since the last arm ran,
-                    // then defer the tick while a dial is still in flight:
-                    // dispatching now would find no link and park the message
-                    // behind a NoRoute backoff.
+                    // then defer the core wake while a dial is still in
+                    // flight: dispatching now would find no link and park
+                    // the message behind a NoRoute backoff.
                     while let Ok(outcome) = dial_rx.try_recv() {
                         self.handle_dial_outcome(outcome).await;
                     }
-                    if self.dials_in_flight > 0 && tick_deferrals < 10 {
+                    if self.dials_in_flight > 0 && tick_deferrals < MAX_WAKE_DEFERRALS {
                         tick_deferrals += 1;
-                    } else {
-                        tick_deferrals = 0;
-                        self.redial_roots();
-                        let now = now_secs();
+                        wake_at = Some(tokio::time::Instant::now() + WAKE_DEFER_DELAY);
+                        continue;
+                    }
+                    tick_deferrals = 0;
+                    self.redial_roots();
+                    let now = now_ms();
+                    // Fire the core only if its deadline is actually due;
+                    // the wake may have been armed for a root dial or the
+                    // retired-key sweep instead.
+                    let core_due = self
+                        .with_node(|n| n.next_deadline())
+                        .is_some_and(|d| now >= d);
+                    if core_due {
                         self.apply(Event::Tick { at: now }).await;
-                        if now >= self.next_retired_key_sweep {
-                            crate::keys::sweep_expired_retired_envelope_keys(
-                                &self.identity_dir,
-                                now,
-                            );
-                            self.next_retired_key_sweep = now + RETIRED_KEY_SWEEP_SECS;
-                        }
+                    }
+                    let now_s = now_secs();
+                    if now_s >= self.next_retired_key_sweep {
+                        crate::keys::sweep_expired_retired_envelope_keys(
+                            &self.identity_dir,
+                            now_s,
+                        );
+                        self.next_retired_key_sweep = now_s + RETIRED_KEY_SWEEP_SECS;
                     }
                 }
             }
+            // Re-arm after every iteration: any event may have moved the
+            // core's deadline (earlier or later), and the daemon's own
+            // deadlines (root redials, the retired-key sweep) may have
+            // changed too. A wake that fires late is not replayed: the
+            // core recomputes its deadline from current state, so a stall
+            // costs one catch-up wake, never a burst of them. (The defer
+            // path above `continue`s and keeps its own short re-arm.)
+            wake_at = self.next_wake_instant();
         }
+    }
+
+    /// The next instant the daemon must wake for: the core's reported
+    /// deadline, the next root redial, or the retired-key sweep —
+    /// whichever is earliest. `None` when nothing is pending.
+    fn next_wake_instant(&self) -> Option<tokio::time::Instant> {
+        let mut best: Option<u64> = self.with_node(|n| n.next_deadline());
+        if let Some(r) = self
+            .roots
+            .iter()
+            .filter(|r| !r.in_flight)
+            .map(|r| r.next_attempt)
+            .min()
+        {
+            let ms = r.saturating_mul(1000);
+            best = Some(best.map_or(ms, |b| b.min(ms)));
+        }
+        let rk = self.next_retired_key_sweep.saturating_mul(1000);
+        best = Some(best.map_or(rk, |b| b.min(rk)));
+        best.map(instant_from_unix_ms)
     }
 
     /// Run one event through the core and apply the resulting actions.
@@ -785,10 +852,7 @@ impl Runtime {
             };
             report_diagnostics(diags);
             for link in self.apply_actions(actions) {
-                queue.push_back(Event::LinkDown {
-                    at: now_secs(),
-                    link,
-                });
+                queue.push_back(Event::LinkDown { at: now_ms(), link });
             }
         }
     }
@@ -1094,7 +1158,7 @@ impl Runtime {
                     let rotation =
                         crate::keys::rotate_signing_key(&dir, &next_key, commitment.as_ref(), kind)
                             .map_err(|e| e.to_string())?;
-                    let now = now_secs();
+                    let now = now_ms();
                     self.with_node(|node| -> Result<(), String> {
                         node.reload_identity(rotation.identity, now, kind)
                             .map_err(|e| e.to_string())?;
@@ -1121,7 +1185,7 @@ impl Runtime {
                     let dir = self.identity_dir.clone();
                     let identity = crate::keys::rotate_envelope_key(&dir, 2 * 24 * 3600)
                         .map_err(|e| e.to_string())?;
-                    let now = now_secs();
+                    let now = now_ms();
                     self.with_node(|node| {
                         node.reload_identity(identity, now, RotationKind::Rotate)
                             .map_err(|e| e.to_string())
@@ -1218,7 +1282,7 @@ impl Runtime {
         for id in dead {
             if self.remove_link(id) {
                 self.apply(Event::LinkDown {
-                    at: now_secs(),
+                    at: now_ms(),
                     link: id,
                 })
                 .await;
