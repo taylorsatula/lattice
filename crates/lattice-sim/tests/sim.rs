@@ -822,3 +822,49 @@ fn private_instance_receives_via_gateway() {
         .count();
     assert!(delivered >= 1, "sender should observe Delivered status");
 }
+
+/// Regression test for R-05 (V2_IMPLEMENTATION_REVIEW.md): the P6b topology.
+/// S=0 to D=5 via X=1/Y=2 and X2=3/Y2=4, with W=6 a sideways option on the
+/// X branch only. With sideways_prob = 0.5, messages used to vanish when a
+/// sideways step bounced back: the relay answered `already have` and the
+/// holder deleted its custody copy. Every message must now be delivered and
+/// no custody rows may remain.
+#[test]
+fn sideways_turns_do_not_lose_messages() {
+    let mut sim = Sim::new(Config {
+        sideways_prob: 0.5,
+        ..fast_config()
+    });
+    for _ in 0..7 {
+        sim.add_node();
+    }
+    for (a, b) in [
+        (0, 1),
+        (1, 2),
+        (2, 5),
+        (0, 3),
+        (3, 4),
+        (4, 5),
+        (1, 6),
+        (2, 6),
+    ] {
+        sim.connect(a, b);
+    }
+    wait_for_path(&mut sim, 0, 5);
+    let mids: Vec<_> = (0..40)
+        .map(|i| sim.app_send(0, 5, format!("p6b-{i}").as_bytes()))
+        .collect();
+    sim.run_for(120);
+    let delivered = mids
+        .iter()
+        .filter(|mid| sim.deliveries.iter().any(|d| &d.mid == *mid))
+        .count();
+    assert_eq!(delivered, 40, "every message must be delivered");
+    for node in 0..7 {
+        assert_eq!(
+            sim.custody_count(node),
+            0,
+            "node {node} must not hold custody after delivery"
+        );
+    }
+}
