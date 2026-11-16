@@ -26,6 +26,10 @@ pub const OP_STATUS: u64 = 3;
 pub const OP_FETCH: u64 = 4;
 pub const OP_ACK: u64 = 5;
 pub const OP_LOOKUP: u64 = 6;
+/// No-op keepalive: returns an empty result and resets the connection's
+/// idle timer. Usable by event-only subscribers that would otherwise be
+/// disconnected for inactivity.
+pub const OP_PING: u64 = 7;
 // Admin ops (owner-only socket).
 pub const OP_NODE: u64 = 101;
 pub const OP_ROTATE: u64 = 102;

@@ -21,8 +21,9 @@ use std::path::Path;
 
 use lattice_proto::local::{
     ERR_BAD_ARGS, ERR_NOT_FOUND, Event, LOCAL_MAX_FRAME, LOCAL_PREFIX_LEN, OP_ABANDON, OP_ACK,
-    OP_DRAIN, OP_FETCH, OP_HELLO, OP_LINK, OP_LOOKUP, OP_NODE, OP_ROTATE, OP_ROTATE_ENVELOPE,
-    OP_SEND, OP_STATUS, OP_UNLINK, Request, Response, deframe_local, err_name, frame_local,
+    OP_DRAIN, OP_FETCH, OP_HELLO, OP_LINK, OP_LOOKUP, OP_NODE, OP_PING, OP_ROTATE,
+    OP_ROTATE_ENVELOPE, OP_SEND, OP_STATUS, OP_UNLINK, Request, Response, deframe_local, err_name,
+    frame_local,
 };
 use lattice_proto::{ProtoError, Value, decode, encode};
 use lattice_types::{ChannelPublicKey, DeliveryId, Identifier, MessageId};
@@ -294,6 +295,13 @@ impl Client {
     }
 
     /// Fetch up to `max` deliveries from this service's inbox.
+    ///
+    /// The daemon caps the encoded response at the local frame limit
+    /// (64 KiB), so a call may return fewer deliveries than `max` — as few
+    /// as one — when the deliveries are large. Fetching is not destructive:
+    /// deliveries not returned stay in the inbox and are returned by a
+    /// later `fetch`. Callers that need everything should loop until an
+    /// empty (or short) page comes back.
     pub async fn fetch(&mut self, max: u64) -> Result<Vec<Delivery>> {
         let args = Value::map(vec![(Value::UInt(0), Value::UInt(max))]);
         let result = self.call(OP_FETCH, args).await?;
@@ -309,6 +317,16 @@ impl Client {
         let args = Value::map(vec![(Value::UInt(0), arr)]);
         let result = self.call(OP_ACK, args).await?;
         uint_at(&result, 0)
+    }
+
+    /// Ping the daemon. A no-op that returns an empty result; its purpose is
+    /// to reset the daemon's read-idle timer for this connection. The daemon
+    /// closes application connections that send no inbound frame for 5
+    /// minutes, so event-only subscribers should call this periodically
+    /// (e.g. every minute) to stay connected.
+    pub async fn ping(&mut self) -> Result<()> {
+        self.call(OP_PING, Value::map(vec![])).await?;
+        Ok(())
     }
 
     /// Whether a valid record for `id` is held, its mode, and whether a path exists now.
@@ -625,6 +643,64 @@ mod tests {
             (Value::UInt(5), Value::Bool(false)),
         ]);
         Value::map(pairs)
+    }
+
+    async fn read_one_frame(sock: &mut tokio::net::UnixStream, buf: &mut Vec<u8>) -> Vec<u8> {
+        let mut chunk = [0u8; 4096];
+        loop {
+            if let Some(frame) = deframe_local(buf).unwrap() {
+                let out = frame.payload.to_vec();
+                buf.drain(..frame.consumed);
+                return out;
+            }
+            let n = tokio::io::AsyncReadExt::read(sock, &mut chunk)
+                .await
+                .unwrap();
+            assert!(n > 0, "client closed before sending a frame");
+            buf.extend_from_slice(&chunk[..n]);
+        }
+    }
+
+    async fn write_empty_ok(sock: &mut tokio::net::UnixStream, id: u64) {
+        let resp = Value::map(vec![
+            (Value::UInt(0), Value::UInt(id)),
+            (Value::UInt(1), Value::map(vec![])),
+        ]);
+        let frame = frame_local(&encode(&resp)).unwrap();
+        tokio::io::AsyncWriteExt::write_all(sock, &frame)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn ping_round_trips_as_ping_op() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daemon.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = Vec::new();
+            // Hello handshake.
+            let hello = read_one_frame(&mut sock, &mut buf).await;
+            let hello_id = lattice_proto::cbor::map_get(&decode(&hello).unwrap(), 0)
+                .and_then(Value::as_uint)
+                .unwrap();
+            write_empty_ok(&mut sock, hello_id).await;
+            // Ping: assert the op code on the wire, then reply with an empty result.
+            let ping = read_one_frame(&mut sock, &mut buf).await;
+            let ping_req = decode(&ping).unwrap();
+            assert_eq!(
+                lattice_proto::cbor::map_get(&ping_req, 1).and_then(Value::as_uint),
+                Some(OP_PING)
+            );
+            let ping_id = lattice_proto::cbor::map_get(&ping_req, 0)
+                .and_then(Value::as_uint)
+                .unwrap();
+            write_empty_ok(&mut sock, ping_id).await;
+        });
+        let mut client = Client::connect_app(&path, "mira", b"secret").await.unwrap();
+        client.ping().await.unwrap();
+        server.await.unwrap();
     }
 
     #[tokio::test]
