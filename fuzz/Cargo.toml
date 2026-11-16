@@ -45,5 +45,23 @@ path = "fuzz_targets/message_open.rs"
 test = false
 doc = false
 
+[[bin]]
+name = "parse_init"
+path = "fuzz_targets/parse_init.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "local_deframe"
+path = "fuzz_targets/local_deframe.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "decode_kel"
+path = "fuzz_targets/decode_kel.rs"
+test = false
+doc = false
+
 [profile.release]
 debug = 1
