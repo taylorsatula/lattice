@@ -1868,6 +1868,19 @@ impl<S: Store> Node<S> {
         }
     }
 
+    /// The custody-already-have frame for `leg`.
+    fn already_have(link: LinkId, leg: LegId) -> Action {
+        Action::SendFrame {
+            pad_to: None,
+            link,
+            frame: Frame::Custody(CustodyFrame {
+                leg,
+                result: CUSTODY_ALREADY_HAVE,
+                retry_after: None,
+            }),
+        }
+    }
+
     /// Shared tail of the three custody-accept paths (relay, waypoint,
     /// gateway): fair-share and transit-cap checks, the custody-entry
     /// write, the ACCEPTED frame, and the forwarding kick. `class` is
@@ -2081,20 +2094,38 @@ impl<S: Store> Node<S> {
                 true
             }
         };
+        // An unknown tsvc must not consume the shared inbox cap: record the
+        // mid as delivered so redeliveries dedup, and answer with a negative
+        // receipt instead of storing or delivering.
+        if !self.config.services.iter().any(|s| s == &opened.tsvc) {
+            if !already_delivered {
+                if let Err(e) = self.store.delivered_add(mid_hash, msg.header.exp) {
+                    self.diag("delivered_add", &e);
+                }
+            }
+            if let Err(e) = self.store.seen_add(*leg_hash, msg.header.exp) {
+                self.diag("seen_add", &e);
+            }
+            actions.push(if already_delivered {
+                Self::already_have(link, leg)
+            } else {
+                Self::custody_accepted(link, leg)
+            });
+            actions.extend(self.send_negative_receipt(
+                now,
+                opened.from,
+                &opened,
+                lattice_proto::message::REASON_UNKNOWN_SERVICE,
+                &opened.tsvc,
+            ));
+            return actions;
+        }
         if already_delivered {
             if let Err(e) = self.store.seen_add(*leg_hash, msg.header.exp) {
                 self.diag("seen_add", &e);
             }
             actions.extend(self.send_receipt(now, &opened));
-            actions.push(Action::SendFrame {
-                pad_to: None,
-                link,
-                frame: Frame::Custody(CustodyFrame {
-                    leg,
-                    result: CUSTODY_ALREADY_HAVE,
-                    retry_after: None,
-                }),
-            });
+            actions.push(Self::already_have(link, leg));
             return actions;
         }
         // Fail closed on store error: treat the inbox as full rather than

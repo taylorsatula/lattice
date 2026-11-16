@@ -244,7 +244,10 @@ impl Runtime {
                 ))
             })
             .collect::<Result<_, lattice_core::NodeError>>()?;
+        let mut services: Vec<String> = cfg.services.keys().cloned().collect();
+        services.sort_unstable();
         let core_cfg = lattice_core::Config {
+            services,
             snow_per_min: cfg.limits.snow_per_min,
             sideways_prob: cfg.limits.sideways_prob,
             waypoint_share: cfg.limits.waypoint_share,

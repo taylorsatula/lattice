@@ -15,6 +15,7 @@ fn fast_config() -> Config {
         snow_per_min: 0.0,
         receipt_timeout_public: 30,
         fresh_waypoint_retries: 1,
+        services: vec!["test".to_string()],
         ..Config::default()
     }
 }
