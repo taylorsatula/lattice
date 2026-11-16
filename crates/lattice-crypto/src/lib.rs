@@ -36,3 +36,4 @@ pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     use subtle::ConstantTimeEq;
     a.ct_eq(b).into()
 }
+pub use sign::{KEY_EVENT_CONTEXT, RECEIPT_CONTEXT, RECORD_CONTEXT, signing_preimage};

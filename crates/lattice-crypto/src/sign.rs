@@ -87,3 +87,23 @@ pub fn verify(public: &impl Ed25519PublicKey, message: &[u8], signature: &Signat
     key.verify_strict(message, &DalekSignature::from_bytes(signature.as_bytes()))
         .is_ok()
 }
+
+/// Domain-separation contexts for signature preimages (V2_SPEC §1). Every
+/// signature preimage is `context ‖ 0x00 ‖ body`; the context string is
+/// never part of the encoded object.
+pub const KEY_EVENT_CONTEXT: &str = "lattice v1 key event";
+/// Record signatures (`sig` and `csig`).
+pub const RECORD_CONTEXT: &str = "lattice v1 record";
+/// Envelope signature for kinds 1 and 2 (receipts). The kind-0 context is
+/// `ENVELOPE_CONTEXT` (shared with the AEAD KDF context, per spec §1).
+pub const RECEIPT_CONTEXT: &str = "lattice v1 receipt";
+
+/// Build a domain-separated signing preimage: `context ‖ 0x00 ‖ body`.
+#[must_use]
+pub fn signing_preimage(context: &str, body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(context.len() + 1 + body.len());
+    out.extend_from_slice(context.as_bytes());
+    out.push(0);
+    out.extend_from_slice(body);
+    out
+}
