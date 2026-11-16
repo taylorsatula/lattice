@@ -180,6 +180,10 @@ pub struct Runtime {
     peer_rx: Option<mpsc::UnboundedReceiver<lattice_net::PeerIo>>,
     dial_rx: Option<mpsc::UnboundedReceiver<DialOutcome>>,
     dial_tx: mpsc::UnboundedSender<DialOutcome>,
+    /// Dials currently in flight. Ticks are deferred while any dial is
+    /// outstanding: a tick dispatches queued messages, and dispatching
+    /// before the link exists parks the message behind a NoRoute backoff.
+    dials_in_flight: u32,
     link_rx: Option<mpsc::UnboundedReceiver<LinkEvent>>,
     link_tx: mpsc::UnboundedSender<LinkEvent>,
     cmd_rx: mpsc::UnboundedReceiver<Cmd>,
@@ -307,6 +311,7 @@ impl Runtime {
             peer_rx: Some(peer_rx),
             dial_rx: Some(dial_rx),
             dial_tx,
+            dials_in_flight: 0,
             cmd_rx,
             cmd_tx,
             roots: Vec::new(),
@@ -433,7 +438,17 @@ impl Runtime {
         let mut api_rx = self.api_rx.take().expect("run once");
         let mut peer_rx = self.peer_rx.take().expect("run once");
         let mut dial_rx = self.dial_rx.take().expect("run once");
-        let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+        // First tick after 1s, not immediately: the initial dials are
+        // spawned before the loop starts, and an immediate tick could
+        // dispatch queued messages before any link exists.
+        let mut tick = tokio::time::interval_at(
+            tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(1),
+        );
+        // Consecutive ticks deferred because a dial was in flight. Bounded
+        // so a lost dial outcome (e.g. a panicked dial task) cannot stall
+        // the loop forever.
+        let mut tick_deferrals = 0u32;
         tokio::pin!(shutdown);
         loop {
             tokio::select! {
@@ -463,8 +478,20 @@ impl Runtime {
                     }
                 },
                 _ = tick.tick() => {
-                    self.redial_roots();
-                    self.apply(Event::Tick { at: now_secs() });
+                    // Attach any dials that completed since the last arm ran,
+                    // then defer the tick while a dial is still in flight:
+                    // dispatching now would find no link and park the message
+                    // behind a NoRoute backoff.
+                    while let Ok(outcome) = dial_rx.try_recv() {
+                        self.handle_dial_outcome(outcome);
+                    }
+                    if self.dials_in_flight > 0 && tick_deferrals < 10 {
+                        tick_deferrals += 1;
+                    } else {
+                        tick_deferrals = 0;
+                        self.redial_roots();
+                        self.apply(Event::Tick { at: now_secs() });
+                    }
                 }
             }
         }
@@ -696,6 +723,7 @@ impl Runtime {
         };
         let seed = self.channel_seed.clone();
         let tx = self.dial_tx.clone();
+        self.dials_in_flight += 1;
         tokio::spawn(async move {
             let result = tokio::time::timeout(DIAL_DEADLINE, lattice_net::connect(contact, &seed))
                 .await
@@ -717,6 +745,7 @@ impl Runtime {
     /// Apply the outcome of a spawned dial: attach the link on success,
     /// log on failure, and release the root's in-flight slot either way.
     fn handle_dial_outcome(&mut self, outcome: DialOutcome) {
+        self.dials_in_flight = self.dials_in_flight.saturating_sub(1);
         match outcome.result {
             Ok(io) => {
                 let remote_ck = io.remote_static;
