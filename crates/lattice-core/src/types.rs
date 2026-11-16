@@ -1,4 +1,9 @@
 //! Public types for the core: events, actions, config, identity.
+//!
+//! All timestamps in events and in the core's public API are milliseconds
+//! since the Unix epoch. The wire format and the store keep Unix seconds;
+//! conversions happen at those boundaries. `AppSend::exp` is the one
+//! exception: it is a wire time (Unix seconds), matching the local API.
 
 use lattice_proto::record::Mode;
 use lattice_types::{DeliveryId, Identifier, MessageId, X25519PublicKey};
@@ -32,6 +37,7 @@ pub struct AppSend {
     pub tmbx: Vec<u8>,
     pub fmbx: Vec<u8>,
     pub body: Vec<u8>,
+    /// Expiry as Unix seconds (wire time), as accepted by the local API.
     pub exp: Option<u64>,
     pub priority: u8,
     /// 0 = default (share decides), 1 = waypoint, 2 = direct.
@@ -55,7 +61,15 @@ pub enum Event {
         link: LinkId,
         from: Identifier,
         frame: lattice_proto::frames::Frame,
+        /// Bucket index (0-3) of the wire frame as received, if known.
+        /// The transport knows the wire length; the core does not. Used
+        /// to answer an echo request in the same bucket (spec §6, snow).
+        /// `None` for synthetic frames; the core falls back to a sampled
+        /// bucket.
+        bucket: Option<usize>,
     },
+    /// Wake the core. Delivered by the caller at the instant reported by
+    /// [`crate::Node::next_deadline`] (or earlier, which is always safe).
     Tick {
         at: u64,
     },
@@ -89,6 +103,7 @@ pub enum Action {
         fmbx: Vec<u8>,
         tmbx: Vec<u8>,
         body: Vec<u8>,
+        /// Unix seconds (as stored and as reported on the local API).
         received: u64,
     },
     /// Status transition for a message this node originated (or accepted).

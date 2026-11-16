@@ -44,6 +44,19 @@ fn record_hash_prefix(bytes: &[u8]) -> [u8; 8] {
         .expect("hash is 32 bytes")
 }
 
+/// The core's internal clock is milliseconds since the Unix epoch. The
+/// wire format and the store keep Unix seconds; conversions happen at
+/// those boundaries (`secs_to_ms` / `ms_to_secs`).
+const MS_PER_SEC: u64 = 1_000;
+
+fn secs_to_ms(s: u64) -> u64 {
+    s.saturating_mul(MS_PER_SEC)
+}
+
+fn ms_to_secs(ms: u64) -> u64 {
+    ms / MS_PER_SEC
+}
+
 /// Map a payload size to its frame bucket index (2048/4096/8192/32768).
 fn bucket_index(len: usize) -> usize {
     if len <= 2048 {
@@ -286,6 +299,40 @@ struct LinkState {
     /// True when the peer id was pinned by operator config (root `id`); pinned
     /// bindings are never re-derived from records or revoked by contest.
     pinned: bool,
+    /// Token bucket for echo replies (R-29): a peer cannot make us emit
+    /// more than a small burst plus a slow trickle of echo replies per
+    /// link. Refilled lazily from the clock.
+    echo_tokens: f64,
+    echo_refilled_at: u64,
+}
+
+impl LinkState {
+    fn new(peer: Option<Identifier>, remote_ck: X25519PublicKey, pinned: bool, now: u64) -> Self {
+        Self {
+            peer,
+            remote_ck,
+            pinned,
+            echo_tokens: ECHO_BUDGET_CAPACITY,
+            echo_refilled_at: now,
+        }
+    }
+
+    /// Take one echo-reply token, refilling from the elapsed time first.
+    /// Returns false when the bucket is empty (the echo is dropped).
+    fn echo_budget_take(&mut self, now: u64) -> bool {
+        let elapsed_ms = now.saturating_sub(self.echo_refilled_at);
+        if elapsed_ms > 0 {
+            let refill = elapsed_ms as f64 * (ECHO_BUDGET_REFILL_PER_SEC / 1000.0);
+            self.echo_tokens = (self.echo_tokens + refill).min(ECHO_BUDGET_CAPACITY);
+            self.echo_refilled_at = now;
+        }
+        if self.echo_tokens >= 1.0 {
+            self.echo_tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 /// A dummy frame scheduled to be sent after a short random delay.
@@ -293,6 +340,9 @@ struct LinkState {
 struct PendingEcho {
     due: u64,
     link: LinkId,
+    /// Bucket of the echo request that triggered this reply; the reply
+    /// goes out in the same bucket (R-29).
+    bucket: usize,
 }
 
 /// Outcome of validating a stored record against the KEL we hold.
@@ -342,6 +392,15 @@ pub struct Node<S: Store> {
     frames_since_snow_tick: u32,
     snow_history: [u64; 4],
     inner_pending_echo: Vec<PendingEcho>,
+    /// Exponentially smoothed mean of observed custody-reply RTTs (ms).
+    /// Echo replies are scheduled by sampling from an exponential
+    /// distribution with this mean, so dummy exchanges look like an
+    /// offer and its custody reply (spec §6, snow).
+    custody_rtt_ema_ms: Option<f64>,
+    /// Set when a custody entry could not be routed; the core asks to be
+    /// woken at this instant to retry. Cleared and re-armed by
+    /// `drain_custody`.
+    custody_retry_at: Option<u64>,
     record_refresh_at: u64,
     next_reconcile_at: u64,
     rng: Rng,
@@ -416,14 +475,16 @@ impl<S: Store> Node<S> {
             frames_since_snow_tick: 0,
             snow_history: [0; 4],
             inner_pending_echo: Vec::new(),
-            record_refresh_at: now + 3600,
-            next_reconcile_at: now + 1,
+            custody_rtt_ema_ms: None,
+            custody_retry_at: None,
+            record_refresh_at: now + secs_to_ms(3600),
+            next_reconcile_at: now + secs_to_ms(1),
             rng: Rng::new(rng_seed),
             now,
             draining: local::DrainState::Serving,
             ck_claims: HashMap::new(),
-            next_claim_sweep_at: now + CLAIM_SWEEP_SECS,
-            next_data_sweep_at: now + DATA_SWEEP_SECS,
+            next_claim_sweep_at: now + CLAIM_SWEEP_MS,
+            next_data_sweep_at: now + DATA_SWEEP_MS,
             contested: 0,
             records_version: 0,
             graph_cache: None,
@@ -464,9 +525,10 @@ impl<S: Store> Node<S> {
         // so at-least-once survives a restart.
         match node.store.outbound_all() {
             Ok(all) => {
-                for mut msg in all {
+                for msg in all {
+                    let mut msg = outbound_from_store(msg);
                     if msg.state == OutboundState::InFlight && msg.requeue(now) {
-                        if let Err(e) = node.store.outbound_put(&msg) {
+                        if let Err(e) = node.store.outbound_put(&outbound_to_store(&msg)) {
                             node.diag("outbound_put", &e);
                         }
                     }
@@ -481,6 +543,10 @@ impl<S: Store> Node<S> {
     /// (non-fatal internal failures, e.g. store errors) observed while
     /// handling it. Diagnostics are drained on every call; a caller that
     /// drops them loses them.
+    ///
+    /// All timestamps are milliseconds since the Unix epoch. After handling
+    /// an event, call [`Node::next_deadline`] to learn when the core next
+    /// wants to be woken (via [`Event::Tick`]); there is no periodic tick.
     pub fn handle(&mut self, event: Event) -> (Vec<Action>, Vec<Diagnostic>) {
         let actions = self.handle_inner(event);
         let actions = self.drop_oversize_frames(actions);
@@ -559,8 +625,12 @@ impl<S: Store> Node<S> {
             } => self.on_link_up(at, link, peer, remote_ck),
             Event::LinkDown { at, link } => self.on_link_down(at, link),
             Event::Frame {
-                at, link, frame, ..
-            } => self.on_frame(at, link, frame),
+                at,
+                link,
+                frame,
+                bucket,
+                ..
+            } => self.on_frame(at, link, frame, bucket),
             Event::Tick { at } => self.on_tick(at),
             Event::AppSend(send) => self.on_app_send(&send),
             Event::AppAck {
@@ -573,6 +643,67 @@ impl<S: Store> Node<S> {
 }
 
 impl<S: Store> Node<S> {
+    /// The next instant at which the core wants to be woken, in
+    /// milliseconds since the Unix epoch, or `None` if nothing is pending.
+    ///
+    /// The caller (daemon or simulator) arms a timer for exactly this
+    /// instant and delivers [`Event::Tick`] then; the core does no work
+    /// between wakes. Recomputed from current state on every call.
+    pub fn next_deadline(&self) -> Option<u64> {
+        let mut best: Option<u64> = None;
+        // `u64::MAX` means "no deadline" (e.g. snow disabled).
+        let mut consider = |t: u64| {
+            if t == u64::MAX {
+                return;
+            }
+            best = Some(best.map_or(t, |b: u64| b.min(t)));
+        };
+        if self.config.snow_per_min > 0.0 {
+            consider(self.snow_next);
+        }
+        if let Some(d) = self.inner_pending_echo.iter().map(|p| p.due).min() {
+            consider(d);
+        }
+        consider(self.next_reconcile_at);
+        consider(self.record_refresh_at);
+        consider(self.next_claim_sweep_at);
+        consider(self.next_data_sweep_at);
+        if let Some(t) = self.custody_retry_at {
+            consider(t);
+        }
+        if let Some(t) = self
+            .pending
+            .values()
+            .map(|p| p.sent_at.saturating_add(CUSTODY_TIMEOUT_MS))
+            .min()
+        {
+            consider(t);
+        }
+        // Store-derived deadlines (store values are seconds; the
+        // boundary helpers convert to ms).
+        if let Ok(all) = self.store.outbound_all() {
+            for m in all.into_iter().map(outbound_from_store) {
+                if m.state == OutboundState::Queued {
+                    consider(m.next_attempt);
+                }
+                if m.state == OutboundState::InFlight {
+                    if let Some(d) = m.receipt_deadline {
+                        consider(d);
+                    }
+                }
+                if !m.state.is_terminal() {
+                    consider(m.exp);
+                }
+            }
+        }
+        if let Ok(all) = self.store.custody_all() {
+            for e in all.into_iter().map(custody_from_store) {
+                consider(e.exp);
+            }
+        }
+        best
+    }
+
     fn touch(&mut self, at: u64) {
         self.now = at;
     }
@@ -580,7 +711,9 @@ impl<S: Store> Node<S> {
     // ---------- records ----------
 
     fn build_own_record(&self, prev_seq: u64, now: u64) -> Result<Vec<u8>, NodeError> {
-        let exp = now + 7 * 24 * 3600;
+        // Wire times are seconds.
+        let now_secs = ms_to_secs(now);
+        let exp = now_secs + 7 * 24 * 3600;
         let private = self.config.mode == Mode::Private;
         let links: Vec<Identifier> = if private {
             vec![]
@@ -608,7 +741,7 @@ impl<S: Store> Node<S> {
             lattice_proto::record::RecordParams {
                 kel: self.identity.kel.clone(),
                 prev_seq,
-                now,
+                now: now_secs,
                 exp,
                 channel_key: lattice_crypto::channel_public(&self.identity.channel_seed),
                 channel_seed: self.identity.channel_seed.clone(),
@@ -637,7 +770,8 @@ impl<S: Store> Node<S> {
             seen: now,
             abandoned: head.is_abandoned(),
         };
-        self.store.kel_put(&self.own_id, &bytes, &seen)?;
+        self.store
+            .kel_put(&self.own_id, &bytes, &kel_head_to_store(seen))?;
         Ok(())
     }
 
@@ -648,7 +782,8 @@ impl<S: Store> Node<S> {
         if let Ok(parsed) = PeerRecord::parse(&bytes) {
             self.own_seq = parsed.seq();
         }
-        self.store.record_put(&id, self.scope, &bytes, now)?;
+        self.store
+            .record_put(&id, self.scope, &bytes, ms_to_secs(now))?;
         self.records_version += 1;
         Ok(())
     }
@@ -661,25 +796,22 @@ impl<S: Store> Node<S> {
         remote_ck: X25519PublicKey,
     ) -> Vec<Action> {
         self.touch(at);
-        self.links.insert(
-            link,
-            LinkState {
-                peer,
-                remote_ck,
-                pinned: peer.is_some(),
-            },
-        );
+        self.links
+            .insert(link, LinkState::new(peer, remote_ck, peer.is_some(), at));
         self.next_link_order.push(link);
         self.reconcile_sessions
             .insert(link, ReconcileSession::new());
         // Reconcile promptly: the peer needs our record (and we need theirs)
         // for routing to work at all; waiting a full interval stalls delivery.
-        self.next_reconcile_at = self.next_reconcile_at.min(at + 1);
+        self.next_reconcile_at = self.next_reconcile_at.min(at + secs_to_ms(1));
         // Publish the new link set immediately so peers can route via us.
         if let Err(e) = self.publish_record(at) {
             self.diag("publish_record", &e);
         }
-        self.reevaluate_link_bindings(at)
+        let mut actions = self.reevaluate_link_bindings(at);
+        // A new link may open routes for custody entries that had none.
+        actions.extend(self.drain_custody(at));
+        actions
     }
 
     fn on_link_down(&mut self, at: u64, link: LinkId) -> Vec<Action> {
@@ -959,6 +1091,8 @@ impl<S: Store> Node<S> {
         for bytes in records {
             actions.extend(self.admit_record(at, link, &bytes));
         }
+        // New records may open routes for custody entries that had none.
+        actions.extend(self.drain_custody(at));
         actions
     }
 
@@ -993,7 +1127,7 @@ impl<S: Store> Node<S> {
             self.records_version += 1;
             // The records that cite these KELs can now be validated; ask
             // for them on the next round rather than waiting a full interval.
-            self.next_reconcile_at = self.next_reconcile_at.min(at + 1);
+            self.next_reconcile_at = self.next_reconcile_at.min(at + secs_to_ms(1));
         }
         for id in abandoned {
             actions.extend(self.drop_records_for(at, &id));
@@ -1006,7 +1140,7 @@ impl<S: Store> Node<S> {
         let id = kel.identifier();
         let head = kel.head();
         let stored = match self.store.kel_head(&id) {
-            Ok(s) => s,
+            Ok(s) => s.map(kel_head_from_store),
             Err(e) => {
                 self.diag("kel_head", &e);
                 return KelAdmission::Dropped;
@@ -1050,6 +1184,7 @@ impl<S: Store> Node<S> {
             seen: at,
             abandoned: head.is_abandoned(),
         };
+        let head_seen = kel_head_to_store(head_seen);
         let head_changed = stored.as_ref().map(|s| s.commitment) != Some(head.commitment);
         match self.store.kel_put(&id, bytes, &head_seen) {
             Ok(()) => {
@@ -1106,7 +1241,7 @@ impl<S: Store> Node<S> {
             Err(()) => return StoredRecord::Unknown,
         };
         let result = if check_time {
-            parsed.validate(Some(now), &kel)
+            parsed.validate(Some(ms_to_secs(now)), &kel)
         } else {
             parsed.validate(None, &kel)
         };
@@ -1180,7 +1315,10 @@ impl<S: Store> Node<S> {
                     // dropped: they can never be used again. A record we
                     // could not check (store error) is kept.
                     let keep = match self.validate_stored(&record.bytes, now, false) {
-                        StoredRecord::Valid(p) => p.exp.saturating_add(RETENTION_GRACE_SECS) >= now,
+                        // Record expiry is a wire time (seconds); compare in ms.
+                        StoredRecord::Valid(p) => {
+                            secs_to_ms(p.exp).saturating_add(RETENTION_GRACE_MS) >= now
+                        }
                         StoredRecord::Invalid => false,
                         StoredRecord::Unknown => true,
                     };
@@ -1195,14 +1333,17 @@ impl<S: Store> Node<S> {
             }
             Err(e) => self.diag("record_all", &e),
         }
-        if let Err(e) = self.store.inbox_sweep_expired(INBOX_TTL_SECS, now) {
+        if let Err(e) = self
+            .store
+            .inbox_sweep_expired(INBOX_TTL_SECS, ms_to_secs(now))
+        {
             self.diag("inbox_sweep_expired", &e);
         }
         match self.store.outbound_all() {
             Ok(all) => {
-                for msg in all {
+                for msg in all.into_iter().map(outbound_from_store) {
                     let terminal = msg.state.is_terminal();
-                    if terminal && msg.exp.saturating_add(RETENTION_GRACE_SECS) < now {
+                    if terminal && msg.exp.saturating_add(RETENTION_GRACE_MS) < now {
                         if let Err(e) = self.store.outbound_remove(&msg.mid) {
                             self.diag("outbound_remove", &e);
                         }
@@ -1213,7 +1354,7 @@ impl<S: Store> Node<S> {
         }
         match self
             .store
-            .kel_sweep(now.saturating_sub(KEL_HEAD_MAX_AGE_SECS))
+            .kel_sweep(ms_to_secs(now).saturating_sub(KEL_HEAD_MAX_AGE_SECS))
         {
             Ok(n) => {
                 if n > 0 {
@@ -1223,7 +1364,8 @@ impl<S: Store> Node<S> {
             }
             Err(e) => self.diag("kel_sweep", &e),
         }
-        self.identity.sweep_retired_envelope_keys(now);
+        // Retired-key grace times are wall-clock seconds (file names).
+        self.identity.sweep_retired_envelope_keys(ms_to_secs(now));
     }
 
     /// The claim key for a record's channel key: the X25519 form, matching
@@ -1294,7 +1436,7 @@ impl<S: Store> Node<S> {
             if let Err(e) = self.publish_record(at) {
                 self.diag("publish_record", &e);
             }
-            self.next_reconcile_at = self.next_reconcile_at.min(at + 1);
+            self.next_reconcile_at = self.next_reconcile_at.min(at + secs_to_ms(1));
         }
         actions
     }
@@ -1326,13 +1468,13 @@ impl<S: Store> Node<S> {
             // a fork at the same sn). Ask for the KEL; drop the record.
             return self.want_kel(link, id);
         }
-        let Ok(validated) = parsed.validate(Some(at), &kel) else {
+        let Ok(validated) = parsed.validate(Some(ms_to_secs(at)), &kel) else {
             // Stale (cites a head behind ours), malformed, or badly signed.
             return Vec::new();
         };
         // A validated record is evidence the identity is alive; keep its
         // KEL from aging out of the retention sweep.
-        if let Err(e) = self.store.kel_touch(&id, at) {
+        if let Err(e) = self.store.kel_touch(&id, ms_to_secs(at)) {
             self.diag("kel_touch", &e);
         }
         let rec = validated.into_inner();
@@ -1367,7 +1509,7 @@ impl<S: Store> Node<S> {
             }
         }
         if admit {
-            match self.store.record_put(&rec.id, scope, bytes, at) {
+            match self.store.record_put(&rec.id, scope, bytes, ms_to_secs(at)) {
                 Ok(()) => self.records_version += 1,
                 Err(e) => self.diag("record_put", &e),
             }
@@ -1427,18 +1569,82 @@ enum DispatchResult {
     NoRoute,
 }
 
-const CUSTODY_TIMEOUT_SECS: u64 = 30;
-const CLAIM_SWEEP_SECS: u64 = 60;
+const CUSTODY_TIMEOUT_MS: u64 = 30_000;
+const CLAIM_SWEEP_MS: u64 = 60_000;
 const MAX_PENDING_ECHOES: usize = 256;
 /// How often the retention sweep runs.
-const DATA_SWEEP_SECS: u64 = 3600;
+const DATA_SWEEP_MS: u64 = 3_600_000;
 /// Grace period past a record's/message's expiry before it is purged.
-const RETENTION_GRACE_SECS: u64 = 7 * 24 * 3600;
-/// Undelivered inbox entries older than this are dropped by the sweep.
+const RETENTION_GRACE_MS: u64 = 7 * 24 * 3600 * 1000;
+/// Undelivered inbox entries older than this are dropped by the sweep
+/// (the store takes seconds).
 const INBOX_TTL_SECS: u64 = 30 * 24 * 3600;
-/// KEL heads not seen for this long are dropped (spec: one year).
+/// KEL heads not seen for this long are dropped (spec: one year; the
+/// store takes seconds).
 const KEL_HEAD_MAX_AGE_SECS: u64 = 365 * 24 * 3600;
 const BUF_CLASSES: usize = 16;
+/// Backstop for a custody entry with no route: retry this often until a
+/// route appears (an event can also trigger a retry sooner).
+const CUSTODY_RETRY_MS: u64 = 5_000;
+/// Per-link budget for echo replies (R-29): a peer cannot make us emit
+/// more than a small burst plus a slow trickle of echo replies.
+const ECHO_BUDGET_CAPACITY: f64 = 8.0;
+const ECHO_BUDGET_REFILL_PER_SEC: f64 = 0.5;
+/// Uninformed prior for the custody-reply RTT, used to schedule echo
+/// replies before any sample exists (100 ms).
+const DEFAULT_CUSTODY_RTT_MS: f64 = 100.0;
+/// Cap on a sampled echo delay, so one bad sample cannot park a reply
+/// absurdly far in the future.
+const MAX_ECHO_DELAY_MS: u64 = 60_000;
+/// Exponential smoothing factor for the custody-reply RTT estimate.
+const CUSTODY_RTT_ALPHA: f64 = 0.125;
+
+// ── store boundary conversions ──────────────────────────────────────
+// The store keeps Unix seconds; the core keeps milliseconds. These
+// convert the time fields of the store's row types in both directions.
+// Wire-derived expiries (message/record headers) enter the core as
+// seconds and are converted to ms at the ingestion point.
+
+fn outbound_to_store(m: &lattice_store::OutboundMessage) -> lattice_store::OutboundMessage {
+    let mut m = m.clone();
+    m.exp = ms_to_secs(m.exp);
+    m.receipt_deadline = m.receipt_deadline.map(ms_to_secs);
+    m.next_attempt = ms_to_secs(m.next_attempt);
+    m
+}
+
+fn outbound_from_store(mut m: lattice_store::OutboundMessage) -> lattice_store::OutboundMessage {
+    m.exp = secs_to_ms(m.exp);
+    m.receipt_deadline = m.receipt_deadline.map(secs_to_ms);
+    m.next_attempt = secs_to_ms(m.next_attempt);
+    m
+}
+
+fn custody_to_store(mut e: CustodyEntry) -> CustodyEntry {
+    e.exp = ms_to_secs(e.exp);
+    for ex in &mut e.excluded {
+        ex.until = ms_to_secs(ex.until);
+    }
+    e
+}
+
+fn custody_from_store(mut e: CustodyEntry) -> CustodyEntry {
+    e.exp = secs_to_ms(e.exp);
+    for ex in &mut e.excluded {
+        ex.until = secs_to_ms(ex.until);
+    }
+    e
+}
+
+fn kel_head_to_store(mut h: KelHeadSeen) -> KelHeadSeen {
+    h.seen = ms_to_secs(h.seen);
+    h
+}
+
+fn kel_head_from_store(mut h: KelHeadSeen) -> KelHeadSeen {
+    h.seen = secs_to_ms(h.seen);
+    h
+}
 
 impl<S: Store> Node<S> {
     fn on_app_send(&mut self, send: &AppSend) -> Vec<Action> {
@@ -1455,10 +1661,12 @@ impl<S: Store> Node<S> {
             }];
         }
 
+        // `send.exp` is a wire time (Unix seconds); the core keeps ms.
         let exp = send
             .exp
-            .unwrap_or(now + self.config.default_message_horizon)
-            .min(now + lattice_proto::MAX_MESSAGE_HORIZON);
+            .map(secs_to_ms)
+            .unwrap_or(now + secs_to_ms(self.config.default_message_horizon))
+            .min(now + secs_to_ms(lattice_proto::MAX_MESSAGE_HORIZON));
 
         let envelope = Envelope {
             kind: KIND_MESSAGE,
@@ -1468,7 +1676,7 @@ impl<S: Store> Node<S> {
             fmbx: send.fmbx.clone(),
             tsvc: send.tsvc.clone(),
             tmbx: send.tmbx.clone(),
-            created: now,
+            created: ms_to_secs(now),
             body: Some(send.body.clone()),
             reference: None,
             reason: None,
@@ -1489,12 +1697,12 @@ impl<S: Store> Node<S> {
             exp,
             state: OutboundState::Queued,
             waypoints_tried: Vec::new(),
-            receipt_deadline: Some(now + receipt_timeout),
+            receipt_deadline: Some(now + secs_to_ms(receipt_timeout)),
             attempts: 0,
             next_attempt: now,
             route: send.route,
         };
-        if let Err(e) = self.store.outbound_push(&outbound) {
+        if let Err(e) = self.store.outbound_push(&outbound_to_store(&outbound)) {
             self.diag("outbound_push", &e);
             return vec![Action::Status {
                 mid,
@@ -1629,7 +1837,7 @@ impl<S: Store> Node<S> {
             waypoint_id: choice.id,
             waypoint_ek: choice.envelope_key,
             leg: LegId::from_bytes(lattice_crypto::os_bytes::<16>()),
-            exp: msg.exp,
+            exp: ms_to_secs(msg.exp),
         });
         let used_waypoint_id = waypoint.as_ref().map(|w| w.waypoint_id);
         let wire = Message::build(BuildParams {
@@ -1638,7 +1846,7 @@ impl<S: Store> Node<S> {
             recipient_ek: &recipient_ek,
             real_dst,
             leg: LegId::from_bytes(lattice_crypto::os_bytes::<16>()),
-            exp: msg.exp,
+            exp: ms_to_secs(msg.exp),
             gateway,
             waypoint,
         })
@@ -1714,7 +1922,7 @@ impl<S: Store> Node<S> {
 
     fn pump_outbound(&mut self, now: u64) -> Vec<Action> {
         let mut actions = Vec::new();
-        let due = match self.store.outbound_due(now) {
+        let due = match self.store.outbound_due(ms_to_secs(now)) {
             Ok(d) => {
                 self.outbound_due_failures = 0;
                 d
@@ -1733,7 +1941,8 @@ impl<S: Store> Node<S> {
                 return actions;
             }
         };
-        for mut msg in due {
+        for msg in due {
+            let mut msg = outbound_from_store(msg);
             if msg.state != OutboundState::Queued {
                 continue;
             }
@@ -1745,17 +1954,17 @@ impl<S: Store> Node<S> {
                                 msg.waypoints_tried.push(wp);
                             }
                             msg.mark_in_flight();
-                            msg.next_attempt = now + self.config.retry_base_secs;
+                            msg.next_attempt = now + secs_to_ms(self.config.retry_base_secs);
                             // The receipt clock starts when the message
                             // actually goes on the wire, not at enqueue.
                             msg.receipt_deadline = Some(now + self.receipt_timeout_for(&msg));
-                            if let Err(e) = self.store.outbound_put(&msg) {
+                            if let Err(e) = self.store.outbound_put(&outbound_to_store(&msg)) {
                                 self.diag("outbound_put", &e);
                             }
                         }
                         DispatchResult::NoRoute => {
                             msg.requeue(now + self.backoff(msg.attempts));
-                            if let Err(e) = self.store.outbound_put(&msg) {
+                            if let Err(e) = self.store.outbound_put(&outbound_to_store(&msg)) {
                                 self.diag("outbound_put", &e);
                             }
                         }
@@ -1764,7 +1973,7 @@ impl<S: Store> Node<S> {
                 Err(BuildError::NoRoute) => {
                     if msg.attempts > self.config.fresh_waypoint_retries + 1 {
                         msg.mark_failed();
-                        if let Err(e) = self.store.outbound_put(&msg) {
+                        if let Err(e) = self.store.outbound_put(&outbound_to_store(&msg)) {
                             self.diag("outbound_put", &e);
                         }
                         if let Err(e) = self.store.status_set(
@@ -1781,8 +1990,8 @@ impl<S: Store> Node<S> {
                             service: msg.envelope.fsvc.clone(),
                         });
                     } else {
-                        msg.next_attempt = now + self.config.retry_base_secs;
-                        if let Err(e) = self.store.outbound_put(&msg) {
+                        msg.next_attempt = now + secs_to_ms(self.config.retry_base_secs);
+                        if let Err(e) = self.store.outbound_put(&outbound_to_store(&msg)) {
                             self.diag("outbound_put", &e);
                         }
                     }
@@ -1790,7 +1999,7 @@ impl<S: Store> Node<S> {
                 Err(BuildError::Crypto) => {
                     // Deterministic failure: retrying cannot help.
                     msg.mark_failed();
-                    if let Err(e) = self.store.outbound_put(&msg) {
+                    if let Err(e) = self.store.outbound_put(&outbound_to_store(&msg)) {
                         self.diag("outbound_put", &e);
                     }
                     if let Err(e) = self.store.status_set(
@@ -1813,17 +2022,17 @@ impl<S: Store> Node<S> {
     }
 
     fn receipt_timeout_for(&mut self, msg: &lattice_store::OutboundMessage) -> u64 {
-        if self.record_mode(&msg.recipient) == Some(Mode::Private) {
+        secs_to_ms(if self.record_mode(&msg.recipient) == Some(Mode::Private) {
             self.config.receipt_timeout_private
         } else {
             self.config.receipt_timeout_public
-        }
+        })
     }
 
     fn backoff(&self, attempts: u32) -> u64 {
         let shift = attempts.min(16);
-        let base = self.config.retry_base_secs.saturating_mul(1u64 << shift);
-        base.min(self.config.retry_max_secs)
+        let base = secs_to_ms(self.config.retry_base_secs).saturating_mul(1u64 << shift);
+        base.min(secs_to_ms(self.config.retry_max_secs))
     }
 
     fn pick_next_hop(
@@ -1876,7 +2085,7 @@ impl<S: Store> Node<S> {
         msg: &lattice_store::OutboundMessage,
         actions: &mut Vec<Action>,
     ) -> DispatchResult {
-        let Ok(parsed) = Message::parse(wire, now) else {
+        let Ok(parsed) = Message::parse(wire, ms_to_secs(now)) else {
             return DispatchResult::NoRoute;
         };
         let dst = parsed.header.dst;
@@ -1936,7 +2145,7 @@ impl<S: Store> Node<S> {
     fn on_offer(&mut self, now: u64, link: LinkId, offer: &OfferFrame) -> Vec<Action> {
         let mut actions = Vec::new();
         // Undecodable: no leg to answer to; drop.
-        let Ok(msg) = Message::parse(&offer.message, now) else {
+        let Ok(msg) = Message::parse(&offer.message, ms_to_secs(now)) else {
             return actions;
         };
         let leg = msg.header.leg;
@@ -1951,7 +2160,7 @@ impl<S: Store> Node<S> {
         let leg_hash = lattice_crypto::hash(leg.as_ref());
         // Fail closed on store error: treat the leg as already seen so a
         // broken store cannot cause double-processing.
-        let seen = match self.store.seen_contains(&leg_hash, now) {
+        let seen = match self.store.seen_contains(&leg_hash, ms_to_secs(now)) {
             Ok(v) => v,
             Err(e) => {
                 self.diag("seen_contains", &e);
@@ -1966,7 +2175,7 @@ impl<S: Store> Node<S> {
         // Seen but not held (refused or dropped earlier): SEEN. On store
         // error, fail toward SEEN: never reprocess a leg we cannot account
         // for.
-        let unheld = match self.store.seen_unheld_contains(&leg_hash, now) {
+        let unheld = match self.store.seen_unheld_contains(&leg_hash, ms_to_secs(now)) {
             Ok(v) => v,
             Err(e) => {
                 self.diag("seen_unheld_contains", &e);
@@ -2008,7 +2217,7 @@ impl<S: Store> Node<S> {
                 leg,
                 message: offer.message.clone(),
                 destination: dst,
-                exp: msg.header.exp,
+                exp: secs_to_ms(msg.header.exp),
                 class,
                 leg_hash,
             },
@@ -2152,12 +2361,12 @@ impl<S: Store> Node<S> {
             excluded: vec![Exclusion { link, until: exp }],
         };
         let accept = CustodyAccept {
-            entry,
+            entry: custody_to_store(entry),
             share_dest: destination,
             share_upstream: link,
             share_bytes: msg_len as i64,
             seen_hash: leg_hash,
-            seen_exp: exp,
+            seen_exp: ms_to_secs(exp),
         };
         if let Err(e) = self.store.custody_accept(accept) {
             self.diag("custody_accept", &e);
@@ -2184,9 +2393,12 @@ impl<S: Store> Node<S> {
                     // The outer header's expiry is checked in Message::parse;
                     // the inner header's is not, so enforce the same horizon
                     // here before the expiry is used for custody accounting.
-                    if hdr.exp <= now
-                        || hdr.exp
-                            > now + lattice_proto::MAX_MESSAGE_HORIZON + lattice_proto::CLOCK_SKEW
+                    if secs_to_ms(hdr.exp) <= now
+                        || secs_to_ms(hdr.exp)
+                            > now
+                                + secs_to_ms(
+                                    lattice_proto::MAX_MESSAGE_HORIZON + lattice_proto::CLOCK_SKEW,
+                                )
                     {
                         actions.push(Self::refuse(link, leg));
                         return actions;
@@ -2210,7 +2422,7 @@ impl<S: Store> Node<S> {
                             leg,
                             message: inner,
                             destination: hdr_dst,
-                            exp: hdr_exp,
+                            exp: secs_to_ms(hdr_exp),
                             class,
                             leg_hash: *leg_hash,
                         },
@@ -2235,7 +2447,7 @@ impl<S: Store> Node<S> {
                             leg,
                             message: stripped,
                             destination: rcpt,
-                            exp: msg.header.exp,
+                            exp: secs_to_ms(msg.header.exp),
                             class,
                             leg_hash: *leg_hash,
                         },
@@ -2264,7 +2476,7 @@ impl<S: Store> Node<S> {
             actions.push(Self::refuse(link, leg));
             return actions;
         };
-        if opened.validate_created(now).is_err() {
+        if opened.validate_created(ms_to_secs(now)).is_err() {
             // Absurd `created` (future beyond skew, or older than the
             // message horizon): refuse custody rather than store or relay it.
             actions.push(Self::refuse(link, leg));
@@ -2300,7 +2512,7 @@ impl<S: Store> Node<S> {
         let mid_hash = lattice_crypto::hash(mid_bytes.as_ref());
         // Fail closed on store error: treat the message as already delivered
         // so a broken store cannot cause duplicate delivery.
-        let already_delivered = match self.store.delivered_contains(&mid_hash, now) {
+        let already_delivered = match self.store.delivered_contains(&mid_hash, ms_to_secs(now)) {
             Ok(v) => v,
             Err(e) => {
                 self.diag("delivered_contains", &e);
@@ -2372,7 +2584,7 @@ impl<S: Store> Node<S> {
             tsvc: opened.tsvc.clone(),
             tmbx: opened.tmbx.clone(),
             body: opened.body.clone().unwrap_or_default(),
-            received: now,
+            received: ms_to_secs(now),
         };
         if let Err(e) = self.store.inbox_push(entry.clone()) {
             self.diag("inbox_push", &e);
@@ -2394,7 +2606,7 @@ impl<S: Store> Node<S> {
             fmbx: opened.fmbx.clone(),
             tmbx: opened.tmbx.clone(),
             body: opened.body.clone().unwrap_or_default(),
-            received: now,
+            received: ms_to_secs(now),
         });
         // Best effort: on store error report 0 rather than fail the delivery;
         // the diagnostic carries the real failure.
@@ -2441,7 +2653,7 @@ impl<S: Store> Node<S> {
 
     fn forward_custody(&mut self, now: u64, leg: LegId, actions: &mut Vec<Action>) {
         let entry = match self.store.custody_get(&leg) {
-            Ok(Some(e)) => e,
+            Ok(Some(e)) => custody_from_store(e),
             // The entry is gone (already delivered or swept): nothing to do.
             Ok(None) => return,
             Err(e) => {
@@ -2465,8 +2677,8 @@ impl<S: Store> Node<S> {
         let dst = entry.destination;
         // The offer we send may carry a *different* leg than the custody key
         // (waypoint re-origination): key `pending` by the leg on the wire.
-        let offer_leg =
-            lattice_proto::Message::parse(&entry.message, now).map_or(entry.leg, |m| m.header.leg);
+        let offer_leg = lattice_proto::Message::parse(&entry.message, ms_to_secs(now))
+            .map_or(entry.leg, |m| m.header.leg);
         let excluded: Vec<Exclusion> = entry
             .excluded
             .iter()
@@ -2478,8 +2690,15 @@ impl<S: Store> Node<S> {
             peer: _peer,
         }) = self.pick_next_hop(&dst, &excluded, now)
         else {
-            return; // no route right now; retried on tick
+            // No route right now. Ask to be woken to retry; events that
+            // create routes (link up, records arriving) also re-drive
+            // custody, but only once one of them happens.
+            let retry_at = now + CUSTODY_RETRY_MS;
+            self.custody_retry_at =
+                Some(self.custody_retry_at.map_or(retry_at, |t| t.min(retry_at)));
+            return;
         };
+
         self.pending.insert(
             offer_leg,
             PendingOffer {
@@ -2520,6 +2739,12 @@ impl<S: Store> Node<S> {
             }
         }
         let pending = self.pending.remove(&leg);
+        // Track the custody-reply RTT: echo replies are scheduled from
+        // this distribution so dummy exchanges look like an offer and
+        // its custody reply (spec §6, snow).
+        if let Some(p) = &pending {
+            self.observe_custody_rtt(now.saturating_sub(p.sent_at));
+        }
         match frame.result {
             CUSTODY_ACCEPTED => self.custody_accepted_reply(pending, &mut actions),
             // SEEN behaves like ALREADY_HAVE for the sender: exclude the
@@ -2537,7 +2762,7 @@ impl<S: Store> Node<S> {
     /// found or unreadable"; callers treat both as "nothing to update".
     fn load_outbound(&mut self, mid: &MessageId) -> Option<lattice_store::OutboundMessage> {
         match self.store.outbound_get(mid) {
-            Ok(Some(msg)) => Some(msg),
+            Ok(Some(msg)) => Some(outbound_from_store(msg)),
             Ok(None) => None,
             Err(e) => {
                 self.diag("outbound_get", &e);
@@ -2547,9 +2772,31 @@ impl<S: Store> Node<S> {
     }
 
     fn store_outbound(&mut self, msg: &lattice_store::OutboundMessage) {
-        if let Err(e) = self.store.outbound_put(msg) {
+        if let Err(e) = self.store.outbound_put(&outbound_to_store(msg)) {
             self.diag("outbound_put", &e);
         }
+    }
+
+    /// Fold one custody-reply RTT sample (ms) into the running estimate.
+    fn observe_custody_rtt(&mut self, sample_ms: u64) {
+        let sample = sample_ms as f64;
+        self.custody_rtt_ema_ms = Some(match self.custody_rtt_ema_ms {
+            None => sample,
+            Some(ema) => ema + CUSTODY_RTT_ALPHA * (sample - ema),
+        });
+    }
+
+    /// Sample an echo-reply delay (ms) from the estimated custody-reply
+    /// latency distribution: exponential with the observed mean, or the
+    /// uninformed prior before the first sample. Capped so a bad sample
+    /// cannot park a reply arbitrarily far out.
+    fn sample_custody_rtt_ms(&mut self) -> u64 {
+        let mean = self
+            .custody_rtt_ema_ms
+            .unwrap_or(DEFAULT_CUSTODY_RTT_MS)
+            .max(1.0);
+        let sample = self.rng.expovariate(1.0 / mean);
+        (sample as u64).min(MAX_ECHO_DELAY_MS)
     }
 
     /// Drop a relay custody entry and release its share of the upstream's
@@ -2607,10 +2854,13 @@ impl<S: Store> Node<S> {
         actions: &mut Vec<Action>,
     ) {
         let busy = frame.result == CUSTODY_BUSY;
-        let retry = frame
-            .retry_after
-            .unwrap_or(self.config.retry_base_secs)
-            .clamp(1, 3600);
+        // `retry_after` is a wire time (seconds).
+        let retry = secs_to_ms(
+            frame
+                .retry_after
+                .unwrap_or(self.config.retry_base_secs)
+                .clamp(1, 3600),
+        );
         let Some(p) = pending else { return };
         match p.origin {
             PendingOrigin::Outbound { mid } => {
@@ -2632,9 +2882,10 @@ impl<S: Store> Node<S> {
             PendingOrigin::Relay { custody_leg } => {
                 if busy {
                     match self.store.custody_get(&custody_leg) {
-                        Ok(Some(mut e)) => {
+                        Ok(Some(e)) => {
+                            let mut e = custody_from_store(e);
                             add_exclusion(&mut e.excluded, link, now + retry);
-                            if let Err(e) = self.store.custody_put(e) {
+                            if let Err(e) = self.store.custody_put(custody_to_store(e)) {
                                 self.diag("custody_put", &e);
                             }
                         }
@@ -2648,9 +2899,10 @@ impl<S: Store> Node<S> {
                     // this leg, and re-forward via another candidate.
                     // Custody is released only on ACCEPTED or REFUSED.
                     match self.store.custody_get(&custody_leg) {
-                        Ok(Some(mut e)) => {
+                        Ok(Some(e)) => {
+                            let mut e = custody_from_store(e);
                             add_exclusion(&mut e.excluded, link, e.exp);
-                            if let Err(e) = self.store.custody_put(e) {
+                            if let Err(e) = self.store.custody_put(custody_to_store(e)) {
                                 self.diag("custody_put", &e);
                             }
                         }
@@ -2714,7 +2966,7 @@ impl<S: Store> Node<S> {
         match envelope.kind {
             KIND_RECEIPT | KIND_NEGATIVE_RECEIPT => {
                 let mut msg = match self.store.outbound_get(&reference) {
-                    Ok(Some(msg)) => msg,
+                    Ok(Some(msg)) => outbound_from_store(msg),
                     // Not one of ours (or already forgotten): nothing to update.
                     Ok(None) => return actions,
                     Err(e) => {
@@ -2735,7 +2987,7 @@ impl<S: Store> Node<S> {
                     } else {
                         msg.mark_failed();
                     }
-                    if let Err(e) = self.store.outbound_put(&msg) {
+                    if let Err(e) = self.store.outbound_put(&outbound_to_store(&msg)) {
                         self.diag("outbound_put", &e);
                     }
                 }
@@ -2774,7 +3026,7 @@ impl<S: Store> Node<S> {
             fmbx: delivered.tmbx.clone(),
             tsvc: delivered.fsvc.clone(),
             tmbx: delivered.fmbx.clone(),
-            created: now,
+            created: ms_to_secs(now),
             body: None,
             reference: Some(delivered.mid),
             reason: None,
@@ -2799,7 +3051,7 @@ impl<S: Store> Node<S> {
             fmbx: Vec::new(),
             tsvc: original.fsvc.clone(),
             tmbx: original.fmbx.clone(),
-            created: now,
+            created: ms_to_secs(now),
             body: None,
             reference: Some(original.mid),
             reason: Some(reason),
@@ -2820,7 +3072,7 @@ impl<S: Store> Node<S> {
             recipient,
             envelope,
             priority: 3,
-            exp: now + self.config.default_message_horizon,
+            exp: now + secs_to_ms(self.config.default_message_horizon),
             state: OutboundState::Queued,
             waypoints_tried: Vec::new(),
             receipt_deadline: None,
@@ -2828,7 +3080,7 @@ impl<S: Store> Node<S> {
             next_attempt: now,
             route: 0,
         };
-        if let Err(e) = self.store.outbound_push(&outbound) {
+        if let Err(e) = self.store.outbound_push(&outbound_to_store(&outbound)) {
             self.diag("outbound_push", &e);
             return Vec::new();
         }
@@ -2854,7 +3106,6 @@ impl<S: Store> Node<S> {
         actions.extend(self.sweep_stale_custody(now));
         actions.extend(self.drain_custody(now));
         self.sweep_custody_expiry(now);
-        self.sweep_store_expired(now);
         actions.extend(self.pump_outbound(now));
         actions
     }
@@ -2868,7 +3119,7 @@ impl<S: Store> Node<S> {
         if let Some(link) = self.random_link() {
             actions.extend(self.reconcile_with(link));
         }
-        self.next_reconcile_at = now + self.config.reconcile_interval_secs;
+        self.next_reconcile_at = now + secs_to_ms(self.config.reconcile_interval_secs);
         actions
     }
 
@@ -2880,7 +3131,7 @@ impl<S: Store> Node<S> {
         if let Err(e) = self.publish_record(now) {
             self.diag("publish_record", &e);
         }
-        self.record_refresh_at = now + self.config.record_refresh_secs;
+        self.record_refresh_at = now + secs_to_ms(self.config.record_refresh_secs);
     }
 
     fn sweep_claims_if_due(&mut self, now: u64) -> Vec<Action> {
@@ -2888,7 +3139,7 @@ impl<S: Store> Node<S> {
             return Vec::new();
         }
         let actions = self.sweep_ck_claims(now);
-        self.next_claim_sweep_at = now + CLAIM_SWEEP_SECS;
+        self.next_claim_sweep_at = now + CLAIM_SWEEP_MS;
         actions
     }
 
@@ -2897,7 +3148,8 @@ impl<S: Store> Node<S> {
             return;
         }
         self.sweep_expired_data(now);
-        self.next_data_sweep_at = now + DATA_SWEEP_SECS;
+        self.sweep_store_expired(now);
+        self.next_data_sweep_at = now + DATA_SWEEP_MS;
     }
 
     /// Expire originated messages whose horizon has passed.
@@ -2905,10 +3157,11 @@ impl<S: Store> Node<S> {
         let mut actions = Vec::new();
         match self.store.outbound_all() {
             Ok(all) => {
-                for mut msg in all {
+                for msg in all {
+                    let mut msg = outbound_from_store(msg);
                     if !msg.state.is_terminal() && msg.exp <= now {
                         msg.mark_expired();
-                        if let Err(e) = self.store.outbound_put(&msg) {
+                        if let Err(e) = self.store.outbound_put(&outbound_to_store(&msg)) {
                             self.diag("outbound_put", &e);
                         }
                         if let Err(e) = self.store.status_set(
@@ -2937,7 +3190,8 @@ impl<S: Store> Node<S> {
         let mut actions = Vec::new();
         match self.store.outbound_all() {
             Ok(all) => {
-                for mut msg in all {
+                for msg in all {
+                    let mut msg = outbound_from_store(msg);
                     if msg.state != OutboundState::InFlight {
                         continue;
                     }
@@ -2949,7 +3203,7 @@ impl<S: Store> Node<S> {
                     }
                     if msg.attempts > self.config.fresh_waypoint_retries {
                         msg.mark_failed();
-                        if let Err(e) = self.store.outbound_put(&msg) {
+                        if let Err(e) = self.store.outbound_put(&outbound_to_store(&msg)) {
                             self.diag("outbound_put", &e);
                         }
                         if let Err(e) = self.store.status_set(
@@ -2967,7 +3221,7 @@ impl<S: Store> Node<S> {
                         });
                     } else {
                         msg.requeue(now);
-                        if let Err(e) = self.store.outbound_put(&msg) {
+                        if let Err(e) = self.store.outbound_put(&outbound_to_store(&msg)) {
                             self.diag("outbound_put", &e);
                         }
                     }
@@ -2984,7 +3238,7 @@ impl<S: Store> Node<S> {
         let stale: Vec<LegId> = self
             .pending
             .iter()
-            .filter(|(_, p)| now.saturating_sub(p.sent_at) > CUSTODY_TIMEOUT_SECS)
+            .filter(|(_, p)| now.saturating_sub(p.sent_at) > CUSTODY_TIMEOUT_MS)
             .map(|(leg, _)| *leg)
             .collect();
         for leg in stale {
@@ -2992,15 +3246,18 @@ impl<S: Store> Node<S> {
                 match p.origin {
                     PendingOrigin::Outbound { mid } => {
                         let excl = self.outbound_exclusions.entry(mid).or_default();
-                        add_exclusion(excl, p.link, now + self.config.retry_base_secs);
+                        add_exclusion(excl, p.link, now + secs_to_ms(self.config.retry_base_secs));
                         for e in p.excluded {
                             add_exclusion(excl, e.link, e.until);
                         }
                         match self.store.outbound_get(&mid) {
-                            Ok(Some(mut msg)) => {
+                            Ok(Some(msg)) => {
+                                let mut msg = outbound_from_store(msg);
                                 if msg.state == OutboundState::InFlight {
-                                    msg.requeue(now + self.config.retry_base_secs);
-                                    if let Err(e) = self.store.outbound_put(&msg) {
+                                    msg.requeue(now + secs_to_ms(self.config.retry_base_secs));
+                                    if let Err(e) =
+                                        self.store.outbound_put(&outbound_to_store(&msg))
+                                    {
                                         self.diag("outbound_put", &e);
                                     }
                                 }
@@ -3011,16 +3268,17 @@ impl<S: Store> Node<S> {
                     }
                     PendingOrigin::Relay { custody_leg } => {
                         match self.store.custody_get(&custody_leg) {
-                            Ok(Some(mut e)) => {
+                            Ok(Some(e)) => {
+                                let mut e = custody_from_store(e);
                                 add_exclusion(
                                     &mut e.excluded,
                                     p.link,
-                                    now + self.config.retry_base_secs,
+                                    now + secs_to_ms(self.config.retry_base_secs),
                                 );
                                 for ex in p.excluded {
                                     add_exclusion(&mut e.excluded, ex.link, ex.until);
                                 }
-                                if let Err(e) = self.store.custody_put(e) {
+                                if let Err(e) = self.store.custody_put(custody_to_store(e)) {
                                     self.diag("custody_put", &e);
                                 }
                             }
@@ -3040,11 +3298,15 @@ impl<S: Store> Node<S> {
     /// first, which is what keeps the class partition deadlock-free.
     fn drain_custody(&mut self, now: u64) -> Vec<Action> {
         let mut actions = Vec::new();
+        // Re-arm from scratch: entries that still cannot route re-set the
+        // retry deadline inside `forward_custody`.
+        self.custody_retry_at = None;
         match self.store.custody_all() {
-            Ok(mut all) => {
+            Ok(all) => {
+                let mut all: Vec<_> = all.into_iter().map(custody_from_store).collect();
                 all.sort_by_key(|e| e.class);
                 for entry in all {
-                    let offer_leg = lattice_proto::Message::parse(&entry.message, now)
+                    let offer_leg = lattice_proto::Message::parse(&entry.message, ms_to_secs(now))
                         .map_or(entry.leg, |m| m.header.leg);
                     let in_flight = self.pending.contains_key(&offer_leg);
                     if !in_flight {
@@ -3061,7 +3323,7 @@ impl<S: Store> Node<S> {
     fn sweep_custody_expiry(&mut self, now: u64) {
         match self.store.custody_all() {
             Ok(all) => {
-                for entry in all {
+                for entry in all.into_iter().map(custody_from_store) {
                     if entry.exp <= now {
                         match self.store.custody_remove(&entry.leg) {
                             Ok(Some(e)) => {
@@ -3084,7 +3346,7 @@ impl<S: Store> Node<S> {
     }
 
     fn sweep_store_expired(&mut self, now: u64) {
-        if let Err(e) = self.store.sweep_expired(now) {
+        if let Err(e) = self.store.sweep_expired(ms_to_secs(now)) {
             self.diag("sweep_expired", &e);
         }
     }
@@ -3118,7 +3380,9 @@ impl<S: Store> Node<S> {
         for echo in due {
             let link = echo.link;
             if self.links.contains_key(&link) {
-                let bucket = self.sample_snow_bucket();
+                // The reply goes out in the same bucket as the request
+                // (R-29), not a freshly sampled one.
+                let bucket = echo.bucket;
                 actions.push(Action::SendFrame {
                     pad_to: Some(bucket),
                     link,
@@ -3132,11 +3396,12 @@ impl<S: Store> Node<S> {
             return actions;
         }
         let interval = if self.config.snow_per_min > 0.0 {
-            (self.rng.expovariate(self.config.snow_per_min / 60.0)).max(0.001) as u64
+            // Exponential gap in milliseconds (snow_per_min per 60_000 ms).
+            (self.rng.expovariate(self.config.snow_per_min / 60_000.0)).max(1.0) as u64
         } else {
-            u64::MAX / 2
+            u64::MAX
         };
-        self.snow_next = now + interval.max(1);
+        self.snow_next = now.saturating_add(interval.max(1));
 
         if self.frames_since_snow_tick > 0 {
             self.frames_since_snow_tick = 0;
@@ -3203,7 +3468,13 @@ impl<S: Store> Node<S> {
         self.rng.next_u64() as f64 / u64::MAX as f64
     }
 
-    fn on_frame(&mut self, at: u64, link: LinkId, frame: Frame) -> Vec<Action> {
+    fn on_frame(
+        &mut self,
+        at: u64,
+        link: LinkId,
+        frame: Frame,
+        bucket: Option<usize>,
+    ) -> Vec<Action> {
         self.now = at;
         match frame {
             Frame::Offer(offer) => self.on_offer(at, link, &offer),
@@ -3218,15 +3489,28 @@ impl<S: Store> Node<S> {
             }],
             Frame::Dummy(d) => {
                 if d.echo && self.inner_pending_echo.len() < MAX_PENDING_ECHOES {
-                    // The node's clock has 1s granularity; the spec's "short
-                    // random delay" (same distribution as a custody reply,
-                    // i.e. ~immediate) is expressed as 0-1 ticks. Sub-second
-                    // delay needs a millisecond time base.
-                    let jitter = self.rng.next_u64() % 2;
-                    self.inner_pending_echo.push(PendingEcho {
-                        due: at + jitter,
-                        link,
-                    });
+                    // Per-link echo budget (R-29): a peer cannot make us
+                    // emit more than a small burst plus a slow trickle of
+                    // echo replies. The dummy itself is ignored either way.
+                    let allowed = self
+                        .links
+                        .get_mut(&link)
+                        .map(|l| l.echo_budget_take(at))
+                        .unwrap_or(false);
+                    if allowed {
+                        // The reply is scheduled with a delay drawn from the
+                        // measured custody-reply latency distribution, and
+                        // goes out in the request's bucket (R-29). If the
+                        // bucket is unknown (e.g. a synthetic frame), fall
+                        // back to a sampled bucket.
+                        let delay = self.sample_custody_rtt_ms();
+                        let bucket = bucket.unwrap_or_else(|| self.sample_snow_bucket());
+                        self.inner_pending_echo.push(PendingEcho {
+                            due: at + delay,
+                            link,
+                            bucket,
+                        });
+                    }
                 }
                 Vec::new()
             }
@@ -3282,7 +3566,7 @@ impl<S: Store> Node<S> {
             // KEL does the talking from here.
             let id = self.own_id;
             self.drop_records_for(now, &id);
-            self.next_reconcile_at = self.next_reconcile_at.min(now + 1);
+            self.next_reconcile_at = self.next_reconcile_at.min(now + secs_to_ms(1));
             return Ok(());
         }
         self.publish_record(now)
@@ -3802,7 +4086,7 @@ mod tests {
             .unwrap();
 
         // Within the grace window the record must survive; garbage is dropped.
-        node.sweep_expired_data(exp + RETENTION_GRACE_SECS - 1);
+        node.sweep_expired_data(secs_to_ms(exp) + RETENTION_GRACE_MS - 1);
         assert!(node.store.record_get(&id, Scope::Wan).unwrap().is_some());
         assert!(
             node.store
@@ -3812,7 +4096,7 @@ mod tests {
         );
 
         // Past the grace window the expired record is dropped.
-        node.sweep_expired_data(exp + RETENTION_GRACE_SECS + 1);
+        node.sweep_expired_data(secs_to_ms(exp) + RETENTION_GRACE_MS + 1);
         assert!(node.store.record_get(&id, Scope::Wan).unwrap().is_none());
     }
 
@@ -3859,6 +4143,7 @@ mod tests {
             link: 999,
             from: kel.identifier(),
             frame,
+            bucket: None,
         });
     }
 
@@ -4110,7 +4395,7 @@ mod tests {
         // Past the record grace period the KEL is still held: the head is
         // fresh, and the KEL is the only carrier of the abandonment for
         // peers that were offline.
-        node.sweep_expired_data(1_000 + RETENTION_GRACE_SECS + 1);
+        node.sweep_expired_data(1_000 + RETENTION_GRACE_MS + 1);
         assert!(node.store.kel_head(&id).unwrap().is_some());
         assert!(node.store.kel_get(&id).unwrap().is_some());
         assert!(node.record_items().unwrap().iter().any(|i| i.id == id));
@@ -4130,7 +4415,7 @@ mod tests {
                 },
             )
             .unwrap();
-        node.sweep_expired_data(KEL_HEAD_MAX_AGE_SECS + 1);
+        node.sweep_expired_data(secs_to_ms(KEL_HEAD_MAX_AGE_SECS + 1));
         assert!(node.store.kel_head(&id).unwrap().is_none());
         assert!(node.store.kel_get(&id).unwrap().is_none());
         assert!(!node.record_items().unwrap().iter().any(|i| i.id == id));
@@ -4263,6 +4548,7 @@ mod tests {
             link: 200,
             from: dst,
             frame: custody_frame(leg, CUSTODY_ALREADY_HAVE),
+            bucket: None,
         });
         // Custody is kept, not released.
         let entry = node
@@ -4313,6 +4599,7 @@ mod tests {
             link: 200,
             from: dst,
             frame: custody_frame(leg, CUSTODY_ALREADY_HAVE),
+            bucket: None,
         });
         // Our copy is kept and requeued, not deleted or failed.
         let stored = node
@@ -4356,6 +4643,7 @@ mod tests {
                 link: 200,
                 from: dst,
                 frame: custody_frame(leg, result),
+                bucket: None,
             });
             assert!(
                 node.store.custody_get(&leg).unwrap().is_none(),
@@ -4394,6 +4682,7 @@ mod tests {
             link: 300,
             from: stray,
             frame: custody_frame(leg, CUSTODY_ACCEPTED),
+            bucket: None,
         });
         assert!(actions.is_empty());
         assert!(node.pending.contains_key(&leg));
@@ -4404,6 +4693,7 @@ mod tests {
             link: 200,
             from: dst,
             frame: custody_frame(leg, CUSTODY_ACCEPTED),
+            bucket: None,
         });
         assert!(!node.pending.contains_key(&leg));
         assert!(node.store.custody_get(&leg).unwrap().is_none());
@@ -4436,6 +4726,7 @@ mod tests {
             link: 300,
             from: stray,
             frame: custody_frame(leg, CUSTODY_REFUSED),
+            bucket: None,
         });
         assert!(actions.is_empty());
         let stored = node.store.outbound_get(&mid).unwrap().unwrap();
@@ -4447,6 +4738,7 @@ mod tests {
             link: 200,
             from: dst,
             frame: custody_frame(leg, CUSTODY_REFUSED),
+            bucket: None,
         });
         let stored = node.store.outbound_get(&mid).unwrap().unwrap();
         assert_eq!(stored.state, OutboundState::Failed);
@@ -4526,6 +4818,7 @@ mod tests {
             link: 100,
             from: sender.id(),
             frame: Frame::Offer(OfferFrame { message: wire }),
+            bucket: None,
         });
         assert!(
             actions.iter().any(|a| matches!(
@@ -4579,6 +4872,7 @@ mod tests {
             link: 100,
             from: sender.id(),
             frame: Frame::Offer(OfferFrame { message: wire }),
+            bucket: None,
         });
         assert!(
             actions.iter().any(|a| matches!(
@@ -4620,6 +4914,7 @@ mod tests {
             link: 100,
             from: sender.id(),
             frame: Frame::Offer(OfferFrame { message: wire }),
+            bucket: None,
         });
         assert!(
             actions.iter().any(|a| matches!(
@@ -4691,6 +4986,7 @@ mod tests {
             link: 100,
             from: sender.id(),
             frame: Frame::Offer(OfferFrame { message: wire }),
+            bucket: None,
         });
         assert!(
             actions.iter().any(|a| matches!(
@@ -4728,6 +5024,7 @@ mod tests {
             link: 100,
             from: sender.id(),
             frame: Frame::Offer(OfferFrame { message: wire }),
+            bucket: None,
         });
         assert!(
             actions.iter().any(|a| matches!(
@@ -4782,6 +5079,7 @@ mod tests {
             link: 100,
             from: sender.id(),
             frame: Frame::Offer(OfferFrame { message: wire }),
+            bucket: None,
         });
         assert!(
             actions.iter().any(|a| matches!(
@@ -4810,6 +5108,7 @@ mod tests {
             link: 100,
             from: upstream,
             frame: Frame::Offer(OfferFrame { message: wire }),
+            bucket: None,
         });
         assert!(
             actions.iter().any(|a| matches!(
@@ -4891,6 +5190,7 @@ mod tests {
                 link: 100,
                 from: peer,
                 frame: Frame::Reconcile(ReconcileFrame { ranges }),
+                bucket: None,
             })
             .0
         };
@@ -4972,6 +5272,7 @@ mod tests {
             link: 300,
             from: stray,
             frame: Frame::Offer(OfferFrame { message: wire }),
+            bucket: None,
         });
         assert!(
             actions.iter().any(|a| matches!(
@@ -4985,5 +5286,291 @@ mod tests {
         );
         // We must not take custody of our own message.
         assert!(node.store.custody_get(&leg).unwrap().is_none());
+    }
+
+    // ── deadline reporting, echo bucket/budget, RTT sampling ─────────
+
+    /// Set every internal timer to "never" so tests can observe exactly
+    /// which deadline the core reports.
+    fn silence_timers(node: &mut Node<MemStore>) {
+        node.next_reconcile_at = u64::MAX;
+        node.record_refresh_at = u64::MAX;
+        node.next_claim_sweep_at = u64::MAX;
+        node.next_data_sweep_at = u64::MAX;
+        node.snow_next = u64::MAX;
+    }
+
+    fn dummy_echo_actions(actions: &[Action]) -> Vec<(u64, Option<usize>)> {
+        actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::SendFrame {
+                    link,
+                    frame: Frame::Dummy(_),
+                    pad_to,
+                } => Some((*link, *pad_to)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn next_deadline_is_none_when_nothing_is_pending() {
+        let mut node = test_node();
+        silence_timers(&mut node);
+        assert_eq!(node.next_deadline(), None);
+    }
+
+    #[test]
+    fn next_deadline_reports_reconcile_when_only_housekeeping_pending() {
+        let node = test_node();
+        // Fresh node: reconcile is due 1s after construction (t=1000 ms).
+        assert_eq!(node.next_deadline(), Some(2_000));
+    }
+
+    #[test]
+    fn next_deadline_is_min_of_pending_timers() {
+        let mut node = test_node();
+        silence_timers(&mut node);
+        // Custody entry expiring at t=5s (store holds seconds).
+        let leg = LegId::from_bytes([0x42; 16]);
+        let dst = Identifier::from_bytes([0xD5; 32]);
+        let wire = wire_message(leg, dst, 60);
+        insert_relay_custody(&mut node, leg, wire, 100, dst, 5);
+        assert_eq!(node.next_deadline(), Some(5_000));
+        // A queued outbound with an earlier next_attempt wins.
+        let mid = MessageId::from_bytes([0x43; 16]);
+        let mut msg = outbound(mid, dst, OutboundState::Queued);
+        msg.next_attempt = 2; // store seconds
+        node.store.outbound_push(&msg).unwrap();
+        assert_eq!(node.next_deadline(), Some(2_000));
+        // A pending custody offer with an even earlier timeout wins.
+        let leg2 = LegId::from_bytes([0x44; 16]);
+        node.pending.insert(
+            leg2,
+            PendingOffer {
+                origin: PendingOrigin::Relay { custody_leg: leg2 },
+                sent_at: 1_000,
+                excluded: Vec::new(),
+                link: 100,
+            },
+        );
+        // sent_at (1000) + CUSTODY_TIMEOUT_MS (30_000) = 31_000, which is
+        // later than 2_000, so the outbound still wins.
+        assert_eq!(node.next_deadline(), Some(2_000));
+        // An echo due sooner than everything wins.
+        let peer = Identifier::from_bytes([0xE1; 32]);
+        link_up(&mut node, 100, peer, 1_000);
+        node.handle(Event::Frame {
+            at: 1_000,
+            link: 100,
+            from: peer,
+            frame: Frame::Dummy(DummyFrame { echo: true }),
+            bucket: Some(1),
+        });
+        let echo_due = node.inner_pending_echo[0].due;
+        assert_eq!(node.next_deadline(), Some(echo_due.min(2_000)));
+    }
+
+    #[test]
+    fn next_deadline_clears_after_tick_processes_timers() {
+        let mut node = test_node();
+        silence_timers(&mut node);
+        let leg = LegId::from_bytes([0x42; 16]);
+        let dst = Identifier::from_bytes([0xD5; 32]);
+        let wire = wire_message(leg, dst, 60);
+        insert_relay_custody(&mut node, leg, wire, 100, dst, 5);
+        assert_eq!(node.next_deadline(), Some(5_000));
+        // The custody entry expires at t=5s; a tick there sweeps it.
+        node.handle(Event::Tick { at: 5_000 });
+        assert_eq!(node.next_deadline(), None);
+    }
+
+    #[test]
+    fn echo_reply_uses_request_bucket() {
+        let mut node = test_node();
+        let peer = Identifier::from_bytes([0xE1; 32]);
+        link_up(&mut node, 100, peer, 1_000);
+        for bucket in [0usize, 1, 2, 3] {
+            node.handle(Event::Frame {
+                at: 1_000,
+                link: 100,
+                from: peer,
+                frame: Frame::Dummy(DummyFrame { echo: true }),
+                bucket: Some(bucket),
+            });
+        }
+        let (actions, _) = node.handle(Event::Tick {
+            at: 1_000 + MAX_ECHO_DELAY_MS + 1,
+        });
+        let buckets = dummy_echo_actions(&actions);
+        assert_eq!(buckets.len(), 4);
+        assert_eq!(
+            buckets.iter().map(|&(_, b)| b).collect::<Vec<_>>(),
+            vec![Some(0), Some(1), Some(2), Some(3)],
+            "echo replies must go out in the request's bucket"
+        );
+    }
+
+    #[test]
+    fn echo_reply_without_bucket_hint_uses_a_valid_bucket() {
+        let mut node = test_node();
+        let peer = Identifier::from_bytes([0xE1; 32]);
+        link_up(&mut node, 100, peer, 1_000);
+        node.handle(Event::Frame {
+            at: 1_000,
+            link: 100,
+            from: peer,
+            frame: Frame::Dummy(DummyFrame { echo: true }),
+            bucket: None,
+        });
+        let (actions, _) = node.handle(Event::Tick {
+            at: 1_000 + MAX_ECHO_DELAY_MS + 1,
+        });
+        let buckets = dummy_echo_actions(&actions);
+        assert_eq!(buckets.len(), 1);
+        assert!(buckets[0].1.is_some_and(|b| b < 4));
+    }
+
+    #[test]
+    fn echo_budget_limits_replies_per_link() {
+        let mut node = test_node();
+        let peer = Identifier::from_bytes([0xE1; 32]);
+        link_up(&mut node, 100, peer, 1_000);
+        // Flood the node with echo requests; only the budget is honored.
+        for _ in 0..20 {
+            node.handle(Event::Frame {
+                at: 1_000,
+                link: 100,
+                from: peer,
+                frame: Frame::Dummy(DummyFrame { echo: true }),
+                bucket: Some(2),
+            });
+        }
+        assert_eq!(node.inner_pending_echo.len(), ECHO_BUDGET_CAPACITY as usize);
+        let (actions, _) = node.handle(Event::Tick {
+            at: 1_000 + MAX_ECHO_DELAY_MS + 1,
+        });
+        assert_eq!(
+            dummy_echo_actions(&actions).len(),
+            ECHO_BUDGET_CAPACITY as usize
+        );
+    }
+
+    #[test]
+    fn echo_budget_refills_over_time() {
+        let mut node = test_node();
+        let peer = Identifier::from_bytes([0xE1; 32]);
+        link_up(&mut node, 100, peer, 1_000);
+        for _ in 0..20 {
+            node.handle(Event::Frame {
+                at: 1_000,
+                link: 100,
+                from: peer,
+                frame: Frame::Dummy(DummyFrame { echo: true }),
+                bucket: Some(2),
+            });
+        }
+        assert_eq!(node.inner_pending_echo.len(), ECHO_BUDGET_CAPACITY as usize);
+        // 3 seconds later the bucket has refilled by 1.5 tokens: one more
+        // echo is allowed, the next is not.
+        node.handle(Event::Frame {
+            at: 4_000,
+            link: 100,
+            from: peer,
+            frame: Frame::Dummy(DummyFrame { echo: true }),
+            bucket: Some(2),
+        });
+        assert_eq!(
+            node.inner_pending_echo.len(),
+            ECHO_BUDGET_CAPACITY as usize + 1
+        );
+        node.handle(Event::Frame {
+            at: 4_000,
+            link: 100,
+            from: peer,
+            frame: Frame::Dummy(DummyFrame { echo: true }),
+            bucket: Some(2),
+        });
+        assert_eq!(
+            node.inner_pending_echo.len(),
+            ECHO_BUDGET_CAPACITY as usize + 1
+        );
+    }
+
+    #[test]
+    fn echo_budget_is_per_link() {
+        let mut node = test_node();
+        let peer_a = Identifier::from_bytes([0xE1; 32]);
+        let peer_b = Identifier::from_bytes([0xE2; 32]);
+        link_up(&mut node, 100, peer_a, 1_000);
+        link_up(&mut node, 200, peer_b, 1_000);
+        for _ in 0..20 {
+            node.handle(Event::Frame {
+                at: 1_000,
+                link: 100,
+                from: peer_a,
+                frame: Frame::Dummy(DummyFrame { echo: true }),
+                bucket: Some(2),
+            });
+        }
+        // The other link has its own budget.
+        node.handle(Event::Frame {
+            at: 1_000,
+            link: 200,
+            from: peer_b,
+            frame: Frame::Dummy(DummyFrame { echo: true }),
+            bucket: Some(2),
+        });
+        assert_eq!(
+            node.inner_pending_echo.len(),
+            ECHO_BUDGET_CAPACITY as usize + 1
+        );
+    }
+
+    #[test]
+    fn custody_rtt_estimate_converges_and_samples() {
+        let mut node = test_node();
+        // No samples yet: the prior is used and every sample is in range.
+        for _ in 0..100 {
+            assert!(node.sample_custody_rtt_ms() <= MAX_ECHO_DELAY_MS);
+        }
+        // Feed a steady 50 ms RTT; the EMA converges on it.
+        for _ in 0..200 {
+            node.observe_custody_rtt(50);
+        }
+        let ema = node.custody_rtt_ema_ms.expect("samples recorded");
+        assert!((ema - 50.0).abs() < 1.0, "ema was {ema}");
+        // Samples drawn from the fitted distribution average near 50 ms.
+        let n = 2_000u64;
+        let sum: u64 = (0..n).map(|_| node.sample_custody_rtt_ms()).sum();
+        let mean = sum as f64 / n as f64;
+        assert!((30.0..75.0).contains(&mean), "mean sample was {mean}");
+    }
+
+    #[test]
+    fn custody_reply_updates_rtt_estimate() {
+        let mut node = test_node();
+        let peer = Identifier::from_bytes([0xE1; 32]);
+        link_up(&mut node, 100, peer, 1_000);
+        let leg = LegId::from_bytes([0x77; 16]);
+        node.pending.insert(
+            leg,
+            PendingOffer {
+                origin: PendingOrigin::Relay { custody_leg: leg },
+                sent_at: 1_000,
+                excluded: Vec::new(),
+                link: 100,
+            },
+        );
+        node.handle(Event::Frame {
+            at: 1_050,
+            link: 100,
+            from: peer,
+            frame: custody_frame(leg, CUSTODY_ACCEPTED),
+            bucket: None,
+        });
+        let ema = node.custody_rtt_ema_ms.expect("reply observed");
+        assert!((ema - 50.0).abs() < f64::EPSILON);
     }
 }
