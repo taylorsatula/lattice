@@ -10,6 +10,7 @@
 
 mod mem;
 mod redb_store;
+mod row_codec;
 
 pub use mem::MemStore;
 pub use redb_store::RedbStore;
@@ -106,28 +107,14 @@ pub struct KelHeadSeen {
 
 /// A neighbor excluded from custody forwarding until `until` (unix time).
 ///
-/// Serialized as `[link, until]` inside custody entries; the serde impls
-/// round-trip through `(u64, u64)` so the on-disk format is unchanged.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(from = "(u64, u64)", into = "(u64, u64)")]
+/// Encoded as a CBOR map `{0: link, 1: until}` inside custody entries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Exclusion {
     pub link: u64,
     pub until: u64,
 }
 
-impl From<(u64, u64)> for Exclusion {
-    fn from((link, until): (u64, u64)) -> Self {
-        Self { link, until }
-    }
-}
-
-impl From<Exclusion> for (u64, u64) {
-    fn from(e: Exclusion) -> Self {
-        (e.link, e.until)
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct OutboundMessage {
     pub mid: MessageId,
     /// Final recipient (never the gateway).
@@ -148,11 +135,10 @@ pub struct OutboundMessage {
     /// Next allowed attempt time (backoff).
     pub next_attempt: u64,
     /// 0 = default routing (waypoint share decides), 1 = force waypoint, 2 = force direct.
-    #[serde(default)]
     pub route: u8,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OutboundState {
     Queued,
     InFlight,
@@ -161,7 +147,7 @@ pub enum OutboundState {
     Expired,
 }
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CustodyEntry {
     pub leg: LegId,
     pub message: Vec<u8>,
@@ -174,7 +160,7 @@ pub struct CustodyEntry {
     pub excluded: Vec<Exclusion>,
 }
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InboxEntry {
     pub delivery_id: DeliveryId,
     pub mid: MessageId,

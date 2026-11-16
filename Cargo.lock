@@ -703,8 +703,6 @@ dependencies = [
  "lattice-proto",
  "lattice-types",
  "redb",
- "serde",
- "serde_json",
  "tempfile",
  "thiserror",
 ]

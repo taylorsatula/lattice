@@ -5,19 +5,23 @@
 //! backend exists for the simulator; behavior is contract-tested for
 //! equivalence.
 //!
-//! Read-path validation policy: rows are serde_json bytes written by an
-//! earlier build and are never trusted as-is. On every decode, a row is
-//! re-validated where a validator exists (the outbound envelope, via
-//! `Envelope::from_value`); a failed validation fails the read loudly with
-//! `StoreError::Codec`, which the core surfaces on its diagnostic channel.
-//! Bounded integer fields (outbound `priority` and `route`, custody `class`)
-//! are clamped to their valid ranges rather than rejected. Everything else
-//! is serde-trusted: if it deserializes, it is accepted as-is.
+//! Read-path validation policy: rows are CBOR bytes (see `row_codec`) and
+//! are never trusted as-is. On every decode, a row is re-validated where a
+//! validator exists (the outbound envelope, via `Envelope::from_value`); a
+//! failed validation fails the read loudly with `StoreError::Codec`, which
+//! the core surfaces on its diagnostic channel. Bounded integer fields
+//! (outbound `priority` and `route`, custody `class`) are clamped to their
+//! valid ranges rather than rejected. Everything else is decode-trusted:
+//! if it decodes, it is accepted as-is.
 
 use std::path::Path;
 
 use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
 
+use crate::row_codec::{
+    decode_custody, decode_inbox, decode_outbound, decode_status, encode_custody, encode_inbox,
+    encode_outbound, encode_status,
+};
 use crate::*;
 use lattice_proto::local::DrainState;
 use lattice_proto::record::Scope;
@@ -94,7 +98,11 @@ macro_rules! ensure_tables {
     }};
 }
 
-const SCHEMA_VERSION: u64 = 1;
+// v2: rows are CBOR (was serde_json) and custody rows store the message
+// with its wire padding stripped plus the bucket index. There is no
+// migration from v1: pre-release, no deployed base, so a v1 database fails
+// loudly at open (see `migrate`).
+const SCHEMA_VERSION: u64 = 2;
 
 const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
 const RECORDS: TableDefinition<[u8; 33], Vec<u8>> = TableDefinition::new("records");
@@ -194,19 +202,12 @@ fn sanitize_custody(mut entry: CustodyEntry) -> CustodyEntry {
 }
 
 /// Ordered schema migrations. Each step upgrades the database from version
-/// `n` to `n + 1`. There are no steps yet (v1 is the initial schema); the
-/// framework exists so a future bump fails loudly instead of silently
-/// opening a mismatched database.
-fn migrate(txn: &redb::WriteTransaction, from: u64) -> Result<(), StoreError> {
-    // Ordered steps would go here: 1 => migrate_1_to_2(txn)?, etc.
-    // v1 is the initial schema, so there is nothing to do yet; any other
-    // older version has no path and must fail loudly.
-    if from != 1 {
-        return Err(StoreError::NoMigration { from });
-    }
-    let mut meta = txn.open_table(META)?;
-    meta.insert("schema_version", SCHEMA_VERSION)?;
-    Ok(())
+/// `n` to `n + 1`. There are no steps: v2 is a clean break from v1 (rows
+/// changed encoding wholesale), and there is no deployed base to migrate.
+/// A v1 database fails loudly here rather than being silently misread.
+fn migrate(from: u64) -> Result<(), StoreError> {
+    // Ordered steps would go here: 2 => migrate_2_to_3(txn)?, etc.
+    Err(StoreError::NoMigration { from })
 }
 
 /// Read a u64 counter from the meta table inside a write transaction.
@@ -258,8 +259,7 @@ impl RedbStore {
                     });
                 }
                 Some(v) if v < SCHEMA_VERSION => {
-                    drop(meta);
-                    migrate(&txn, v).map_err(|e| e.at(OP))?;
+                    migrate(v).map_err(|e| e.at(OP))?;
                 }
                 Some(_) => {}
             }
@@ -339,12 +339,7 @@ fn rebuild_custody_counters(
         let t = txn.open_table(CUSTODY).map_err(ctx(op))?;
         for entry in t.iter().map_err(ctx(op))? {
             let (_, v) = entry.map_err(ctx(op))?;
-            let e: CustodyEntry =
-                serde_json::from_slice(&v.value()).map_err(|e| StoreError::Codec {
-                    context: "decode custody entry",
-                    source: e.into(),
-                })?;
-            let e = sanitize_custody(e);
+            let e = sanitize_custody(decode_custody(&v.value())?);
             custody_bytes += e.message.len() as u64;
             class_bytes[e.class as usize] += e.message.len() as u64;
         }
@@ -374,18 +369,10 @@ fn custody_put_txn(
     // The byte counters track message bytes, so recover the old entry's
     // message length and class from the stored row if this leg is overwritten.
     let (old_msg_len, old_class) = match t.get(leg.as_bytes())? {
-        Some(v) => match serde_json::from_slice::<CustodyEntry>(&v.value()) {
-            Ok(e) => {
-                let e = sanitize_custody(e);
-                (e.message.len() as i64, e.class as usize)
-            }
-            Err(e) => {
-                return Err(StoreError::Codec {
-                    context: "decode custody entry",
-                    source: e.into(),
-                });
-            }
-        },
+        Some(v) => {
+            let e = sanitize_custody(decode_custody(&v.value())?);
+            (e.message.len() as i64, e.class as usize)
+        }
         None => (0, 0),
     };
     t.insert(*leg.as_bytes(), bytes)?;
@@ -588,10 +575,7 @@ impl Store for RedbStore {
     }
 
     fn outbound_push(&mut self, msg: &OutboundMessage) -> Result<(), StoreError> {
-        let bytes = serde_json::to_vec(msg).map_err(|e| StoreError::Codec {
-            context: "encode outbound message",
-            source: e.into(),
-        })?;
+        let bytes = encode_outbound(msg);
         self.write("outbound_push", |txn| {
             let mut t = txn.open_table(OUTBOUND)?;
             t.insert(*msg.mid.as_bytes(), bytes)?;
@@ -605,11 +589,7 @@ impl Store for RedbStore {
             match t.get(mid.as_bytes())? {
                 None => Ok(None),
                 Some(v) => {
-                    let msg: OutboundMessage =
-                        serde_json::from_slice(&v.value()).map_err(|e| StoreError::Codec {
-                            context: "decode outbound message",
-                            source: e.into(),
-                        })?;
+                    let msg = decode_outbound(&v.value())?;
                     Ok(Some(sanitize_outbound(msg)?))
                 }
             }
@@ -640,11 +620,7 @@ impl Store for RedbStore {
             let mut out = Vec::new();
             for entry in t.iter()? {
                 let (_, v) = entry?;
-                let msg: OutboundMessage =
-                    serde_json::from_slice(&v.value()).map_err(|e| StoreError::Codec {
-                        context: "decode outbound message",
-                        source: e.into(),
-                    })?;
+                let msg = decode_outbound(&v.value())?;
                 out.push(sanitize_outbound(msg)?);
             }
             Ok(out)
@@ -660,10 +636,7 @@ impl Store for RedbStore {
             seen_hash,
             seen_exp,
         } = accept;
-        let bytes = serde_json::to_vec(&entry).map_err(|e| StoreError::Codec {
-            context: "encode custody entry",
-            source: e.into(),
-        })?;
+        let bytes = encode_custody(&entry);
         self.write("custody_accept", |txn| {
             custody_put_txn(txn, &entry, bytes)?;
             share_add_txn(txn, &share_dest, share_upstream, share_bytes)?;
@@ -673,10 +646,7 @@ impl Store for RedbStore {
     }
 
     fn custody_put(&mut self, entry: CustodyEntry) -> Result<(), StoreError> {
-        let bytes = serde_json::to_vec(&entry).map_err(|e| StoreError::Codec {
-            context: "encode custody entry",
-            source: e.into(),
-        })?;
+        let bytes = encode_custody(&entry);
         self.write("custody_put", |txn| custody_put_txn(txn, &entry, bytes))
     }
 
@@ -686,11 +656,7 @@ impl Store for RedbStore {
             match t.get(leg.as_bytes())? {
                 None => Ok(None),
                 Some(v) => {
-                    let e: CustodyEntry =
-                        serde_json::from_slice(&v.value()).map_err(|e| StoreError::Codec {
-                            context: "decode custody entry",
-                            source: e.into(),
-                        })?;
+                    let e = decode_custody(&v.value())?;
                     Ok(Some(sanitize_custody(e)))
                 }
             }
@@ -719,11 +685,7 @@ impl Store for RedbStore {
             let mut out = Vec::new();
             for entry in t.iter()? {
                 let (_, v) = entry?;
-                let e: CustodyEntry =
-                    serde_json::from_slice(&v.value()).map_err(|e| StoreError::Codec {
-                        context: "decode custody entry",
-                        source: e.into(),
-                    })?;
+                let e = decode_custody(&v.value())?;
                 out.push(sanitize_custody(e));
             }
             Ok(out)
@@ -814,10 +776,7 @@ impl Store for RedbStore {
     }
 
     fn inbox_push(&mut self, entry: InboxEntry) -> Result<(), StoreError> {
-        let bytes = serde_json::to_vec(&entry).map_err(|e| StoreError::Codec {
-            context: "encode inbox entry",
-            source: e.into(),
-        })?;
+        let bytes = encode_inbox(&entry);
         let key = inbox_key(&entry.tsvc, entry.received, &entry.delivery_id)?;
         self.write("inbox_push", |txn| {
             let mut t = txn.open_table(INBOX)?;
@@ -838,11 +797,7 @@ impl Store for RedbStore {
                     break;
                 }
                 let (_, v) = entry?;
-                let e: InboxEntry =
-                    serde_json::from_slice(&v.value()).map_err(|e| StoreError::Codec {
-                        context: "decode inbox entry",
-                        source: e.into(),
-                    })?;
+                let e = decode_inbox(&v.value())?;
                 // Defense in depth: the key prefix already scopes the scan to
                 // this service; a row whose tsvc disagrees with its key is
                 // skipped rather than delivered to the wrong service.
@@ -915,11 +870,7 @@ impl Store for RedbStore {
             let mut stale = Vec::new();
             for entry in t.iter()? {
                 let (k, v) = entry?;
-                let e: InboxEntry =
-                    serde_json::from_slice(&v.value()).map_err(|e| StoreError::Codec {
-                        context: "decode inbox entry",
-                        source: e.into(),
-                    })?;
+                let e = decode_inbox(&v.value())?;
                 if e.received.saturating_add(max_age_secs) <= now {
                     stale.push(k.value().to_vec());
                 }
@@ -938,12 +889,7 @@ impl Store for RedbStore {
         status: u64,
         detail: Option<u64>,
     ) -> Result<(), StoreError> {
-        let bytes = serde_json::to_vec(&MessageStatus { status, detail }).map_err(|e| {
-            StoreError::Codec {
-                context: "encode status",
-                source: e.into(),
-            }
-        })?;
+        let bytes = encode_status(&MessageStatus { status, detail });
         self.write("status_set", |txn| {
             let mut t = txn.open_table(STATUS)?;
             t.insert(*mid.as_bytes(), bytes)?;
@@ -956,14 +902,7 @@ impl Store for RedbStore {
             let t = txn.open_table(STATUS)?;
             match t.get(mid.as_bytes())? {
                 None => Ok(None),
-                Some(v) => {
-                    serde_json::from_slice(&v.value())
-                        .map(Some)
-                        .map_err(|e| StoreError::Codec {
-                            context: "decode status",
-                            source: e.into(),
-                        })
-                }
+                Some(v) => decode_status(&v.value()).map(Some),
             }
         })
     }
@@ -1001,10 +940,7 @@ impl RedbStore {
     pub fn custody_put_batch(&self, entries: &[CustodyEntry]) -> Result<(), StoreError> {
         self.write("custody_put_batch", |txn| {
             for entry in entries {
-                let bytes = serde_json::to_vec(entry).map_err(|e| StoreError::Codec {
-                    context: "encode custody entry",
-                    source: e.into(),
-                })?;
+                let bytes = encode_custody(entry);
                 custody_put_txn(txn, entry, bytes)?;
             }
             Ok(())

@@ -79,9 +79,9 @@ pub const MSG_STATUS_EXPIRED: u64 = 5;
 /// Message status as stored by the daemon and returned by the local API:
 /// the status code and an optional detail (e.g. an error code on failure).
 ///
-/// Serialized as a two-element array `[status, detail]`; the on-disk STATUS
-/// table depends on that exact shape, so the serde impls below round-trip
-/// through `(u64, Option<u64>)`.
+/// The on-disk STATUS table encodes this as a CBOR map (see
+/// `lattice-store`'s row codec), not via serde; the serde impls below are
+/// retained for compatibility and round-trip through `(u64, Option<u64>)`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(from = "(u64, Option<u64>)", into = "(u64, Option<u64>)")]
 pub struct MessageStatus {
