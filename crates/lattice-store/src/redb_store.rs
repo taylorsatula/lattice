@@ -99,7 +99,7 @@ const SCHEMA_VERSION: u64 = 1;
 const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
 const RECORDS: TableDefinition<[u8; 33], Vec<u8>> = TableDefinition::new("records");
 const RECORD_RECV: TableDefinition<[u8; 33], u64> = TableDefinition::new("record_recv");
-const KEL_HEADS: TableDefinition<[u8; 32], [u8; 48]> = TableDefinition::new("kel_heads");
+const KEL_HEADS: TableDefinition<[u8; 32], [u8; 49]> = TableDefinition::new("kel_heads");
 const OUTBOUND: TableDefinition<[u8; 16], Vec<u8>> = TableDefinition::new("outbound");
 const CUSTODY: TableDefinition<[u8; 16], Vec<u8>> = TableDefinition::new("custody");
 const SHARES: TableDefinition<[u8; 40], u64> = TableDefinition::new("shares");
@@ -515,16 +515,18 @@ impl Store for RedbStore {
                 None => Ok(None),
                 Some(v) => {
                     let raw = v.value();
-                    if raw.len() != 48 {
+                    if raw.len() != 49 {
                         return Err(StoreError::Corrupt("kel_heads value"));
                     }
                     let seq = u64::from_le_bytes(fixed(&raw[..8], "kel_heads value")?);
                     let commitment = Commitment::from_bytes(fixed(&raw[8..40], "kel_heads value")?);
-                    let seen = u64::from_le_bytes(fixed(&raw[40..], "kel_heads value")?);
+                    let seen = u64::from_le_bytes(fixed(&raw[40..48], "kel_heads value")?);
+                    let abandoned = raw[48] != 0;
                     Ok(Some(KelHeadSeen {
                         seq,
                         commitment,
                         seen,
+                        abandoned,
                     }))
                 }
             }
@@ -539,7 +541,7 @@ impl Store for RedbStore {
                 for entry in t.iter()? {
                     let (k, v) = entry?;
                     let raw = v.value();
-                    if raw.len() != 48 {
+                    if raw.len() != 49 {
                         return Err(StoreError::Corrupt("kel_heads value"));
                     }
                     let seen = u64::from_le_bytes(fixed(&raw[40..48], "kel_heads value")?);
@@ -563,11 +565,13 @@ impl Store for RedbStore {
         seq: u64,
         commitment: Commitment,
         seen: u64,
+        abandoned: bool,
     ) -> Result<(), StoreError> {
-        let mut raw = [0u8; 48];
+        let mut raw = [0u8; 49];
         raw[..8].copy_from_slice(&seq.to_le_bytes());
         raw[8..40].copy_from_slice(commitment.as_ref());
-        raw[40..].copy_from_slice(&seen.to_le_bytes());
+        raw[40..48].copy_from_slice(&seen.to_le_bytes());
+        raw[48] = u8::from(abandoned);
         self.write("kel_head_put", |txn| {
             let mut t = txn.open_table(KEL_HEADS)?;
             t.insert(*id.as_bytes(), raw)?;

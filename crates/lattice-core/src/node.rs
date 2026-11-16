@@ -8,7 +8,7 @@ use lattice_proto::frames::{
     CUSTODY_ACCEPTED, CUSTODY_ALREADY_HAVE, CUSTODY_BUSY, CUSTODY_REFUSED, CustodyFrame,
     DummyFrame, Frame, OfferFrame, PingFrame, ReconcileFrame, RecordsFrame, WantFrame,
 };
-use lattice_proto::kel::{KeyEvent, ValidatedKel};
+use lattice_proto::kel::{KelHead, KelRelation, KeyEvent, ValidatedKel, classify};
 use lattice_proto::local;
 use lattice_proto::message::{
     BuildParams, Envelope, GatewaySeal, HopLayerPlain, KIND_MESSAGE, KIND_NEGATIVE_RECEIPT,
@@ -34,9 +34,10 @@ use crate::types::{
 
 /// Which kind of rotation an identity reload represents.
 ///
-/// `Rotate` publishes the updated record; `Abandon` is a rotation with no
-/// next-key commitment — the identity is terminal and nothing is published
-/// (peers reject abandoned records at validation anyway).
+/// `Rotate` publishes the updated record. `Abandon` is a rotation with no
+/// next-key commitment: it publishes the tombstone record (a record whose
+/// KEL ends in the abandonment) so peers learn the identity is dead, and
+/// the caller then drains. Peers never route on a tombstone.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RotationKind {
     Rotate,
@@ -116,7 +117,8 @@ impl Identity {
     }
 
     /// True if the KEL ends in an abandonment (a rotation with no next-key
-    /// commitment). An abandoned identity must not sign or publish.
+    /// commitment). An abandoned identity must not sign or publish, except
+    /// for the tombstone record published by the abandon path.
     #[must_use]
     pub fn is_abandoned(&self) -> bool {
         self.kel.is_abandoned()
@@ -389,6 +391,9 @@ impl<S: Store> Node<S> {
             Ok(records) => {
                 for record in records {
                     if let Ok(parsed) = PeerRecord::from_bytes(&record.bytes, now, None) {
+                        if parsed.is_tombstone() {
+                            continue;
+                        }
                         if let Some(k) = Self::claim_key(&parsed) {
                             node.ck_claims.entry(k).or_default().insert(parsed.id);
                         }
@@ -663,6 +668,7 @@ impl<S: Store> Node<S> {
             .filter_map(|record| {
                 PeerRecord::from_bytes(&record.bytes, self.now, None)
                     .ok()
+                    .filter(|p| !p.is_tombstone())
                     .map(|p| {
                         let r = p.into_inner();
                         (record.id, r.links, r.gateways)
@@ -707,13 +713,20 @@ impl<S: Store> Node<S> {
         let mut items: Vec<reconcile::Item> = stored
             .iter()
             .filter_map(|record| {
-                PeerRecord::from_bytes(&record.bytes, self.now, None)
-                    .ok()
-                    .map(|p| reconcile::Item {
-                        id: record.id,
-                        scope: scope_as_u8(record.scope),
-                        seq: p.seq,
-                    })
+                // Expired tombstones stay in the record set for the KEL-head
+                // retention period so the abandonment keeps propagating;
+                // everything else must be unexpired to be advertised.
+                let parsed = match PeerRecord::from_bytes(&record.bytes, self.now, None) {
+                    Ok(p) => p,
+                    Err(_) => PeerRecord::from_bytes_unchecked_time(&record.bytes, None)
+                        .ok()
+                        .filter(|p| p.is_tombstone())?,
+                };
+                Some(reconcile::Item {
+                    id: record.id,
+                    scope: scope_as_u8(record.scope),
+                    seq: parsed.seq,
+                })
             })
             .collect();
         items.sort();
@@ -807,6 +820,9 @@ impl<S: Store> Node<S> {
             Ok(records) => {
                 for record in records {
                     if let Ok(parsed) = PeerRecord::from_bytes(&record.bytes, now, None) {
+                        if parsed.is_tombstone() {
+                            continue;
+                        }
                         if let Some(k) = Self::claim_key(&parsed) {
                             fresh.entry(k).or_default().insert(parsed.id);
                         }
@@ -839,15 +855,32 @@ impl<S: Store> Node<S> {
                     }
                     // Skip the time check: expired records must still decode so
                     // the grace period can elapse; undecodable records are dropped.
-                    let expired = match PeerRecord::from_bytes_unchecked_time(&record.bytes, None) {
-                        Ok(parsed) => parsed.exp.saturating_add(RETENTION_GRACE_SECS) < now,
-                        Err(_) => true,
-                    };
-                    if expired {
-                        match self.store.record_remove(&record.id, record.scope) {
-                            Ok(()) => self.records_version += 1,
-                            Err(e) => self.diag("record_remove", &e),
+                    let parsed = PeerRecord::from_bytes_unchecked_time(&record.bytes, None).ok();
+                    if parsed.as_ref().is_some_and(|p| p.is_tombstone()) {
+                        // Tombstones live for the KEL-head retention period,
+                        // not the record grace period: they are the only
+                        // carrier of the abandonment to peers that were
+                        // offline. Drop one only once its head is gone or
+                        // stale (the head sweep below uses the same horizon).
+                        let keep = match self.store.kel_head(&record.id) {
+                            Ok(Some(h)) => now.saturating_sub(h.seen) < KEL_HEAD_MAX_AGE_SECS,
+                            Ok(None) | Err(_) => false,
+                        };
+                        if keep {
+                            continue;
                         }
+                    } else {
+                        let expired = match &parsed {
+                            Some(p) => p.exp.saturating_add(RETENTION_GRACE_SECS) < now,
+                            None => true,
+                        };
+                        if !expired {
+                            continue;
+                        }
+                    }
+                    match self.store.record_remove(&record.id, record.scope) {
+                        Ok(()) => self.records_version += 1,
+                        Err(e) => self.diag("record_remove", &e),
                     }
                 }
             }
@@ -885,7 +918,12 @@ impl<S: Store> Node<S> {
     }
 
     /// Fold a record's (channel_key, id) claim into the claim set.
+    /// Tombstones claim nothing: the identity is dead and must not be
+    /// attributed to links.
     fn note_ck_claim(&mut self, rec: &PeerRecord) {
+        if rec.is_tombstone() {
+            return;
+        }
         if let Some(k) = Self::claim_key(rec) {
             self.ck_claims.entry(k).or_default().insert(rec.id);
         }
@@ -1010,6 +1048,7 @@ impl<S: Store> Node<S> {
             Ok(k) => k.map(|h| KnownHead {
                 seq: h.seq,
                 commitment: h.commitment,
+                abandoned: h.abandoned,
             }),
             // Fail closed: without the known head we cannot rule out
             // equivocation, so refuse the record.
@@ -1018,49 +1057,146 @@ impl<S: Store> Node<S> {
                 return;
             }
         };
-        if let Ok(validated) = parsed.validate(Some(at), known) {
-            let head = validated.kel.head();
-            let rec = validated.into_inner();
-            let scope = rec.scope;
-            let existing = match self.store.record_get(&rec.id, scope) {
-                Ok(e) => e,
-                // Fail closed: without the current row we cannot apply
-                // last-writer-wins, so keep what we have.
-                Err(e) => {
-                    self.diag("record_get", &e);
-                    return;
+        let Ok(validated) = parsed.validate(Some(at), known) else {
+            return;
+        };
+        let head = validated.kel.head();
+        let rec = validated.into_inner();
+        let scope = rec.scope;
+        let tombstone = rec.is_tombstone();
+        let existing = match self.store.record_get(&rec.id, scope) {
+            Ok(e) => e,
+            // Fail closed: without the current row we cannot apply
+            // last-writer-wins, so keep what we have.
+            Err(e) => {
+                self.diag("record_get", &e);
+                return;
+            }
+        };
+        // KEL order dominates last-writer-wins. A record whose chain
+        // extends the stored record's chain is accepted regardless of
+        // `seq`; one whose chain is behind is rejected regardless of
+        // `seq`. Only equal chains fall through to seq LWW (lower hash
+        // wins at equal seq, the equivocation rule). This compares against
+        // the stored *record*; the stored *head* is handled separately
+        // below and advances even when this record loses the LWW race.
+        let mut admit = true;
+        if let Some(existing) = &existing {
+            // The stored bytes may be expired; the KEL relation does not
+            // depend on wall-clock time, so read them without the expiry
+            // check. Undecodable stored bytes are treated as absent below.
+            let old = PeerRecord::from_bytes_unchecked_time(&existing.bytes, None).ok();
+            let relation = old
+                .as_ref()
+                .map(|o| classify(o.kel.head().seq, &o.kel.head().commitment, rec.kel.events()));
+            match relation {
+                // Extends the stored chain: wins regardless of seq.
+                Some(KelRelation::Extends) => {}
+                // Behind the stored chain: rejected regardless of seq.
+                Some(KelRelation::Behind) => admit = false,
+                // Equal chains or divergent chains: the existing
+                // last-writer-wins rule (lower hash wins at equal seq).
+                // Divergent chains are rejected at validation against the
+                // known head, so this arm is a fallback, not a new rule.
+                Some(KelRelation::Same | KelRelation::Divergent) => {
+                    let old_seq = old.as_ref().map_or(0, |o| o.seq);
+                    if compare_lww(bytes, rec.seq, &existing.bytes, old_seq)
+                        != std::cmp::Ordering::Greater
+                    {
+                        admit = false; // keep ours
+                    }
                 }
-            };
-            if let Some(existing) = existing {
-                let old_bytes = &existing.bytes;
-                // Lower-hash wins at equal seq (equivocation rule);
-                // otherwise normal last-writer-wins by seq.
-                let old_seq = PeerRecord::from_bytes(old_bytes, at, None).map_or(0, |p| p.seq);
-                if compare_lww(bytes, rec.seq, old_bytes, old_seq) != std::cmp::Ordering::Greater {
-                    return; // keep ours
+                // Stored bytes undecodable: admit; the put overwrites them.
+                None => {}
+            }
+        }
+        if admit {
+            if tombstone {
+                // A tombstone replaces the identity's records in both
+                // scopes; it is the only record of the identity left, and
+                // it is never used for routing.
+                for s in [Scope::Wan, Scope::Hive] {
+                    if let Err(e) = self.store.record_remove(&rec.id, s) {
+                        self.diag("record_remove", &e);
+                    }
                 }
+                self.records_version += 1;
             }
             match self.store.record_put(&rec.id, scope, bytes, at) {
                 Ok(()) => self.records_version += 1,
                 Err(e) => self.diag("record_put", &e),
             }
-            // Advance the stored head only when we could read it, and
-            // record a first-seen head when none exists. On a read error
-            // leave the stored head alone rather than overwrite blindly.
-            match self.store.kel_head(&rec.id) {
-                Ok(Some(stored_head)) if head.seq <= stored_head.seq => {}
-                Ok(_) => {
-                    if let Err(e) = self
-                        .store
-                        .kel_head_put(&rec.id, head.seq, head.commitment, at)
-                    {
-                        self.diag("kel_head_put", &e);
+        }
+        // Advance the stored head for every validated record whose KEL
+        // extends it — even one that lost the LWW comparison — and flag it
+        // abandoned once a tombstone is seen. The flag is never cleared.
+        let stored_abandoned = known.as_ref().is_some_and(|k| k.abandoned);
+        let head_relation = known.as_ref().map_or(KelRelation::Extends, |k| {
+            classify(k.seq, &k.commitment, rec.kel.events())
+        });
+        let advance = match head_relation {
+            KelRelation::Extends => true,
+            // Head unchanged, but a tombstone just proved it abandoned.
+            KelRelation::Same => head.is_abandoned() && !stored_abandoned,
+            KelRelation::Behind | KelRelation::Divergent => false,
+        };
+        if advance {
+            let abandoned = head.is_abandoned() || stored_abandoned;
+            match self
+                .store
+                .kel_head_put(&rec.id, head.seq, head.commitment, at, abandoned)
+            {
+                Ok(()) => {
+                    if matches!(head_relation, KelRelation::Extends) {
+                        // The head moved: drop stored records whose KEL is
+                        // now behind it (both scopes). The admitted record
+                        // carries the head itself, so it survives.
+                        self.evict_records_behind(&rec.id, &head);
                     }
                 }
-                Err(e) => self.diag("kel_head", &e),
+                Err(e) => self.diag("kel_head_put", &e),
+            }
+        }
+        if admit {
+            if tombstone {
+                // The identity is dead: drop its channel-key claims so no
+                // link stays attributed to it.
+                for claims in self.ck_claims.values_mut() {
+                    claims.remove(&rec.id);
+                }
             }
             self.note_ck_claim(&rec);
             self.reevaluate_link_bindings(at);
+        }
+    }
+
+    /// Drop stored records (both scopes) whose KEL is behind `head`.
+    /// Called when the stored KEL head advances. The record carrying the
+    /// head itself classifies as `Same` and survives; undecodable rows are
+    /// dropped.
+    fn evict_records_behind(&mut self, id: &Identifier, head: &KelHead) {
+        for scope in [Scope::Wan, Scope::Hive] {
+            let stored = match self.store.record_get(id, scope) {
+                Ok(s) => s,
+                Err(e) => {
+                    self.diag("record_get", &e);
+                    continue;
+                }
+            };
+            let Some(stored) = stored else { continue };
+            let behind = match PeerRecord::from_bytes_unchecked_time(&stored.bytes, None) {
+                Ok(p) => matches!(
+                    classify(head.seq, &head.commitment, p.kel.events()),
+                    KelRelation::Behind
+                ),
+                Err(_) => true,
+            };
+            if behind {
+                match self.store.record_remove(id, scope) {
+                    Ok(()) => self.records_version += 1,
+                    Err(e) => self.diag("record_remove", &e),
+                }
+            }
         }
     }
 }
@@ -1200,19 +1336,11 @@ impl<S: Store> Node<S> {
         actions
     }
 
-    /// Presence check only; does not validate. Used where a missing record
-    /// is the error condition and validation happens (and is memoized)
-    /// downstream.
+    /// Presence check for a usable record: a tombstone is held but is not
+    /// a route. Validation happens (and is memoized) downstream.
     #[must_use]
     fn has_record(&mut self, id: &Identifier) -> bool {
-        for scope in [Scope::Wan, Scope::Hive] {
-            match self.store.record_get(id, scope) {
-                Ok(Some(_)) => return true,
-                Ok(None) => {}
-                Err(e) => self.diag("record_get", &e),
-            }
-        }
-        false
+        self.lookup_validated(id).is_some()
     }
 
     /// Validate a stored record, memoized on `(records_version, now)`.
@@ -1230,7 +1358,8 @@ impl<S: Store> Node<S> {
         let rec = match self.store.record_get(id, scope) {
             Ok(Some(stored)) => PeerRecord::from_bytes(&stored.bytes, self.now, None)
                 .ok()
-                .map(|p| p.into_inner()),
+                .map(|p| p.into_inner())
+                .filter(|r| !r.is_tombstone()),
             Ok(None) => None,
             // Store error: treat as missing (callers fail closed), but say so.
             Err(e) => {
@@ -1394,7 +1523,7 @@ impl<S: Store> Node<S> {
             .into_iter()
             .filter_map(|record| {
                 let parsed = PeerRecord::from_bytes(&record.bytes, self.now, None).ok()?;
-                (parsed.mode == Mode::Public).then(|| WaypointChoice {
+                (parsed.mode == Mode::Public && !parsed.is_tombstone()).then(|| WaypointChoice {
                     id: record.id,
                     envelope_key: parsed.into_inner().envelope_key,
                 })
@@ -2871,18 +3000,25 @@ impl<S: Store> Node<S> {
 
     /// Swap in a new identity (after a rotation) and republish the record.
     /// The identifier is unchanged by rotation, so the record keeps its id.
-    /// `kind` is [`RotationKind::Abandon`] for abandonment: peers reject
-    /// abandoned records at validation, so there is nothing useful to publish.
+    /// `kind` is [`RotationKind::Abandon`] for abandonment: the published
+    /// record is a tombstone — valid, signed, and carried by reconciliation
+    /// like any record — which peers store in place of the identity's
+    /// records and never route on. Callers drain after this returns.
     pub fn reload_identity(
         &mut self,
         identity: Identity,
         now: u64,
         kind: RotationKind,
     ) -> Result<(), NodeError> {
+        debug_assert_eq!(
+            identity.is_abandoned(),
+            kind == RotationKind::Abandon,
+            "RotationKind must match the identity's KEL"
+        );
+        // The identifier is unchanged by rotation; keep own_id in step in
+        // case a caller reloads a different identity.
+        self.own_id = identity.id();
         self.identity = identity;
-        if kind == RotationKind::Abandon {
-            return Ok(());
-        }
         self.own_seq += 1;
         self.publish_record(now)
     }
@@ -3000,7 +3136,8 @@ impl<S: Store> Node<S> {
         &mut self.store
     }
 
-    /// Whether we hold a valid record for `id`, and its mode if so.
+    /// Whether we hold a usable record for `id`, and its mode if so.
+    /// A tombstone is held but not usable, so it reports `Absent`.
     pub fn lookup(&mut self, id: &Identifier) -> LookupResult {
         for scope in [
             lattice_proto::record::Scope::Wan,
@@ -3008,14 +3145,17 @@ impl<S: Store> Node<S> {
         ] {
             match self.store.record_get(id, scope) {
                 Ok(Some(stored)) => {
-                    let mode = lattice_proto::record::PeerRecord::from_bytes(
+                    return match lattice_proto::record::PeerRecord::from_bytes(
                         &stored.bytes,
                         self.now,
                         None,
-                    )
-                    .map(|p| p.mode)
-                    .ok();
-                    return LookupResult::Present { mode };
+                    ) {
+                        // A tombstone is held but not usable: report absent.
+                        Ok(p) if p.is_tombstone() => LookupResult::Absent,
+                        Ok(p) => LookupResult::Present { mode: Some(p.mode) },
+                        // Held but undecodable: still reported as held.
+                        Err(_) => LookupResult::Present { mode: None },
+                    };
                 }
                 Ok(None) => {}
                 Err(e) => self.diag("record_get", &e),
@@ -3392,5 +3532,302 @@ mod tests {
         // Past the grace window the expired record is dropped.
         node.sweep_expired_data(exp + RETENTION_GRACE_SECS + 1);
         assert!(node.store.record_get(&id, Scope::Wan).unwrap().is_none());
+    }
+
+    fn build_record(
+        kel: Vec<KeyEvent>,
+        seq: u64,
+        scope: Scope,
+        signing_seed: &SigningSeed,
+        channel_seed: &ChannelSeed,
+    ) -> lattice_proto::record::PeerRecord {
+        lattice_proto::record::PeerRecord::build(
+            lattice_proto::record::RecordParams {
+                kel,
+                seq,
+                exp: 1_000 + 86_400,
+                channel_key: lattice_crypto::channel_public(channel_seed),
+                channel_seed: channel_seed.clone(),
+                envelope_key: XWingPublicKey::from_bytes([7u8; 1216]),
+                mode: Mode::Public,
+                scope,
+                endpoints: vec![lattice_proto::record::Endpoint {
+                    url: "ws://mesh.example.com/".into(),
+                    ips: vec![],
+                }],
+                links: vec![],
+                gateways: vec![],
+                capabilities: 0,
+            },
+            signing_seed,
+        )
+        .unwrap()
+    }
+
+    fn stored_record(
+        node: &Node<MemStore>,
+        id: &Identifier,
+        scope: Scope,
+    ) -> Option<lattice_proto::record::PeerRecord> {
+        node.store.record_get(id, scope).unwrap().map(|r| {
+            lattice_proto::record::PeerRecord::from_bytes_unchecked_time(&r.bytes, None)
+                .unwrap()
+                .into_inner()
+        })
+    }
+
+    #[test]
+    fn r01_stolen_key_max_seq_loses_to_owner_rotation() {
+        let (owner, next_seed, next_next_seed) = test_identity();
+        let id = owner.id();
+        let channel_seed = owner.channel_seed.clone();
+        let inception = owner.kel.events().to_vec();
+        let inception_seed = owner.signing_seed.clone();
+        let mut node = test_node();
+
+        // Attacker holds the current signing key and publishes seq = u64::MAX.
+        let attacker = build_record(
+            inception.clone(),
+            u64::MAX,
+            Scope::Wan,
+            &inception_seed,
+            &channel_seed,
+        );
+        node.admit_record(1_000, &attacker.encode());
+        assert_eq!(stored_record(&node, &id, Scope::Wan).unwrap().seq, u64::MAX);
+
+        // The owner rotates; the rotated record must win despite its lower seq.
+        let mut owner = owner;
+        owner.rotate(&next_seed, Some(next_next_seed)).unwrap();
+        let rotated = build_record(
+            owner.kel.events().to_vec(),
+            1,
+            Scope::Wan,
+            &owner.signing_seed,
+            &channel_seed,
+        );
+        node.admit_record(1_001, &rotated.encode());
+        let stored = stored_record(&node, &id, Scope::Wan).unwrap();
+        assert_eq!(
+            stored.seq, 1,
+            "owner's rotation must displace the attacker's record"
+        );
+        assert_eq!(stored.kel.head().seq, 1);
+        let head = node.store.kel_head(&id).unwrap().unwrap();
+        assert_eq!(head.seq, 1);
+        assert!(!head.abandoned);
+
+        // A record behind the stored KEL is rejected even with a higher seq.
+        let stale = build_record(
+            inception,
+            u64::MAX,
+            Scope::Wan,
+            &inception_seed,
+            &channel_seed,
+        );
+        node.admit_record(1_002, &stale.encode());
+        let stored = stored_record(&node, &id, Scope::Wan).unwrap();
+        assert_eq!(stored.seq, 1);
+        assert_eq!(stored.kel.head().seq, 1);
+        assert_eq!(node.store.kel_head(&id).unwrap().unwrap().seq, 1);
+    }
+
+    #[test]
+    fn r01_head_advance_evicts_records_behind_it() {
+        let (owner, next_seed, next_next_seed) = test_identity();
+        let id = owner.id();
+        let channel_seed = owner.channel_seed.clone();
+        let inception = owner.kel.events().to_vec();
+        let mut node = test_node();
+
+        // The identity is present in both scopes with the pre-rotation KEL.
+        let wan = build_record(
+            inception.clone(),
+            7,
+            Scope::Wan,
+            &owner.signing_seed,
+            &channel_seed,
+        );
+        let hive = build_record(
+            inception,
+            7,
+            Scope::Hive,
+            &owner.signing_seed,
+            &channel_seed,
+        );
+        node.admit_record(1_000, &wan.encode());
+        node.admit_record(1_000, &hive.encode());
+        assert!(node.store.record_get(&id, Scope::Hive).unwrap().is_some());
+
+        // The owner rotates; the rotated WAN record advances the head and
+        // the Hive record, now behind the head, is evicted.
+        let mut owner = owner;
+        owner.rotate(&next_seed, Some(next_next_seed)).unwrap();
+        let rotated = build_record(
+            owner.kel.events().to_vec(),
+            1,
+            Scope::Wan,
+            &owner.signing_seed,
+            &channel_seed,
+        );
+        node.admit_record(1_001, &rotated.encode());
+        let wan_stored = stored_record(&node, &id, Scope::Wan).unwrap();
+        assert_eq!(wan_stored.kel.head().seq, 1);
+        assert!(node.store.record_get(&id, Scope::Hive).unwrap().is_none());
+    }
+
+    #[test]
+    fn r02_tombstone_replaces_records_and_stops_routing() {
+        let (owner, next_seed, _) = test_identity();
+        let id = owner.id();
+        let channel_seed = owner.channel_seed.clone();
+        let inception = owner.kel.events().to_vec();
+        let mut node = test_node();
+
+        let wan = build_record(
+            inception.clone(),
+            1,
+            Scope::Wan,
+            &owner.signing_seed,
+            &channel_seed,
+        );
+        let hive = build_record(
+            inception,
+            1,
+            Scope::Hive,
+            &owner.signing_seed,
+            &channel_seed,
+        );
+        node.admit_record(1_000, &wan.encode());
+        node.admit_record(1_000, &hive.encode());
+        assert!(node.has_record(&id));
+
+        // The owner abandons the identity; the tombstone is admitted.
+        let mut owner = owner;
+        owner.rotate(&next_seed, None).unwrap();
+        assert!(owner.is_abandoned());
+        let tombstone = build_record(
+            owner.kel.events().to_vec(),
+            2,
+            Scope::Wan,
+            &owner.signing_seed,
+            &channel_seed,
+        );
+        assert!(tombstone.is_tombstone());
+        node.admit_record(1_001, &tombstone.encode());
+
+        // The tombstone replaced both scopes' records.
+        let stored = stored_record(&node, &id, Scope::Wan).unwrap();
+        assert!(stored.is_tombstone());
+        assert!(node.store.record_get(&id, Scope::Hive).unwrap().is_none());
+        // The stored head is flagged abandoned.
+        let head = node.store.kel_head(&id).unwrap().unwrap();
+        assert!(head.abandoned);
+        assert_eq!(head.seq, 1);
+        // No routing, delivery, or waypoint use.
+        assert!(!node.has_record(&id));
+        assert!(matches!(node.lookup(&id), LookupResult::Absent));
+        let graph = node.build_graph();
+        assert!(!graph.distances(&node.own_id).contains_key(&id));
+        // The tombstone stays in the record set for reconciliation.
+        assert!(node.record_items().unwrap().iter().any(|i| i.id == id));
+    }
+
+    #[test]
+    fn r02_after_tombstone_every_record_for_id_is_rejected() {
+        let (owner, next_seed, _) = test_identity();
+        let id = owner.id();
+        let channel_seed = owner.channel_seed.clone();
+        let inception = owner.kel.events().to_vec();
+        let inception_seed = owner.signing_seed.clone();
+        let mut node = test_node();
+
+        let mut owner = owner;
+        owner.rotate(&next_seed, None).unwrap();
+        let tombstone = build_record(
+            owner.kel.events().to_vec(),
+            2,
+            Scope::Wan,
+            &owner.signing_seed,
+            &channel_seed,
+        );
+        node.admit_record(1_000, &tombstone.encode());
+
+        // Attacker with the superseded (pre-abandonment) key, max seq.
+        let stale = build_record(
+            inception,
+            u64::MAX,
+            Scope::Wan,
+            &inception_seed,
+            &channel_seed,
+        );
+        node.admit_record(1_001, &stale.encode());
+        let stored = stored_record(&node, &id, Scope::Wan).unwrap();
+        assert!(stored.is_tombstone());
+        assert_eq!(stored.seq, 2);
+
+        // Attacker with the abandonment key itself, same KEL, max seq.
+        let same_kel = build_record(
+            owner.kel.events().to_vec(),
+            u64::MAX,
+            Scope::Wan,
+            &owner.signing_seed,
+            &channel_seed,
+        );
+        node.admit_record(1_002, &same_kel.encode());
+        let stored = stored_record(&node, &id, Scope::Wan).unwrap();
+        assert_eq!(stored.seq, 2, "the tombstone must survive later records");
+        assert!(node.store.kel_head(&id).unwrap().unwrap().abandoned);
+    }
+
+    #[test]
+    fn r02_tombstone_outlives_record_grace_until_head_ages_out() {
+        let (owner, next_seed, _) = test_identity();
+        let id = owner.id();
+        let channel_seed = owner.channel_seed.clone();
+        let mut node = test_node();
+
+        let mut owner = owner;
+        owner.rotate(&next_seed, None).unwrap();
+        let tombstone = build_record(
+            owner.kel.events().to_vec(),
+            2,
+            Scope::Wan,
+            &owner.signing_seed,
+            &channel_seed,
+        );
+        node.admit_record(1_000, &tombstone.encode());
+        let exp = 1_000 + 86_400;
+
+        // Past the record grace period the tombstone is still held: the
+        // KEL head is fresh, and the tombstone is the only carrier of the
+        // abandonment for peers that were offline.
+        node.sweep_expired_data(exp + RETENTION_GRACE_SECS + 1);
+        assert!(node.store.record_get(&id, Scope::Wan).unwrap().is_some());
+        assert!(node.record_items().unwrap().iter().any(|i| i.id == id));
+
+        // Once the head itself is stale, both are swept.
+        let head = node.store.kel_head(&id).unwrap().unwrap();
+        node.store
+            .kel_head_put(&id, head.seq, head.commitment, 0, true)
+            .unwrap();
+        node.sweep_expired_data(KEL_HEAD_MAX_AGE_SECS + 1);
+        assert!(node.store.record_get(&id, Scope::Wan).unwrap().is_none());
+        assert!(node.store.kel_head(&id).unwrap().is_none());
+    }
+
+    #[test]
+    fn r02_abandon_publishes_tombstone() {
+        let (owner, next_seed, _) = test_identity();
+        let id = owner.id();
+        let mut node = test_node();
+        let mut owner = owner;
+        owner.rotate(&next_seed, None).unwrap();
+        node.reload_identity(owner, 1_001, RotationKind::Abandon)
+            .unwrap();
+        // The abandon path published the tombstone as the node's own record.
+        let stored = stored_record(&node, &id, Scope::Wan).unwrap();
+        assert!(stored.is_tombstone());
+        assert!(!node.has_record(&id));
     }
 }

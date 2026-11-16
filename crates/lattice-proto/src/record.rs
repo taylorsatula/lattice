@@ -291,10 +291,16 @@ impl PeerRecord {
 /// The KEL head this node already holds for an identity, passed to
 /// validation so a record whose chain is behind or divergent can be
 /// rejected.
+///
+/// `abandoned` is set once the head's event ends the identity (a rotation
+/// with no next-key commitment). No record for the identifier is accepted
+/// afterwards: the KEL cannot extend past an abandonment, so anything
+/// presented later is either stale or forged.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KnownHead {
     pub seq: u64,
     pub commitment: Commitment,
+    pub abandoned: bool,
 }
 
 /// A record decoded from the wire, before any validation.
@@ -442,7 +448,9 @@ impl PeerRecord {
     /// `now` is injected so the same code runs in the simulator and the
     /// daemon. `known_head`, when supplied, is the head this node already
     /// holds for the record's identifier; a record whose KEL is behind or
-    /// divergent is rejected.
+    /// divergent is rejected, as is any record once the known head is
+    /// abandoned. A record whose KEL ends in an abandonment validates as a
+    /// tombstone; see [`PeerRecord::is_tombstone`].
     pub fn from_bytes(
         bytes: &[u8],
         now: u64,
@@ -465,6 +473,9 @@ impl PeerRecord {
 impl ParsedRecord {
     /// Validate the parsed record: expiry horizon, structure, KEL chain,
     /// identifier binding, known-head monotonicity, and both signatures.
+    /// A record whose KEL ends in an abandonment is valid (a tombstone);
+    /// it is never usable for routing, delivery, waypoint selection or
+    /// link binding — see [`PeerRecord::is_tombstone`].
     pub fn validate(
         self,
         now: Option<u64>,
@@ -523,17 +534,20 @@ impl ParsedRecord {
             validate_endpoint(ep, scope)?;
         }
 
-        // KEL validation and monotonicity.
+        // KEL validation and monotonicity. A KEL ending in an abandonment
+        // is valid: the record is a tombstone (see `PeerRecord::is_tombstone`)
+        // and callers decide how to treat it. What is never valid is a
+        // record for an identifier whose known head is already abandoned.
         let kel = ValidatedKel::validate(kel)?;
-        if kel.is_abandoned() {
-            return Err(ProtoError::BadKeyLog("identity abandoned"));
-        }
         if kel.identifier() != id {
             return Err(ProtoError::BadKeyLog(
                 "identifier does not match inception event",
             ));
         }
         if let Some(known) = known_head {
+            if known.abandoned {
+                return Err(ProtoError::BadKeyLog("identity abandoned"));
+            }
             match classify(known.seq, &known.commitment, kel.events()) {
                 KelRelation::Extends | KelRelation::Same => {}
                 KelRelation::Behind => {
@@ -578,6 +592,17 @@ impl PeerRecord {
     /// The current signing key (head of the validated KEL).
     pub fn current_signing_key(&self) -> SigningPublicKey {
         self.kel.current_key()
+    }
+
+    /// True if this record's KEL ends in an abandonment. A tombstone is a
+    /// full, validly signed record; it exists so the abandonment can
+    /// propagate. It is never used for routing, delivery, waypoint
+    /// selection or link binding, it replaces the identity's stored
+    /// records, and it is retained for the KEL-head retention period like
+    /// any record.
+    #[must_use]
+    pub fn is_tombstone(&self) -> bool {
+        self.kel.is_abandoned()
     }
 }
 

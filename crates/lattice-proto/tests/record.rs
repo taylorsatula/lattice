@@ -270,6 +270,7 @@ fn known_head_divergence_rejected() {
             Some(KnownHead {
                 seq: 0,
                 commitment: Commitment::from_bytes([0xAA; 32]),
+                abandoned: false,
             }),
         )
         .is_err()
@@ -284,8 +285,111 @@ fn known_head_divergence_rejected() {
             Some(KnownHead {
                 seq: 0,
                 commitment: real_commitment,
+                abandoned: false,
             }),
         )
         .is_ok()
     );
+}
+
+fn abandoned_fixture() -> (Fixture, SigningSeed) {
+    // The inception commits to `next_seed`; the abandonment rotation must
+    // be signed by that key.
+    let seed = generate_seed();
+    let next_seed = generate_seed();
+    let channel_seed = ChannelSeed::from_bytes(lattice_crypto::os_bytes::<32>());
+    let inception = KeyEvent::inception(
+        &seed,
+        commitment(lattice_crypto::public_key(&next_seed).as_ref()),
+    );
+    let abandonment = KeyEvent::rotation(&inception, &next_seed, None);
+    let channel = lattice_crypto::channel_public(&channel_seed);
+    (
+        Fixture {
+            seed,
+            kel: vec![inception, abandonment],
+            envelope: XWingPublicKey::from_bytes([7u8; 1216]),
+            channel,
+            channel_seed,
+        },
+        next_seed,
+    )
+}
+
+#[test]
+fn tombstone_record_validates_and_is_marked() {
+    let (f, abandon_seed) = abandoned_fixture();
+    let rec = PeerRecord::build(
+        lattice_proto::record::RecordParams {
+            kel: f.kel.clone(),
+            seq: 2,
+            exp: NOW + 86_400,
+            channel_key: f.channel,
+            channel_seed: f.channel_seed.clone(),
+            envelope_key: f.envelope,
+            mode: Mode::Public,
+            scope: Scope::Wan,
+            endpoints: vec![],
+            links: vec![],
+            gateways: vec![],
+            capabilities: 0,
+        },
+        &abandon_seed,
+    )
+    .unwrap();
+    assert!(rec.is_tombstone());
+    let parsed = PeerRecord::from_bytes(&rec.encode(), NOW, None).unwrap();
+    assert!(parsed.is_tombstone());
+}
+
+#[test]
+fn record_rejected_once_known_head_is_abandoned() {
+    let (f, abandon_seed) = abandoned_fixture();
+    let tombstone = PeerRecord::build(
+        lattice_proto::record::RecordParams {
+            kel: f.kel.clone(),
+            seq: 2,
+            exp: NOW + 86_400,
+            channel_key: f.channel,
+            channel_seed: f.channel_seed.clone(),
+            envelope_key: f.envelope,
+            mode: Mode::Public,
+            scope: Scope::Wan,
+            endpoints: vec![],
+            links: vec![],
+            gateways: vec![],
+            capabilities: 0,
+        },
+        &abandon_seed,
+    )
+    .unwrap();
+    let head = KeyEvent::validate_chain(&f.kel).unwrap();
+    // Any record for this identifier is rejected once the stored head is
+    // flagged abandoned — even the tombstone itself.
+    let known = KnownHead {
+        seq: head.seq,
+        commitment: head.commitment,
+        abandoned: true,
+    };
+    assert!(PeerRecord::from_bytes(&tombstone.encode(), NOW, Some(known)).is_err());
+    // And an ordinary pre-abandonment record is rejected too.
+    let stale = PeerRecord::build(
+        lattice_proto::record::RecordParams {
+            kel: f.kel[..1].to_vec(),
+            seq: 3,
+            exp: NOW + 86_400,
+            channel_key: f.channel,
+            channel_seed: f.channel_seed.clone(),
+            envelope_key: f.envelope,
+            mode: Mode::Public,
+            scope: Scope::Wan,
+            endpoints: vec![],
+            links: vec![],
+            gateways: vec![],
+            capabilities: 0,
+        },
+        &f.seed,
+    )
+    .unwrap();
+    assert!(PeerRecord::from_bytes(&stale.encode(), NOW, Some(known)).is_err());
 }

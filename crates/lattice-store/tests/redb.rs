@@ -84,7 +84,7 @@ fn exercise<S: Store>(s: &mut S) -> String {
     );
     assert_eq!(s.record_get(&id(1), Scope::Hive).unwrap(), None);
 
-    s.kel_head_put(&id(1), 3, Commitment::from_bytes([0xAB; 32]), 500)
+    s.kel_head_put(&id(1), 3, Commitment::from_bytes([0xAB; 32]), 500, true)
         .unwrap();
     assert_eq!(
         s.kel_head(&id(1)).unwrap(),
@@ -92,6 +92,7 @@ fn exercise<S: Store>(s: &mut S) -> String {
             seq: 3,
             commitment: Commitment::from_bytes([0xAB; 32]),
             seen: 500,
+            abandoned: true,
         })
     );
 
@@ -181,7 +182,7 @@ fn redb_persists_across_reopen() {
         s.record_put(&id(7), Scope::Wan, b"persistent-record", 777)
             .unwrap();
         s.custody_put(custody(9)).unwrap();
-        s.kel_head_put(&id(7), 11, Commitment::from_bytes([0xCD; 32]), 4242)
+        s.kel_head_put(&id(7), 11, Commitment::from_bytes([0xCD; 32]), 4242, false)
             .unwrap();
     }
     let s = RedbStore::open(&path).unwrap();
@@ -196,6 +197,7 @@ fn redb_persists_across_reopen() {
             seq: 11,
             commitment: Commitment::from_bytes([0xCD; 32]),
             seen: 4242,
+            abandoned: false,
         })
     );
 }

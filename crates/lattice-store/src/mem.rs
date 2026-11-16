@@ -92,6 +92,7 @@ impl Store for MemStore {
         seq: u64,
         commitment: Commitment,
         seen: u64,
+        abandoned: bool,
     ) -> Result<(), StoreError> {
         self.kel_heads.insert(
             *id,
@@ -99,6 +100,7 @@ impl Store for MemStore {
                 seq,
                 commitment,
                 seen,
+                abandoned,
             },
         );
         Ok(())

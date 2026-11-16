@@ -146,8 +146,15 @@ Each is last-writer-wins on its own (id, scope) pair. Hive-only instances
 publish only a hive record.
 
 **Validation:**
-- The KEL is valid (§2), not abandoned, and not behind the KEL head already
-  known for this identifier (§2, monotonic history).
+- The KEL is valid (§2) and not behind the KEL head already known for this
+  identifier (§2, monotonic history). A record whose KEL ends in an
+  abandonment is valid: it is a *tombstone*. A tombstone is never used for
+  routing, delivery, waypoint selection or link binding. It replaces the
+  identity's stored records, and it is retained for the KEL-head retention
+  period (it is the only carrier of the abandonment to peers that were
+  offline). Once its KEL head is known, no further record for that
+  identifier is accepted. The `abandon` admin operation (§7) publishes the
+  tombstone before draining.
 - `sig` verifies under the current key in the KEL.
 - `csig` verifies under the channel key, over the same preimage as `sig`.
 - `id` matches the KEL's inception.
@@ -587,7 +594,7 @@ Operation, event and error codes are part of the wire contract:
 |---|---|
 | `node` | Identity, mode, links, queue and custody counts, peer record count |
 | `rotate` | Rotate the signing key using the stored next key, and supply a new next-key hash |
-| `abandon` | Abandon the identity permanently |
+| `abandon` | Abandon the identity permanently; publishes a tombstone record (§3) before draining |
 | `rotate_envelope` | Publish new envelope keys and delete the old private keys |
 | `link` | Connect to an address, with an optional identifier (adds a root) |
 | `unlink` | Drop and demote a link |
@@ -610,7 +617,7 @@ redb tables, derived from the objects above:
 | `shares` | (destination, upstream link) | Count held, for fair-share custody |
 | `seen` | BLAKE3(leg) | Expiry. Hop-level dedup |
 | `delivered` | BLAKE3(mid) | Expiry. Recipient-level dedup |
-| `kel_heads` | id | Latest KEL sn and event hash, last-seen time (kept one year) |
+| `kel_heads` | id | Latest KEL sn and event hash, last-seen time, abandoned flag (kept one year) |
 | `inbox` | (service, received, delivery_id) | Service, delivery fields, received |
 | `status` | mid | Latest status, for the API |
 

@@ -92,11 +92,16 @@ pub struct RecordBytes {
 }
 
 /// The KEL head this node last saw for an identity, and when.
+///
+/// `abandoned` is set once the head's event ends the identity (a rotation
+/// with no next-key commitment). It is never cleared: no record for the
+/// identifier is accepted afterwards.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KelHeadSeen {
     pub seq: u64,
     pub commitment: Commitment,
     pub seen: u64,
+    pub abandoned: bool,
 }
 
 /// A neighbor excluded from custody forwarding until `until` (unix time).
@@ -217,6 +222,7 @@ pub trait Store {
         seq: u64,
         commitment: Commitment,
         seen: u64,
+        abandoned: bool,
     ) -> Result<(), StoreError>;
     /// Drop KEL heads last seen before `older_than`. Returns how many were removed.
     fn kel_head_sweep(&mut self, older_than: u64) -> Result<usize, StoreError>;
