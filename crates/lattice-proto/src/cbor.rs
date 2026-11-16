@@ -1,7 +1,10 @@
 //! Deterministic CBOR (RFC 8949 §4.2), restricted to what Lattice uses.
 //!
 //! Encoding is fully deterministic: shortest-form integers and lengths,
-//! definite lengths only, map keys sorted length-first then bytewise.
+//! definite lengths only, map keys sorted length-first then bytewise
+//! (RFC 8949 §4.2.3, the old RFC 7049 order) rather than bytewise
+//! (§4.2.1). The two orders coincide for the integer map keys Lattice
+//! uses, so the choice is unobservable on the wire for conforming objects.
 //! Decoding enforces the spec's limits: depth 8, at most 512 entries per
 //! container, strings bounded by the input, and a total-value budget bounded
 //! by the input length. Canonical-form violations are hard errors, never
