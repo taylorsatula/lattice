@@ -56,7 +56,17 @@ test = {{ secret = "test-secret-with-plenty-of-entropy" }}
         app = app_sock.display(),
         admin = admin_sock.display(),
     );
-    std::fs::write(dir.join("lattice.toml"), toml).unwrap();
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(dir.join("lattice.toml"))
+            .and_then(|mut f| std::io::Write::write_all(&mut f, toml.as_bytes()))
+            .unwrap();
+    }
 }
 
 fn start_node(dir: &Path) -> Child {
@@ -320,7 +330,17 @@ admin_socket = "{admin}"
         app = app.display(),
         admin = admin.display(),
     );
-    std::fs::write(dir.join("lattice.toml"), toml).unwrap();
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(dir.join("lattice.toml"))
+            .and_then(|mut f| std::io::Write::write_all(&mut f, toml.as_bytes()))
+            .unwrap();
+    }
 }
 
 fn boot_node(

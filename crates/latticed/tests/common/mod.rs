@@ -153,7 +153,17 @@ reconcile_interval_secs = 1
         app = spec.app.display(),
         admin = spec.admin.display(),
     );
-    std::fs::write(dir.join("lattice.toml"), toml).unwrap();
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(dir.join("lattice.toml"))
+            .and_then(|mut f| std::io::Write::write_all(&mut f, toml.as_bytes()))
+            .unwrap();
+    }
 }
 
 pub fn start_node(dir: &Path) -> Child {
