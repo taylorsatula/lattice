@@ -4,6 +4,11 @@
 //! socket (service-authenticated) or the admin socket (owner-only). Wire
 //! format is the spec's length-prefixed CBOR (`lattice_proto::local`).
 //!
+//! This client only ever sees local-API frames; it never parses network
+//! frames (`offer`, `custody`, `reconcile`, `kels`, …), so the v1 frame set
+//! cannot trip it. The custody result codes are re-exported below for
+//! callers that interpret wire-level diagnostics.
+//!
 //! Application events (`inbox`, `status`) arrive interleaved with responses;
 //! [`Client::call`] stashes them and they can be drained with
 //! [`Client::take_events`] or awaited with [`Client::next_event`].
@@ -22,7 +27,24 @@ use lattice_proto::local::{
 use lattice_proto::{ProtoError, Value, decode, encode};
 use lattice_types::{ChannelPublicKey, DeliveryId, Identifier, MessageId};
 
+/// Custody result codes carried by the wire `custody` frame (spec §6).
+/// The local API never carries these — custody is negotiated hop by hop on
+/// the wire and is invisible to applications — but they are re-exported so
+/// the complete v1 set, including `CUSTODY_SEEN` (4: the receiver saw the
+/// leg but does not hold the message; the sender should try another link),
+/// is available to callers that inspect wire-level diagnostics.
+pub use lattice_proto::frames::{
+    CUSTODY_ACCEPTED, CUSTODY_ALREADY_HAVE, CUSTODY_BUSY, CUSTODY_REFUSED, CUSTODY_SEEN,
+};
+/// `MessageStatus::detail` (re-exported here) never carries a custody
+/// result code: the local API carries the sender-side failure detail (the
+/// `ERR_*` codes from lattice-core, or a negative-receipt reason), not the
+/// wire custody namespace (`CUSTODY_*`, 0–4).
 pub use lattice_proto::local::{DrainRequest, DrainState, DrainStatus, Lookup, MessageStatus};
+/// Text forms for identifiers and addresses (spec §1): base32 identifiers,
+/// `service:mailbox@identifier` addresses. Re-exported so callers can print
+/// and parse the text forms without depending on `lattice-proto` directly.
+pub use lattice_proto::text;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
