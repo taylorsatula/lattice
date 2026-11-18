@@ -177,7 +177,7 @@ The KEL travels as its own object, not embedded in records.
 | 7 | ck | ed25519 | All | Channel key: Ed25519 public key; the Noise static key is the derived X25519 key (below) |
 | 8 | ek | xwing_pk | All | Envelope key (§4) |
 | 9 | mode | uint | All | 0 = public, 1 = private |
-| 10 | ep | array of endpoint | Public | Endpoint = `{0: url, 1: [ip address, …] or absent}`. `url` is `ws://` or `wss://` (§6). Connecting nodes prefer the listed IPs, using the URL's host only for the `Host` header |
+| 10 | ep | array of endpoint | Public | Endpoint = `{0: url, 1: [ip address, …] or absent}`. `url` is `ws://` (§6). Connecting nodes prefer the listed IPs, using the URL's host only for the `Host` header |
 | 11 | ln | array of id | Public | Current links, at most 32 |
 | 12 | gw | array of id | Private | One to three gateways |
 | 13 | cap | uint | All | Capability bitset |
@@ -359,14 +359,14 @@ or the message expires.
 
 ## 6. Channel (§3)
 
-Lattice uses WebSocket over TCP. `ws://` is the default. An endpoint may
-instead use `wss://`: the TLS session is an opaque outer wrapper whose only
-purpose is reachability and camouflage through TLS-terminating fronts
-(reverse proxies, tunnels). No certificate trust decisions are made — the
-certificate is not validated, because Noise, not TLS, authenticates the
-peer. `ws://` remains the default; `wss://` is chosen per endpoint.
-Confidentiality and integrity come from the Noise session, not from TLS:
-the payload is encrypted end to end before the WebSocket ever sees it.
+Lattice uses plain WebSocket (`ws://`). Confidentiality and integrity come
+from the Noise session, not from TLS: the payload is encrypted end to end
+before the WebSocket ever sees it, so a second encryption layer would add
+certificate management for nameless nodes without adding protection.
+`wss://` is not supported in this version; a `wss://` endpoint is refused
+before any network I/O. (A future version may allow it as an opaque outer
+wrapper for TLS-terminating fronts, with no certificate trust decisions —
+Noise, not TLS, authenticates the peer.)
 
 Each WebSocket binary frame carries one CBOR value.
 
@@ -387,7 +387,7 @@ Each WebSocket binary frame carries one CBOR value.
 - **The upgrade path** is `/` followed by the base32 encoding of the first
   16 bytes of BLAKE3 keyed-derivation (context `"lattice v1 path"`) over the
   responder's channel key. An endpoint URL may carry a path prefix (for
-  example `wss://front.example.com/lattice/`); the dialer prepends it to the
+  example `ws://front.example.com/lattice/`); the dialer prepends it to the
   derived upgrade path, so the request line is `GET /lattice/<derived>`. The
   front must forward the path unchanged: the prologue binds the request-line
   path, so a front that rewrites it breaks the handshake. The `Host` header
