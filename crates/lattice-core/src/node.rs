@@ -36,14 +36,6 @@ use crate::types::{
     ERR_REFUSED, Event, LinkId,
 };
 
-/// First 8 bytes of the record's hash; the `hash-prefix` used by
-/// reconciliation entries (spec §6).
-fn record_hash_prefix(bytes: &[u8]) -> [u8; 8] {
-    lattice_proto::record::record_hash(bytes).as_bytes()[..8]
-        .try_into()
-        .expect("hash is 32 bytes")
-}
-
 /// The core's internal clock is milliseconds since the Unix epoch. The
 /// wire format and the store keep Unix seconds; conversions happen at
 /// those boundaries (`secs_to_ms` / `ms_to_secs`).
@@ -367,6 +359,15 @@ impl StoredRecord {
     }
 }
 
+/// A record held in the in-memory index. Validation happened once, at
+/// admission (or at startup load); reads never re-validate. `hash` is the
+/// BLAKE3 of the stored bytes: the reconcile item hash-prefix and the
+/// (khs, seq, hash) admission order both derive from it.
+struct IndexedRecord {
+    record: lattice_proto::record::PeerRecord,
+    hash: Hash32,
+}
+
 /// Outcome of admitting a KEL object from the wire.
 enum KelAdmission {
     /// The KEL was stored (or refreshed).
@@ -413,23 +414,32 @@ pub struct Node<S: Store> {
     next_claim_sweep_at: u64,
     next_data_sweep_at: u64,
     contested: u64,
-    /// Bumped on every record-set mutation (admit, sweep, publish, or any
-    /// `store_mut`). Keys the derived-data caches below.
-    records_version: u64,
-    /// Memoized routing graph. Stored bytes are untrusted and are
-    /// re-validated whenever the record set changes (see `records_version`);
-    /// within a stable record set the graph is a pure function of the
-    /// records, so re-validating on every routing decision would be a
-    /// remote-triggerable CPU amplifier.
+    /// In-memory index of the stored records, keyed by (id, scope).
+    /// Populated at startup and on admission; entries leave at expiry
+    /// (the retention sweep evicts them) or when the record is dropped.
+    /// Reads filter on `exp > now`; nothing here re-validates. The store
+    /// remains the system of record for bytes; this index is the read
+    /// path for routing, reconcile and waypoint selection.
+    record_index: HashMap<(Identifier, u8), IndexedRecord>,
+    /// Bumped on every change to the index or to the KEL head set (KEL
+    /// admission, KEL sweep). Keys the derived-data caches below; cheap
+    /// to bump, so callers never have to reason about which cache a
+    /// change affects.
+    derived_version: u64,
+    /// Memoized routing graph. Rebuilt from the index (no re-validation)
+    /// when the index changes or the clock moves; building it is a BFS
+    /// over already-validated records, so a rebuild never touches the
+    /// store or the signature verifier.
     graph_cache: Option<(u64, u64, Arc<Graph>)>,
     /// Memoized reconcile item list; same invalidation as `graph_cache`.
     items_cache: Option<(u64, u64, Vec<reconcile::Item>)>,
     /// Memoized public-mode (id, envelope key) pairs for waypoint
     /// selection; same invalidation as `graph_cache`.
     waypoint_cache: Option<(u64, u64, Arc<WaypointCandidates>)>,
-    /// Memoized validation of stored records, keyed by (id, scope). Same
-    /// invalidation as the graph cache; bounded, cleared when full.
-    record_cache: HashMap<(Identifier, u8), (u64, u64, Option<PeerRecord>)>,
+    /// Test-only count of stored-byte validations, so tests can prove
+    /// the per-tick path never re-validates.
+    #[cfg(test)]
+    validation_count: u64,
     /// Non-fatal internal failures observed since the last `handle` call.
     /// Drained by `handle` and returned alongside the actions; the caller
     /// decides how to surface them.
@@ -486,24 +496,31 @@ impl<S: Store> Node<S> {
             next_claim_sweep_at: now + CLAIM_SWEEP_MS,
             next_data_sweep_at: now + DATA_SWEEP_MS,
             contested: 0,
-            records_version: 0,
+            record_index: HashMap::new(),
+            derived_version: 0,
             graph_cache: None,
             items_cache: None,
             waypoint_cache: None,
-            record_cache: HashMap::new(),
+            #[cfg(test)]
+            validation_count: 0,
             diagnostics: Vec::new(),
             outbound_due_failures: 0,
         };
-        // Seed the claim set from records already in the store so links can be
-        // attributed immediately after a restart. Best-effort: on failure the
-        // claims rebuild as records are re-admitted; report it.
+        // Load and validate the stored records once; the index serves
+        // every later read. Records that fail validation stay in the store
+        // (the retention sweep drops them) but are never served. Seed the
+        // claim set from the same pass so links can be attributed
+        // immediately after a restart. Best-effort: on failure the claims
+        // rebuild as records are re-admitted; report it.
         match node.store.record_all() {
             Ok(records) => {
                 for record in records {
                     if let Some(parsed) = node.validate_stored(&record.bytes, now, true).valid() {
-                        if let Some(k) = Self::claim_key(&parsed) {
-                            node.ck_claims.entry(k).or_default().insert(parsed.id);
+                        let rec = parsed.into_inner();
+                        if let Some(k) = Self::claim_key(&rec) {
+                            node.ck_claims.entry(k).or_default().insert(rec.id);
                         }
+                        node.index_record(&record.bytes, rec);
                     }
                 }
             }
@@ -784,7 +801,14 @@ impl<S: Store> Node<S> {
         }
         self.store
             .record_put(&id, self.scope, &bytes, ms_to_secs(now))?;
-        self.records_version += 1;
+        // The own record is validated here too, so the index only ever
+        // holds records that passed full validation.
+        match PeerRecord::parse(&bytes)
+            .and_then(|p| p.validate(Some(ms_to_secs(now)), &self.identity.kel))
+        {
+            Ok(v) => self.index_record(&bytes, v.into_inner()),
+            Err(e) => self.diag("own_record_validate", &e),
+        }
         Ok(())
     }
 
@@ -825,37 +849,70 @@ impl<S: Store> Node<S> {
         Vec::new()
     }
 
-    /// Build the routing graph from the stored records.
+    /// Insert (or replace) a validated record in the index. Bumps the
+    /// derived-data version. `bytes` are the stored bytes the record was
+    /// validated from; their hash keys the reconcile item hash-prefix and
+    /// the admission order.
+    fn index_record(&mut self, bytes: &[u8], record: lattice_proto::record::PeerRecord) {
+        let hash = lattice_proto::record::record_hash(bytes);
+        self.record_index.insert(
+            (record.id, scope_as_u8(record.scope)),
+            IndexedRecord { record, hash },
+        );
+        self.derived_version += 1;
+    }
+
+    /// Drop an index entry, if present. Bumps the derived-data version
+    /// only when something was actually removed.
+    fn unindex_record(&mut self, id: &Identifier, scope: Scope) {
+        if self
+            .record_index
+            .remove(&(*id, scope_as_u8(scope)))
+            .is_some()
+        {
+            self.derived_version += 1;
+        }
+    }
+
+    /// Evict index entries whose expiry has passed. Reads filter on expiry
+    /// anyway; this keeps the index bounded. Driven by the retention
+    /// sweep; the store keeps the bytes until the grace period elapses.
+    fn evict_expired_records(&mut self, now: u64) {
+        let now_secs = ms_to_secs(now);
+        let before = self.record_index.len();
+        self.record_index.retain(|_, e| e.record.exp > now_secs);
+        if self.record_index.len() != before {
+            self.derived_version += 1;
+        }
+    }
+
+    /// Build the routing graph from the in-memory index.
     ///
-    /// Stored bytes are untrusted and re-validated on read; the result is
-    /// memoized on `(records_version, now)` so repeated calls within one
-    /// operation (relay path, `class_for`, `pick_next_hop`) validate the
-    /// store once instead of once per call. Any record-set mutation or the
-    /// passage of time invalidates the memo.
+    /// Records were validated once, at admission or startup; building the
+    /// graph is a BFS over already-validated entries, so it never touches
+    /// the store or the signature verifier. The result is memoized on
+    /// `(derived_version, now)` so repeated calls within one operation
+    /// (relay path, `class_for`, `pick_next_hop`) rebuild at most once per
+    /// clock tick and once per index mutation.
     fn build_graph(&mut self) -> Arc<Graph> {
-        let key = (self.records_version, self.now);
+        let key = (self.derived_version, self.now);
         if let Some((v, t, g)) = &self.graph_cache {
             if (*v, *t) == key {
                 return Arc::clone(g);
             }
         }
         type RecordParts = (Identifier, Vec<Identifier>, Vec<Identifier>);
-        // On store failure the graph is empty: routing degrades to "no
-        // route" (retried next call) rather than crashing or fabricating
-        // routes. The diagnostic makes the failure visible.
-        let stored = match self.store.record_all() {
-            Ok(records) => records,
-            Err(e) => {
-                self.diag("record_all", &e);
-                Vec::new()
+        let now_secs = ms_to_secs(self.now);
+        let mut records: Vec<RecordParts> = Vec::with_capacity(self.record_index.len());
+        for entry in self.record_index.values() {
+            if entry.record.exp <= now_secs {
+                continue;
             }
-        };
-        let mut records: Vec<RecordParts> = Vec::with_capacity(stored.len());
-        for record in &stored {
-            if let Some(p) = self.validate_stored(&record.bytes, self.now, true).valid() {
-                let r = p.into_inner();
-                records.push((record.id, r.links, r.gateways));
-            }
+            records.push((
+                entry.record.id,
+                entry.record.links.clone(),
+                entry.record.gateways.clone(),
+            ));
         }
         let mut graph = Graph::build(
             &self.own_id,
@@ -875,37 +932,29 @@ impl<S: Store> Node<S> {
     }
 
     /// Reconcile item list for the stored records. Memoized on the same
-    /// key as [`Self::build_graph`]. Returns `None` when the record set
-    /// cannot be read: answering a reconcile with an empty set would tell
-    /// the peer we hold nothing, so the round is skipped instead.
+    /// key as [`Self::build_graph`]. Returns `None` when the KEL head set
+    /// cannot be read: answering a reconcile with an incomplete set would
+    /// tell the peer we hold less than we do, so the round is skipped
+    /// instead.
     fn record_items(&mut self) -> Option<Vec<reconcile::Item>> {
-        let key = (self.records_version, self.now);
+        let key = (self.derived_version, self.now);
         if let Some((v, t, items)) = &self.items_cache {
             if (*v, *t) == key {
                 return Some(items.clone());
             }
         }
-        let stored = match self.store.record_all() {
-            Ok(records) => records,
-            Err(e) => {
-                self.diag("record_all", &e);
-                return None;
-            }
-        };
-        let mut items: Vec<reconcile::Item> = stored
-            .iter()
-            .filter_map(|record| {
-                // Only unexpired, currently-valid records are advertised.
-                let validated = self
-                    .validate_stored(&record.bytes, self.now, true)
-                    .valid()?;
-                Some(reconcile::Item {
-                    id: record.id,
-                    scope: scope_as_u8(record.scope),
-                    khs: validated.khs,
-                    seq: validated.seq,
-                    hash_prefix: record_hash_prefix(&record.bytes),
-                })
+        let now_secs = ms_to_secs(self.now);
+        // Only unexpired records are advertised.
+        let mut items: Vec<reconcile::Item> = self
+            .record_index
+            .values()
+            .filter(|e| e.record.exp > now_secs)
+            .map(|e| reconcile::Item {
+                id: e.record.id,
+                scope: scope_as_u8(e.record.scope),
+                khs: e.record.khs,
+                seq: e.record.seq,
+                hash_prefix: e.hash.as_bytes()[..8].try_into().expect("hash is 32 bytes"),
             })
             .collect();
         // KELs reconcile in the same set as records (spec §6): scope 255,
@@ -1124,7 +1173,9 @@ impl<S: Store> Node<S> {
             }
         }
         if changed {
-            self.records_version += 1;
+            // KEL heads are part of the reconcile item set; invalidate the
+            // derived-data caches.
+            self.derived_version += 1;
             // The records that cite these KELs can now be validated; ask
             // for them on the next round rather than waiting a full interval.
             self.next_reconcile_at = self.next_reconcile_at.min(at + secs_to_ms(1));
@@ -1228,7 +1279,16 @@ impl<S: Store> Node<S> {
     }
 
     /// Validate stored record bytes against the KEL we hold.
+    ///
+    /// This is the only place stored bytes are re-validated; it runs at
+    /// startup and on the cold path of the retention sweep. The per-tick
+    /// read paths (graph, reconcile items, waypoints, lookups) never call
+    /// it — they read the in-memory index.
     fn validate_stored(&mut self, bytes: &[u8], now: u64, check_time: bool) -> StoredRecord {
+        #[cfg(test)]
+        {
+            self.validation_count += 1;
+        }
         let parsed = match PeerRecord::parse(bytes) {
             Ok(p) => p,
             Err(_) => return StoredRecord::Invalid,
@@ -1257,7 +1317,7 @@ impl<S: Store> Node<S> {
     fn drop_records_for(&mut self, at: u64, id: &Identifier) -> Vec<Action> {
         for scope in [Scope::Wan, Scope::Hive] {
             match self.store.record_remove(id, scope) {
-                Ok(()) => self.records_version += 1,
+                Ok(()) => self.unindex_record(id, scope),
                 Err(e) => self.diag("record_remove", &e),
             }
         }
@@ -1268,27 +1328,18 @@ impl<S: Store> Node<S> {
     }
 
     /// Drop claims whose backing record is gone or no longer valid
-    /// (expired). Records are never removed from the store today (record
-    /// lifecycle is a separate decision), so this keys off validity at
-    /// `now`; when a record-expiry sweep lands it will plug in here.
+    /// (expired). Rebuilt from the in-memory index, so this costs no
+    /// store reads and no re-validation.
     fn sweep_ck_claims(&mut self, now: u64) -> Vec<Action> {
+        let now_secs = ms_to_secs(now);
         let mut fresh: HashMap<X25519PublicKey, std::collections::HashSet<Identifier>> =
             HashMap::new();
-        match self.store.record_all() {
-            Ok(records) => {
-                for record in records {
-                    if let Some(parsed) = self.validate_stored(&record.bytes, now, true).valid() {
-                        if let Some(k) = Self::claim_key(&parsed) {
-                            fresh.entry(k).or_default().insert(parsed.id);
-                        }
-                    }
-                }
+        for entry in self.record_index.values() {
+            if entry.record.exp <= now_secs {
+                continue;
             }
-            // Keep the old claim set rather than dropping all claims on a
-            // transient read failure; report it.
-            Err(e) => {
-                self.diag("record_all", &e);
-                return Vec::new();
+            if let Some(k) = Self::claim_key(&entry.record) {
+                fresh.entry(k).or_default().insert(entry.record.id);
             }
         }
         if fresh != self.ck_claims {
@@ -1303,17 +1354,28 @@ impl<S: Store> Node<S> {
     /// only unbounded growth left in the store; everything else already
     /// expires (seen/delivered) or is capped (inbox, custody).
     fn sweep_expired_data(&mut self, now: u64) {
+        // Entries whose expiry has passed leave the index; reads filter on
+        // expiry anyway, this just keeps the index bounded. The store
+        // keeps the bytes until the grace period elapses.
+        self.evict_expired_records(now);
         match self.store.record_all() {
             Ok(records) => {
                 for record in records {
                     if record.id == self.own_id {
                         continue;
                     }
-                    // Keep records that still validate and are within the
-                    // grace period past expiry. Records that no longer
-                    // validate (stale KEL, undecodable, KEL swept) are
-                    // dropped: they can never be used again. A record we
-                    // could not check (store error) is kept.
+                    if self
+                        .record_index
+                        .contains_key(&(record.id, scope_as_u8(record.scope)))
+                    {
+                        // Unexpired and validated at admission; keep.
+                        continue;
+                    }
+                    // Not in the index: expired (evicted above or never
+                    // admitted) or never valid. Fall back to a full
+                    // validation to decide; this path is cold in normal
+                    // operation. A record we could not check (store error)
+                    // is kept.
                     let keep = match self.validate_stored(&record.bytes, now, false) {
                         // Record expiry is a wire time (seconds); compare in ms.
                         StoredRecord::Valid(p) => {
@@ -1326,7 +1388,7 @@ impl<S: Store> Node<S> {
                         continue;
                     }
                     match self.store.record_remove(&record.id, record.scope) {
-                        Ok(()) => self.records_version += 1,
+                        Ok(()) => self.unindex_record(&record.id, record.scope),
                         Err(e) => self.diag("record_remove", &e),
                     }
                 }
@@ -1359,7 +1421,7 @@ impl<S: Store> Node<S> {
             Ok(n) => {
                 if n > 0 {
                     // The reconcile set changed (KEL entries are gone).
-                    self.records_version += 1;
+                    self.derived_version += 1;
                 }
             }
             Err(e) => self.diag("kel_sweep", &e),
@@ -1510,10 +1572,15 @@ impl<S: Store> Node<S> {
         }
         if admit {
             match self.store.record_put(&rec.id, scope, bytes, ms_to_secs(at)) {
-                Ok(()) => self.records_version += 1,
-                Err(e) => self.diag("record_put", &e),
+                Ok(()) => {
+                    self.note_ck_claim(&rec);
+                    self.index_record(bytes, rec);
+                }
+                Err(e) => {
+                    self.diag("record_put", &e);
+                    self.note_ck_claim(&rec);
+                }
             }
-            self.note_ck_claim(&rec);
             return self.reevaluate_link_bindings(at);
         }
         Vec::new()
@@ -1721,46 +1788,25 @@ impl<S: Store> Node<S> {
         actions
     }
 
-    /// Presence check for a usable record. Validation happens (and is
-    /// memoized) downstream.
+    /// Presence check for a usable record. Records in the index were
+    /// validated at admission; expiry is checked here.
     #[must_use]
-    fn has_record(&mut self, id: &Identifier) -> bool {
+    fn has_record(&self, id: &Identifier) -> bool {
         self.lookup_validated(id).is_some()
     }
 
-    /// Validate a stored record, memoized on `(records_version, now)`.
-    /// Stored bytes are untrusted; the memo is keyed on the record-set
-    /// version and the current time, so it never serves a result that a
-    /// fresh read would not produce. Bounded; cleared when full.
-    fn validated_record(&mut self, id: &Identifier, scope: Scope) -> Option<PeerRecord> {
-        let key = (*id, scope_as_u8(scope));
-        let tag = (self.records_version, self.now);
-        if let Some((v, t, rec)) = self.record_cache.get(&key) {
-            if (*v, *t) == tag {
-                return rec.clone();
-            }
-        }
-        let rec = match self.store.record_get(id, scope) {
-            Ok(Some(stored)) => self
-                .validate_stored(&stored.bytes, self.now, true)
-                .valid()
-                .map(|v| v.into_inner()),
-            Ok(None) => None,
-            // Store error: treat as missing (callers fail closed), but say so.
-            Err(e) => {
-                self.diag("record_get", &e);
-                None
-            }
-        };
-        if self.record_cache.len() >= 256 {
-            self.record_cache.clear();
-        }
-        self.record_cache.insert(key, (tag.0, tag.1, rec.clone()));
-        rec
+    /// Look up a record in the in-memory index. Records were validated at
+    /// admission (or at startup); the only check here is expiry.
+    fn validated_record(&self, id: &Identifier, scope: Scope) -> Option<PeerRecord> {
+        let now_secs = ms_to_secs(self.now);
+        self.record_index
+            .get(&(*id, scope_as_u8(scope)))
+            .filter(|e| e.record.exp > now_secs)
+            .map(|e| e.record.clone())
     }
 
-    /// Look up and validate a record in either scope (WAN first, then hive).
-    fn lookup_validated(&mut self, id: &Identifier) -> Option<PeerRecord> {
+    /// Look up a record in either scope (WAN first, then hive).
+    fn lookup_validated(&self, id: &Identifier) -> Option<PeerRecord> {
         for scope in [Scope::Wan, Scope::Hive] {
             if let Some(rec) = self.validated_record(id, scope) {
                 return Some(rec);
@@ -1769,15 +1815,15 @@ impl<S: Store> Node<S> {
         None
     }
 
-    fn record_mode(&mut self, id: &Identifier) -> Option<Mode> {
+    fn record_mode(&self, id: &Identifier) -> Option<Mode> {
         self.lookup_validated(id).map(|r| r.mode)
     }
 
-    fn record_envelope_key(&mut self, id: &Identifier) -> Option<XWingPublicKey> {
+    fn record_envelope_key(&self, id: &Identifier) -> Option<XWingPublicKey> {
         self.lookup_validated(id).map(|r| r.envelope_key)
     }
 
-    fn record_gateways(&mut self, id: &Identifier) -> Vec<Identifier> {
+    fn record_gateways(&self, id: &Identifier) -> Vec<Identifier> {
         self.lookup_validated(id)
             .map(|r| r.gateways)
             .unwrap_or_default()
@@ -1867,7 +1913,7 @@ impl<S: Store> Node<S> {
         let own_links: HashSet<Identifier> = self.links.values().filter_map(|l| l.peer).collect();
         let recipient_gateways: HashSet<Identifier> =
             self.record_gateways(recipient).into_iter().collect();
-        let cached = self.waypoint_candidates()?;
+        let cached = self.waypoint_candidates();
         let mut candidates: Vec<WaypointChoice> = cached
             .iter()
             .filter(|c| {
@@ -1886,38 +1932,28 @@ impl<S: Store> Node<S> {
         Some(candidates.swap_remove(idx))
     }
 
-    /// Public-mode (id, envelope key) pairs from the store, memoized on
-    /// `(records_version, now)` like the graph cache. On store failure
-    /// there is no candidate set; report and skip waypoint selection (a
-    /// direct route may still work).
-    fn waypoint_candidates(&mut self) -> Option<Arc<WaypointCandidates>> {
-        let key = (self.records_version, self.now);
+    /// Public-mode (id, envelope key) pairs from the index, memoized on
+    /// `(derived_version, now)` like the graph cache.
+    fn waypoint_candidates(&mut self) -> Arc<WaypointCandidates> {
+        let key = (self.derived_version, self.now);
         if let Some((v, t, cached)) = &self.waypoint_cache {
             if (*v, *t) == key {
-                return Some(Arc::clone(cached));
+                return Arc::clone(cached);
             }
         }
-        let stored = match self.store.record_all() {
-            Ok(records) => records,
-            Err(e) => {
-                self.diag("record_all", &e);
-                return None;
-            }
-        };
-        let mut candidates: WaypointCandidates = Vec::new();
-        for record in &stored {
-            if let Some(parsed) = self.validate_stored(&record.bytes, self.now, true).valid() {
-                if parsed.mode == Mode::Public {
-                    candidates.push(WaypointChoice {
-                        id: record.id,
-                        envelope_key: parsed.envelope_key,
-                    });
-                }
-            }
-        }
+        let now_secs = ms_to_secs(self.now);
+        let candidates: WaypointCandidates = self
+            .record_index
+            .values()
+            .filter(|e| e.record.exp > now_secs && e.record.mode == Mode::Public)
+            .map(|e| WaypointChoice {
+                id: e.record.id,
+                envelope_key: e.record.envelope_key,
+            })
+            .collect();
         let candidates = Arc::new(candidates);
         self.waypoint_cache = Some((key.0, key.1, Arc::clone(&candidates)));
-        Some(candidates)
+        candidates
     }
 
     fn pump_outbound(&mut self, now: u64) -> Vec<Action> {
@@ -3677,12 +3713,11 @@ impl<S: Store> Node<S> {
         &self.store
     }
 
-    /// Mutable access to the store. Bumps the record-set version so the
-    /// memoized graph and reconcile items are rebuilt on next use; callers
-    /// must not use this to mutate records behind the node's back without
-    /// accepting that cost.
+    /// Mutable access to the store for non-record state (drain flag,
+    /// inbox acks). Record writes through this handle are not reflected
+    /// in the in-memory index — the routing graph and reconcile set would
+    /// serve stale data — so records go through the admission path only.
     pub fn store_mut(&mut self) -> &mut S {
-        self.records_version += 1;
         &mut self.store
     }
 
@@ -3693,16 +3728,10 @@ impl<S: Store> Node<S> {
             lattice_proto::record::Scope::Wan,
             lattice_proto::record::Scope::Hive,
         ] {
-            match self.store.record_get(id, scope) {
-                Ok(Some(stored)) => {
-                    return match self.validate_stored(&stored.bytes, self.now, true) {
-                        StoredRecord::Valid(p) => LookupResult::Present { mode: Some(p.mode) },
-                        // Held but not valid: report absent.
-                        _ => LookupResult::Absent,
-                    };
-                }
-                Ok(None) => {}
-                Err(e) => self.diag("record_get", &e),
+            if let Some(rec) = self.validated_record(id, scope) {
+                return LookupResult::Present {
+                    mode: Some(rec.mode),
+                };
             }
         }
         LookupResult::Absent
@@ -5601,5 +5630,149 @@ mod tests {
         });
         let ema = node.custody_rtt_ema_ms.expect("reply observed");
         assert!((ema - 50.0).abs() < f64::EPSILON);
+    }
+
+    /// R-21: stored records are validated once — at admission or at
+    /// startup — and never on the per-tick read paths. The test-only
+    /// `validation_count` counts every call to `validate_stored`.
+    #[test]
+    fn stored_records_are_validated_once_not_per_tick() {
+        let ext_a = Identity::from_seed(&[0xA1; 32]);
+        let ext_b = Identity::from_seed(&[0xB2; 32]);
+
+        // Pre-populate the store as a previous run would have left it.
+        let mut store = MemStore::new();
+        for ext in [&ext_a, &ext_b] {
+            let kel_bytes = ext.kel.to_object_bytes().unwrap();
+            let head = ext.kel.head();
+            store
+                .kel_put(
+                    &ext.id(),
+                    &kel_bytes,
+                    &KelHeadSeen {
+                        seq: head.seq,
+                        commitment: head.commitment,
+                        seen: 0,
+                        abandoned: false,
+                    },
+                )
+                .unwrap();
+            let rec = build_record(
+                ext.kel.events().to_vec(),
+                1,
+                Scope::Wan,
+                &ext.signing_seed,
+                &ext.channel_seed,
+            );
+            store
+                .record_put(&ext.id(), Scope::Wan, &rec.encode(), 0)
+                .unwrap();
+        }
+
+        let mut node = Node::new(
+            Config {
+                snow_per_min: 0.0,
+                ..Config::default()
+            },
+            Identity::from_seed(&[0xC3; 32]),
+            store,
+            1_000,
+        )
+        .expect("node construction");
+
+        // Startup validated each stored record exactly once.
+        assert_eq!(node.validation_count, 2);
+        // Two external records plus our own published record.
+        assert_eq!(node.record_index.len(), 3);
+
+        // From here on, no read path may re-validate stored bytes.
+        node.validation_count = 0;
+        for at in [2_000, 3_000, 4_000] {
+            node.handle(Event::Tick { at });
+        }
+        assert!(matches!(
+            node.lookup(&ext_a.id()),
+            LookupResult::Present { .. }
+        ));
+        assert!(matches!(
+            node.lookup(&ext_b.id()),
+            LookupResult::Present { .. }
+        ));
+        let items = node.record_items().expect("items");
+        assert!(items.iter().any(|i| i.id == ext_a.id()));
+        let _ = node.build_graph();
+        let _ = node.waypoint_candidates();
+        node.sweep_ck_claims(5_000);
+        node.sweep_expired_data(5_000);
+        assert_eq!(node.validation_count, 0);
+        // The sweep kept the unexpired records.
+        assert!(
+            node.store
+                .record_get(&ext_a.id(), Scope::Wan)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// Records leave the index at expiry; reads filter on expiry even
+    /// before the retention sweep evicts the entry.
+    #[test]
+    fn expired_record_leaves_index_and_reads() {
+        let mut node = test_node();
+        let sender = Identity::from_seed(&[0x5A; 32]);
+        admit_kel(&mut node, &sender.kel, 1_000);
+        let kel = ValidatedKel::validate(sender.kel.events().to_vec()).unwrap();
+        let rec = lattice_proto::record::PeerRecord::build(
+            lattice_proto::record::RecordParams {
+                kel,
+                prev_seq: 0,
+                now: 1,
+                exp: 2,
+                channel_key: lattice_crypto::channel_public(&sender.channel_seed),
+                channel_seed: sender.channel_seed.clone(),
+                envelope_key: XWingPublicKey::from_bytes([7u8; 1216]),
+                mode: Mode::Public,
+                scope: Scope::Wan,
+                endpoints: vec![lattice_proto::record::Endpoint {
+                    url: "ws://mesh.example.com/".into(),
+                    ips: vec![],
+                }],
+                links: vec![],
+                gateways: vec![],
+                capabilities: 0,
+                serves: vec![],
+            },
+            &sender.signing_seed,
+        )
+        .unwrap();
+        node.admit_record(1_000, 999, &rec.encode());
+        assert!(matches!(
+            node.lookup(&sender.id()),
+            LookupResult::Present { .. }
+        ));
+        // One second past expiry: filtered from every read path.
+        node.handle(Event::Tick { at: 3_000 });
+        assert!(matches!(node.lookup(&sender.id()), LookupResult::Absent));
+        let items = node.record_items().expect("items");
+        assert!(
+            !items
+                .iter()
+                .any(|i| i.id == sender.id() && i.scope == scope_as_u8(Scope::Wan))
+        );
+        // The retention sweep evicts the stale entry from the index;
+        // the store keeps the bytes until the grace period elapses.
+        node.sweep_expired_data(3_000);
+        assert!(
+            !node
+                .record_index
+                .values()
+                .any(|e| e.record.id == sender.id())
+        );
+        assert!(
+            node.store
+                .record_get(&sender.id(), Scope::Wan)
+                .unwrap()
+                .is_some()
+        );
     }
 }
