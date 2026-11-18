@@ -122,6 +122,14 @@ fn record_self_test(cfg: &config::Config, identity: &lattice_core::Identity) -> 
     } else {
         lattice_proto::record::Mode::Public
     };
+    let advertise_ips: Vec<std::net::IpAddr> = cfg
+        .ips
+        .iter()
+        .map(|s| {
+            s.parse()
+                .map_err(|_| format!("ips entry {s:?} is not an IP address"))
+        })
+        .collect::<Result<_, _>>()?;
     let endpoints = if private {
         Vec::new()
     } else {
@@ -129,7 +137,7 @@ fn record_self_test(cfg: &config::Config, identity: &lattice_core::Identity) -> 
             .iter()
             .map(|url| lattice_proto::record::Endpoint {
                 url: url.clone(),
-                ips: Vec::new(),
+                ips: advertise_ips.clone(),
             })
             .collect()
     };

@@ -331,3 +331,122 @@ fn serves_roundtrip_and_limits() {
 fn record_size_limit_is_3kb() {
     assert_eq!(lattice_proto::RECORD_MAX, 3072);
 }
+
+#[test]
+fn wss_endpoint_builds_and_validates() {
+    let f = fixture();
+    let mut params = f.params();
+    params.endpoints = vec![Endpoint {
+        url: "wss://front.example.com/lattice/".into(),
+        ips: vec![],
+    }];
+    let rec = PeerRecord::build(params, &f.seed).unwrap();
+    let kel = f.validated_kel();
+    let parsed = PeerRecord::from_bytes(&rec.encode(), NOW, &kel).unwrap();
+    assert_eq!(parsed.endpoints[0].url, "wss://front.example.com/lattice/");
+}
+
+#[test]
+fn bracketed_ipv6_endpoint_builds_and_validates() {
+    let f = fixture();
+    for url in [
+        "ws://[2001:4860:4860::8888]/",
+        "ws://[2001:4860:4860::8888]:8443/",
+        "wss://[2001:4860:4860::8888]/",
+    ] {
+        let mut params = f.params();
+        params.endpoints = vec![Endpoint {
+            url: url.into(),
+            ips: vec![],
+        }];
+        let rec = PeerRecord::build(params, &f.seed).unwrap_or_else(|e| panic!("{url}: {e:?}"));
+        let kel = f.validated_kel();
+        PeerRecord::from_bytes(&rec.encode(), NOW, &kel).unwrap_or_else(|e| panic!("{url}: {e:?}"));
+    }
+}
+
+#[test]
+fn bracketed_ipv6_private_rejected_in_wan_accepted_in_hive() {
+    let f = fixture();
+    let mut params = f.params();
+    params.endpoints = vec![Endpoint {
+        url: "ws://[fd00::1]:8443/".into(),
+        ips: vec![],
+    }];
+    assert!(PeerRecord::build(params, &f.seed).is_err());
+    let mut params = f.params();
+    params.scope = Scope::Hive;
+    params.endpoints = vec![Endpoint {
+        url: "ws://[fd00::1]:8443/".into(),
+        ips: vec![],
+    }];
+    let rec = PeerRecord::build(params, &f.seed).unwrap();
+    let kel = f.validated_kel();
+    assert!(PeerRecord::from_bytes(&rec.encode(), NOW, &kel).is_ok());
+}
+
+#[test]
+fn bracketed_ipv6_malformed_rejected() {
+    let f = fixture();
+    for url in [
+        "ws://[2001:4860:4860::8888",         // unterminated
+        "ws://[not-an-ip]/",                  // not an IPv6 literal
+        "ws://[2001:4860:4860::8888]x/",      // trailing garbage
+        "ws://[2001:4860:4860::8888]:0/",     // port zero
+        "ws://[2001:4860:4860::8888]:99999/", // port out of range
+        "ws://2001:4860:4860::8888/",         // bare IPv6 must be bracketed
+    ] {
+        let mut params = f.params();
+        params.endpoints = vec![Endpoint {
+            url: url.into(),
+            ips: vec![],
+        }];
+        assert!(
+            PeerRecord::build(params, &f.seed).is_err(),
+            "{url} must be rejected"
+        );
+    }
+}
+
+#[test]
+fn endpoint_ips_roundtrip_through_record() {
+    let f = fixture();
+    let mut params = f.params();
+    params.endpoints = vec![Endpoint {
+        url: "ws://mesh.example.com/".into(),
+        ips: vec![
+            "1.2.3.4".parse().unwrap(),
+            "2001:4860:4860::8888".parse().unwrap(),
+        ],
+    }];
+    let rec = PeerRecord::build(params, &f.seed).unwrap();
+    let kel = f.validated_kel();
+    let parsed = PeerRecord::from_bytes(&rec.encode(), NOW, &kel).unwrap();
+    assert_eq!(
+        parsed.endpoints[0].ips,
+        vec![
+            "1.2.3.4".parse::<std::net::IpAddr>().unwrap(),
+            "2001:4860:4860::8888".parse().unwrap(),
+        ]
+    );
+}
+
+#[test]
+fn wss_scheme_required_exactly() {
+    let f = fixture();
+    for url in [
+        "http://mesh.example.com/",
+        "wssx://mesh.example.com/",
+        "WSS://mesh.example.com/",
+    ] {
+        let mut params = f.params();
+        params.endpoints = vec![Endpoint {
+            url: url.into(),
+            ips: vec![],
+        }];
+        assert!(
+            PeerRecord::build(params, &f.seed).is_err(),
+            "{url} must be rejected"
+        );
+    }
+}

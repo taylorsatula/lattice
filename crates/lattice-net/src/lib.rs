@@ -15,8 +15,8 @@ pub mod path;
 pub mod peer;
 pub mod server;
 
-pub use client::{PeerContact, connect};
-pub use dial::{EndpointUrl, connect_scoped, parse_endpoint, scoped_addresses};
+pub use client::{DialTarget, PeerContact, connect};
+pub use dial::{EndpointUrl, Scheme, connect_scoped, parse_endpoint, scoped_addresses};
 pub use errors::NetError;
 pub use frame::{FRAME_BUCKETS, FrameError, decode_wire, encode_wire, encode_wire_to_bucket};
 pub use path::{upgrade_path, validate_upgrade_path};

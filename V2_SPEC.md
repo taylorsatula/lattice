@@ -177,7 +177,7 @@ The KEL travels as its own object, not embedded in records.
 | 7 | ck | ed25519 | All | Channel key: Ed25519 public key; the Noise static key is the derived X25519 key (below) |
 | 8 | ek | xwing_pk | All | Envelope key (§4) |
 | 9 | mode | uint | All | 0 = public, 1 = private |
-| 10 | ep | array of endpoint | Public | Endpoint = `{0: url, 1: [ip address, …] or absent}`. `url` is `ws://`. Connecting nodes prefer the listed IPs, using the URL's host only for the `Host` header |
+| 10 | ep | array of endpoint | Public | Endpoint = `{0: url, 1: [ip address, …] or absent}`. `url` is `ws://` or `wss://` (§6). Connecting nodes prefer the listed IPs, using the URL's host only for the `Host` header |
 | 11 | ln | array of id | Public | Current links, at most 32 |
 | 12 | gw | array of id | Private | One to three gateways |
 | 13 | cap | uint | All | Capability bitset |
@@ -359,11 +359,14 @@ or the message expires.
 
 ## 6. Channel (§3)
 
-Lattice uses plain WebSocket (`ws://`). Confidentiality and integrity come
-from the Noise session, not from TLS: the payload is encrypted end to end
-before the WebSocket ever sees it, so a second encryption layer would add
-certificate management for nameless nodes without adding protection. `wss://`
-is not used; implementations must reject it rather than silently downgrade.
+Lattice uses WebSocket over TCP. `ws://` is the default. An endpoint may
+instead use `wss://`: the TLS session is an opaque outer wrapper whose only
+purpose is reachability and camouflage through TLS-terminating fronts
+(reverse proxies, tunnels). No certificate trust decisions are made — the
+certificate is not validated, because Noise, not TLS, authenticates the
+peer. `ws://` remains the default; `wss://` is chosen per endpoint.
+Confidentiality and integrity come from the Noise session, not from TLS:
+the payload is encrypted end to end before the WebSocket ever sees it.
 
 Each WebSocket binary frame carries one CBOR value.
 
@@ -383,10 +386,16 @@ Each WebSocket binary frame carries one CBOR value.
   frames carry no type markers at all.
 - **The upgrade path** is `/` followed by the base32 encoding of the first
   16 bytes of BLAKE3 keyed-derivation (context `"lattice v1 path"`) over the
-  responder's channel key. Any upgrade request to another path, and any
-  non-upgrade request other than an enabled `/status`, gets a generic `404`.
-  A root given without an identifier publishes its path alongside its
-  address, since its key isn't known in advance.
+  responder's channel key. An endpoint URL may carry a path prefix (for
+  example `wss://front.example.com/lattice/`); the dialer prepends it to the
+  derived upgrade path, so the request line is `GET /lattice/<derived>`. The
+  front must forward the path unchanged: the prologue binds the request-line
+  path, so a front that rewrites it breaks the handshake. The `Host` header
+  carries the URL's host, not the resolved address, so fronts that route by
+  name work. Any upgrade request to another path, and any non-upgrade
+  request other than an enabled `/status`, gets a generic `404`. A root
+  given without an identifier publishes its path alongside its address,
+  since its key isn't known in advance.
 
 - **mac1** is keyed by the responder's channel key. A responder discards any
   init whose mac1 is wrong, at negligible cost. The XX pattern cannot use
@@ -409,12 +418,12 @@ Each WebSocket binary frame carries one CBOR value.
   is used inside Noise because that's what Noise implementations support;
   everywhere else uses BLAKE3.
 - **Prologue.** The Noise prologue is `"lattice v1" ‖ 0x00 ‖` the upgrade
-  path exactly as it appears in the request line, including the leading `/`,
-  as ASCII bytes (for example `lattice v1\0/k7f3…`). Both patterns use the
-  same prologue. Binding the protocol name and the path into the handshake
-  hash keeps a handshake from one path from being replayed on another, and
-  separates this protocol's handshakes from any other Noise protocol that
-  shares the pattern.
+  path exactly as it appears in the request line (including any path prefix
+  from the endpoint URL), leading `/` included, as ASCII bytes (for example
+  `lattice v1\0/k7f3…`). Both patterns use the same prologue. Binding the
+  protocol name and the path into the handshake hash keeps a handshake from
+  one path from being replayed on another, and separates this protocol's
+  handshakes from any other Noise protocol that shares the pattern.
 - **After the handshake,** each side checks that the peer's Noise static key
   equals the `ck` in that peer's record. With XX, it first obtains the
   record through gossip. This check is the only binding between a link and

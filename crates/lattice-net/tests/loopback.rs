@@ -54,6 +54,45 @@ async fn start_server(
 }
 
 #[tokio::test]
+async fn ik_handshake_with_url_path_prefix() {
+    // An endpoint URL may carry a path prefix (e.g. `wss://front/lattice/`),
+    // which the dialer prepends to the derived upgrade path. The server
+    // accepts the prefixed path and binds the prologue to it, so the
+    // handshake completes exactly as it does without a prefix.
+    let seeds = test_seeds();
+    let server_seed = seeds.server;
+    let client_seed = seeds.client;
+    let server_ck = lattice_crypto::channel_public(&server_seed);
+    let (addr, mut peers, _flag) = start_server(server_seed, ServerOpts::default()).await;
+
+    let client = tokio::spawn(async move {
+        connect(
+            PeerContact::Ik {
+                target: lattice_net::DialTarget {
+                    addr,
+                    host: "front.example.com".to_string(),
+                    path_prefix: "/lattice".to_string(),
+                    tls: false,
+                },
+                channel_key: server_ck,
+            },
+            &client_seed,
+        )
+        .await
+        .unwrap()
+    });
+
+    let mut server_side = peers.recv().await.unwrap();
+    let mut client_side = client.await.unwrap();
+    client_side
+        .send_frame(&Frame::Ping(PingFrame { nonce: 4321 }), None)
+        .await
+        .unwrap();
+    let got = server_side.recv_frame().await.unwrap().unwrap();
+    assert!(matches!(got, Frame::Ping(p) if p.nonce == 4321));
+}
+
+#[tokio::test]
 async fn ik_handshake_and_ping_pong() {
     let seeds = test_seeds();
     let server_seed = seeds.server;
@@ -64,7 +103,7 @@ async fn ik_handshake_and_ping_pong() {
     let client = tokio::spawn(async move {
         connect(
             PeerContact::Ik {
-                addr,
+                target: lattice_net::DialTarget::plain(addr),
                 channel_key: server_ck,
             },
             &client_seed,
@@ -105,9 +144,15 @@ async fn xx_handshake_works() {
     let (addr, mut peers, _flag) = start_server(server_seed.clone(), ServerOpts::default()).await;
 
     let client = tokio::spawn(async move {
-        connect(PeerContact::Xx { addr, path }, &client_seed)
-            .await
-            .unwrap()
+        connect(
+            PeerContact::Xx {
+                target: lattice_net::DialTarget::plain(addr),
+                path,
+            },
+            &client_seed,
+        )
+        .await
+        .unwrap()
     });
     let mut server_side = peers.recv().await.unwrap();
     let mut client_side = client.await.unwrap();
@@ -146,7 +191,7 @@ async fn cookie_flow_enforced_under_load() {
     let client = tokio::spawn(async move {
         connect(
             PeerContact::Ik {
-                addr,
+                target: lattice_net::DialTarget::plain(addr),
                 channel_key: server_ck,
             },
             &client_seed,

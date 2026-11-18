@@ -524,6 +524,15 @@ impl Runtime {
             inbox_max_total: cfg.limits.inbox_max_total,
             rng_seed: u64::from_le_bytes(os_bytes::<8>()),
             advertise: cfg.advertise.clone(),
+            advertise_ips: cfg
+                .ips
+                .iter()
+                .map(|s| {
+                    s.parse::<std::net::IpAddr>().map_err(|e| {
+                        lattice_core::NodeError::Config(format!("ips entry {s:?}: {e}"))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?,
             gateways,
             mode,
             ..lattice_core::Config::default()
@@ -1219,12 +1228,13 @@ impl Runtime {
                  attribution will come from records"
             );
         }
+        let target = lattice_net::DialTarget::plain(addr);
         let contact = match (ik_key, path) {
             (Some(ck), _) => lattice_net::PeerContact::Ik {
-                addr,
+                target,
                 channel_key: ck,
             },
-            (None, Some(p)) => lattice_net::PeerContact::Xx { addr, path: p },
+            (None, Some(p)) => lattice_net::PeerContact::Xx { target, path: p },
             (None, None) => {
                 self.clear_root_in_flight(addr);
                 return;
@@ -1362,6 +1372,7 @@ mod tests {
             app_socket: dir.join("app.sock"),
             admin_socket: dir.join("admin.sock"),
             advertise: vec![],
+            ips: vec![],
             gateways: vec![],
             limits: crate::config::Limits::default(),
         };
