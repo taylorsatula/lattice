@@ -4,6 +4,12 @@
 //!   latticed init [--dir DIR] [--next-key-out PATH]
 //!                               create an identity and write a sample config
 //!   latticed run [--config PATH]  run the daemon
+//!   latticed rotate-offline --dir DIR --next-key-file PATH
+//!       (--next-next-commitment HEX | --abandon)
+//!                               offline signing-key rotation (credentials mode)
+//!   latticed rotate-envelope-offline --dir DIR --seed-out PATH
+//!       [--old-seed-file PATH] [--grace-secs N]
+//!                               offline envelope-key rotation (credentials mode)
 //!
 //! Secrets: 32-byte raw files in the identity directory (or systemd
 //! credentials when $CREDENTIALS_DIRECTORY is set). The next signing key is
@@ -11,7 +17,10 @@
 //! `--next-key-out` (outside the identity directory) or prints it once to
 //! stdout, and the directory stores only its BLAKE3 commitment. The daemon
 //! refuses to start if a `next_signing_seed` file is present. The daemon
-//! refuses to start if key self-tests fail.
+//! refuses to start if key self-tests fail. When $CREDENTIALS_DIRECTORY is
+//! set, online rotation is refused (the daemon cannot update the credential);
+//! use the offline subcommands above, provision the credential with the new
+//! seed, and restart.
 
 #![forbid(unsafe_code)]
 
@@ -31,8 +40,12 @@ async fn main() -> std::process::ExitCode {
     match args.get(1).map(String::as_str) {
         Some("init") => cmd_init(&args[2..]),
         Some("run") | None => cmd_run(&args[2..]).await,
+        Some("rotate-offline") => cmd_rotate_offline(&args[2..]),
+        Some("rotate-envelope-offline") => cmd_rotate_envelope_offline(&args[2..]),
         Some(other) => {
-            eprintln!("unknown subcommand {other:?}; expected `init` or `run`");
+            eprintln!(
+                "unknown subcommand {other:?}; expected `init`, `run`, `rotate-offline` or `rotate-envelope-offline`"
+            );
             std::process::ExitCode::from(2)
         }
     }
@@ -109,6 +122,220 @@ fn hex(bytes: &[u8]) -> String {
         let _ = write!(s, "{b:02x}");
     }
     s
+}
+
+/// Decode 64 lowercase/uppercase hex chars into 32 bytes.
+fn unhex32(s: &str) -> Result<[u8; 32], String> {
+    let s = s.trim();
+    if s.len() != 64 {
+        return Err(format!("expected 64 hex chars, got {}", s.len()));
+    }
+    let mut out = [0u8; 32];
+    for (i, pair) in s.as_bytes().chunks_exact(2).enumerate() {
+        let hi = (pair[0] as char).to_digit(16).ok_or("invalid hex")?;
+        let lo = (pair[1] as char).to_digit(16).ok_or("invalid hex")?;
+        out[i] = ((hi << 4) | lo) as u8;
+    }
+    Ok(out)
+}
+
+/// Read a 32-byte seed file.
+fn read_seed_file(path: &std::path::Path) -> Result<[u8; 32], String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| format!("{}: expected 32 bytes, got {}", path.display(), bytes.len()))
+}
+
+/// Offline signing-key rotation for credentials-mode deployments: advances
+/// the KEL and the stored commitment without touching the credential. The
+/// operator provisions the credential with the same next key afterwards.
+fn cmd_rotate_offline(args: &[String]) -> std::process::ExitCode {
+    let mut dir = PathBuf::from("/var/lib/lattice");
+    let mut next_key_file: Option<PathBuf> = None;
+    let mut commitment_hex: Option<String> = None;
+    let mut abandon = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--dir" => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!("--dir needs a value");
+                    return std::process::ExitCode::from(2);
+                };
+                dir = PathBuf::from(v);
+                i += 2;
+            }
+            "--next-key-file" => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!("--next-key-file needs a value");
+                    return std::process::ExitCode::from(2);
+                };
+                next_key_file = Some(PathBuf::from(v));
+                i += 2;
+            }
+            "--next-next-commitment" => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!("--next-next-commitment needs a value");
+                    return std::process::ExitCode::from(2);
+                };
+                commitment_hex = Some(v.clone());
+                i += 2;
+            }
+            "--abandon" => {
+                abandon = true;
+                i += 1;
+            }
+            other => {
+                eprintln!("unknown flag {other:?}");
+                return std::process::ExitCode::from(2);
+            }
+        }
+    }
+    let Some(next_key_file) = next_key_file else {
+        eprintln!(
+            "rotate-offline requires --next-key-file <path> (the offline, pre-committed next key)"
+        );
+        return std::process::ExitCode::from(2);
+    };
+    if abandon && commitment_hex.is_some() {
+        eprintln!("--abandon takes no --next-next-commitment");
+        return std::process::ExitCode::from(2);
+    }
+    let kind = if abandon {
+        lattice_core::RotationKind::Abandon
+    } else {
+        lattice_core::RotationKind::Rotate
+    };
+    let commitment = match (&commitment_hex, abandon) {
+        (Some(h), false) => match unhex32(h) {
+            Ok(c) => Some(lattice_types::Commitment::from_bytes(c)),
+            Err(e) => {
+                eprintln!("--next-next-commitment: {e}");
+                return std::process::ExitCode::from(2);
+            }
+        },
+        (None, false) => {
+            eprintln!("rotate-offline requires --next-next-commitment <hex> (or --abandon)");
+            return std::process::ExitCode::from(2);
+        }
+        _ => None,
+    };
+    let next_key = match read_seed_file(&next_key_file) {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("{e}");
+            return std::process::ExitCode::from(1);
+        }
+    };
+    match keys::rotate_signing_key_offline(&dir, &next_key, commitment.as_ref(), kind) {
+        Ok(()) => {
+            println!(
+                "KEL advanced and next_key_commitment updated in {}",
+                dir.display()
+            );
+            println!("next steps:");
+            println!(
+                "  1. provision the credential behind $CREDENTIALS_DIRECTORY/signing_seed with {}",
+                next_key_file.display()
+            );
+            println!(
+                "     (file-mode deployments: copy it to {}/signing_seed instead)",
+                dir.display()
+            );
+            println!("  2. start latticed");
+            std::process::ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("rotate-offline failed: {e}");
+            std::process::ExitCode::from(1)
+        }
+    }
+}
+
+/// Offline envelope-key rotation for credentials-mode deployments: generates
+/// a fresh X-Wing keypair, writes the new seed to --seed-out, and retires the
+/// old seed into the identity directory. The operator provisions the
+/// credential with the new seed afterwards.
+fn cmd_rotate_envelope_offline(args: &[String]) -> std::process::ExitCode {
+    let mut dir = PathBuf::from("/var/lib/lattice");
+    let mut seed_out: Option<PathBuf> = None;
+    let mut old_seed_file: Option<PathBuf> = None;
+    let mut grace_secs: u64 = 2 * 24 * 3600;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--dir" => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!("--dir needs a value");
+                    return std::process::ExitCode::from(2);
+                };
+                dir = PathBuf::from(v);
+                i += 2;
+            }
+            "--seed-out" => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!("--seed-out needs a value");
+                    return std::process::ExitCode::from(2);
+                };
+                seed_out = Some(PathBuf::from(v));
+                i += 2;
+            }
+            "--old-seed-file" => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!("--old-seed-file needs a value");
+                    return std::process::ExitCode::from(2);
+                };
+                old_seed_file = Some(PathBuf::from(v));
+                i += 2;
+            }
+            "--grace-secs" => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!("--grace-secs needs a value");
+                    return std::process::ExitCode::from(2);
+                };
+                match v.parse::<u64>() {
+                    Ok(n) => grace_secs = n,
+                    Err(_) => {
+                        eprintln!("--grace-secs: expected a non-negative integer, got {v:?}");
+                        return std::process::ExitCode::from(2);
+                    }
+                }
+                i += 2;
+            }
+            other => {
+                eprintln!("unknown flag {other:?}");
+                return std::process::ExitCode::from(2);
+            }
+        }
+    }
+    let Some(seed_out) = seed_out else {
+        eprintln!(
+            "rotate-envelope-offline requires --seed-out <path> (must lie outside the identity directory)"
+        );
+        return std::process::ExitCode::from(2);
+    };
+    match keys::rotate_envelope_key_offline(&dir, grace_secs, &seed_out, old_seed_file.as_deref()) {
+        Ok(()) => {
+            println!("new envelope key written to {}", seed_out.display());
+            println!("next steps:");
+            println!(
+                "  1. provision the credential behind $CREDENTIALS_DIRECTORY/envelope_seed with {}",
+                seed_out.display()
+            );
+            println!(
+                "     (file-mode deployments: copy it to {}/envelope_seed instead)",
+                dir.display()
+            );
+            println!("  2. start latticed");
+            std::process::ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("rotate-envelope-offline failed: {e}");
+            std::process::ExitCode::from(1)
+        }
+    }
 }
 
 /// Build the record this node will publish and check it passes validation.

@@ -82,6 +82,18 @@ the following key offline, then run
 `latticectl rotate --next-key-file <path> --next-next-commitment <hex>`;
 `latticectl abandon --next-key-file <path>` retires the identity for good.
 
+If the daemon runs with systemd credentials (`$CREDENTIALS_DIRECTORY` set,
+e.g. the `LoadCredential=` lines in `deploy/latticed.service`), online
+rotation is refused before any write: the daemon cannot update the credential
+that holds the seed. Rotate offline instead: stop the daemon, run
+`latticed rotate-offline --dir /var/lib/lattice --next-key-file <path> --next-next-commitment <hex>`
+(signing; `--abandon` to retire the identity) or
+`latticed rotate-envelope-offline --dir /var/lib/lattice --seed-out <path>`
+(envelope), provision the credential(s) with the new seed(s), and start the
+daemon again. The following key for `--next-next-commitment` is generated
+offline, e.g. `latticed init --dir /tmp/scratch --next-key-out <following-key>`
+prints its commitment; discard the scratch identity afterwards.
+
 Applications talk to the node over the local API (length-prefixed CBOR over a
 Unix socket, see `V2_SPEC.md` §7) using `lattice-client` (Rust),
 `clients/python` (Python), or their own implementation. Administration goes
