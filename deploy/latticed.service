@@ -38,9 +38,22 @@ RuntimeDirectoryGroup=lattice
 # LoadCredential=envelope_seed:/etc/lattice/keys/envelope_seed
 #
 # The next signing key never lives on this host: `latticed init` writes it to
-# an operator-chosen path outside the identity directory (or prints it once),
-# and rotation takes it over the admin socket. The identity directory stores
-# only its BLAKE3 commitment (next_key_commitment).
+# an operator-chosen path outside the identity directory (or prints it once).
+# The identity directory stores only its BLAKE3 commitment (next_key_commitment).
+#
+# Online rotation (latticectl rotate / rotate-envelope) is NOT supported in
+# this mode: the daemon cannot update the credential that holds a seed, so
+# both rotations are refused before any write. Rotate offline instead:
+#   1. stop latticed
+#   2. latticed rotate-offline --dir /var/lib/lattice --next-key-file <next-key> \
+#        --next-next-commitment <hex>   (or --abandon)
+#      latticed rotate-envelope-offline --dir /var/lib/lattice --seed-out <path>
+#   3. provision the credential(s) with the new seed(s): the same next key for
+#      signing_seed; the --seed-out file for envelope_seed
+#   4. start latticed
+# The following key for --next-next-commitment is generated offline, e.g.
+# `latticed init --dir /tmp/scratch --next-key-out <following-key>` prints its
+# commitment; discard the scratch identity afterwards.
 
 ExecStart=/usr/local/bin/latticed run --config /etc/lattice/lattice.toml
 Restart=on-failure

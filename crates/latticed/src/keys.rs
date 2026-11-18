@@ -7,6 +7,15 @@
 //! it once to stdout), and the identity directory stores only its BLAKE3
 //! commitment in `next_key_commitment`. Rotation takes the next key's bytes
 //! over the admin socket and never writes any future secret key to disk.
+//!
+//! When $CREDENTIALS_DIRECTORY is set the daemon cannot update the
+//! credential that holds a seed, so online rotation is refused before any
+//! write: `rotate_signing_key` and `rotate_envelope_key` fail with an error
+//! naming the offline procedure. `latticed rotate-offline` (signing) and
+//! `latticed rotate-envelope-offline` (envelope) advance the identity
+//! directory without touching the credential; the operator then provisions
+//! the credential with the new seed and restarts the daemon. See
+//! deploy/latticed.service.
 
 use std::fs;
 use std::io;
@@ -155,45 +164,52 @@ fn resolve_outside(dir: &Path, out: &Path) -> io::Result<PathBuf> {
     Ok(resolved)
 }
 
-/// Write the next signing key to an operator-chosen path outside `dir`.
-/// Refuses to overwrite an existing file: clobbering an offline key file
-/// would destroy the only copy of a key the identity is committed to.
-fn write_next_key_out(dir: &Path, out: &Path, seed: &SigningSeed) -> io::Result<PathBuf> {
-    let resolved = resolve_outside(dir, out)?;
+/// Write `bytes` to `path` with mode 0600, refusing to overwrite an
+/// existing file. Used for key material headed to operator-chosen paths.
+fn write_new_seed_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
     #[cfg(unix)]
     {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
         let mut opts = fs::OpenOptions::new();
         opts.write(true).create_new(true).mode(0o600);
-        let mut f = opts.open(&resolved).map_err(|e| {
+        let mut f = opts.open(path).map_err(|e| {
             if e.kind() == io::ErrorKind::AlreadyExists {
                 io::Error::new(
                     e.kind(),
                     format!(
-                        "{} already exists; refusing to overwrite the next key",
-                        resolved.display()
+                        "{} already exists; refusing to overwrite the key file",
+                        path.display()
                     ),
                 )
             } else {
                 e
             }
         })?;
-        f.write_all(seed.as_bytes())?;
+        f.write_all(bytes)?;
     }
     #[cfg(not(unix))]
     {
-        if resolved.exists() {
+        if path.exists() {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 format!(
-                    "{} already exists; refusing to overwrite the next key",
-                    resolved.display()
+                    "{} already exists; refusing to overwrite the key file",
+                    path.display()
                 ),
             ));
         }
-        fs::write(&resolved, seed.as_bytes())?;
+        fs::write(path, bytes)?;
     }
+    Ok(())
+}
+
+/// Write the next signing key to an operator-chosen path outside `dir`.
+/// Refuses to overwrite an existing file: clobbering an offline key file
+/// would destroy the only copy of a key the identity is committed to.
+fn write_next_key_out(dir: &Path, out: &Path, seed: &SigningSeed) -> io::Result<PathBuf> {
+    let resolved = resolve_outside(dir, out)?;
+    write_new_seed_file(&resolved, seed.as_bytes())?;
     Ok(resolved)
 }
 
@@ -272,6 +288,21 @@ pub fn init_identity(dir: &Path, next_key_out: Option<&Path>) -> io::Result<Init
     })
 }
 
+/// Read and validate kel.bin.
+fn read_kel(dir: &Path) -> io::Result<lattice_proto::kel::ValidatedKel> {
+    let bytes = fs::read(dir.join("kel.bin")).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!(
+                "{}: read kel.bin: {e} (identity is corrupt or incomplete)",
+                dir.display()
+            ),
+        )
+    })?;
+    lattice_proto::kel::decode_kel(&bytes)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
 pub fn load_identity(dir: &Path) -> io::Result<Identity> {
     // Fail closed: a next signing key inside the identity directory means an
     // offline key ended up next to the daemon's secrets. Refuse to run until
@@ -292,19 +323,7 @@ pub fn load_identity(dir: &Path) -> io::Result<Identity> {
     let channel_seed = ChannelSeed::from_bytes(read_seed(dir, "channel_seed")?);
     let envelope_seed = XWingSecretKey::from_bytes(read_seed(dir, "envelope_seed")?);
 
-    let kel = {
-        let bytes = fs::read(dir.join("kel.bin")).map_err(|e| {
-            io::Error::new(
-                e.kind(),
-                format!(
-                    "{}: read kel.bin: {e} (identity is corrupt or incomplete)",
-                    dir.display()
-                ),
-            )
-        })?;
-        lattice_proto::kel::decode_kel(&bytes)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
-    };
+    let kel = read_kel(dir)?;
     let retired_xwing = load_retired_envelope_keys(dir)?;
     // The signing seed must match the KEL's current head key. `decode_kel`
     // already validated the chain; no second pass is needed. (Before
@@ -473,8 +492,8 @@ pub struct Rotation {
 /// (e.g. a crash between writing kel.bin and the file), the file is rebuilt
 /// from the KEL head and a warning is printed. The provided key is always
 /// checked against this value, never against an unverified file.
-fn stored_next_commitment(dir: &Path, identity: &lattice_core::Identity) -> io::Result<Commitment> {
-    let kel_commitment = identity.kel.head().next.ok_or_else(|| {
+fn stored_next_commitment(dir: &Path, kel_next: Option<Commitment>) -> io::Result<Commitment> {
+    let kel_commitment = kel_next.ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             "identity is abandoned; rotation is impossible",
@@ -503,6 +522,100 @@ fn stored_next_commitment(dir: &Path, identity: &lattice_core::Identity) -> io::
     }
 }
 
+/// Refusal used when a rotation is attempted with $CREDENTIALS_DIRECTORY
+/// set. The daemon cannot update the credential that holds the seed, so an
+/// online rotation would write the new seed where the loader never reads it.
+/// The message names the offline procedure; keep it actionable.
+fn signing_credentials_refusal() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        "refusing to rotate the signing key: $CREDENTIALS_DIRECTORY is set, so the daemon cannot update the credential that holds signing_seed; the new seed would be written where the loader never reads it.\n\
+         Rotate offline instead:\n  \
+         1. stop latticed\n  \
+         2. generate the following key offline, e.g. `latticed init --dir /tmp/scratch --next-key-out <following-key>` (its printed commitment is --next-next-commitment)\n  \
+         3. latticed rotate-offline --dir <identity-dir> --next-key-file <next-key-file> --next-next-commitment <hex>   (or --abandon)\n  \
+         4. provision the credential behind $CREDENTIALS_DIRECTORY/signing_seed with that same next key (file-mode deployments: copy it to <identity-dir>/signing_seed)\n  \
+         5. start latticed",
+    )
+}
+
+/// Refusal used when an envelope rotation is attempted with
+/// $CREDENTIALS_DIRECTORY set. See [`signing_credentials_refusal`].
+fn envelope_credentials_refusal() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        "refusing to rotate the envelope key: $CREDENTIALS_DIRECTORY is set, so the daemon cannot update the credential that holds envelope_seed; the new seed would be written where the loader never reads it.\n\
+         Rotate offline instead:\n  \
+         1. stop latticed\n  \
+         2. latticed rotate-envelope-offline --dir <identity-dir> --seed-out <new-seed-path>\n  \
+         3. provision the credential behind $CREDENTIALS_DIRECTORY/envelope_seed with <new-seed-path> (file-mode deployments: copy it to <identity-dir>/envelope_seed)\n  \
+         4. start latticed",
+    )
+}
+
+/// Argument rules shared by the online and offline signing-key rotations.
+fn check_rotation_args(
+    kind: lattice_core::RotationKind,
+    next_next_commitment: Option<&Commitment>,
+) -> io::Result<()> {
+    match (kind, next_next_commitment) {
+        (lattice_core::RotationKind::Rotate, Some(_))
+        | (lattice_core::RotationKind::Abandon, None) => Ok(()),
+        (lattice_core::RotationKind::Rotate, None) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "rotate requires the commitment to the following key",
+        )),
+        (lattice_core::RotationKind::Abandon, Some(_)) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "abandon takes no next-next commitment",
+        )),
+    }
+}
+
+/// Verify `next_key` against the expected commitment (constant-time).
+fn verify_next_key(expected: &Commitment, next_key: &[u8; 32]) -> io::Result<()> {
+    let next_seed = SigningSeed::from_bytes(*next_key);
+    let provided = next_key_commitment(&next_seed);
+    if expected.as_bytes().ct_eq(provided.as_bytes()).unwrap_u8() != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "the provided next key does not match the commitment stored in the identity directory; refusing to rotate",
+        ));
+    }
+    Ok(())
+}
+
+/// Persist the post-rotation commitment state: store the following key's
+/// commitment, or remove the file entirely on abandon (the identity is
+/// terminal; a stale file must not be mistaken for a live one).
+fn store_commitment_after_rotation(
+    dir: &Path,
+    kind: lattice_core::RotationKind,
+    next_next_commitment: Option<&Commitment>,
+) -> io::Result<()> {
+    match kind {
+        lattice_core::RotationKind::Rotate => {
+            // `next_next_commitment` is Some here (checked by check_rotation_args).
+            write_next_commitment(
+                dir,
+                next_next_commitment.expect("checked by check_rotation_args"),
+            )
+        }
+        lattice_core::RotationKind::Abandon => {
+            if let Err(e) = fs::remove_file(dir.join(NEXT_KEY_COMMITMENT_FILE)) {
+                if e.kind() != io::ErrorKind::NotFound {
+                    eprintln!(
+                        "lattice: identity abandoned but failed to remove {}: {e}. \
+                         Remove it manually; the identity is already terminal.",
+                        dir.join(NEXT_KEY_COMMITMENT_FILE).display()
+                    );
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
 /// Rotate the signing key.
 ///
 /// `next_key` is the offline, pre-committed next key, supplied by the
@@ -512,12 +625,36 @@ fn stored_next_commitment(dir: &Path, identity: &lattice_core::Identity) -> io::
 /// it is required for [`lattice_core::RotationKind::Rotate`] and forbidden
 /// for [`lattice_core::RotationKind::Abandon`]. No secret key is written to
 /// disk: the stored commitment is replaced with the one provided.
+///
+/// Refused before any write when $CREDENTIALS_DIRECTORY is set: the daemon
+/// cannot update the credential that holds signing_seed, so the new seed
+/// would be written where the loader never reads it. See
+/// [`rotate_signing_key_offline`] for the credentials-mode procedure.
 pub fn rotate_signing_key(
     dir: &Path,
     next_key: &[u8; 32],
     next_next_commitment: Option<&Commitment>,
     kind: lattice_core::RotationKind,
 ) -> io::Result<Rotation> {
+    rotate_signing_key_impl(
+        dir,
+        next_key,
+        next_next_commitment,
+        kind,
+        credentials_dir().is_some(),
+    )
+}
+
+fn rotate_signing_key_impl(
+    dir: &Path,
+    next_key: &[u8; 32],
+    next_next_commitment: Option<&Commitment>,
+    kind: lattice_core::RotationKind,
+    credentials_mode: bool,
+) -> io::Result<Rotation> {
+    if credentials_mode {
+        return Err(signing_credentials_refusal());
+    }
     let mut identity = load_identity(dir)?;
     if identity.is_abandoned() {
         return Err(io::Error::new(
@@ -525,31 +662,11 @@ pub fn rotate_signing_key(
             "identity is abandoned; rotation is impossible",
         ));
     }
-    match (kind, next_next_commitment) {
-        (lattice_core::RotationKind::Rotate, Some(_))
-        | (lattice_core::RotationKind::Abandon, None) => {}
-        (lattice_core::RotationKind::Rotate, None) => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "rotate requires the commitment to the following key",
-            ));
-        }
-        (lattice_core::RotationKind::Abandon, Some(_)) => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "abandon takes no next-next commitment",
-            ));
-        }
-    }
-    let expected = stored_next_commitment(dir, &identity)?;
+    check_rotation_args(kind, next_next_commitment)?;
+    let kel_next = identity.kel.head().next;
+    let expected = stored_next_commitment(dir, kel_next)?;
+    verify_next_key(&expected, next_key)?;
     let next_seed = SigningSeed::from_bytes(*next_key);
-    let provided = next_key_commitment(&next_seed);
-    if expected.as_bytes().ct_eq(provided.as_bytes()).unwrap_u8() != 1 {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "the provided next key does not match the commitment stored in the identity directory; refusing to rotate",
-        ));
-    }
     identity
         .rotate(&next_seed, next_next_commitment.copied())
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -577,31 +694,69 @@ pub fn rotate_signing_key(
         lattice_proto::kel::encode_kel(&identity.kel),
     )?;
     write_seed(dir, "signing_seed", &identity.signing_seed)?;
-    match kind {
-        lattice_core::RotationKind::Rotate => {
-            // `next_next_commitment` is Some here (checked above).
-            write_next_commitment(dir, next_next_commitment.expect("checked above"))?;
-        }
-        lattice_core::RotationKind::Abandon => {
-            // The identity is terminal; the commitment is meaningless now.
-            // Remove it so a stale file cannot be mistaken for a live one.
-            if let Err(e) = fs::remove_file(dir.join(NEXT_KEY_COMMITMENT_FILE)) {
-                if e.kind() != io::ErrorKind::NotFound {
-                    eprintln!(
-                        "lattice: identity abandoned but failed to remove {}: {e}. \
-                         Remove it manually; the identity is already terminal.",
-                        dir.join(NEXT_KEY_COMMITMENT_FILE).display()
-                    );
-                }
-            }
-        }
-    }
+    store_commitment_after_rotation(dir, kind, next_next_commitment)?;
     Ok(Rotation { identity })
+}
+
+/// Offline signing-key rotation for credentials-mode deployments (and for
+/// operators who prefer to rotate with the daemon stopped).
+///
+/// Advances the KEL in `dir` and updates `next_key_commitment`, but does NOT
+/// write `signing_seed`: the new current key is the pre-committed next key,
+/// which the operator already holds offline and must provision as the
+/// credential (or copy to `<dir>/signing_seed` in file-mode deployments)
+/// before restarting the daemon. Does not read the credential at all, so it
+/// is safe to run with or without $CREDENTIALS_DIRECTORY set.
+pub fn rotate_signing_key_offline(
+    dir: &Path,
+    next_key: &[u8; 32],
+    next_next_commitment: Option<&Commitment>,
+    kind: lattice_core::RotationKind,
+) -> io::Result<()> {
+    check_rotation_args(kind, next_next_commitment)?;
+    let kel = read_kel(dir)?;
+    if kel.is_abandoned() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "identity is abandoned; rotation is impossible",
+        ));
+    }
+    let expected = stored_next_commitment(dir, kel.head().next)?;
+    verify_next_key(&expected, next_key)?;
+    let next_seed = SigningSeed::from_bytes(*next_key);
+    let event = lattice_proto::kel::KeyEvent::rotation(
+        kel.events()
+            .last()
+            .expect("a validated KEL holds at least one event"),
+        &next_seed,
+        next_next_commitment.copied(),
+    );
+    let mut kel = kel;
+    kel.append(event)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    fs::write(dir.join("kel.bin"), lattice_proto::kel::encode_kel(&kel))?;
+    store_commitment_after_rotation(dir, kind, next_next_commitment)?;
+    Ok(())
 }
 
 /// Rotate the envelope (X-Wing) key. The old private key is kept, decrypt-only,
 /// for `grace_secs`, then deleted by the next load.
+///
+/// Refused before any write when $CREDENTIALS_DIRECTORY is set: the daemon
+/// cannot update the credential that holds envelope_seed. See
+/// [`rotate_envelope_key_offline`] for the credentials-mode procedure.
 pub fn rotate_envelope_key(dir: &Path, grace_secs: u64) -> io::Result<lattice_core::Identity> {
+    rotate_envelope_key_impl(dir, grace_secs, credentials_dir().is_some())
+}
+
+fn rotate_envelope_key_impl(
+    dir: &Path,
+    grace_secs: u64,
+    credentials_mode: bool,
+) -> io::Result<lattice_core::Identity> {
+    if credentials_mode {
+        return Err(envelope_credentials_refusal());
+    }
     let mut identity = load_identity(dir)?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -615,6 +770,94 @@ pub fn rotate_envelope_key(dir: &Path, grace_secs: u64) -> io::Result<lattice_co
     identity.rotate_envelope(retire_at);
     write_seed(dir, "envelope_seed", &identity.xwing_secret)?;
     Ok(identity)
+}
+
+/// Resolve the current envelope seed for the offline rotation: an explicit
+/// `--old-seed-file` wins, then `<dir>/envelope_seed` (file-mode deployments),
+/// then `$CREDENTIALS_DIRECTORY/envelope_seed`. Returns the seed and whether
+/// it came from `<dir>/envelope_seed` (in which case the caller retires it by
+/// removing the live file). `Ok(None)` means no old seed was found; the
+/// rotation can still proceed, but the old key cannot be retired.
+fn resolve_old_envelope_seed(
+    dir: &Path,
+    old_seed_file: Option<&Path>,
+) -> io::Result<Option<([u8; 32], bool)>> {
+    fn read32(path: &Path) -> io::Result<[u8; 32]> {
+        let bytes = fs::read(path)
+            .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", path.display())))?;
+        bytes.as_slice().try_into().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{}: expected 32 bytes", path.display()),
+            )
+        })
+    }
+    if let Some(path) = old_seed_file {
+        return Ok(Some((read32(path)?, false)));
+    }
+    let in_dir = dir.join("envelope_seed");
+    if in_dir.exists() {
+        return Ok(Some((read32(&in_dir)?, true)));
+    }
+    if let Some(cred) = credentials_dir().map(|d| d.join("envelope_seed")) {
+        if cred.exists() {
+            return Ok(Some((read32(&cred)?, false)));
+        }
+    }
+    Ok(None)
+}
+
+/// Offline envelope-key rotation for credentials-mode deployments (and for
+/// operators who prefer to rotate with the daemon stopped).
+///
+/// Generates a fresh X-Wing keypair and writes the new secret seed to
+/// `seed_out` (mode 0600, never overwriting); the operator provisions it as
+/// the credential (or copies it to `<dir>/envelope_seed` in file-mode
+/// deployments) and restarts the daemon. The old seed is moved to
+/// `<dir>/envelope_seed.retired.<expiry>` so in-flight envelopes stay
+/// decryptable for `grace_secs`; if the old seed cannot be found, a warning
+/// is printed and the old key is not retired. Does not touch the credential.
+pub fn rotate_envelope_key_offline(
+    dir: &Path,
+    grace_secs: u64,
+    seed_out: &Path,
+    old_seed_file: Option<&Path>,
+) -> io::Result<()> {
+    // Resolve destinations and inputs before writing anything.
+    let resolved_out = resolve_outside(dir, seed_out)?;
+    let old = resolve_old_envelope_seed(dir, old_seed_file)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let retire_at = now + grace_secs;
+
+    let keypair = lattice_crypto::generate_keypair();
+    write_new_seed_file(&resolved_out, keypair.secret.as_bytes())?;
+
+    match old {
+        Some((old_seed, from_identity_dir)) => {
+            let retired_name = format!("{RETIRED_ENVELOPE_PREFIX}{retire_at}");
+            write_seed(dir, &retired_name, &old_seed)?;
+            if from_identity_dir {
+                // The live file must not linger: in file-mode deployments the
+                // loader would keep using the old key and never see the new one.
+                if let Err(e) = fs::remove_file(dir.join("envelope_seed")) {
+                    eprintln!(
+                        "lattice: retired the old envelope key but could not remove {}: {e}. \
+                         Remove it manually; it must not remain as the live seed.",
+                        dir.join("envelope_seed").display()
+                    );
+                }
+            }
+        }
+        None => {
+            eprintln!(
+                "lattice: warning: no old envelope seed found (looked at --old-seed-file, {}, and $CREDENTIALS_DIRECTORY/envelope_seed); the old key was NOT retired and envelopes sealed to it will be undecryptable after the restart",
+                dir.join("envelope_seed").display()
+            );
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -907,6 +1150,267 @@ mod tests {
         let reloaded = load_identity(&dir).unwrap();
         assert_eq!(reloaded.xwing_public, after.xwing_public);
         assert_eq!(reloaded.retired_xwing.len(), 1);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn dir_snapshot(dir: &Path) -> Vec<(String, Vec<u8>)> {
+        let mut entries: Vec<(String, Vec<u8>)> = fs::read_dir(dir)
+            .unwrap()
+            .map(|e| {
+                let e = e.unwrap();
+                let name = e.file_name().to_str().unwrap().to_string();
+                let bytes = fs::read(e.path()).unwrap_or_default();
+                (name, bytes)
+            })
+            .collect();
+        entries.sort();
+        entries
+    }
+
+    #[test]
+    fn rotate_signing_key_refused_in_credentials_mode_before_any_write() {
+        let dir = temp_dir("rotate-cred-refusal");
+        let outcome = init_identity(&dir, None).unwrap();
+        let before = dir_snapshot(&dir);
+        let next_key = *outcome.next_key.as_bytes();
+        let following = SigningSeed::from_bytes([7u8; 32]);
+        let following_commitment = commitment_of(&following);
+
+        let err = expect_err(rotate_signing_key_impl(
+            &dir,
+            &next_key,
+            Some(&following_commitment),
+            lattice_core::RotationKind::Rotate,
+            true,
+        ));
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        let msg = err.to_string();
+        assert!(msg.contains("CREDENTIALS_DIRECTORY"), "{msg}");
+        assert!(msg.contains("rotate-offline"), "{msg}");
+        // Nothing was written: the identity directory is byte-for-byte intact.
+        assert_eq!(dir_snapshot(&dir), before);
+
+        // Abandon is refused the same way, before any write.
+        let err = expect_err(rotate_signing_key_impl(
+            &dir,
+            &next_key,
+            None,
+            lattice_core::RotationKind::Abandon,
+            true,
+        ));
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert!(err.to_string().contains("rotate-offline"));
+        assert_eq!(dir_snapshot(&dir), before);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rotate_envelope_key_refused_in_credentials_mode_before_any_write() {
+        let dir = temp_dir("envelope-cred-refusal");
+        init_identity(&dir, None).unwrap();
+        let before = dir_snapshot(&dir);
+
+        let err = expect_err(rotate_envelope_key_impl(&dir, 3600, true));
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        let msg = err.to_string();
+        assert!(msg.contains("CREDENTIALS_DIRECTORY"), "{msg}");
+        assert!(msg.contains("rotate-envelope-offline"), "{msg}");
+        // Nothing was written: no retired key, envelope_seed untouched.
+        assert_eq!(dir_snapshot(&dir), before);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rotate_signing_key_offline_advances_kel_without_writing_seed() {
+        let dir = temp_dir("rotate-offline");
+        let outcome = init_identity(&dir, None).unwrap();
+        let next_key = *outcome.next_key.as_bytes();
+        let seed_before = fs::read(dir.join("signing_seed")).unwrap();
+        let kel_len_before = load_identity(&dir).unwrap().kel.len();
+
+        let following = SigningSeed::from_bytes([7u8; 32]);
+        let following_commitment = commitment_of(&following);
+        rotate_signing_key_offline(
+            &dir,
+            &next_key,
+            Some(&following_commitment),
+            lattice_core::RotationKind::Rotate,
+        )
+        .unwrap();
+
+        // KEL advanced, commitment updated, signing_seed NOT written.
+        let kel = lattice_proto::kel::decode_kel(&fs::read(dir.join("kel.bin")).unwrap()).unwrap();
+        assert_eq!(kel.len(), kel_len_before + 1);
+        assert_eq!(
+            fs::read(dir.join(NEXT_KEY_COMMITMENT_FILE)).unwrap(),
+            following_commitment.as_bytes()
+        );
+        assert_eq!(fs::read(dir.join("signing_seed")).unwrap(), seed_before);
+
+        // Simulate provisioning the credential with the next key: the daemon
+        // starts and the KEL head check passes.
+        write_seed(&dir, "signing_seed", &next_key).unwrap();
+        let id = load_identity(&dir).unwrap();
+        assert_eq!(id.kel.len(), kel_len_before + 1);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rotate_signing_key_offline_abandon_removes_commitment() {
+        let dir = temp_dir("rotate-offline-abandon");
+        let outcome = init_identity(&dir, None).unwrap();
+        let next_key = *outcome.next_key.as_bytes();
+
+        rotate_signing_key_offline(&dir, &next_key, None, lattice_core::RotationKind::Abandon)
+            .unwrap();
+
+        assert!(!dir.join(NEXT_KEY_COMMITMENT_FILE).exists());
+        let kel = lattice_proto::kel::decode_kel(&fs::read(dir.join("kel.bin")).unwrap()).unwrap();
+        assert!(kel.is_abandoned());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rotate_signing_key_offline_rejects_wrong_key_without_writing() {
+        let dir = temp_dir("rotate-offline-wrong-key");
+        init_identity(&dir, None).unwrap();
+        let before = dir_snapshot(&dir);
+        let following = SigningSeed::from_bytes([7u8; 32]);
+        let following_commitment = commitment_of(&following);
+
+        let err = expect_err(rotate_signing_key_offline(
+            &dir,
+            &[9u8; 32],
+            Some(&following_commitment),
+            lattice_core::RotationKind::Rotate,
+        ));
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(dir_snapshot(&dir), before);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rotate_envelope_key_offline_generates_and_retires() {
+        let dir = temp_dir("envelope-offline");
+        let out_dir = temp_dir("envelope-offline-out");
+        fs::create_dir_all(&out_dir).unwrap();
+        let seed_out = out_dir.join("new_envelope_seed");
+        init_identity(&dir, None).unwrap();
+        let old_seed = fs::read(dir.join("envelope_seed")).unwrap();
+
+        rotate_envelope_key_offline(&dir, 3600, &seed_out, None).unwrap();
+
+        // New seed written with 0600, outside the identity directory.
+        let new_seed = fs::read(&seed_out).unwrap();
+        assert_eq!(new_seed.len(), 32);
+        assert_ne!(new_seed, old_seed);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&seed_out).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        // The old seed was retired into the identity directory and the live
+        // file is gone (file-mode deployments must not keep using it).
+        assert!(!dir.join("envelope_seed").exists());
+        let retired: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .is_some_and(|n| n.starts_with(RETIRED_ENVELOPE_PREFIX))
+            })
+            .collect();
+        assert_eq!(retired.len(), 1);
+        assert_eq!(fs::read(retired[0].path()).unwrap(), old_seed);
+
+        // Simulate provisioning the credential with the new seed: the daemon
+        // starts and the retired key is picked up.
+        write_seed(&dir, "envelope_seed", &new_seed).unwrap();
+        let id = load_identity(&dir).unwrap();
+        assert_eq!(id.retired_xwing.len(), 1);
+
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&out_dir);
+    }
+
+    #[test]
+    fn rotate_envelope_key_offline_without_old_seed_still_rotates() {
+        let dir = temp_dir("envelope-offline-noold");
+        let out_dir = temp_dir("envelope-offline-noold-out");
+        fs::create_dir_all(&out_dir).unwrap();
+        let seed_out = out_dir.join("new_envelope_seed");
+        init_identity(&dir, None).unwrap();
+        fs::remove_file(dir.join("envelope_seed")).unwrap();
+
+        rotate_envelope_key_offline(&dir, 3600, &seed_out, None).unwrap();
+
+        assert_eq!(fs::read(&seed_out).unwrap().len(), 32);
+        let retired = fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).any(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|n| n.starts_with(RETIRED_ENVELOPE_PREFIX))
+        });
+        assert!(!retired);
+
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&out_dir);
+    }
+
+    #[test]
+    fn rotate_envelope_key_offline_uses_explicit_old_seed_file() {
+        let dir = temp_dir("envelope-offline-explicit");
+        let out_dir = temp_dir("envelope-offline-explicit-out");
+        fs::create_dir_all(&out_dir).unwrap();
+        let seed_out = out_dir.join("new_envelope_seed");
+        let old_seed_path = out_dir.join("old_seed");
+        init_identity(&dir, None).unwrap();
+        let old_seed = fs::read(dir.join("envelope_seed")).unwrap();
+        fs::write(&old_seed_path, &old_seed).unwrap();
+        // Remove the in-dir copy so only the explicit file can supply it.
+        fs::remove_file(dir.join("envelope_seed")).unwrap();
+
+        rotate_envelope_key_offline(&dir, 3600, &seed_out, Some(&old_seed_path)).unwrap();
+
+        let retired: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .is_some_and(|n| n.starts_with(RETIRED_ENVELOPE_PREFIX))
+            })
+            .collect();
+        assert_eq!(retired.len(), 1);
+        assert_eq!(fs::read(retired[0].path()).unwrap(), old_seed);
+
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&out_dir);
+    }
+
+    #[test]
+    fn rotate_envelope_key_offline_refuses_seed_out_inside_identity_dir() {
+        let dir = temp_dir("envelope-offline-inside");
+        init_identity(&dir, None).unwrap();
+        let before = dir_snapshot(&dir);
+
+        let err = expect_err(rotate_envelope_key_offline(
+            &dir,
+            3600,
+            &dir.join("envelope_seed.new"),
+            None,
+        ));
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(dir_snapshot(&dir), before);
 
         let _ = fs::remove_dir_all(&dir);
     }
