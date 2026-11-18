@@ -88,7 +88,7 @@ async fn ik_handshake_with_url_path_prefix() {
         .send_frame(&Frame::Ping(PingFrame { nonce: 4321 }), None)
         .await
         .unwrap();
-    let got = server_side.recv_frame().await.unwrap().unwrap();
+    let (got, _bucket) = server_side.recv_frame().await.unwrap().unwrap();
     assert!(matches!(got, Frame::Ping(p) if p.nonce == 4321));
 }
 
