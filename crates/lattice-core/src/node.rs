@@ -283,6 +283,29 @@ enum PendingOrigin {
     },
 }
 
+/// In-memory bookkeeping for a custody entry: the leg to offer on the
+/// wire (cached so retries do not re-parse the message), the retry
+/// backoff state, and the class slot (for drain ordering). Rebuilt at
+/// startup from the custody rows; the store remains the source of truth
+/// for the message itself.
+struct CustodyMeta {
+    offer_leg: Option<LegId>,
+    attempts: u32,
+    next_attempt: u64,
+    class_slot: u8,
+}
+
+/// The fields of an outbound message the due-time indexes are keyed on.
+/// Mirrors the store row; rebuilt at startup and maintained on every
+/// outbound mutation.
+#[derive(Clone, Copy)]
+struct OutboundIndexEntry {
+    next_attempt: u64,
+    receipt_deadline: Option<u64>,
+    exp: u64,
+    state: lattice_store::OutboundState,
+}
+
 /// The parts of an inbound offer the custody-accept path needs,
 /// independent of which path (relay, waypoint, gateway) produced it.
 struct CustodyOffer {
@@ -292,6 +315,9 @@ struct CustodyOffer {
     exp: u64,
     class: u8,
     leg_hash: Hash32,
+    /// True when the stored message carries a hop layer (it is traveling
+    /// toward a waypoint or gateway). Selects the first-leg class phase.
+    has_hop_layer: bool,
 }
 
 struct LinkState {
@@ -449,10 +475,32 @@ pub struct Node<S: Store> {
     /// distribution with this mean, so dummy exchanges look like an
     /// offer and its custody reply (spec §6, snow).
     custody_rtt_ema_ms: Option<f64>,
-    /// Set when a custody entry could not be routed; the core asks to be
-    /// woken at this instant to retry. Cleared and re-armed by
-    /// `drain_custody`.
-    custody_retry_at: Option<u64>,
+    /// Per-leg custody bookkeeping (offer leg, retry backoff, class
+    /// slot). Rebuilt at startup from the custody rows.
+    custody_meta: std::collections::HashMap<LegId, CustodyMeta>,
+    /// Custody legs waiting for their retry backoff to expire, keyed by
+    /// the time they become due. Entries whose offer is in flight are
+    /// not in this index.
+    custody_retry: std::collections::BTreeMap<u64, std::collections::HashSet<LegId>>,
+    /// Custody legs by message expiry (ms), for the expiry sweep.
+    custody_expiry: std::collections::BTreeMap<u64, std::collections::HashSet<LegId>>,
+    /// Bytes of custody held per upstream link, rebuilt at startup from
+    /// the custody rows. Drives the per-upstream aggregate cap.
+    upstream_bytes: std::collections::HashMap<u64, u64>,
+    /// Outbound queue index, keyed by message id. Rebuilt at startup.
+    outbound_index: std::collections::HashMap<MessageId, OutboundIndexEntry>,
+    /// Queued outbound messages by next attempt (ms).
+    outbound_due: std::collections::BTreeMap<u64, std::collections::HashSet<MessageId>>,
+    /// In-flight outbound messages by receipt deadline (ms).
+    outbound_deadline: std::collections::BTreeMap<u64, std::collections::HashSet<MessageId>>,
+    /// Non-terminal outbound messages by expiry (ms).
+    outbound_expiry: std::collections::BTreeMap<u64, std::collections::HashSet<MessageId>>,
+    /// Memoized distance maps, keyed by (records_version, now_secs,
+    /// source). Bounded; cleared when full.
+    distance_cache: std::collections::HashMap<
+        (u64, u64, Identifier),
+        Arc<std::collections::BTreeMap<Identifier, u32>>,
+    >,
     record_refresh_at: u64,
     /// Links that went down within the grace window; still advertised.
     recently_lost: Vec<LostLink>,
@@ -512,9 +560,6 @@ pub struct Node<S: Store> {
     /// Drained by `handle` and returned alongside the actions; the caller
     /// decides how to surface them.
     diagnostics: Vec<Diagnostic>,
-    /// Consecutive `outbound_due` failures; reset on success. Keeps a
-    /// persistently failing outbound queue loud instead of silent.
-    outbound_due_failures: u32,
 }
 
 impl<S: Store> Node<S> {
@@ -563,7 +608,15 @@ impl<S: Store> Node<S> {
             snow_history: [0; 4],
             inner_pending_echo: Vec::new(),
             custody_rtt_ema_ms: None,
-            custody_retry_at: None,
+            custody_meta: std::collections::HashMap::new(),
+            custody_retry: std::collections::BTreeMap::new(),
+            custody_expiry: std::collections::BTreeMap::new(),
+            upstream_bytes: std::collections::HashMap::new(),
+            outbound_index: std::collections::HashMap::new(),
+            outbound_due: std::collections::BTreeMap::new(),
+            outbound_deadline: std::collections::BTreeMap::new(),
+            outbound_expiry: std::collections::BTreeMap::new(),
+            distance_cache: std::collections::HashMap::new(),
             record_refresh_at: first_refresh,
             recently_lost: Vec::new(),
             last_published_links: Vec::new(),
@@ -588,7 +641,6 @@ impl<S: Store> Node<S> {
             #[cfg(test)]
             validation_count: 0,
             diagnostics: Vec::new(),
-            outbound_due_failures: 0,
         };
         // Load and validate the stored records once; the index serves
         // every later read. Records that fail validation stay in the store
@@ -656,6 +708,27 @@ impl<S: Store> Node<S> {
                 }
             }
             Err(e) => node.diag("outbound_all", &e),
+        }
+        // Rebuild the in-memory due-time indexes and the per-upstream byte
+        // counts from the store; neither is persisted. Custody entries are
+        // re-armed for immediate forwarding.
+        match node.store.outbound_all() {
+            Ok(all) => {
+                for msg in all {
+                    let msg = outbound_from_store(msg);
+                    node.index_outbound(&msg);
+                }
+            }
+            Err(e) => node.diag("outbound_all", &e),
+        }
+        match node.store.custody_all() {
+            Ok(all) => {
+                for entry in all {
+                    let entry = custody_from_store(entry);
+                    node.track_custody_insert(&entry, now);
+                }
+            }
+            Err(e) => node.diag("custody_all", &e),
         }
         Ok(node)
     }
@@ -803,8 +876,8 @@ impl<S: Store> Node<S> {
             // actually pruned and the advertised set changes.
             consider(t.saturating_add(LINK_GRACE_MS).saturating_add(1));
         }
-        if let Some(t) = self.custody_retry_at {
-            consider(t);
+        if let Some(t) = self.custody_retry.keys().next() {
+            consider(*t);
         }
         if let Some(t) = self
             .pending
@@ -814,27 +887,17 @@ impl<S: Store> Node<S> {
         {
             consider(t);
         }
-        // Store-derived deadlines (store values are seconds; the
-        // boundary helpers convert to ms).
-        if let Ok(all) = self.store.outbound_all() {
-            for m in all.into_iter().map(outbound_from_store) {
-                if m.state == OutboundState::Queued {
-                    consider(m.next_attempt);
-                }
-                if m.state == OutboundState::InFlight {
-                    if let Some(d) = m.receipt_deadline {
-                        consider(d);
-                    }
-                }
-                if !m.state.is_terminal() {
-                    consider(m.exp);
-                }
-            }
+        if let Some(t) = self.outbound_due.keys().next() {
+            consider(*t);
         }
-        if let Ok(all) = self.store.custody_all() {
-            for e in all.into_iter().map(custody_from_store) {
-                consider(e.exp);
-            }
+        if let Some(t) = self.outbound_deadline.keys().next() {
+            consider(*t);
+        }
+        if let Some(t) = self.outbound_expiry.keys().next() {
+            consider(*t);
+        }
+        if let Some(t) = self.custody_expiry.keys().next() {
+            consider(*t);
         }
         best
     }
@@ -1165,11 +1228,10 @@ impl<S: Store> Node<S> {
     /// Records were validated once, at admission or startup; building the
     /// graph is a BFS over already-validated entries, so it never touches
     /// the store or the signature verifier. The result is memoized on
-    /// `(derived_version, now)` so repeated calls within one operation
-    /// (relay path, `class_for`, `pick_next_hop`) rebuild at most once per
-    /// clock tick and once per index mutation.
+    /// `(derived_version, now_secs)` so repeated calls within one second
+    /// and one index mutation share one build.
     fn build_graph(&mut self) -> Arc<Graph> {
-        let key = (self.derived_version, self.now);
+        let key = (self.derived_version, ms_to_secs(self.now));
         if let Some((v, t, g)) = &self.graph_cache {
             if (*v, *t) == key {
                 return Arc::clone(g);
@@ -1203,6 +1265,23 @@ impl<S: Store> Node<S> {
         let graph = Arc::new(graph);
         self.graph_cache = Some((key.0, key.1, Arc::clone(&graph)));
         graph
+    }
+
+    /// Distance map from `source` to every reachable node, memoized per
+    /// (records_version, now_secs, source). BFS is O(V + E); without this
+    /// every custody forward recomputed it per entry per tick.
+    fn distances_cached(&mut self, source: &Identifier) -> Arc<BTreeMap<Identifier, u32>> {
+        let key = (self.derived_version, ms_to_secs(self.now), *source);
+        if let Some(d) = self.distance_cache.get(&key) {
+            return Arc::clone(d);
+        }
+        let graph = self.build_graph();
+        let dist = Arc::new(graph.distances(source));
+        if self.distance_cache.len() >= 256 {
+            self.distance_cache.clear();
+        }
+        self.distance_cache.insert(key, Arc::clone(&dist));
+        dist
     }
 
     /// Reconcile item list for the stored records. Memoized on the same
@@ -1721,6 +1800,8 @@ impl<S: Store> Node<S> {
                     if terminal && msg.exp.saturating_add(RETENTION_GRACE_MS) < now {
                         if let Err(e) = self.store.outbound_remove(&msg.mid) {
                             self.diag("outbound_remove", &e);
+                        } else {
+                            self.unindex_outbound(&msg.mid);
                         }
                     }
                 }
@@ -1980,9 +2061,15 @@ const INBOX_TTL_SECS: u64 = 30 * 24 * 3600;
 /// store takes seconds).
 const KEL_HEAD_MAX_AGE_SECS: u64 = 365 * 24 * 3600;
 const BUF_CLASSES: usize = 16;
-/// Backstop for a custody entry with no route: retry this often until a
-/// route appears (an event can also trigger a retry sooner).
-const CUSTODY_RETRY_MS: u64 = 5_000;
+/// Class slots: two leg phases of [`BUF_CLASSES`] classes each. Slot =
+/// phase * 16 + class, where phase 0 (slots 0..16) is the second leg (no
+/// hop layer; the message is traveling toward its final destination) and
+/// phase 1 (slots 16..32) is the first leg (hop layer present; toward the
+/// waypoint or gateway). Slots are internal; the wire never sees them.
+const CLASS_SLOTS: usize = 2 * BUF_CLASSES;
+/// Base delay for the per-entry custody retry backoff. Doubles per failed
+/// attempt up to the configured `retry_max_secs`.
+const CUSTODY_RETRY_BASE_MS: u64 = 5_000;
 /// Per-link budget for echo replies (R-29): a peer cannot make us emit
 /// more than a small burst plus a slow trickle of echo replies.
 const ECHO_BUDGET_CAPACITY: f64 = 8.0;
@@ -1995,6 +2082,39 @@ const DEFAULT_CUSTODY_RTT_MS: f64 = 100.0;
 const MAX_ECHO_DELAY_MS: u64 = 60_000;
 /// Exponential smoothing factor for the custody-reply RTT estimate.
 const CUSTODY_RTT_ALPHA: f64 = 0.125;
+
+/// Per-slot reserve for the buffer classes: the minimum bytes a class
+/// slot can always hold, even when the shared pool is exhausted. Sized so
+/// every slot holds at least one minimum-bucket message on any cap of
+/// 64 KiB or more, and never more than a quarter of the cap in total.
+/// The shared pool is what remains after all reserves.
+fn class_reserve(transit_cap: u64) -> u64 {
+    (transit_cap / 128).max(2048.min(transit_cap / 32)).max(1)
+}
+
+/// Bytes available to all slots above their reserves.
+fn shared_pool_cap(transit_cap: u64) -> u64 {
+    transit_cap.saturating_sub(CLASS_SLOTS as u64 * class_reserve(transit_cap))
+}
+
+/// The class slot for a (phase, class) pair. `has_hop_layer` selects the
+/// first-leg phase (toward the waypoint/gateway); otherwise the message is
+/// on its second leg (toward the final destination).
+fn class_slot(has_hop_layer: bool, class: u8) -> u8 {
+    if has_hop_layer {
+        BUF_CLASSES as u8 + class
+    } else {
+        class
+    }
+}
+
+/// Exponential backoff for a relayed custody entry that cannot be placed:
+/// `base * 2^(attempts - 1)`, capped at `retry_max_secs`.
+fn custody_backoff_ms(attempts: u32, retry_max_secs: u64) -> u64 {
+    let shift = attempts.saturating_sub(1).min(20);
+    let cap = secs_to_ms(retry_max_secs).max(CUSTODY_RETRY_BASE_MS);
+    CUSTODY_RETRY_BASE_MS.saturating_mul(1u64 << shift).min(cap)
+}
 
 // ── store boundary conversions ──────────────────────────────────────
 // The store keeps Unix seconds; the core keeps milliseconds. These
@@ -2107,7 +2227,7 @@ impl<S: Store> Node<S> {
             next_attempt: now,
             route: send.route,
         };
-        if let Err(e) = self.store.outbound_push(&outbound_to_store(&outbound)) {
+        if let Err(e) = self.push_outbound(&outbound) {
             self.diag("outbound_push", &e);
             return vec![Action::Status {
                 mid,
@@ -2300,27 +2420,38 @@ impl<S: Store> Node<S> {
 
     fn pump_outbound(&mut self, now: u64) -> Vec<Action> {
         let mut actions = Vec::new();
-        let due = match self.store.outbound_due(ms_to_secs(now)) {
-            Ok(d) => {
-                self.outbound_due_failures = 0;
-                d
+        // Collect the due messages from the in-memory index, then process
+        // them in (priority, next_attempt) order.
+        let due_mids: Vec<MessageId> = self
+            .outbound_due
+            .range(..=now)
+            .flat_map(|(_, mids)| mids.iter().copied())
+            .collect();
+        let mut due: Vec<lattice_store::OutboundMessage> = Vec::with_capacity(due_mids.len());
+        for mid in due_mids {
+            match self.store.outbound_get(&mid) {
+                Ok(Some(msg)) => {
+                    let msg = outbound_from_store(msg);
+                    if msg.state == OutboundState::Queued
+                        && msg.next_attempt <= now
+                        && msg.exp > now
+                    {
+                        due.push(msg);
+                    } else {
+                        // Index drifted; re-sync it.
+                        self.index_outbound(&msg);
+                    }
+                }
+                Ok(None) => self.unindex_outbound(&mid),
+                Err(e) => self.diag("outbound_get", &e),
             }
-            Err(e) => {
-                // The queue stalls until the store recovers. That is the safe
-                // direction (nothing is lost or double-sent), but it must not
-                // be silent: report every failure with a consecutive count so
-                // a persistent outage is loud, not a one-off.
-                self.outbound_due_failures = self.outbound_due_failures.saturating_add(1);
-                let n = self.outbound_due_failures;
-                self.diag(
-                    "outbound_due",
-                    format_args!("{e} (consecutive failure #{n})"),
-                );
-                return actions;
-            }
-        };
-        for msg in due {
-            let mut msg = outbound_from_store(msg);
+        }
+        due.sort_by(|a, b| {
+            b.priority
+                .cmp(&a.priority)
+                .then(a.next_attempt.cmp(&b.next_attempt))
+        });
+        for mut msg in due {
             if msg.state != OutboundState::Queued {
                 continue;
             }
@@ -2336,24 +2467,18 @@ impl<S: Store> Node<S> {
                             // The receipt clock starts when the message
                             // actually goes on the wire, not at enqueue.
                             msg.receipt_deadline = Some(now + self.receipt_timeout_for(&msg));
-                            if let Err(e) = self.store.outbound_put(&outbound_to_store(&msg)) {
-                                self.diag("outbound_put", &e);
-                            }
+                            self.store_outbound(&msg);
                         }
                         DispatchResult::NoRoute => {
                             msg.requeue(now + self.backoff(msg.attempts));
-                            if let Err(e) = self.store.outbound_put(&outbound_to_store(&msg)) {
-                                self.diag("outbound_put", &e);
-                            }
+                            self.store_outbound(&msg);
                         }
                     }
                 }
                 Err(BuildError::NoRoute) => {
                     if msg.attempts > self.config.fresh_waypoint_retries + 1 {
                         msg.mark_failed();
-                        if let Err(e) = self.store.outbound_put(&outbound_to_store(&msg)) {
-                            self.diag("outbound_put", &e);
-                        }
+                        self.store_outbound(&msg);
                         if let Err(e) = self.store.status_set(
                             &msg.mid,
                             local::MSG_STATUS_FAILED,
@@ -2370,17 +2495,13 @@ impl<S: Store> Node<S> {
                         });
                     } else {
                         msg.next_attempt = now + secs_to_ms(self.config.retry_base_secs);
-                        if let Err(e) = self.store.outbound_put(&outbound_to_store(&msg)) {
-                            self.diag("outbound_put", &e);
-                        }
+                        self.store_outbound(&msg);
                     }
                 }
                 Err(BuildError::Crypto) => {
                     // Deterministic failure: retrying cannot help.
                     msg.mark_failed();
-                    if let Err(e) = self.store.outbound_put(&outbound_to_store(&msg)) {
-                        self.diag("outbound_put", &e);
-                    }
+                    self.store_outbound(&msg);
                     if let Err(e) = self.store.status_set(
                         &msg.mid,
                         local::MSG_STATUS_FAILED,
@@ -2435,7 +2556,7 @@ impl<S: Store> Node<S> {
         // Distances are measured from the destination; the graph is undirected,
         // so BFS from dst gives each node's distance to the destination.
         let graph = self.build_graph();
-        let dist = graph.distances(dst);
+        let dist = self.distances_cached(dst);
         let excluded_peers: HashSet<Identifier> = exclude
             .iter()
             .filter(|e| e.until > now)
@@ -2444,7 +2565,7 @@ impl<S: Store> Node<S> {
         let up: HashSet<Identifier> = self.links.values().filter_map(|l| l.peer).collect();
         let peer = graph.next_hop(
             &self.own_id,
-            &dist,
+            dist.as_ref(),
             self.config.sideways_prob,
             &excluded_peers,
             &up,
@@ -2585,8 +2706,7 @@ impl<S: Store> Node<S> {
         // Relay path: buffer class (forwarding priority / wait order), fair
         // share per destination upstream, transit cap.
         let dist = {
-            let g = self.build_graph();
-            let d = g.distances(&self.own_id);
+            let d = self.distances_cached(&self.own_id.clone());
             d.get(&dst).copied().unwrap_or(u32::MAX) as usize
         };
         let class = dist.min(BUF_CLASSES - 1) as u8;
@@ -2600,6 +2720,7 @@ impl<S: Store> Node<S> {
                 exp: secs_to_ms(msg.header.exp),
                 class,
                 leg_hash,
+                has_hop_layer: msg.hop_layer.is_some(),
             },
             &mut actions,
         );
@@ -2610,8 +2731,11 @@ impl<S: Store> Node<S> {
     /// error, fail closed (treat the allowance as exhausted) and report.
     #[must_use]
     fn share_exceeded(&mut self, dest: &Identifier, link: LinkId, msg_len: u64) -> bool {
-        let upstream_count = self.links.len().max(1) as u64;
-        let share_limit = self.config.custody_allowance / upstream_count;
+        // Per-destination allowance, divided among the upstreams currently
+        // active for that destination (those holding a non-zero share). An
+        // upstream with no share yet is counted too, so a newcomer cannot
+        // ride on the shares of those already present. On store error,
+        // fail closed.
         let used = match self.store.share_get(dest, link) {
             Ok(v) => v,
             Err(e) => {
@@ -2619,22 +2743,62 @@ impl<S: Store> Node<S> {
                 u64::MAX
             }
         };
-        used.saturating_add(msg_len) > share_limit
+        let active = match self.store.share_upstream_count(dest) {
+            Ok(v) => v,
+            Err(e) => {
+                self.diag("share_upstream_count", &e);
+                u64::MAX
+            }
+        };
+        let divisor = if used > 0 {
+            active
+        } else {
+            active.saturating_add(1)
+        }
+        .max(1);
+        let share_limit = self.config.custody_allowance / divisor;
+        if used.saturating_add(msg_len) > share_limit {
+            return true;
+        }
+        // Per-upstream aggregate cap across all destinations: one upstream
+        // flooding many destinations cannot fill a class slice.
+        let bound_links = self
+            .links
+            .values()
+            .filter(|l| l.peer.is_some())
+            .count()
+            .max(1) as u64;
+        let aggregate_cap = self.config.transit_cap / bound_links;
+        let aggregate_used = self.upstream_bytes.get(&link).copied().unwrap_or(0);
+        aggregate_used.saturating_add(msg_len) > aggregate_cap
     }
 
-    /// Transit-cap check for a buffer class. On store error, fail closed
-    /// (treat the class as full) and report.
+    /// Buffer-class admission check for one class slot. Each slot has a
+    /// small reserve it can always use; above the reserve, slots draw from
+    /// a shared pool. First-leg (hop layer present) and second-leg slots
+    /// never share a reserve, so a second-leg wait never depends on
+    /// first-leg space; both may draw on the shared pool, which is what
+    /// lets a first leg wait on second-leg space. On store error, fail
+    /// closed (treat the slot as full) and report.
     #[must_use]
-    fn class_full(&mut self, class: u8, msg_len: u64) -> bool {
+    fn class_full(&mut self, slot: u8, msg_len: u64) -> bool {
         let class_bytes = match self.store.custody_class_bytes() {
             Ok(b) => b,
             Err(e) => {
                 self.diag("custody_class_bytes", &e);
-                [u64::MAX; 16]
+                [u64::MAX; CLASS_SLOTS]
             }
         };
-        class_bytes[class as usize].saturating_add(msg_len)
-            > self.config.transit_cap / BUF_CLASSES as u64
+        let reserve = class_reserve(self.config.transit_cap);
+        let slot_used = class_bytes[slot as usize];
+        if slot_used.saturating_add(msg_len) <= reserve {
+            return false;
+        }
+        let shared_used: u64 = class_bytes
+            .iter()
+            .map(|&used| used.saturating_sub(reserve))
+            .sum();
+        shared_used.saturating_add(msg_len) > shared_pool_cap(self.config.transit_cap)
     }
 
     fn busy(&self, link: LinkId, leg: LegId) -> Action {
@@ -2709,24 +2873,25 @@ impl<S: Store> Node<S> {
             exp,
             class,
             leg_hash,
+            has_hop_layer,
         } = offer;
         let msg_len = message.len() as u64;
-        // Fair-share accounting is per (destination, upstream link): each
-        // upstream gets custody_allowance/N per destination. The spec's
-        // wording suggests a per-upstream aggregate cap; the per-destination
-        // form is strictly more permissive for single-destination floods and
-        // equivalent otherwise. If per-upstream aggregate accounting is ever
-        // wanted, add a second counter keyed by upstream alone and check both
-        // here — the store already keys shares by (dest, upstream).
+        // Fair-share accounting is per (destination, upstream link), with
+        // the allowance divided among the upstreams currently active for
+        // the destination, plus a per-upstream aggregate cap so one
+        // upstream flooding many destinations cannot fill a class slice.
         if self.share_exceeded(&destination, link, msg_len) {
             actions.push(self.busy(link, leg));
             return;
         }
-        // Merlin-Schweitzer buffer classes: each class gets an equal slice
-        // of the transit cap, so a flood in one class cannot starve the
-        // others and waits can't form a cycle (a class-d message only ever
-        // waits on class < d room at the next hop).
-        if self.class_full(class, msg_len) {
+        // Buffer classes: a shared pool plus a small per-slot reserve.
+        // First-leg (hop layer present) and second-leg slots never share
+        // a reserve, so a second-leg wait never depends on first-leg
+        // space; both may draw on the shared pool, which is what lets a
+        // first leg wait on second-leg space. A class-d message only ever
+        // waits on class < d room at the next hop, so waits cannot cycle.
+        let slot = class_slot(has_hop_layer, class);
+        if self.class_full(slot, msg_len) {
             actions.push(self.busy(link, leg));
             return;
         }
@@ -2735,13 +2900,13 @@ impl<S: Store> Node<S> {
             message,
             upstream: link,
             destination,
-            class,
+            class: slot,
             exp,
             // Never hand the message back to the link it arrived on.
             excluded: vec![Exclusion { link, until: exp }],
         };
         let accept = CustodyAccept {
-            entry: custody_to_store(entry),
+            entry: custody_to_store(entry.clone()),
             share_dest: destination,
             share_upstream: link,
             share_bytes: msg_len as i64,
@@ -2753,6 +2918,8 @@ impl<S: Store> Node<S> {
             actions.push(self.busy(link, leg));
             return;
         }
+        // The store committed; track the entry in the in-memory indexes.
+        self.track_custody_insert(&entry, now);
         actions.push(Self::custody_accepted(link, leg));
         self.forward_custody(now, leg, actions);
     }
@@ -2805,6 +2972,7 @@ impl<S: Store> Node<S> {
                             exp: secs_to_ms(hdr_exp),
                             class,
                             leg_hash: *leg_hash,
+                            has_hop_layer: false,
                         },
                         &mut actions,
                     );
@@ -2830,6 +2998,7 @@ impl<S: Store> Node<S> {
                             exp: secs_to_ms(msg.header.exp),
                             class,
                             leg_hash: *leg_hash,
+                            has_hop_layer: false,
                         },
                         &mut actions,
                     );
@@ -3023,8 +3192,7 @@ impl<S: Store> Node<S> {
     }
 
     fn class_for(&mut self, dst: &Identifier) -> u8 {
-        let g = self.build_graph();
-        let d = g.distances(&self.own_id);
+        let d = self.distances_cached(&self.own_id.clone());
         d.get(dst)
             .copied()
             .unwrap_or(u32::MAX)
@@ -3042,23 +3210,25 @@ impl<S: Store> Node<S> {
             }
         };
         if entry.exp <= now {
-            if let Err(e) = self.store.custody_remove(&leg) {
-                self.diag("custody_remove", &e);
-            }
-            if let Err(e) = self.store.share_add(
-                &entry.destination,
-                entry.upstream,
-                -(entry.message.len() as i64),
-            ) {
-                self.diag("share_add", &e);
-            }
+            self.release_custody(leg);
             return;
         }
         let dst = entry.destination;
         // The offer we send may carry a *different* leg than the custody key
         // (waypoint re-origination): key `pending` by the leg on the wire.
-        let offer_leg = lattice_proto::Message::parse(&entry.message, ms_to_secs(now))
-            .map_or(entry.leg, |m| m.header.leg);
+        // Parsed once and cached in the custody meta.
+        let offer_leg = match self.custody_meta.get(&leg).and_then(|m| m.offer_leg) {
+            Some(l) => l,
+            None => {
+                let parsed = lattice_proto::Message::parse(&entry.message, ms_to_secs(now))
+                    .map(|m| m.header.leg)
+                    .unwrap_or(entry.leg);
+                if let Some(meta) = self.custody_meta.get_mut(&leg) {
+                    meta.offer_leg = Some(parsed);
+                }
+                parsed
+            }
+        };
         let excluded: Vec<Exclusion> = entry
             .excluded
             .iter()
@@ -3070,14 +3240,22 @@ impl<S: Store> Node<S> {
             peer: _peer,
         }) = self.pick_next_hop(&dst, &excluded, now)
         else {
-            // No route right now. Ask to be woken to retry; events that
-            // create routes (link up, records arriving) also re-drive
+            // No route right now. Back off exponentially (capped); events
+            // that create routes (link up, records arriving) also re-drive
             // custody, but only once one of them happens.
-            let retry_at = now + CUSTODY_RETRY_MS;
-            self.custody_retry_at =
-                Some(self.custody_retry_at.map_or(retry_at, |t| t.min(retry_at)));
+            let attempts = self
+                .custody_meta
+                .get(&leg)
+                .map(|m| m.attempts)
+                .unwrap_or(0)
+                .saturating_add(1);
+            let backoff = custody_backoff_ms(attempts, self.config.retry_max_secs);
+            self.reschedule_custody(leg, now.saturating_add(backoff), attempts);
             return;
         };
+        // The entry is now in flight; it leaves the retry index until the
+        // reply arrives or the offer times out.
+        self.untrack_custody_retry(leg);
 
         self.pending.insert(
             offer_leg,
@@ -3154,6 +3332,195 @@ impl<S: Store> Node<S> {
     fn store_outbound(&mut self, msg: &lattice_store::OutboundMessage) {
         if let Err(e) = self.store.outbound_put(&outbound_to_store(msg)) {
             self.diag("outbound_put", &e);
+            return;
+        }
+        self.index_outbound(msg);
+    }
+
+    /// Push a new outbound message to the store and index it.
+    fn push_outbound(
+        &mut self,
+        msg: &lattice_store::OutboundMessage,
+    ) -> Result<(), lattice_store::StoreError> {
+        self.store.outbound_push(&outbound_to_store(msg))?;
+        self.index_outbound(msg);
+        Ok(())
+    }
+
+    /// Insert or refresh an outbound message's due-time index entries.
+    fn index_outbound(&mut self, msg: &lattice_store::OutboundMessage) {
+        let entry = OutboundIndexEntry {
+            next_attempt: msg.next_attempt,
+            receipt_deadline: msg.receipt_deadline,
+            exp: msg.exp,
+            state: msg.state,
+        };
+        if let Some(old) = self.outbound_index.insert(msg.mid, entry) {
+            Self::outbound_index_remove(
+                &mut self.outbound_due,
+                &mut self.outbound_deadline,
+                &mut self.outbound_expiry,
+                msg.mid,
+                &old,
+            );
+        }
+        if entry.state == OutboundState::Queued {
+            self.outbound_due
+                .entry(entry.next_attempt)
+                .or_default()
+                .insert(msg.mid);
+        }
+        if entry.state == OutboundState::InFlight {
+            if let Some(d) = entry.receipt_deadline {
+                self.outbound_deadline.entry(d).or_default().insert(msg.mid);
+            }
+        }
+        if !entry.state.is_terminal() {
+            self.outbound_expiry
+                .entry(entry.exp)
+                .or_default()
+                .insert(msg.mid);
+        }
+    }
+
+    /// Drop an outbound message's due-time index entries.
+    fn unindex_outbound(&mut self, mid: &MessageId) {
+        if let Some(old) = self.outbound_index.remove(mid) {
+            Self::outbound_index_remove(
+                &mut self.outbound_due,
+                &mut self.outbound_deadline,
+                &mut self.outbound_expiry,
+                *mid,
+                &old,
+            );
+        }
+    }
+
+    fn outbound_index_remove(
+        due: &mut std::collections::BTreeMap<u64, std::collections::HashSet<MessageId>>,
+        deadline: &mut std::collections::BTreeMap<u64, std::collections::HashSet<MessageId>>,
+        expiry: &mut std::collections::BTreeMap<u64, std::collections::HashSet<MessageId>>,
+        mid: MessageId,
+        old: &OutboundIndexEntry,
+    ) {
+        fn remove_from(
+            map: &mut std::collections::BTreeMap<u64, std::collections::HashSet<MessageId>>,
+            key: u64,
+            mid: &MessageId,
+        ) {
+            if let Some(set) = map.get_mut(&key) {
+                set.remove(mid);
+                if set.is_empty() {
+                    map.remove(&key);
+                }
+            }
+        }
+        if old.state == OutboundState::Queued {
+            remove_from(due, old.next_attempt, &mid);
+        }
+        if old.state == OutboundState::InFlight {
+            if let Some(d) = old.receipt_deadline {
+                remove_from(deadline, d, &mid);
+            }
+        }
+        if !old.state.is_terminal() {
+            remove_from(expiry, old.exp, &mid);
+        }
+    }
+
+    /// Register a custody entry in the in-memory indexes. `next_attempt`
+    /// is when the entry first becomes due for a forwarding attempt.
+    fn track_custody_insert(&mut self, entry: &CustodyEntry, next_attempt: u64) {
+        self.custody_meta.insert(
+            entry.leg,
+            CustodyMeta {
+                offer_leg: None,
+                attempts: 0,
+                next_attempt,
+                class_slot: entry.class,
+            },
+        );
+        self.custody_retry
+            .entry(next_attempt)
+            .or_default()
+            .insert(entry.leg);
+        self.custody_expiry
+            .entry(entry.exp)
+            .or_default()
+            .insert(entry.leg);
+        *self.upstream_bytes.entry(entry.upstream).or_insert(0) += entry.message.len() as u64;
+    }
+
+    /// Drop a custody entry from the in-memory indexes.
+    fn track_custody_remove(&mut self, entry: &CustodyEntry) {
+        if let Some(meta) = self.custody_meta.remove(&entry.leg) {
+            if let Some(set) = self.custody_retry.get_mut(&meta.next_attempt) {
+                set.remove(&entry.leg);
+                if set.is_empty() {
+                    self.custody_retry.remove(&meta.next_attempt);
+                }
+            }
+        }
+        if let Some(set) = self.custody_expiry.get_mut(&entry.exp) {
+            set.remove(&entry.leg);
+            if set.is_empty() {
+                self.custody_expiry.remove(&entry.exp);
+            }
+        }
+        if let Some(v) = self.upstream_bytes.get_mut(&entry.upstream) {
+            *v = v.saturating_sub(entry.message.len() as u64);
+            if *v == 0 {
+                self.upstream_bytes.remove(&entry.upstream);
+            }
+        }
+    }
+
+    /// Re-arm a custody entry's retry timer with a fresh backoff.
+    fn reschedule_custody(&mut self, leg: LegId, next_attempt: u64, attempts: u32) {
+        if let Some(meta) = self.custody_meta.get_mut(&leg) {
+            if let Some(set) = self.custody_retry.get_mut(&meta.next_attempt) {
+                set.remove(&leg);
+                if set.is_empty() {
+                    self.custody_retry.remove(&meta.next_attempt);
+                }
+            }
+            meta.next_attempt = next_attempt;
+            meta.attempts = attempts;
+            self.custody_retry
+                .entry(next_attempt)
+                .or_default()
+                .insert(leg);
+        }
+    }
+
+    /// Remove a custody entry from the retry index (its offer is in
+    /// flight; the reply or the stale-offer sweep re-arms it).
+    fn untrack_custody_retry(&mut self, leg: LegId) {
+        if let Some(meta) = self.custody_meta.get(&leg) {
+            let at = meta.next_attempt;
+            if let Some(set) = self.custody_retry.get_mut(&at) {
+                set.remove(&leg);
+                if set.is_empty() {
+                    self.custody_retry.remove(&at);
+                }
+            }
+        }
+    }
+
+    /// Atomically release a custody entry (row delete + share decrement in
+    /// one store transaction) and drop it from the in-memory indexes.
+    fn release_custody(&mut self, leg: LegId) -> Option<CustodyEntry> {
+        match self.store.custody_release(&leg) {
+            Ok(Some(e)) => {
+                let e = custody_from_store(e);
+                self.track_custody_remove(&e);
+                Some(e)
+            }
+            Ok(None) => None,
+            Err(e) => {
+                self.diag("custody_release", &e);
+                None
+            }
         }
     }
 
@@ -3184,18 +3551,8 @@ impl<S: Store> Node<S> {
     /// refused). `ALREADY_HAVE` does not release: the downstream may only
     /// have seen the leg, not hold the message.
     fn release_relay_custody(&mut self, custody_leg: LegId) {
-        match self.store.custody_remove(&custody_leg) {
-            Ok(Some(e)) => {
-                if let Err(e) =
-                    self.store
-                        .share_add(&e.destination, e.upstream, -(e.message.len() as i64))
-                {
-                    self.diag("share_add", &e);
-                }
-            }
-            Ok(None) => {}
-            Err(e) => self.diag("custody_remove", &e),
-        }
+        // One atomic store operation: custody row delete + share decrement.
+        self.release_custody(custody_leg);
     }
 
     fn custody_accepted_reply(&mut self, pending: Option<PendingOffer>, actions: &mut Vec<Action>) {
@@ -3371,9 +3728,7 @@ impl<S: Store> Node<S> {
                     } else {
                         msg.mark_failed();
                     }
-                    if let Err(e) = self.store.outbound_put(&outbound_to_store(&msg)) {
-                        self.diag("outbound_put", &e);
-                    }
+                    self.store_outbound(&msg);
                 }
                 // Terminal states are sticky: a late receipt must not flip
                 // Delivered/Failed/Expired.
@@ -3467,7 +3822,7 @@ impl<S: Store> Node<S> {
             next_attempt: now,
             route: 0,
         };
-        if let Err(e) = self.store.outbound_push(&outbound_to_store(&outbound)) {
+        if let Err(e) = self.push_outbound(&outbound) {
             self.diag("outbound_push", &e);
             return Vec::new();
         }
@@ -3553,34 +3908,46 @@ impl<S: Store> Node<S> {
     /// Expire originated messages whose horizon has passed.
     fn expire_outbound(&mut self, now: u64) -> Vec<Action> {
         let mut actions = Vec::new();
-        match self.store.outbound_all() {
-            Ok(mut all) => {
-                all.sort_by_key(|m| m.mid);
-                for msg in all {
-                    let mut msg = outbound_from_store(msg);
-                    if !msg.state.is_terminal() && msg.exp <= now {
-                        msg.mark_expired();
-                        if let Err(e) = self.store.outbound_put(&outbound_to_store(&msg)) {
-                            self.diag("outbound_put", &e);
-                        }
-                        if let Err(e) = self.store.status_set(
-                            &msg.mid,
-                            local::MSG_STATUS_EXPIRED,
-                            Some(ERR_EXPIRED),
-                            ms_to_secs(now),
-                        ) {
-                            self.diag("status_set", &e);
-                        }
-                        actions.push(Action::Status {
-                            mid: msg.mid,
-                            status: local::MSG_STATUS_EXPIRED,
-                            detail: Some(ERR_EXPIRED),
-                            service: msg.envelope.fsvc.clone(),
-                        });
-                    }
+        let due: Vec<MessageId> = self
+            .outbound_expiry
+            .range(..=now)
+            .flat_map(|(_, mids)| mids.iter().copied())
+            .collect();
+        for mid in due {
+            let mut msg = match self.store.outbound_get(&mid) {
+                Ok(Some(m)) => outbound_from_store(m),
+                // Gone from the store: drop the stale index entry.
+                Ok(None) => {
+                    self.unindex_outbound(&mid);
+                    continue;
                 }
+                // Store error: keep the index entry and retry next tick.
+                Err(e) => {
+                    self.diag("outbound_get", &e);
+                    continue;
+                }
+            };
+            if msg.state.is_terminal() || msg.exp > now {
+                // Index drifted; re-sync it.
+                self.index_outbound(&msg);
+                continue;
             }
-            Err(e) => self.diag("outbound_all", &e),
+            msg.mark_expired();
+            self.store_outbound(&msg);
+            if let Err(e) = self.store.status_set(
+                &msg.mid,
+                local::MSG_STATUS_EXPIRED,
+                Some(ERR_EXPIRED),
+                ms_to_secs(now),
+            ) {
+                self.diag("status_set", &e);
+            }
+            actions.push(Action::Status {
+                mid: msg.mid,
+                status: local::MSG_STATUS_EXPIRED,
+                detail: Some(ERR_EXPIRED),
+                service: msg.envelope.fsvc.clone(),
+            });
         }
         actions
     }
@@ -3588,48 +3955,56 @@ impl<S: Store> Node<S> {
     /// Receipt deadlines: retry via a fresh waypoint, else fail.
     fn sweep_receipt_deadlines(&mut self, now: u64) -> Vec<Action> {
         let mut actions = Vec::new();
-        match self.store.outbound_all() {
-            Ok(mut all) => {
-                all.sort_by_key(|m| m.mid);
-                for msg in all {
-                    let mut msg = outbound_from_store(msg);
-                    if msg.state != OutboundState::InFlight {
-                        continue;
-                    }
-                    let Some(deadline) = msg.receipt_deadline else {
-                        continue;
-                    };
-                    if now < deadline {
-                        continue;
-                    }
-                    if msg.attempts > self.config.fresh_waypoint_retries {
-                        msg.mark_failed();
-                        if let Err(e) = self.store.outbound_put(&outbound_to_store(&msg)) {
-                            self.diag("outbound_put", &e);
-                        }
-                        if let Err(e) = self.store.status_set(
-                            &msg.mid,
-                            local::MSG_STATUS_FAILED,
-                            Some(ERR_NO_ROUTE),
-                            ms_to_secs(now),
-                        ) {
-                            self.diag("status_set", &e);
-                        }
-                        actions.push(Action::Status {
-                            mid: msg.mid,
-                            status: local::MSG_STATUS_FAILED,
-                            detail: Some(ERR_NO_ROUTE),
-                            service: msg.envelope.fsvc.clone(),
-                        });
-                    } else {
-                        msg.requeue(now);
-                        if let Err(e) = self.store.outbound_put(&outbound_to_store(&msg)) {
-                            self.diag("outbound_put", &e);
-                        }
-                    }
+        let due: Vec<MessageId> = self
+            .outbound_deadline
+            .range(..=now)
+            .flat_map(|(_, mids)| mids.iter().copied())
+            .collect();
+        for mid in due {
+            let mut msg = match self.store.outbound_get(&mid) {
+                Ok(Some(m)) => outbound_from_store(m),
+                Ok(None) => {
+                    self.unindex_outbound(&mid);
+                    continue;
                 }
+                Err(e) => {
+                    self.diag("outbound_get", &e);
+                    continue;
+                }
+            };
+            if msg.state != OutboundState::InFlight {
+                self.index_outbound(&msg);
+                continue;
             }
-            Err(e) => self.diag("outbound_all", &e),
+            let Some(deadline) = msg.receipt_deadline else {
+                self.index_outbound(&msg);
+                continue;
+            };
+            if now < deadline {
+                self.index_outbound(&msg);
+                continue;
+            }
+            if msg.attempts > self.config.fresh_waypoint_retries {
+                msg.mark_failed();
+                self.store_outbound(&msg);
+                if let Err(e) = self.store.status_set(
+                    &msg.mid,
+                    local::MSG_STATUS_FAILED,
+                    Some(ERR_NO_ROUTE),
+                    ms_to_secs(now),
+                ) {
+                    self.diag("status_set", &e);
+                }
+                actions.push(Action::Status {
+                    mid: msg.mid,
+                    status: local::MSG_STATUS_FAILED,
+                    detail: Some(ERR_NO_ROUTE),
+                    service: msg.envelope.fsvc.clone(),
+                });
+            } else {
+                msg.requeue(now);
+                self.store_outbound(&msg);
+            }
         }
         actions
     }
@@ -3657,11 +4032,7 @@ impl<S: Store> Node<S> {
                                 let mut msg = outbound_from_store(msg);
                                 if msg.state == OutboundState::InFlight {
                                     msg.requeue(now + secs_to_ms(self.config.retry_base_secs));
-                                    if let Err(e) =
-                                        self.store.outbound_put(&outbound_to_store(&msg))
-                                    {
-                                        self.diag("outbound_put", &e);
-                                    }
+                                    self.store_outbound(&msg);
                                 }
                             }
                             Ok(None) => {}
@@ -3700,51 +4071,36 @@ impl<S: Store> Node<S> {
     /// first, which is what keeps the class partition deadlock-free.
     fn drain_custody(&mut self, now: u64) -> Vec<Action> {
         let mut actions = Vec::new();
-        // Re-arm from scratch: entries that still cannot route re-set the
-        // retry deadline inside `forward_custody`.
-        self.custody_retry_at = None;
-        match self.store.custody_all() {
-            Ok(all) => {
-                let mut all: Vec<_> = all.into_iter().map(custody_from_store).collect();
-                all.sort_by(|a, b| a.class.cmp(&b.class).then(a.leg.cmp(&b.leg)));
-                for entry in all {
-                    let offer_leg = lattice_proto::Message::parse(&entry.message, ms_to_secs(now))
-                        .map_or(entry.leg, |m| m.header.leg);
-                    let in_flight = self.pending.contains_key(&offer_leg);
-                    if !in_flight {
-                        self.forward_custody(now, entry.leg, &mut actions);
-                    }
-                }
-            }
-            Err(e) => self.diag("custody_all", &e),
+        // Only entries whose retry backoff has expired are due. Second-leg
+        // slots drain before first-leg slots (their slots sort first), and
+        // within a slot lower classes drain first — the order that keeps
+        // the class partition deadlock-free.
+        let mut due: Vec<(u8, LegId)> = self
+            .custody_retry
+            .range(..=now)
+            .flat_map(|(_, legs)| legs.iter().copied())
+            .map(|leg| {
+                let slot = self.custody_meta.get(&leg).map_or(0, |m| m.class_slot);
+                (slot, leg)
+            })
+            .collect();
+        due.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+        for (_, leg) in due {
+            self.untrack_custody_retry(leg);
+            self.forward_custody(now, leg, &mut actions);
         }
         actions
     }
 
     /// Expire custody entries whose messages timed out.
     fn sweep_custody_expiry(&mut self, now: u64) {
-        match self.store.custody_all() {
-            Ok(mut all) => {
-                all.sort_by_key(|e| e.leg);
-                for entry in all.into_iter().map(custody_from_store) {
-                    if entry.exp <= now {
-                        match self.store.custody_remove(&entry.leg) {
-                            Ok(Some(e)) => {
-                                if let Err(e) = self.store.share_add(
-                                    &e.destination,
-                                    e.upstream,
-                                    -(e.message.len() as i64),
-                                ) {
-                                    self.diag("share_add", &e);
-                                }
-                            }
-                            Ok(None) => {}
-                            Err(e) => self.diag("custody_remove", &e),
-                        }
-                    }
-                }
-            }
-            Err(e) => self.diag("custody_all", &e),
+        let due: Vec<LegId> = self
+            .custody_expiry
+            .range(..=now)
+            .flat_map(|(_, legs)| legs.iter().copied())
+            .collect();
+        for leg in due {
+            self.release_custody(leg);
         }
     }
 
@@ -4019,6 +4375,8 @@ impl<S: Store> Node<S> {
         }
     }
 
+    /// Buffer-class slots of the held custody entries (0..16 second leg,
+    /// 16..32 first leg). Test/diagnostic only.
     #[doc(hidden)]
     pub fn debug_custody_classes(&mut self) -> Vec<u8> {
         match self.store.custody_all() {
@@ -5238,17 +5596,20 @@ mod tests {
         destination: Identifier,
         exp: u64,
     ) {
-        node.store
-            .custody_put(CustodyEntry {
-                leg,
-                message,
-                upstream,
-                destination,
-                class: 0,
-                exp,
-                excluded: Vec::new(),
-            })
-            .unwrap();
+        let entry = CustodyEntry {
+            leg,
+            message,
+            upstream,
+            destination,
+            class: 0,
+            exp,
+            excluded: Vec::new(),
+        };
+        node.store.custody_put(entry.clone()).unwrap();
+        // Track in the in-memory indexes without scheduling a retry: the
+        // entry is treated as in flight (the tests drive it via explicit
+        // replies or expiry).
+        node.track_custody_insert(&custody_from_store(entry), u64::MAX);
     }
 
     fn offer_links(actions: &[Action]) -> Vec<u64> {
@@ -5326,7 +5687,7 @@ mod tests {
         let mid = MessageId::from_bytes([0x11; 16]);
         let mut msg = outbound(mid, dst, OutboundState::InFlight);
         msg.exp = now + 10_000;
-        node.store.outbound_put(&msg).unwrap();
+        node.store_outbound(&msg);
         let leg = LegId::from_bytes([0x22; 16]);
         node.pending.insert(
             leg,
@@ -5449,7 +5810,7 @@ mod tests {
         let mid = MessageId::from_bytes([0x44; 16]);
         let mut msg = outbound(mid, dst, OutboundState::InFlight);
         msg.exp = now + 10_000;
-        node.store.outbound_put(&msg).unwrap();
+        node.store_outbound(&msg);
         let leg = LegId::from_bytes([0x55; 16]);
         node.pending.insert(
             leg,
@@ -5593,7 +5954,7 @@ mod tests {
         let mid = MessageId::from_bytes([0x66; 16]);
         let mut msg = outbound(mid, sender.id(), OutboundState::InFlight);
         msg.exp = now + 10_000;
-        node.store.outbound_put(&msg).unwrap();
+        node.store_outbound(&msg);
         let wire = sealed_to_node(
             &node,
             &sender,
@@ -5634,7 +5995,7 @@ mod tests {
         let mid = MessageId::from_bytes([0x67; 16]);
         let mut msg = outbound(mid, sender.id(), OutboundState::InFlight);
         msg.exp = now + 10_000;
-        node.store.outbound_put(&msg).unwrap();
+        node.store_outbound(&msg);
         let wire = sealed_to_node(
             &node,
             &sender,
@@ -5688,7 +6049,7 @@ mod tests {
         let mid = MessageId::from_bytes([0x68; 16]);
         let mut msg = outbound(mid, sender.id(), OutboundState::InFlight);
         msg.exp = now + 10_000;
-        node.store.outbound_put(&msg).unwrap();
+        node.store_outbound(&msg);
         // Sealed to this node, addressed to its gateway: the gateway strips
         // the gateway layer and forwards with dst naming the gateway.
         let wire = Message::build(BuildParams {
@@ -6072,8 +6433,8 @@ mod tests {
         // A queued outbound with an earlier next_attempt wins.
         let mid = MessageId::from_bytes([0x43; 16]);
         let mut msg = outbound(mid, dst, OutboundState::Queued);
-        msg.next_attempt = 2; // store seconds
-        node.store.outbound_push(&msg).unwrap();
+        msg.next_attempt = 2_000; // ms
+        node.store_outbound(&msg);
         assert_eq!(node.next_deadline(), Some(2_000));
         // A pending custody offer with an even earlier timeout wins.
         let leg2 = LegId::from_bytes([0x44; 16]);
@@ -6437,5 +6798,176 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    fn insert_custody_slot(
+        node: &mut Node<MemStore>,
+        leg_byte: u8,
+        slot: u8,
+        len: usize,
+        upstream: u64,
+        destination: Identifier,
+    ) {
+        node.store
+            .custody_put(CustodyEntry {
+                leg: LegId::from_bytes([leg_byte; 16]),
+                message: vec![7u8; len],
+                upstream,
+                destination,
+                class: slot,
+                exp: u64::MAX / 2,
+                excluded: Vec::new(),
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn class_reserve_admits_when_shared_pool_is_full() {
+        let mut node = test_node();
+        node.config.transit_cap = 100_000;
+        // reserve = max(100_000/128, min(2048, 100_000/32)) = 2048;
+        // shared pool = 100_000 - 32 * 2048 = 34_464.
+        let dst = Identifier::from_bytes([0xD5; 32]);
+        // Fill the shared pool via slot 0 (second-leg class 0): 2048 reserve
+        // plus 34_464 shared-pool bytes.
+        insert_custody_slot(&mut node, 1, 0, 2048 + 34_464, 100, dst);
+        // Slot 0 is now full: reserve exhausted and the shared pool is full.
+        assert!(node.class_full(0, 1));
+        // A different second-leg slot still has its reserve: admitted.
+        assert!(!node.class_full(1, 2048));
+        // A first-leg slot is unaffected by second-leg pressure.
+        assert!(!node.class_full(16, 2048));
+        // Fill the first-leg slot 16 too; now it is full as well.
+        insert_custody_slot(&mut node, 2, 16, 2048, 100, dst);
+        assert!(node.class_full(16, 1));
+        // Second-leg slot 1 still has its reserve (first-leg bytes cannot
+        // touch it).
+        assert!(!node.class_full(1, 2048));
+    }
+
+    #[test]
+    fn second_leg_cannot_use_first_leg_reserve() {
+        let mut node = test_node();
+        node.config.transit_cap = 100_000;
+        let dst = Identifier::from_bytes([0xD5; 32]);
+        // Fill the shared pool and second-leg slot 0's reserve.
+        insert_custody_slot(&mut node, 1, 0, 2048 + 34_464, 100, dst);
+        // Fill first-leg slot 16's reserve completely.
+        insert_custody_slot(&mut node, 2, 16, 2048, 100, dst);
+        // Second-leg slot 0 is full even though first-leg slot 16's reserve
+        // is now also full — neither phase may borrow the other's reserve.
+        assert!(node.class_full(0, 1));
+        // And first-leg slot 16 is full even though second-leg slot 1 is free.
+        assert!(node.class_full(16, 1));
+        assert!(!node.class_full(17, 2048));
+    }
+
+    #[test]
+    fn share_exceeded_divides_by_active_upstreams() {
+        let mut node = test_node();
+        node.config.custody_allowance = 1_000;
+        node.config.transit_cap = 1_000_000; // aggregate cap stays out of the way
+        let dst = Identifier::from_bytes([0xD5; 32]);
+        let peer_a = Identifier::from_bytes([0xA1; 32]);
+        let peer_b = Identifier::from_bytes([0xB2; 32]);
+        link_up(&mut node, 100, peer_a, 1_000);
+        link_up(&mut node, 200, peer_b, 1_000);
+        // Upstream 100 holds a 400-byte share for dst; upstream 200 has none.
+        node.store.share_add(&dst, 100, 400).unwrap();
+        // New upstream (no share yet): divisor = active (1) + 1 = 2.
+        assert!(!node.share_exceeded(&dst, 200, 500));
+        assert!(node.share_exceeded(&dst, 200, 501));
+        // Established upstream: divisor = active = 1, limit = 1000.
+        assert!(!node.share_exceeded(&dst, 100, 600));
+        assert!(node.share_exceeded(&dst, 100, 601));
+    }
+
+    #[test]
+    fn custody_backoff_grows_exponentially_and_caps() {
+        assert_eq!(custody_backoff_ms(1, 1800), 5_000);
+        assert_eq!(custody_backoff_ms(2, 1800), 10_000);
+        assert_eq!(custody_backoff_ms(3, 1800), 20_000);
+        assert_eq!(custody_backoff_ms(4, 1800), 40_000);
+        // Capped at retry_max_secs.
+        assert_eq!(custody_backoff_ms(100, 1800), 1_800_000);
+        // A zero retry_max_secs still yields the base delay, never zero.
+        assert_eq!(custody_backoff_ms(1, 0), 5_000);
+    }
+
+    #[test]
+    fn custody_entry_without_route_backs_off() {
+        let mut node = test_node();
+        let dst = Identifier::from_bytes([0xD5; 32]);
+        let leg = LegId::from_bytes([0x42; 16]);
+        let wire = wire_message(leg, dst, 60);
+        // No links up: the entry has no route and must back off.
+        let entry = CustodyEntry {
+            leg,
+            message: wire,
+            upstream: 100,
+            destination: dst,
+            class: 0,
+            exp: 60,
+            excluded: Vec::new(),
+        };
+        node.store.custody_put(entry.clone()).unwrap();
+        node.track_custody_insert(&custody_from_store(entry), 1_000);
+        let actions = node.drain_custody(1_000);
+        assert!(actions.is_empty());
+        let meta = node.custody_meta.get(&leg).expect("entry is tracked");
+        assert_eq!(meta.attempts, 1);
+        assert_eq!(meta.next_attempt, 6_000);
+        // Not due before the backoff elapses.
+        assert!(node.drain_custody(5_999).is_empty());
+        assert_eq!(node.custody_meta.get(&leg).unwrap().attempts, 1);
+        // Due after the backoff; backs off further.
+        let _ = node.drain_custody(6_000);
+        let meta = node.custody_meta.get(&leg).expect("entry is tracked");
+        assert_eq!(meta.attempts, 2);
+        assert_eq!(meta.next_attempt, 16_000);
+    }
+
+    #[test]
+    fn upstream_bytes_track_accept_and_release() {
+        let mut node = test_node();
+        let dst = Identifier::from_bytes([0xD5; 32]);
+        let entry = CustodyEntry {
+            leg: LegId::from_bytes([0x43; 16]),
+            message: vec![7u8; 100],
+            upstream: 100,
+            destination: dst,
+            class: 0,
+            exp: u64::MAX / 2,
+            excluded: Vec::new(),
+        };
+        node.store.custody_put(entry.clone()).unwrap();
+        node.track_custody_insert(&custody_from_store(entry.clone()), 1_000);
+        assert_eq!(node.upstream_bytes.get(&100), Some(&100));
+        let released = node.release_custody(entry.leg).expect("entry exists");
+        assert_eq!(released.message.len(), 100);
+        assert_eq!(node.upstream_bytes.get(&100), None);
+        assert!(node.custody_meta.is_empty());
+        assert!(node.custody_retry.is_empty());
+        assert!(node.custody_expiry.is_empty());
+    }
+
+    #[test]
+    fn upstream_aggregate_cap_binds_across_destinations() {
+        let mut node = test_node();
+        node.config.custody_allowance = 1_000_000; // per-destination share stays out of the way
+        node.config.transit_cap = 100_000; // aggregate cap = 100_000 / 2 bound links = 50_000
+        let dst1 = Identifier::from_bytes([0xD1; 32]);
+        let dst2 = Identifier::from_bytes([0xD2; 32]);
+        let peer_a = Identifier::from_bytes([0xA1; 32]);
+        let peer_b = Identifier::from_bytes([0xB2; 32]);
+        link_up(&mut node, 100, peer_a, 1_000);
+        link_up(&mut node, 200, peer_b, 1_000);
+        // Upstream 100 has already pushed 50_000 bytes across two destinations.
+        node.upstream_bytes.insert(100, 50_000);
+        // One more byte from upstream 100 is refused even for a fresh destination.
+        assert!(node.share_exceeded(&dst1, 100, 1));
+        assert!(node.share_exceeded(&dst2, 100, 1));
+        // Upstream 200 is unaffected.
+        assert!(!node.share_exceeded(&dst1, 200, 1));
     }
 }

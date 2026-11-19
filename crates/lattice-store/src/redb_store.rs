@@ -121,8 +121,9 @@ const SEEN_UNHELD: TableDefinition<[u8; 32], u64> = TableDefinition::new("seen_u
 const DELIVERED: TableDefinition<[u8; 32], u64> = TableDefinition::new("delivered");
 const INBOX: TableDefinition<&[u8], Vec<u8>> = TableDefinition::new("inbox");
 
-/// Custody buffer classes; `class` is clamped to `< BUF_CLASSES` on read.
-const BUF_CLASSES: u8 = 16;
+/// Custody buffer-class slots; `class` is clamped to `< CLASS_SLOTS` on
+/// read. Two leg phases of 16 classes each share the byte.
+const BUF_CLASSES: u8 = CLASS_SLOTS as u8;
 const STATUS: TableDefinition<[u8; 16], Vec<u8>> = TableDefinition::new("status");
 
 fn scope_byte(s: Scope) -> u8 {
@@ -200,8 +201,8 @@ fn sanitize_outbound(mut msg: OutboundMessage) -> Result<OutboundMessage, StoreE
     Ok(msg)
 }
 
-/// Clamp a decoded custody entry's buffer class into range. Nothing else
-/// about a custody entry is meaningfully validatable.
+/// Clamp a decoded custody entry's buffer-class slot into range. Nothing
+/// else about a custody entry is meaningfully validatable.
 fn sanitize_custody(mut entry: CustodyEntry) -> CustodyEntry {
     entry.class = entry.class.min(BUF_CLASSES - 1);
     entry
@@ -215,6 +216,16 @@ fn sanitize_custody(mut entry: CustodyEntry) -> CustodyEntry {
 fn migrate(from: u64) -> Result<(), StoreError> {
     // Ordered steps would go here: 3 => migrate_3_to_4(txn)?, etc.
     Err(StoreError::NoMigration { from })
+}
+
+/// Subtract `delta` from a u64 counter in the meta table, saturating at
+/// zero. Used by custody release, where a drifted counter must not block
+/// the release; the open-time rebuild recomputes exact values.
+fn meta_sub(txn: &redb::WriteTransaction, key: &str, delta: u64) -> Result<(), StoreError> {
+    let cur = meta_u64(txn, key)?;
+    let mut meta = txn.open_table(META)?;
+    meta.insert(key, cur.saturating_sub(delta))?;
+    Ok(())
 }
 
 /// Read a u64 counter from the meta table inside a write transaction.
@@ -339,14 +350,19 @@ impl RedbStore {
     }
 }
 
-/// Rebuild the custody byte counters from the CUSTODY table so they can
-/// never drift from the rows actually present. Runs on open.
+/// Rebuild the custody byte counters and the share table from the CUSTODY
+/// table so neither can drift from the rows actually present. Runs on
+/// open. The share counters are fully derivable from the custody rows, so
+/// rebuilding here is what keeps a crash between the custody write and a
+/// share write from leaking allowance forever.
 fn rebuild_custody_counters(
     txn: &redb::WriteTransaction,
     op: &'static str,
 ) -> Result<(), StoreError> {
     let mut custody_bytes: u64 = 0;
-    let mut class_bytes = [0u64; 16];
+    let mut class_bytes = [0u64; CLASS_SLOTS];
+    let mut shares: std::collections::BTreeMap<(Identifier, u64), u64> =
+        std::collections::BTreeMap::new();
     {
         let t = txn.open_table(CUSTODY).map_err(ctx(op))?;
         for entry in t.iter().map_err(ctx(op))? {
@@ -354,14 +370,33 @@ fn rebuild_custody_counters(
             let e = sanitize_custody(decode_custody(&v.value())?);
             custody_bytes += e.message.len() as u64;
             class_bytes[e.class as usize] += e.message.len() as u64;
+            *shares.entry((e.destination, e.upstream)).or_insert(0) += e.message.len() as u64;
         }
     }
-    let mut meta = txn.open_table(META).map_err(ctx(op))?;
-    meta.insert("custody_bytes", custody_bytes)
-        .map_err(ctx(op))?;
-    for (i, b) in class_bytes.iter().enumerate() {
-        meta.insert(format!("custody_class_{i}").as_str(), *b)
+    {
+        let mut meta = txn.open_table(META).map_err(ctx(op))?;
+        meta.insert("custody_bytes", custody_bytes)
             .map_err(ctx(op))?;
+        for (i, b) in class_bytes.iter().enumerate() {
+            meta.insert(format!("custody_class_{i}").as_str(), *b)
+                .map_err(ctx(op))?;
+        }
+    }
+    {
+        let mut t = txn.open_table(SHARES).map_err(ctx(op))?;
+        let stale: Vec<[u8; 40]> = t
+            .iter()
+            .map_err(ctx(op))?
+            .map(|entry| entry.map(|(k, _)| k.value()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(ctx(op))?;
+        for key in stale {
+            t.remove(key).map_err(ctx(op))?;
+        }
+        for ((dest, upstream), bytes) in shares {
+            t.insert(share_key(&dest, upstream), bytes)
+                .map_err(ctx(op))?;
+        }
     }
     Ok(())
 }
@@ -376,23 +411,47 @@ fn custody_put_txn(
 ) -> Result<(), StoreError> {
     let leg = entry.leg;
     let msg_len = entry.message.len() as i64;
-    let new_class = entry.class.min(15) as usize;
+    let new_class = entry.class.min((CLASS_SLOTS - 1) as u8) as usize;
     let mut t = txn.open_table(CUSTODY)?;
     // The byte counters track message bytes, so recover the old entry's
     // message length and class from the stored row if this leg is overwritten.
     let (old_msg_len, old_class) = match t.get(leg.as_bytes())? {
         Some(v) => {
             let e = sanitize_custody(decode_custody(&v.value())?);
-            (e.message.len() as i64, e.class as usize)
+            (e.message.len() as u64, e.class as usize)
         }
         None => (0, 0),
     };
     t.insert(*leg.as_bytes(), bytes)?;
-    meta_add(txn, "custody_bytes", msg_len - old_msg_len)?;
     if old_msg_len > 0 {
-        meta_add(txn, &format!("custody_class_{old_class}"), -old_msg_len)?;
+        meta_sub(txn, "custody_bytes", old_msg_len)?;
+        meta_sub(txn, &format!("custody_class_{old_class}"), old_msg_len)?;
     }
+    meta_add(txn, "custody_bytes", msg_len)?;
     meta_add(txn, &format!("custody_class_{new_class}"), msg_len)?;
+    Ok(())
+}
+
+/// Subtract `bytes` from a share row, saturating at zero and removing the
+/// row when it empties. Used by `custody_release`: the share is derived
+/// from the custody rows (rebuilt at open), so a shortfall means the books
+/// drifted, not that the release should fail — the custody row must not
+/// be left behind.
+fn share_sub_txn(
+    txn: &redb::WriteTransaction,
+    dest: &Identifier,
+    upstream: u64,
+    bytes: u64,
+) -> Result<(), StoreError> {
+    let key = share_key(dest, upstream);
+    let mut t = txn.open_table(SHARES)?;
+    let cur = t.get(key)?.map_or(0, |v| v.value());
+    let next = cur.saturating_sub(bytes);
+    if next == 0 {
+        t.remove(key)?;
+    } else {
+        t.insert(key, next)?;
+    }
     Ok(())
 }
 
@@ -666,20 +725,6 @@ impl Store for RedbStore {
         self.outbound_push(msg)
     }
 
-    fn outbound_due(&self, now: u64) -> Result<Vec<OutboundMessage>, StoreError> {
-        let mut due: Vec<OutboundMessage> = self
-            .outbound_all()?
-            .into_iter()
-            .filter(|m| m.state == OutboundState::Queued && m.next_attempt <= now && m.exp > now)
-            .collect();
-        due.sort_by(|a, b| {
-            b.priority
-                .cmp(&a.priority)
-                .then(a.next_attempt.cmp(&b.next_attempt))
-        });
-        Ok(due)
-    }
-
     fn outbound_all(&self) -> Result<Vec<OutboundMessage>, StoreError> {
         self.read("outbound_all", |txn| {
             let t = txn.open_table(OUTBOUND)?;
@@ -729,20 +774,29 @@ impl Store for RedbStore {
         })
     }
 
-    fn custody_remove(&mut self, leg: &LegId) -> Result<Option<CustodyEntry>, StoreError> {
-        let existing = self.custody_get(leg)?;
-        if let Some(e) = &existing {
-            let msg_len = e.message.len() as i64;
-            let class = e.class as usize; // already clamped by custody_get
-            self.write("custody_remove", |txn| {
-                let mut t = txn.open_table(CUSTODY)?;
-                t.remove(leg.as_bytes())?;
-                meta_add(txn, "custody_bytes", -msg_len)?;
-                meta_add(txn, &format!("custody_class_{class}"), -msg_len)?;
-                Ok(())
-            })?;
-        }
-        Ok(existing)
+    fn custody_release(&mut self, leg: &LegId) -> Result<Option<CustodyEntry>, StoreError> {
+        // One transaction: custody row delete, byte-counter decrement and
+        // share decrement. A crash either releases all three or none, and
+        // the open-time rebuild heals any drift regardless.
+        self.write("custody_release", |txn| {
+            let existing = {
+                let t = txn.open_table(CUSTODY)?;
+                match t.get(leg.as_bytes())? {
+                    Some(v) => Some(sanitize_custody(decode_custody(&v.value())?)),
+                    None => None,
+                }
+            };
+            let Some(e) = existing else { return Ok(None) };
+            let msg_len = e.message.len() as u64;
+            let class = e.class as usize; // already clamped by sanitize_custody
+            let mut t = txn.open_table(CUSTODY)?;
+            t.remove(leg.as_bytes())?;
+            drop(t);
+            meta_sub(txn, "custody_bytes", msg_len)?;
+            meta_sub(txn, &format!("custody_class_{class}"), msg_len)?;
+            share_sub_txn(txn, &e.destination, e.upstream, msg_len)?;
+            Ok(Some(e))
+        })
     }
 
     fn custody_all(&self) -> Result<Vec<CustodyEntry>, StoreError> {
@@ -765,10 +819,10 @@ impl Store for RedbStore {
         })
     }
 
-    fn custody_class_bytes(&self) -> Result<[u64; 16], StoreError> {
+    fn custody_class_bytes(&self) -> Result<[u64; CLASS_SLOTS], StoreError> {
         self.read("custody_class_bytes", |txn| {
             let meta = txn.open_table(META)?;
-            let mut out = [0u64; 16];
+            let mut out = [0u64; CLASS_SLOTS];
             for (i, slot) in out.iter_mut().enumerate() {
                 *slot = meta
                     .get(format!("custody_class_{i}").as_str())?
@@ -792,6 +846,38 @@ impl Store for RedbStore {
         self.read("share_get", |txn| {
             let t = txn.open_table(SHARES)?;
             Ok(t.get(key)?.map_or(0, |v| v.value()))
+        })
+    }
+
+    fn share_upstream_count(&self, dest: &Identifier) -> Result<u64, StoreError> {
+        self.read("share_upstream_count", |txn| {
+            let t = txn.open_table(SHARES)?;
+            // SHARES keys are dest(32) || upstream(8); scan from the dest
+            // prefix and count while the prefix holds.
+            let mut start = [0u8; 40];
+            start[..32].copy_from_slice(dest.as_bytes());
+            let mut count = 0u64;
+            for entry in t.range(start..)? {
+                let (k, _) = entry?;
+                if k.value()[..32] != start[..32] {
+                    break;
+                }
+                count += 1;
+            }
+            Ok(count)
+        })
+    }
+
+    fn alloc_link_id(&mut self) -> Result<u64, StoreError> {
+        self.write("alloc_link_id", |txn| {
+            let cur = meta_u64(txn, "next_link_id")?;
+            let id = if cur == 0 { LINK_ID_BASE } else { cur };
+            let next = id
+                .checked_add(1)
+                .ok_or_else(|| StoreError::CounterOverflow("next_link_id".into()))?;
+            let mut meta = txn.open_table(META)?;
+            meta.insert("next_link_id", next)?;
+            Ok(id)
         })
     }
 

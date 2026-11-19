@@ -113,14 +113,13 @@ fn exercise<S: Store>(s: &mut S) -> String {
     s.outbound_push(&outbound(1)).unwrap();
     s.outbound_push(&outbound(2)).unwrap();
     assert_eq!(s.outbound_all().unwrap().len(), 2);
-    assert_eq!(s.outbound_due(1000).unwrap().len(), 2);
     assert_eq!(s.outbound_get(&mid(1)).unwrap().unwrap().mid, mid(1));
 
     s.custody_put(custody(1)).unwrap();
     s.custody_put(custody(2)).unwrap();
     assert_eq!(s.custody_bytes().unwrap(), 200);
     assert_eq!(s.custody_all().unwrap().len(), 2);
-    let e = s.custody_remove(&leg(1)).unwrap().unwrap();
+    let e = s.custody_release(&leg(1)).unwrap().unwrap();
     assert_eq!(e.leg, leg(1));
     assert_eq!(s.custody_all().unwrap().len(), 1);
 
@@ -493,7 +492,7 @@ fn custody_class_bytes_track_accept_and_remove() {
     assert_eq!(classes[0], 0);
     assert_eq!(s.custody_bytes().unwrap(), 390);
 
-    s.custody_remove(&leg(1)).unwrap();
+    s.custody_release(&leg(1)).unwrap();
     let classes = s.custody_class_bytes().unwrap();
     assert_eq!(classes[3], 250);
     assert_eq!(s.custody_bytes().unwrap(), 290);
@@ -754,8 +753,8 @@ fn custody_class_is_clamped_on_read() {
     let mut e = custody(1);
     e.class = 200;
     s.custody_put(e).unwrap();
-    assert_eq!(s.custody_get(&leg(1)).unwrap().unwrap().class, 15);
-    assert_eq!(s.custody_all().unwrap()[0].class, 15);
+    assert_eq!(s.custody_get(&leg(1)).unwrap().unwrap().class, 31);
+    assert_eq!(s.custody_all().unwrap()[0].class, 31);
 }
 
 fn check_inbox_fifo<S: Store>(s: &mut S) {
@@ -843,4 +842,111 @@ fn status_rows_are_swept_after_the_ttl() {
     s.sweep_expired(1_000 + STATUS_TTL_SECS + 1).unwrap();
     assert!(s.status_get(&mid(1)).unwrap().is_none());
     assert!(s.status_get(&mid(2)).unwrap().is_some());
+}
+
+fn accept(s: &mut RedbStore, leg_byte: u8, upstream: u64, dest: Identifier, len: usize) {
+    s.custody_accept(lattice_store::CustodyAccept {
+        entry: CustodyEntry {
+            leg: leg(leg_byte),
+            message: vec![7u8; len],
+            upstream,
+            destination: dest,
+            class: 0,
+            exp: u64::MAX / 2,
+            excluded: vec![],
+        },
+        share_dest: dest,
+        share_upstream: upstream,
+        share_bytes: len as i64,
+        seen_hash: h(leg_byte),
+        seen_exp: u64::MAX / 2,
+    })
+    .unwrap();
+}
+
+#[test]
+fn custody_release_decrements_share_and_bytes_atomically() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("release.redb");
+    let mut s = RedbStore::open(&path).unwrap();
+    accept(&mut s, 1, 7, id(9), 100);
+    accept(&mut s, 2, 7, id(9), 250);
+    assert_eq!(s.share_get(&id(9), 7).unwrap(), 350);
+    assert_eq!(s.custody_bytes().unwrap(), 350);
+
+    let released = s.custody_release(&leg(1)).unwrap().unwrap();
+    assert_eq!(released.message.len(), 100);
+    assert_eq!(s.share_get(&id(9), 7).unwrap(), 250);
+    assert_eq!(s.custody_bytes().unwrap(), 250);
+
+    // Releasing the last entry drops the share row entirely.
+    s.custody_release(&leg(2)).unwrap();
+    assert_eq!(s.share_get(&id(9), 7).unwrap(), 0);
+    assert_eq!(s.custody_bytes().unwrap(), 0);
+}
+
+#[test]
+fn shares_are_rebuilt_from_custody_rows_at_open() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("rebuild.redb");
+    {
+        let mut s = RedbStore::open(&path).unwrap();
+        accept(&mut s, 1, 7, id(9), 100);
+        accept(&mut s, 2, 8, id(9), 250);
+        accept(&mut s, 3, 7, id(10), 40);
+    }
+    // Simulate a share table that drifted (or was lost) by wiping it.
+    {
+        let db = redb::Database::open(&path).unwrap();
+        let txn = db.begin_write().unwrap();
+        {
+            let mut t: redb::Table<[u8; 40], u64> = txn
+                .open_table(redb::TableDefinition::new("shares"))
+                .unwrap();
+            let keys: Vec<[u8; 40]> = t.iter().unwrap().map(|e| e.unwrap().0.value()).collect();
+            for k in keys {
+                t.remove(k).unwrap();
+            }
+        }
+        txn.commit().unwrap();
+    }
+    let s = RedbStore::open(&path).unwrap();
+    assert_eq!(s.share_get(&id(9), 7).unwrap(), 100);
+    assert_eq!(s.share_get(&id(9), 8).unwrap(), 250);
+    assert_eq!(s.share_get(&id(10), 7).unwrap(), 40);
+}
+
+#[test]
+fn share_upstream_count_counts_distinct_upstreams() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut s = RedbStore::open(tmp.path().join("count.redb")).unwrap();
+    assert_eq!(s.share_upstream_count(&id(9)).unwrap(), 0);
+    accept(&mut s, 1, 7, id(9), 100);
+    accept(&mut s, 2, 8, id(9), 100);
+    accept(&mut s, 3, 7, id(10), 100);
+    assert_eq!(s.share_upstream_count(&id(9)).unwrap(), 2);
+    assert_eq!(s.share_upstream_count(&id(10)).unwrap(), 1);
+    s.custody_release(&leg(1)).unwrap();
+    // Upstream 7 still holds a share for id(9)? No: leg(1) was its only
+    // entry for id(9); leg(3) is for id(10).
+    assert_eq!(s.share_upstream_count(&id(9)).unwrap(), 1);
+    s.custody_release(&leg(2)).unwrap();
+    assert_eq!(s.share_upstream_count(&id(9)).unwrap(), 0);
+}
+
+#[test]
+fn alloc_link_id_is_monotonic_across_reopens() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("links.redb");
+    let first;
+    {
+        let mut s = RedbStore::open(&path).unwrap();
+        first = s.alloc_link_id().unwrap();
+        let second = s.alloc_link_id().unwrap();
+        assert!(second > first);
+    }
+    let mut s = RedbStore::open(&path).unwrap();
+    let third = s.alloc_link_id().unwrap();
+    assert!(third > first + 1, "link ids must not restart after reopen");
+    assert!(first >= lattice_store::LINK_ID_BASE);
 }

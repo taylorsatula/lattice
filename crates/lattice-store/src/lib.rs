@@ -24,6 +24,18 @@ use lattice_types::{Commitment, DeliveryId, Hash32, Identifier, LegId, MessageId
 /// the sender might still act on it.
 pub const STATUS_TTL_SECS: u64 = 7 * 24 * 3600;
 
+/// Number of buffer-class slots tracked per custody row: two leg phases
+/// (see `CustodyEntry::class`) times 16 classes per phase.
+pub const CLASS_SLOTS: usize = 32;
+
+/// Base for link ids allocated by [`Store::alloc_link_id`].
+///
+/// Pre-upgrade daemons numbered links from 1, so custody rows persisted
+/// before the upgrade may carry small `upstream` values. Starting the
+/// persisted counter at 2^32 guarantees a freshly allocated id never
+/// aliases an id recorded before the upgrade.
+pub const LINK_ID_BASE: u64 = 1 << 32;
+
 /// Error returned by every store operation.
 ///
 /// `Backend` preserves the underlying backend error as `source` and names the
@@ -158,6 +170,11 @@ pub struct CustodyEntry {
     pub message: Vec<u8>,
     pub upstream: u64, // link id of the neighbor we accepted from; 0 = locally originated
     pub destination: Identifier,
+    /// Buffer-class slot: `0..16` is the second leg (no hop layer; toward
+    /// the final destination), `16..32` is the first leg (hop layer present;
+    /// toward the waypoint/gateway). Within a phase, the value is the
+    /// distance class (0 = closest to the destination). Classes are
+    /// internal; the wire never sees them.
     pub class: u8,
     pub exp: u64,
     /// Neighbors that already replied busy/already-have for this leg,
@@ -235,20 +252,24 @@ pub trait Store {
     fn outbound_remove(&mut self, mid: &MessageId) -> Result<(), StoreError>;
     fn outbound_get(&self, mid: &MessageId) -> Result<Option<OutboundMessage>, StoreError>;
     fn outbound_put(&mut self, msg: &OutboundMessage) -> Result<(), StoreError>;
-    fn outbound_due(&self, now: u64) -> Result<Vec<OutboundMessage>, StoreError>;
     fn outbound_all(&self) -> Result<Vec<OutboundMessage>, StoreError>;
 
     // custody
     fn custody_accept(&mut self, accept: CustodyAccept) -> Result<(), StoreError>;
     fn custody_put(&mut self, entry: CustodyEntry) -> Result<(), StoreError>;
     fn custody_get(&self, leg: &LegId) -> Result<Option<CustodyEntry>, StoreError>;
-    fn custody_remove(&mut self, leg: &LegId) -> Result<Option<CustodyEntry>, StoreError>;
+    /// Remove a custody entry and release its share of the upstream's
+    /// allowance in one transaction (custody row delete + share
+    /// decrement). Returns the removed entry, if any.
+    fn custody_release(&mut self, leg: &LegId) -> Result<Option<CustodyEntry>, StoreError>;
     fn custody_all(&self) -> Result<Vec<CustodyEntry>, StoreError>;
     fn custody_bytes(&self) -> Result<u64, StoreError>;
-    /// Bytes held per buffer class (index = class, 0 = closest to destination).
-    fn custody_class_bytes(&self) -> Result<[u64; 16], StoreError>;
+    /// Bytes held per buffer-class slot (see [`CLASS_SLOTS`]).
+    fn custody_class_bytes(&self) -> Result<[u64; CLASS_SLOTS], StoreError>;
 
-    // fair-share accounting per (destination, upstream link)
+    // fair-share accounting per (destination, upstream link). The share
+    // counters are derived from the custody rows at open (they are fully
+    // derivable), so a crash can never strand one.
     fn share_add(
         &mut self,
         dest: &Identifier,
@@ -256,6 +277,13 @@ pub trait Store {
         bytes: i64,
     ) -> Result<u64, StoreError>;
     fn share_get(&self, dest: &Identifier, upstream: u64) -> Result<u64, StoreError>;
+    /// Number of upstreams holding a non-zero share for `dest`.
+    fn share_upstream_count(&self, dest: &Identifier) -> Result<u64, StoreError>;
+
+    /// Allocate a link id that is unique across restarts. Backed by a
+    /// persisted counter starting at [`LINK_ID_BASE`], so an id never
+    /// aliases a link id recorded in a custody row by an earlier run.
+    fn alloc_link_id(&mut self) -> Result<u64, StoreError>;
 
     // dedup
     fn seen_contains(&self, hash: &Hash32, now: u64) -> Result<bool, StoreError>;

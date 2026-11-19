@@ -23,14 +23,18 @@ pub struct MemStore {
     status: BTreeMap<MessageId, (MessageStatus, u64)>,
     buckets: [u64; 4],
     custody_bytes: u64,
-    custody_class_bytes: [u64; 16],
+    custody_class_bytes: [u64; CLASS_SLOTS],
     drain: DrainState,
+    next_link_id: u64,
 }
 
 impl MemStore {
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            next_link_id: LINK_ID_BASE,
+            ..Self::default()
+        }
     }
 }
 
@@ -140,20 +144,6 @@ impl Store for MemStore {
         self.outbound.insert(msg.mid, msg.clone());
         Ok(())
     }
-    fn outbound_due(&self, now: u64) -> Result<Vec<OutboundMessage>, StoreError> {
-        let mut due: Vec<_> = self
-            .outbound
-            .values()
-            .filter(|m| m.state == OutboundState::Queued && m.next_attempt <= now && m.exp > now)
-            .cloned()
-            .collect();
-        due.sort_by(|a, b| {
-            b.priority
-                .cmp(&a.priority)
-                .then(a.next_attempt.cmp(&b.next_attempt))
-        });
-        Ok(due)
-    }
     fn outbound_all(&self) -> Result<Vec<OutboundMessage>, StoreError> {
         Ok(self.outbound.values().cloned().collect())
     }
@@ -174,10 +164,10 @@ impl Store for MemStore {
     }
     fn custody_put(&mut self, entry: CustodyEntry) -> Result<(), StoreError> {
         let new_len = entry.message.len() as u64;
-        let new_class = entry.class.min(15) as usize;
+        let new_class = entry.class.min((CLASS_SLOTS - 1) as u8) as usize;
         if let Some(old) = self.custody.insert(entry.leg, entry) {
             self.custody_bytes = self.custody_bytes.saturating_sub(old.message.len() as u64);
-            let old_class = old.class.min(15) as usize;
+            let old_class = old.class.min((CLASS_SLOTS - 1) as u8) as usize;
             self.custody_class_bytes[old_class] =
                 self.custody_class_bytes[old_class].saturating_sub(old.message.len() as u64);
         }
@@ -188,13 +178,23 @@ impl Store for MemStore {
     fn custody_get(&self, leg: &LegId) -> Result<Option<CustodyEntry>, StoreError> {
         Ok(self.custody.get(leg).cloned())
     }
-    fn custody_remove(&mut self, leg: &LegId) -> Result<Option<CustodyEntry>, StoreError> {
+    fn custody_release(&mut self, leg: &LegId) -> Result<Option<CustodyEntry>, StoreError> {
         let removed = self.custody.remove(leg);
         if let Some(e) = &removed {
             self.custody_bytes = self.custody_bytes.saturating_sub(e.message.len() as u64);
-            let class = e.class.min(15) as usize;
+            let class = e.class.min((CLASS_SLOTS - 1) as u8) as usize;
             self.custody_class_bytes[class] =
                 self.custody_class_bytes[class].saturating_sub(e.message.len() as u64);
+            // Release the upstream's share in the same operation.
+            let key = (e.destination, e.upstream);
+            if let Some(share) = self.shares.get_mut(&key) {
+                let next = (*share as i64) - e.message.len() as i64;
+                if next <= 0 {
+                    self.shares.remove(&key);
+                } else {
+                    *share = next as u64;
+                }
+            }
         }
         Ok(removed)
     }
@@ -204,7 +204,7 @@ impl Store for MemStore {
     fn custody_bytes(&self) -> Result<u64, StoreError> {
         Ok(self.custody_bytes)
     }
-    fn custody_class_bytes(&self) -> Result<[u64; 16], StoreError> {
+    fn custody_class_bytes(&self) -> Result<[u64; CLASS_SLOTS], StoreError> {
         Ok(self.custody_class_bytes)
     }
 
@@ -226,6 +226,17 @@ impl Store for MemStore {
     }
     fn share_get(&self, dest: &Identifier, upstream: u64) -> Result<u64, StoreError> {
         Ok(*self.shares.get(&(*dest, upstream)).unwrap_or(&0))
+    }
+    fn share_upstream_count(&self, dest: &Identifier) -> Result<u64, StoreError> {
+        Ok(self.shares.keys().filter(|(d, _)| d == dest).count() as u64)
+    }
+    fn alloc_link_id(&mut self) -> Result<u64, StoreError> {
+        let id = self.next_link_id;
+        self.next_link_id = self
+            .next_link_id
+            .checked_add(1)
+            .ok_or_else(|| StoreError::CounterOverflow("link id".into()))?;
+        Ok(id)
     }
 
     fn seen_contains(&self, hash: &Hash32, now: u64) -> Result<bool, StoreError> {

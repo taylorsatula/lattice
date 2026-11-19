@@ -218,12 +218,14 @@ fn fair_share_caps_a_flooded_upstream() {
     // F's excess must be refused while H keeps its slot.
     let mut cfg = fast_config();
     // Each 2KB-bucket message counts full size; per-upstream share must fit two of them.
-    // With the R->D link down, R sees two upstreams; per-upstream share is
-    // allowance/2. F floods, H sends two. F may fill its own share only.
+    // The per-destination allowance is divided among the upstreams currently
+    // active for D (those holding a non-zero share), so once H shows up F
+    // is capped at allowance/2. F, arriving first, may fill the whole
+    // allowance before H is active.
     cfg.custody_allowance = 13000;
-    // Per-class slice is transit_cap / 16; keep it well above the combined
-    // fair shares (2 × 6500) so the class cap does not bind and the
-    // fair-share mechanism is what the test observes.
+    // Keep the transit cap well above the combined fair shares so the
+    // class cap does not bind and the fair-share mechanism is what the
+    // test observes.
     cfg.transit_cap = 16 * 20_000;
     let mut sim = Sim::new(cfg);
     let f = sim.add_node();
@@ -256,10 +258,15 @@ fn fair_share_caps_a_flooded_upstream() {
         sim.statuses.len(),
         sim.statuses.iter().filter(|s| s.status == 2).count()
     );
+    // F arrived first, so it may fill the whole per-destination allowance
+    // (13_000 bytes, ~6-8 messages of ~1.6-2 KB). Once H is active the
+    // allowance is split and F is refused further messages; H keeps its
+    // slot regardless of the flood.
     assert!(
-        from_f <= 3,
-        "flooder exceeded its share: {from_f} messages held"
+        from_f <= 8,
+        "flooder exceeded its allowance: {from_f} messages held"
     );
+    assert!(from_f >= 1, "flooder should hold some messages");
     assert_eq!(
         from_h, 2,
         "honest node's messages must not be displaced by the flood"
@@ -751,13 +758,15 @@ fn queued_message_survives_receipt_timeout_and_delivers() {
 #[test]
 fn buffer_class_isolates_full_classes() {
     // A—B—C—D line. B holds transit custody toward D (class 2) and toward C
-    // (class 1). With a per-class cap that fits exactly one message, a
+    // (class 1). With a per-class reserve that fits exactly one message, a
     // second class-2 message must be refused while a class-1 message is
     // still accepted.
     let mut cfg = fast_config();
-    // Per-class slice = transit_cap / 16. A wire message is ~1.5 KB
-    // (KEM ciphertext dominates), so one fits in 2000 and two do not.
-    cfg.transit_cap = 16 * 2000;
+    // A wire message is ~1.5 KB (KEM ciphertext dominates). With a 64 KiB
+    // transit cap the per-slot reserve is 2048 B and the shared pool is
+    // exhausted (32 slots x 2048 B), so admission is governed by the
+    // per-class reserve alone: one message per class.
+    cfg.transit_cap = 64 * 1024;
     let mut sim = Sim::new(cfg);
     let a = sim.add_node();
     let b = sim.add_node();
@@ -975,4 +984,90 @@ fn frame_exceeding_the_bucket_is_rejected_by_the_encode_path() {
     assert!(lattice_net::FRAME_BUCKETS.contains(&wire.len()));
     let back = lattice_sim::decode_frame_wire(&wire).expect("wire round-trips");
     assert_eq!(back, fits);
+}
+
+#[test]
+fn waypoint_traffic_does_not_deadlock_under_buffer_pressure() {
+    // Deadlock gate for the buffer-class design: with waypoint re-origination,
+    // first-leg (toward the waypoint) and second-leg (toward the final
+    // destination) traffic must not form a wait cycle. Every message here
+    // goes via a waypoint (waypoint_share = 1.0), and the transit cap is
+    // small enough that admission is governed by the per-class reserves
+    // (the shared pool is ~0), so any cross-phase dependency would wedge
+    // the mesh. All messages must still land, and custody must drain.
+    let mut cfg = fast_config();
+    cfg.waypoint_share = 1.0;
+    cfg.transit_cap = 64 * 1024; // per-slot reserve 2048 B; shared pool ~0
+    cfg.custody_allowance = 1 << 20; // fair share stays out of the way
+    let mut sim = Sim::new(cfg);
+    let n = 5;
+    for _ in 0..n {
+        sim.add_node();
+    }
+    full_mesh(&mut sim, n);
+    sim.run_for(6); // converge
+    let mut mids = Vec::new();
+    for from in 0..n {
+        for to in 0..n {
+            if from != to {
+                mids.push(sim.app_send(from, to, &vec![0xAB; 256]));
+            }
+        }
+    }
+    sim.run_for(90);
+    let delivered = mids
+        .iter()
+        .filter(|m| sim.deliveries.iter().any(|d| d.mid == **m))
+        .count();
+    assert_eq!(
+        delivered,
+        mids.len(),
+        "every waypoint message must be delivered ({delivered}/{})",
+        mids.len()
+    );
+    for i in 0..n {
+        assert_eq!(
+            sim.custody_count(i),
+            0,
+            "node {i} still holds custody after delivery"
+        );
+    }
+}
+
+#[test]
+fn upstream_aggregate_cap_limits_one_flooder() {
+    // One upstream flooding many destinations must not fill the relay's
+    // buffers: the per-upstream aggregate cap (transit_cap / bound links)
+    // binds even though each destination's fair share is untouched.
+    let mut cfg = fast_config();
+    cfg.transit_cap = 100_000; // aggregate cap = 100_000 / 4 bound links = 25_000
+    cfg.custody_allowance = 1_000_000; // per-destination allowance stays out of the way
+    let mut sim = Sim::new(cfg);
+    let f = sim.add_node();
+    let r = sim.add_node();
+    let d1 = sim.add_node();
+    let d2 = sim.add_node();
+    let d3 = sim.add_node();
+    sim.connect(f, r);
+    sim.connect(r, d1);
+    sim.connect(r, d2);
+    sim.connect(r, d3);
+    sim.run_for(6); // converge
+    // The destinations drain, so they refuse custody and messages back up
+    // at R. The links stay up and bound (a down link is not bound and
+    // would not count toward the aggregate cap).
+    for &d in &[d1, d2, d3] {
+        sim.nodes[d].set_drain(DrainState::Draining);
+    }
+    for i in 0..30u8 {
+        let to = [d1, d2, d3][(i % 3) as usize];
+        sim.app_send(f, to, &vec![i; 400]);
+    }
+    sim.run_for(3);
+    let held = sim.custody_bytes(r);
+    assert!(
+        held <= 25_000,
+        "upstream exceeded its aggregate cap: {held} bytes held at the relay"
+    );
+    assert!(held > 0, "the relay should hold some of the flood");
 }

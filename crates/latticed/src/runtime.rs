@@ -446,7 +446,6 @@ pub struct Runtime {
     api_rx: Option<mpsc::UnboundedReceiver<ApiCmd>>,
     api_tx: mpsc::UnboundedSender<ApiCmd>,
     pub app_broadcast: broadcast::Sender<ServiceEvent>,
-    next_link: u64,
     /// Hive ranges from the config; links whose address falls in one are
     /// hive-scope for the established-link caps. Empty means every link is
     /// WAN-scope.
@@ -642,7 +641,6 @@ impl Runtime {
             api_rx: Some(api_rx),
             api_tx,
             app_broadcast,
-            next_link: 1,
             hive_cidrs,
             // The startup load already deleted expired files; first sweep an
             // hour from now. (`now` is milliseconds; the sweep is tracked
@@ -739,8 +737,15 @@ impl Runtime {
             // response, consistent with the listener's other refusals.
             return None;
         }
-        let id = self.next_link;
-        self.next_link += 1;
+        // Link ids come from a persisted counter so a custody entry's
+        // `upstream` never aliases an unrelated peer after a restart.
+        let id = match self.with_node(|n| n.store_mut().alloc_link_id()) {
+            Ok(id) => id,
+            Err(e) => {
+                eprintln!("lattice: refusing link: could not allocate a link id: {e}");
+                return None;
+            }
+        };
         let (outbound_tx, outbound_rx) = mpsc::channel(OUTBOUND_CAPACITY);
         let inbound = self.link_tx.clone();
         let task = tokio::spawn(link_task(id, io, inbound, outbound_rx));
