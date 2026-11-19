@@ -25,6 +25,7 @@
 #![forbid(unsafe_code)]
 
 mod api;
+mod cidr;
 mod config;
 mod keys;
 mod runtime;

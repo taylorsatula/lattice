@@ -15,6 +15,7 @@ use lattice_types::{
 };
 use tokio::sync::{broadcast, mpsc};
 
+use crate::cidr::Cidr;
 use crate::config::Config;
 
 /// Events coming up from links into the node.
@@ -194,6 +195,20 @@ const WAKE_DEFER_DELAY: std::time::Duration = std::time::Duration::from_millis(5
 /// Inbound (socket -> event loop) channel capacity, in frames. A peer that
 /// floods past this is disconnected by `link_task` rather than buffered.
 const INBOUND_CAPACITY: usize = 256;
+/// Established-link caps. WAN links get the plan's hard cap (32); hive
+/// links get the plan's 128. Per-prefix caps bound how many links one
+/// /24 (or /48) may hold: 8 for WAN, and the hive cap for hive prefixes
+/// (a hive behind one NAT shares a prefix; capping it lower would defeat
+/// the hive cap). Links whose address is unknown are treated as WAN
+/// (fail closed).
+const MAX_WAN_LINKS: usize = 32;
+const MAX_HIVE_LINKS: usize = 128;
+const MAX_WAN_LINKS_PER_PREFIX: usize = 8;
+const MAX_HIVE_LINKS_PER_PREFIX: usize = MAX_HIVE_LINKS;
+/// How long a link may stay unbound (no record claim) before it is
+/// dropped. Binding normally completes within a reconcile round (~1s);
+/// 60s is generous headroom for a slow peer.
+const UNBOUND_LINK_DEADLINE_SECS: u64 = 60;
 
 /// Outbound/inbound frame classes for per-peer rate limiting and shedding.
 /// Custody is message custody (offers and custody replies): shed last.
@@ -357,6 +372,41 @@ impl LinkStats {
     }
 }
 
+/// Which cap pool a link draws from. Hive membership is decided by the
+/// configured hive CIDRs (the only place scope is visible); everything
+/// else is WAN.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum LinkScope {
+    Wan,
+    Hive,
+}
+
+impl LinkScope {
+    fn name(self) -> &'static str {
+        match self {
+            LinkScope::Wan => "wan",
+            LinkScope::Hive => "hive",
+        }
+    }
+}
+
+/// Classify a link by its remote address. Unknown addresses are WAN: the
+/// tighter cap is the safe default.
+fn scope_of(addr: Option<&std::net::SocketAddr>, hive: &[Cidr]) -> LinkScope {
+    match addr {
+        Some(a) if hive.iter().any(|c| c.contains(a.ip())) => LinkScope::Hive,
+        _ => LinkScope::Wan,
+    }
+}
+
+/// Why a link was refused at admission.
+enum LinkCap {
+    /// The per-scope cap was reached.
+    Scope(LinkScope, usize),
+    /// The per-prefix cap was reached.
+    Prefix(lattice_net::SourcePrefix, usize),
+}
+
 struct LinkHandle {
     peer: Option<Identifier>,
     addr: Option<std::net::SocketAddr>,
@@ -368,6 +418,10 @@ struct LinkHandle {
     /// When the outbound queue first reached the high-water mark and has
     /// not drained below it since. `None` while under the mark.
     over_mark_since: Option<u64>,
+    /// When the link became unbound (no record claim), if it currently is.
+    /// Set at attach time and whenever a binding is cleared; cleared when a
+    /// binding is established. Drives the unbound-link deadline.
+    unbound_since: Option<u64>,
 }
 
 pub struct Runtime {
@@ -393,6 +447,10 @@ pub struct Runtime {
     api_tx: mpsc::UnboundedSender<ApiCmd>,
     pub app_broadcast: broadcast::Sender<ServiceEvent>,
     next_link: u64,
+    /// Hive ranges from the config; links whose address falls in one are
+    /// hive-scope for the established-link caps. Empty means every link is
+    /// WAN-scope.
+    hive_cidrs: Vec<Cidr>,
     /// Next time the retired-envelope-key file sweep runs. Mirrors the
     /// core's data-sweep cadence (`DATA_SWEEP_SECS` in lattice-core); the
     /// core drops expired keys from memory, this deletes the files.
@@ -537,6 +595,20 @@ impl Runtime {
             mode,
             ..lattice_core::Config::default()
         };
+        // The config validator already rejected malformed CIDRs; a parse
+        // failure here means the config was built by hand (tests), so skip
+        // the entry and treat those links as WAN (the tighter cap).
+        let hive_cidrs: Vec<Cidr> = cfg
+            .hive
+            .iter()
+            .filter_map(|s| match Cidr::parse(s) {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    eprintln!("lattice: ignoring hive CIDR {s:?}: {e}");
+                    None
+                }
+            })
+            .collect();
         let mut node = Node::new(core_cfg, identity, store, now)?;
         if draining.load(Ordering::Relaxed) {
             node.set_drain(DrainState::Draining);
@@ -570,6 +642,7 @@ impl Runtime {
             api_tx,
             app_broadcast,
             next_link: 1,
+            hive_cidrs,
             // The startup load already deleted expired files; first sweep an
             // hour from now. (`now` is milliseconds; the sweep is tracked
             // in seconds.)
@@ -593,14 +666,78 @@ impl Runtime {
         f(&mut node)
     }
 
-    /// Register an established peer connection.
+    /// Count established links in `scope` and in `prefix` (when known).
+    fn count_links(
+        &self,
+        scope: LinkScope,
+        prefix: Option<lattice_net::SourcePrefix>,
+    ) -> (usize, usize) {
+        let mut scope_n = 0;
+        let mut prefix_n = 0;
+        for l in self.links.values() {
+            if scope_of(l.addr.as_ref(), &self.hive_cidrs) == scope {
+                scope_n += 1;
+            }
+            if let (Some(p), Some(a)) = (prefix, l.addr.as_ref()) {
+                if lattice_net::prefix_of(a) == p {
+                    prefix_n += 1;
+                }
+            }
+        }
+        (scope_n, prefix_n)
+    }
+
+    /// Check the established-link caps for a prospective link. The cap is
+    /// enforced here, at admission, because only the runtime can see both
+    /// the link's scope (via the configured hive CIDRs) and the current
+    /// link table; the listener cannot.
+    fn check_link_admission(&self, addr: Option<&std::net::SocketAddr>) -> Result<(), LinkCap> {
+        let scope = scope_of(addr, &self.hive_cidrs);
+        let (scope_cap, prefix_cap) = match scope {
+            LinkScope::Wan => (MAX_WAN_LINKS, MAX_WAN_LINKS_PER_PREFIX),
+            LinkScope::Hive => (MAX_HIVE_LINKS, MAX_HIVE_LINKS_PER_PREFIX),
+        };
+        let prefix = addr.map(lattice_net::prefix_of);
+        let (scope_n, prefix_n) = self.count_links(scope, prefix);
+        if scope_n >= scope_cap {
+            return Err(LinkCap::Scope(scope, scope_cap));
+        }
+        if let Some(p) = prefix {
+            if prefix_n >= prefix_cap {
+                return Err(LinkCap::Prefix(p, prefix_cap));
+            }
+        }
+        Ok(())
+    }
+
+    /// Register an established peer connection. Returns the link id, or
+    /// `None` when the link was refused by the established-link caps (the
+    /// connection is dropped without a response).
     pub async fn attach_link(
         &mut self,
         peer: Option<Identifier>,
         remote_ck: X25519PublicKey,
         io: lattice_net::PeerIo,
-        addr: Option<std::net::SocketAddr>,
-    ) -> u64 {
+    ) -> Option<u64> {
+        let addr = Some(io.remote_addr);
+        if let Err(cap) = self.check_link_admission(addr.as_ref()) {
+            match cap {
+                LinkCap::Scope(scope, cap) => eprintln!(
+                    "lattice: refusing link from {}: {scope_name} link cap reached ({cap})",
+                    addr.map(|a| a.to_string())
+                        .unwrap_or_else(|| "unknown".into()),
+                    scope_name = scope.name(),
+                ),
+                LinkCap::Prefix(prefix, cap) => eprintln!(
+                    "lattice: refusing link from {}: per-prefix cap reached ({cap} per {prefix})",
+                    addr.map(|a| a.to_string())
+                        .unwrap_or_else(|| "unknown".into()),
+                ),
+            }
+            // `io` is dropped here: the connection is closed without a
+            // response, consistent with the listener's other refusals.
+            return None;
+        }
         let id = self.next_link;
         self.next_link += 1;
         let (outbound_tx, outbound_rx) = mpsc::channel(OUTBOUND_CAPACITY);
@@ -618,6 +755,7 @@ impl Runtime {
                 in_buckets: in_buckets(now),
                 stats: LinkStats::default(),
                 over_mark_since: None,
+                unbound_since: peer.is_none().then_some(now),
             },
         );
         // The link is registered, so the actions returned by LinkUp can be
@@ -629,7 +767,7 @@ impl Runtime {
             remote_ck,
         })
         .await;
-        id
+        Some(id)
     }
 
     /// Register the configured roots. Each is dialed immediately and then
@@ -721,7 +859,7 @@ impl Runtime {
                 }
                 Some(peer) = peer_rx.recv() => {
                     let ck = peer.remote_static;
-                    self.attach_link(None, ck, peer, None).await;
+                    self.attach_link(None, ck, peer).await;
                 }
                 Some(outcome) = dial_rx.recv() => self.handle_dial_outcome(outcome).await,
                 Some(api) = api_rx.recv() => self.handle_api(api).await,
@@ -764,6 +902,15 @@ impl Runtime {
                     }
                 },
                 _ = wake => {
+                    // Drop links that have been unbound longer than the
+                    // deadline; the core is told via LinkDown below.
+                    for link in self.sweep_unbound_links() {
+                        self.apply(Event::LinkDown {
+                            at: now_ms(),
+                            link,
+                        })
+                        .await;
+                    }
                     // Attach any dials that completed since the last arm ran,
                     // then defer the core wake while a dial is still in
                     // flight: dispatching now would find no link and park
@@ -826,7 +973,38 @@ impl Runtime {
         }
         let rk = self.next_retired_key_sweep.saturating_mul(1000);
         best = Some(best.map_or(rk, |b| b.min(rk)));
+        // Unbound links have a hard deadline; arm the wake for the earliest.
+        if let Some(t) = self.links.values().filter_map(|l| l.unbound_since).min() {
+            let ms = t
+                .saturating_add(UNBOUND_LINK_DEADLINE_SECS)
+                .saturating_mul(1000);
+            best = Some(best.map_or(ms, |b| b.min(ms)));
+        }
         best.map(instant_from_unix_ms)
+    }
+
+    /// Drop links that have been unbound (no record claim) for longer than
+    /// [`UNBOUND_LINK_DEADLINE_SECS`]. Returns the dropped link ids; the
+    /// caller feeds `LinkDown` for each back into the core.
+    fn sweep_unbound_links(&mut self) -> Vec<u64> {
+        let now = now_secs();
+        let expired: Vec<u64> = self
+            .links
+            .iter()
+            .filter(|(_, l)| {
+                l.unbound_since
+                    .is_some_and(|t| now.saturating_sub(t) >= UNBOUND_LINK_DEADLINE_SECS)
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for id in &expired {
+            if let Some(l) = self.links.get(id) {
+                let secs = l.unbound_since.map(|t| now.saturating_sub(t)).unwrap_or(0);
+                eprintln!("lattice: link {id} dropped: unbound (no record claim) for {secs}s");
+            }
+            self.remove_link(*id);
+        }
+        expired
     }
 
     /// Run one event through the core and apply the resulting actions.
@@ -906,6 +1084,11 @@ impl Runtime {
                 Action::LinkBound { link, peer } => {
                     if let Some(h) = self.links.get_mut(&link) {
                         h.peer = peer;
+                        h.unbound_since = if peer.is_some() {
+                            None
+                        } else {
+                            Some(now_secs())
+                        };
                     }
                     if let Some(p) = peer {
                         // One connection per peer: keep the newest link
@@ -1268,11 +1451,18 @@ impl Runtime {
         match outcome.result {
             Ok(io) => {
                 let remote_ck = io.remote_static;
-                self.attach_link(outcome.pinned, remote_ck, io, Some(outcome.addr))
-                    .await;
-                if let Some(root) = self.roots.iter_mut().find(|r| r.addr == outcome.addr) {
-                    root.attempts = 0;
-                    root.next_attempt = now_secs() + 60;
+                // A link refused by the admission caps does not count as a
+                // successful dial: keep the root's backoff so we do not
+                // hammer the cap every 60s.
+                if self
+                    .attach_link(outcome.pinned, remote_ck, io)
+                    .await
+                    .is_some()
+                {
+                    if let Some(root) = self.roots.iter_mut().find(|r| r.addr == outcome.addr) {
+                        root.attempts = 0;
+                        root.next_attempt = now_secs() + 60;
+                    }
                 }
             }
             Err(e) => {
@@ -1382,6 +1572,15 @@ mod tests {
     }
 
     fn attach_test_link(rt: &mut Runtime, link: u64) {
+        attach_test_link_full(rt, link, None, None);
+    }
+
+    fn attach_test_link_full(
+        rt: &mut Runtime,
+        link: u64,
+        addr: Option<std::net::SocketAddr>,
+        unbound_since: Option<u64>,
+    ) {
         let (tx, _rx) = mpsc::channel(OUTBOUND_CAPACITY);
         // Keep the receiver alive by leaking it into the test's runtime; the
         // queue depth is what the test manipulates.
@@ -1392,13 +1591,14 @@ mod tests {
             link,
             LinkHandle {
                 peer: None,
-                addr: None,
+                addr,
                 tx,
                 task,
                 buckets: out_buckets(now),
                 in_buckets: in_buckets(now),
                 stats: LinkStats::default(),
                 over_mark_since: None,
+                unbound_since,
             },
         );
     }
@@ -1566,5 +1766,193 @@ mod tests {
         let id = Identifier::from_bytes([7u8; 32]);
         assert_eq!(pinned_peer(None, Some(id)), None);
         assert_eq!(pinned_peer(None, None), None);
+    }
+
+    fn wan_addr(last: u8) -> std::net::SocketAddr {
+        format!("203.0.113.{last}:4000").parse().unwrap()
+    }
+
+    fn hive_addr(last: u8) -> std::net::SocketAddr {
+        format!("10.1.2.{last}:4000").parse().unwrap()
+    }
+
+    fn test_runtime_with_hive(dir: &std::path::Path) -> Runtime {
+        std::fs::create_dir_all(dir).unwrap();
+        crate::keys::init_identity(dir, None).unwrap();
+        let identity = crate::keys::load_identity(dir).unwrap();
+        let store = lattice_store::RedbStore::open(dir.join("node.redb")).unwrap();
+        let cfg = crate::config::Config {
+            identity_dir: dir.to_path_buf(),
+            mode: "public".to_string(),
+            listen: vec![],
+            hive: vec!["10.0.0.0/8".to_string()],
+            roots: vec![],
+            services: std::collections::HashMap::new(),
+            status: false,
+            app_socket: dir.join("app.sock"),
+            admin_socket: dir.join("admin.sock"),
+            advertise: vec![],
+            ips: vec![],
+            gateways: vec![],
+            limits: crate::config::Limits::default(),
+        };
+        let (_peer_tx, peer_rx) = tokio::sync::mpsc::unbounded_channel();
+        let draining = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        Runtime::new(&cfg, identity, store, 1_000, peer_rx, draining).unwrap()
+    }
+
+    #[test]
+    fn scope_classification_uses_hive_cidrs() {
+        let hive = vec![Cidr::parse("10.0.0.0/8").unwrap()];
+        assert_eq!(scope_of(Some(&hive_addr(7)), &hive), LinkScope::Hive);
+        assert_eq!(scope_of(Some(&wan_addr(7)), &hive), LinkScope::Wan);
+        // Unknown address fails closed to WAN.
+        assert_eq!(scope_of(None, &hive), LinkScope::Wan);
+        // No hive CIDRs configured: everything is WAN.
+        assert_eq!(scope_of(Some(&hive_addr(7)), &[]), LinkScope::Wan);
+    }
+
+    #[tokio::test]
+    async fn wan_scope_cap_refuses_links_beyond_32() {
+        let dir = std::env::temp_dir().join(format!(
+            "latticed-wan-cap-test-{}-{}",
+            std::process::id(),
+            now_secs()
+        ));
+        let mut rt = test_runtime(&dir);
+        // 32 WAN links, each from its own /24 so the per-prefix cap
+        // (8) does not bind first.
+        for i in 0..MAX_WAN_LINKS {
+            let addr = std::net::SocketAddr::new(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, i as u8, 1)),
+                4000,
+            );
+            attach_test_link_full(&mut rt, i as u64 + 1, Some(addr), None);
+        }
+        let extra: std::net::SocketAddr = "203.0.250.1:4000".parse().unwrap();
+        assert!(matches!(
+            rt.check_link_admission(Some(&extra)),
+            Err(LinkCap::Scope(LinkScope::Wan, MAX_WAN_LINKS))
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn per_prefix_cap_refuses_ninth_link_from_same_prefix() {
+        let dir = std::env::temp_dir().join(format!(
+            "latticed-prefix-cap-test-{}-{}",
+            std::process::id(),
+            now_secs()
+        ));
+        let mut rt = test_runtime(&dir);
+        for i in 0..MAX_WAN_LINKS_PER_PREFIX {
+            attach_test_link_full(&mut rt, i as u64 + 1, Some(wan_addr(i as u8 + 1)), None);
+        }
+        // The 9th link from the same /24 is refused.
+        let addr = wan_addr(200);
+        assert!(matches!(
+            rt.check_link_admission(Some(&addr)),
+            Err(LinkCap::Prefix(_, MAX_WAN_LINKS_PER_PREFIX))
+        ));
+        // A different /24 is admitted.
+        let other: std::net::SocketAddr = "198.51.100.7:4000".parse().unwrap();
+        assert!(rt.check_link_admission(Some(&other)).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn hive_links_use_hive_cap() {
+        let dir = std::env::temp_dir().join(format!(
+            "latticed-hive-cap-test-{}-{}",
+            std::process::id(),
+            now_secs()
+        ));
+        let mut rt = test_runtime_with_hive(&dir);
+        // 32 hive links from one /16: fine (hive per-prefix cap is the
+        // hive cap, not the WAN 8).
+        for i in 0..40u8 {
+            attach_test_link_full(&mut rt, i as u64 + 1, Some(hive_addr(i)), None);
+        }
+        let addr = hive_addr(200);
+        assert!(rt.check_link_admission(Some(&addr)).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn wan_scope_cap_counts_only_wan_links() {
+        let dir = std::env::temp_dir().join(format!(
+            "latticed-scope-cap-test-{}-{}",
+            std::process::id(),
+            now_secs()
+        ));
+        let mut rt = test_runtime_with_hive(&dir);
+        // Fill the WAN scope to its cap with distinct prefixes.
+        for i in 0..MAX_WAN_LINKS {
+            let addr = std::net::SocketAddr::new(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                    198,
+                    (i % 250) as u8 + 1,
+                    (i / 250) as u8,
+                    1,
+                )),
+                4000,
+            );
+            attach_test_link_full(&mut rt, i as u64 + 1, Some(addr), None);
+        }
+        let wan_addr: std::net::SocketAddr = "203.0.113.9:4000".parse().unwrap();
+        assert!(matches!(
+            rt.check_link_admission(Some(&wan_addr)),
+            Err(LinkCap::Scope(LinkScope::Wan, MAX_WAN_LINKS))
+        ));
+        // Hive scope is independent and still has room.
+        assert!(rt.check_link_admission(Some(&hive_addr(9))).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn unbound_links_expire_and_bound_links_do_not() {
+        let dir = std::env::temp_dir().join(format!(
+            "latticed-unbound-test-{}-{}",
+            std::process::id(),
+            now_secs()
+        ));
+        let mut rt = test_runtime(&dir);
+        let now = now_secs();
+        // One link unbound for longer than the deadline, one freshly
+        // unbound, one bound.
+        attach_test_link_full(&mut rt, 1, None, Some(now - UNBOUND_LINK_DEADLINE_SECS - 1));
+        attach_test_link_full(&mut rt, 2, None, Some(now));
+        attach_test_link_full(&mut rt, 3, None, None);
+        let dropped = rt.sweep_unbound_links();
+        assert_eq!(dropped, vec![1]);
+        assert!(!rt.links.contains_key(&1));
+        assert!(rt.links.contains_key(&2));
+        assert!(rt.links.contains_key(&3));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn link_bound_action_clears_and_sets_unbound_since() {
+        let dir = std::env::temp_dir().join(format!(
+            "latticed-linkbound-test-{}-{}",
+            std::process::id(),
+            now_secs()
+        ));
+        let mut rt = test_runtime(&dir);
+        attach_test_link_full(&mut rt, 1, None, Some(now_secs()));
+        let peer = Identifier::from_bytes([9u8; 32]);
+        rt.apply_actions(vec![Action::LinkBound {
+            link: 1,
+            peer: Some(peer),
+        }]);
+        assert_eq!(rt.links.get(&1).unwrap().unbound_since, None);
+        assert_eq!(rt.links.get(&1).unwrap().peer, Some(peer));
+        // A cleared binding starts a fresh unbound window.
+        rt.apply_actions(vec![Action::LinkBound {
+            link: 1,
+            peer: None,
+        }]);
+        assert!(rt.links.get(&1).unwrap().unbound_since.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
