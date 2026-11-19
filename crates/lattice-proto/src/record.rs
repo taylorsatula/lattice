@@ -461,6 +461,12 @@ impl ParsedRecord {
     pub fn khc(&self) -> Commitment {
         self.khc
     }
+
+    /// The record's scope (WAN or hive). Only meaningful for routing the
+    /// record to the right reconcile set; never for trust decisions.
+    pub fn scope(&self) -> Scope {
+        self.scope
+    }
 }
 
 impl PeerRecord {

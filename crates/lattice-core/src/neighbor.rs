@@ -22,8 +22,8 @@ use lattice_types::{ChannelPublicKey, Identifier};
 /// Outbound (core-dialed) WAN link cap. The daemon enforces a separate,
 /// higher hard cap on all links (32); this is the selection target.
 pub(crate) const MAX_OUTBOUND_WAN: usize = 16;
-/// Outbound hive link cap. Hive links do not exist yet; the cap is in
-/// place for when they do.
+/// Outbound hive link cap. A gateway can serve a large hive and still
+/// hold its WAN backbone links.
 pub(crate) const MAX_OUTBOUND_HIVE: usize = 128;
 /// Per-range-group sub-caps: at most this many selected candidates from
 /// one /24 (IPv4), one /48 (IPv6), or one hostname.

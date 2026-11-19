@@ -51,6 +51,12 @@ pub enum Event {
         link: LinkId,
         peer: Option<Identifier>,
         remote_ck: X25519PublicKey,
+        /// Scope of the link, classified by the caller from the remote
+        /// address (hive CIDR match → hive, otherwise WAN). The core is
+        /// sans-IO and cannot see addresses, so the scope arrives with the
+        /// event. Hive links carry only hive records; WAN links only WAN
+        /// records.
+        scope: lattice_proto::record::Scope,
     },
     LinkDown {
         at: u64,
@@ -203,6 +209,18 @@ pub struct Config {
     pub fresh_waypoint_retries: u32,
     pub default_message_horizon: u64,
     pub rng_seed: u64,
+    /// CIDRs that make up the hive (e.g. `10.0.0.0/8`). A node whose own
+    /// addresses (listen addresses, `advertise_ips`, or IP-literal hosts in
+    /// `advertise`) fall inside one of these is a hive member and publishes
+    /// a hive-scoped record in addition to its WAN record. Links whose
+    /// remote address falls inside one of these are hive-scoped. Empty
+    /// means the node is never a hive member and every link is WAN.
+    pub hive_cidrs: Vec<String>,
+    /// The node's own listen addresses. Used (with `advertise`/`advertise_ips`)
+    /// to decide hive membership: a listen address inside a hive CIDR makes
+    /// the node a hive member. Unspecified (`0.0.0.0`/`::`) addresses never
+    /// match a CIDR.
+    pub listen_ips: Vec<std::net::IpAddr>,
     /// Endpoints to publish in our record (public mode). `ws://` or `wss://` URLs.
     pub advertise: Vec<String>,
     /// Literal IP addresses advertised in the record's endpoints (public
@@ -247,6 +265,8 @@ impl Default for Config {
             fresh_waypoint_retries: 3,
             default_message_horizon: 3 * 24 * 3600,
             rng_seed: 0x5eed_u64,
+            hive_cidrs: Vec::new(),
+            listen_ips: Vec::new(),
             advertise: Vec::new(),
             advertise_ips: Vec::new(),
             gateways: Vec::new(),

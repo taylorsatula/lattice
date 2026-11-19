@@ -105,6 +105,34 @@ pub struct NodeSpec<'a> {
     pub services: &'a [ServiceSpec],
     pub private_gateways: Option<Vec<Identifier>>,
     pub serves: Option<Vec<Identifier>>,
+    /// Listen addresses. Empty means `127.0.0.1:{port}`.
+    pub listen: Vec<String>,
+    /// Hive CIDRs to configure (`hive = [...]`).
+    pub hive: Vec<String>,
+    /// Endpoints to advertise (`advertise = [...]`).
+    pub advertise: Vec<String>,
+    /// Literal IPs to advertise (`ips = [...]`).
+    pub ips: Vec<String>,
+}
+
+/// Extra per-node config beyond the defaults, for tests that need a
+/// non-default topology.
+#[derive(Default, Clone)]
+pub struct NodeExtras {
+    pub private_gateways: Option<Vec<Identifier>>,
+    pub serves: Option<Vec<Identifier>>,
+    /// Listen addresses; `{port}` is replaced with the allocated port.
+    /// Empty means `127.0.0.1:{port}`.
+    pub listen: Vec<String>,
+    /// Hive CIDRs to configure.
+    pub hive: Vec<String>,
+    /// Endpoints to advertise; `{port}` is replaced with the allocated port.
+    pub advertise: Vec<String>,
+    /// Literal IPs to advertise.
+    pub ips: Vec<String>,
+    /// Pin the listen port instead of allocating a free one. Used when a
+    /// peer must know this node's port before it boots.
+    pub port: Option<u16>,
 }
 
 pub fn write_config(dir: &Path, spec: &NodeSpec) {
@@ -147,11 +175,57 @@ pub fn write_config(dir: &Path, spec: &NodeSpec) {
         (Some(_), Some(_)) => panic!("serves is only valid for public nodes"),
         (None, _) => String::new(),
     };
+    let port = spec.port.to_string();
+    let listen = if spec.listen.is_empty() {
+        format!("\"127.0.0.1:{port}\"")
+    } else {
+        spec.listen
+            .iter()
+            .map(|a| format!("\"{}\"", a.replace("{port}", &port)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let hive = if spec.hive.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "hive = [{}]\n",
+            spec.hive
+                .iter()
+                .map(|c| format!("\"{c}\""))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    let advertise = if spec.advertise.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "advertise = [{}]\n",
+            spec.advertise
+                .iter()
+                .map(|u| format!("\"{}\"", u.replace("{port}", &port)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    let ips = if spec.ips.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "ips = [{}]\n",
+            spec.ips
+                .iter()
+                .map(|i| format!("\"{i}\""))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
     let toml = format!(
         r#"identity_dir = "{dir}"
 mode = "{mode}"
-listen = ["127.0.0.1:{port}"]
-app_socket = "{app}"
+listen = [{listen}]
+{hive}{advertise}{ips}app_socket = "{app}"
 admin_socket = "{admin}"
 {gateways}{serves}
 [services]
@@ -163,7 +237,10 @@ republish_min_interval_secs = 0
 
 {roots}"#,
         dir = dir.display(),
-        port = spec.port,
+        listen = listen,
+        hive = hive,
+        advertise = advertise,
+        ips = ips,
         app = spec.app.display(),
         admin = spec.admin.display(),
     );
@@ -222,7 +299,18 @@ pub fn boot_node_full(
 ) -> TestNode {
     let dir = tmp.join(name);
     let keys = init_node(&dir);
-    boot_initialized(tmp, name, dir, keys, peer, services, private_gateways, None)
+    boot_initialized(
+        tmp,
+        name,
+        dir,
+        keys,
+        peer,
+        services,
+        NodeExtras {
+            private_gateways,
+            ..NodeExtras::default()
+        },
+    )
 }
 
 /// Boot a public node that consents to serve `serves` as a gateway
@@ -237,7 +325,37 @@ pub fn boot_node_with_serves(
 ) -> TestNode {
     let dir = tmp.join(name);
     let keys = init_node(&dir);
-    boot_initialized(tmp, name, dir, keys, peer, services, None, Some(serves))
+    boot_initialized(
+        tmp,
+        name,
+        dir,
+        keys,
+        peer,
+        services,
+        NodeExtras {
+            serves: Some(serves),
+            ..NodeExtras::default()
+        },
+    )
+}
+
+/// Boot a node with explicit per-node extras: listen addresses, hive
+/// CIDRs, advertised endpoints and IPs. `{port}` in `listen` and
+/// `advertise` entries is replaced with the allocated port. Pass
+/// `keys: Some(..)` to boot a node whose identity was pre-created with
+/// `init_node` (needed when another node must name this one's id or key
+/// before this node boots).
+pub fn boot_node_ex(
+    tmp: &Path,
+    name: &str,
+    keys: Option<NodeKeys>,
+    peer: Option<PeerSpec<'_>>,
+    services: &[ServiceSpec],
+    extras: NodeExtras,
+) -> TestNode {
+    let dir = tmp.join(name);
+    let keys = keys.unwrap_or_else(|| init_node(&dir));
+    boot_initialized(tmp, name, dir, keys, peer, services, extras)
 }
 
 /// Boot a node whose identity was already created with `init_node`
@@ -252,10 +370,20 @@ pub fn boot_node_with_keys(
     private_gateways: Option<Vec<Identifier>>,
 ) -> TestNode {
     let dir = tmp.join(name);
-    boot_initialized(tmp, name, dir, keys, peer, services, private_gateways, None)
+    boot_initialized(
+        tmp,
+        name,
+        dir,
+        keys,
+        peer,
+        services,
+        NodeExtras {
+            private_gateways,
+            ..NodeExtras::default()
+        },
+    )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn boot_initialized(
     tmp: &Path,
     name: &str,
@@ -263,8 +391,7 @@ fn boot_initialized(
     keys: NodeKeys,
     peer: Option<PeerSpec<'_>>,
     services: &[ServiceSpec],
-    private_gateways: Option<Vec<Identifier>>,
-    serves: Option<Vec<Identifier>>,
+    extras: NodeExtras,
 ) -> TestNode {
     let NodeKeys {
         id,
@@ -276,15 +403,19 @@ fn boot_initialized(
     let mut attempt = 0;
     loop {
         attempt += 1;
-        let port = free_port();
+        let port = extras.port.unwrap_or_else(free_port);
         let spec = NodeSpec {
             port,
             app: &app,
             admin: &admin,
             peer,
             services,
-            private_gateways: private_gateways.clone(),
-            serves: serves.clone(),
+            private_gateways: extras.private_gateways.clone(),
+            serves: extras.serves.clone(),
+            listen: extras.listen.clone(),
+            hive: extras.hive.clone(),
+            advertise: extras.advertise.clone(),
+            ips: extras.ips.clone(),
         };
         write_config(&dir, &spec);
         let mut child = start_node(&dir);

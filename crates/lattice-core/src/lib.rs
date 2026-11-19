@@ -14,6 +14,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod cidr;
 mod error;
 mod frame_budget;
 pub mod graph;

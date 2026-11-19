@@ -355,6 +355,10 @@ struct LinkState {
     /// `None` while the peer's identity is not safely established.
     peer: Option<Identifier>,
     remote_ck: X25519PublicKey,
+    /// Scope of the link, fixed at link-up from the remote address (hive
+    /// CIDR match → hive, otherwise WAN). Hive links carry only hive
+    /// records; WAN links only WAN records.
+    scope: Scope,
     /// True when the peer id was pinned by operator config (root `id`); pinned
     /// bindings are never re-derived from records or revoked by contest.
     pinned: bool,
@@ -382,13 +386,21 @@ struct LostLink {
     pinned: bool,
     since: u64,
     lost_at: u64,
+    scope: Scope,
 }
 
 impl LinkState {
-    fn new(peer: Option<Identifier>, remote_ck: X25519PublicKey, pinned: bool, now: u64) -> Self {
+    fn new(
+        peer: Option<Identifier>,
+        remote_ck: X25519PublicKey,
+        pinned: bool,
+        now: u64,
+        scope: Scope,
+    ) -> Self {
         Self {
             peer,
             remote_ck,
+            scope,
             pinned,
             since: now,
             echo_tokens: ECHO_BUDGET_CAPACITY,
@@ -501,6 +513,25 @@ impl StoredRecord {
     }
 }
 
+/// Per-scope publication state for our own record. A node publishes one
+/// record per scope it participates in (WAN always, hive when a hive
+/// member); each carries its own seq, expiry and advertised-link set.
+#[derive(Default)]
+struct OwnScopeState {
+    seq: u64,
+    exp: u64,
+    /// The link list as last published for this scope, in published
+    /// order; used for change detection. Empty until the first publish.
+    last_published_links: Vec<Identifier>,
+}
+
+fn scope_index(scope: Scope) -> usize {
+    match scope {
+        Scope::Wan => 0,
+        Scope::Hive => 1,
+    }
+}
+
 /// A record held in the in-memory index. Validation happened once, at
 /// admission (or at startup load); reads never re-validate. `hash` is the
 /// BLAKE3 of the stored bytes: the reconcile item hash-prefix and the
@@ -524,8 +555,9 @@ pub struct Node<S: Store> {
     identity: Identity,
     store: S,
     pub own_id: Identifier,
-    scope: Scope,
-    own_seq: u64,
+    own_records: [OwnScopeState; 2],
+    /// Parsed hive CIDRs from the config; empty means no hive.
+    hive_cidrs: Vec<crate::cidr::Cidr>,
     links: BTreeMap<LinkId, LinkState>,
     next_link_order: Vec<LinkId>,
     reconcile_sessions: BTreeMap<LinkId, ReconcileSession>,
@@ -578,9 +610,6 @@ pub struct Node<S: Store> {
     record_refresh_at: u64,
     /// Links that went down within the grace window; still advertised.
     recently_lost: Vec<LostLink>,
-    /// The link list as last published, in published order; used for
-    /// change detection. Empty until the first publish.
-    last_published_links: Vec<Identifier>,
     /// When the last record publish happened (ms); `None` until the first.
     last_publish_at: Option<u64>,
     /// A republish is owed but the spacing floor has not elapsed.
@@ -609,8 +638,6 @@ pub struct Node<S: Store> {
     /// Saved peers, keyed by (id, scope). Mirrors the `saved_peers`
     /// store table; loaded at startup, written through on change.
     saved_peers: std::collections::HashMap<(Identifier, Scope), SavedPeer>,
-    /// Expiry (unix seconds) of our current record; drives the refresh.
-    own_record_exp: u64,
     next_reconcile_at: u64,
     rng: Rng,
     now: u64,
@@ -640,7 +667,7 @@ pub struct Node<S: Store> {
     /// store or the signature verifier.
     graph_cache: Option<(u64, u64, Arc<Graph>)>,
     /// Memoized reconcile item list; same invalidation as `graph_cache`.
-    items_cache: Option<(u64, u64, Vec<reconcile::Item>)>,
+    items_cache: Option<(u64, u64, u8, Vec<reconcile::Item>)>,
     /// Memoized public-mode (id, envelope key) pairs for waypoint
     /// selection; same invalidation as `graph_cache`.
     waypoint_cache: Option<(u64, u64, Arc<WaypointCandidates>)>,
@@ -688,17 +715,23 @@ impl<S: Store> Node<S> {
             chunk.copy_from_slice(&salt_rng.next_u64().to_le_bytes());
         }
         let neighbor_salt = neighbor::selection_salt(identity.channel_seed.as_bytes());
+        let hive_cidrs = config
+            .hive_cidrs
+            .iter()
+            .map(|s| {
+                crate::cidr::Cidr::parse(s)
+                    .map_err(|e| NodeError::Config(format!("hive {s:?}: {e}")))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let mut rng = Rng::new(rng_seed);
         let first_refresh = now + refresh_interval_ms(&mut rng, config.record_refresh_secs);
-        // Publish our own record if absent.
-        let own_exists = store.record_get(&id, Scope::Wan)?.is_some();
         let mut node = Node {
             config,
             identity,
             store,
             own_id: id,
-            scope: Scope::Wan,
-            own_seq: 0,
+            own_records: Default::default(),
+            hive_cidrs,
             links: BTreeMap::new(),
             next_link_order: Vec::new(),
             reconcile_sessions: BTreeMap::new(),
@@ -722,7 +755,6 @@ impl<S: Store> Node<S> {
             distance_cache: std::collections::HashMap::new(),
             record_refresh_at: first_refresh,
             recently_lost: Vec::new(),
-            last_published_links: Vec::new(),
             last_publish_at: None,
             publish_pending: false,
             publish_retry_at: None,
@@ -733,7 +765,6 @@ impl<S: Store> Node<S> {
             neighbor_check_at: None,
             outbound_links: std::collections::HashMap::new(),
             saved_peers: std::collections::HashMap::new(),
-            own_record_exp: 0,
             next_reconcile_at: now + secs_to_ms(1),
             rng,
             now,
@@ -781,32 +812,50 @@ impl<S: Store> Node<S> {
             }
             Err(e) => node.diag("saved_peer_all", &e),
         }
-        if !own_exists {
+        // Seed the per-scope publication state from the store for both
+        // scopes (a scope that is not publishable yet may become
+        // publishable later, e.g. when a WAN link comes up); publish any
+        // publishable scope that has no stored record. The startup
+        // publish does not arm the republish floor: the first
+        // link-triggered publish must go out immediately, or a fresh node
+        // stays unroutable for a whole republish interval.
+        for scope in [Scope::Wan, Scope::Hive] {
+            if let Ok(Some(stored)) = node.store.record_get(&id, scope) {
+                match lattice_proto::record::PeerRecord::parse(&stored.bytes) {
+                    Ok(p) => {
+                        let st = &mut node.own_records[scope_index(scope)];
+                        st.seq = p.seq();
+                        st.exp = p.exp();
+                        st.last_published_links = p.links().to_vec();
+                    }
+                    Err(_) => {
+                        let st = &mut node.own_records[scope_index(scope)];
+                        st.seq = 0;
+                        st.exp = 0;
+                    }
+                }
+            }
+        }
+        let publish_scopes = node.publish_scopes(now);
+        let mut any_missing = false;
+        for scope in &publish_scopes {
+            if node.store.record_get(&id, *scope)?.is_none() {
+                any_missing = true;
+            }
+        }
+        if any_missing {
             node.publish_record(now)?;
-            // The startup publish does not arm the republish floor: the
-            // first link-triggered publish must go out immediately, or a
-            // fresh node stays unroutable for a whole republish interval.
             node.last_publish_at = None;
-        } else if let Some(stored) = node.store.record_get(&id, Scope::Wan)? {
-            // Seed the change detector from the stored record so the first
-            // tick does not see a spurious difference against an empty
-            // advertised set.
-            match lattice_proto::record::PeerRecord::parse(&stored.bytes) {
-                Ok(p) => {
-                    node.own_seq = p.seq();
-                    node.own_record_exp = p.exp();
-                    node.last_published_links = p.links().to_vec();
-                }
-                Err(_) => {
-                    node.own_seq = 0;
-                    node.own_record_exp = 0;
-                }
-            }
-            // A stored record nearing expiry is refreshed on the first
-            // tick rather than after a full refresh interval.
-            if node.own_record_exp.saturating_sub(ms_to_secs(now)) < REFRESH_EXP_HORIZON_SECS {
-                node.record_refresh_at = now;
-            }
+        }
+        // A stored record nearing expiry is refreshed on the first tick
+        // rather than after a full refresh interval.
+        let now_secs = ms_to_secs(now);
+        let refresh_due = publish_scopes.iter().any(|s| {
+            let exp = node.own_records[scope_index(*s)].exp;
+            exp != 0 && exp.saturating_sub(now_secs) < REFRESH_EXP_HORIZON_SECS
+        });
+        if refresh_due {
+            node.record_refresh_at = now;
         }
         // Serve our own KEL to peers: store it so the `kels` frame can
         // carry it. Unconditional — cheap, and covers stores written by
@@ -983,7 +1032,8 @@ impl<S: Store> Node<S> {
                 link,
                 peer,
                 remote_ck,
-            } => self.on_link_up(at, link, peer, remote_ck),
+                scope,
+            } => self.on_link_up(at, link, peer, remote_ck, scope),
             Event::LinkDown { at, link } => self.on_link_down(at, link),
             Event::DialFailed { at, peer } => self.on_dial_failed(at, peer),
             Event::Frame {
@@ -1088,7 +1138,113 @@ impl<S: Store> Node<S> {
 
     // ---------- records ----------
 
-    fn build_own_record(&mut self, prev_seq: u64, now: u64) -> Result<Vec<u8>, NodeError> {
+    /// Whether any of the node's own addresses falls inside a configured
+    /// hive CIDR. Own addresses are the listen addresses, the advertised
+    /// literal IPs, and IP-literal hosts in the advertised URLs. A node
+    /// with no hive CIDRs configured, or none of its addresses inside one,
+    /// is not a hive member.
+    fn is_hive_member(&self) -> bool {
+        if self.hive_cidrs.is_empty() {
+            return false;
+        }
+        let in_hive = |ip: &std::net::IpAddr| self.hive_cidrs.iter().any(|c| c.contains(*ip));
+        if self.config.listen_ips.iter().any(in_hive) {
+            return true;
+        }
+        if self.config.advertise_ips.iter().any(in_hive) {
+            return true;
+        }
+        self.config
+            .advertise
+            .iter()
+            .filter_map(|url| url_host_ip(url))
+            .any(|ip| in_hive(&ip))
+    }
+
+    /// Split the configured endpoints into (wan, hive). An endpoint whose
+    /// URL host is an IP literal inside a hive CIDR is a hive endpoint;
+    /// everything else (including hostname endpoints, which cannot be
+    /// placed without resolving) is a WAN endpoint. Each endpoint keeps
+    /// only the `advertise_ips` matching its scope, so a hive record never
+    /// carries a WAN address and vice versa.
+    fn split_endpoints(
+        &self,
+    ) -> (
+        Vec<lattice_proto::record::Endpoint>,
+        Vec<lattice_proto::record::Endpoint>,
+    ) {
+        let mut wan = Vec::new();
+        let mut hive = Vec::new();
+        for url in &self.config.advertise {
+            let is_hive = url_host_ip(url).is_some_and(|ip| self.in_hive(ip));
+            let ips: Vec<std::net::IpAddr> = self
+                .config
+                .advertise_ips
+                .iter()
+                .copied()
+                .filter(|ip| self.in_hive(*ip) == is_hive)
+                .collect();
+            let ep = lattice_proto::record::Endpoint {
+                url: url.clone(),
+                ips,
+            };
+            if is_hive {
+                hive.push(ep);
+            } else {
+                wan.push(ep);
+            }
+        }
+        (wan, hive)
+    }
+
+    fn in_hive(&self, ip: std::net::IpAddr) -> bool {
+        self.hive_cidrs.iter().any(|c| c.contains(ip))
+    }
+
+    /// Whether the node has any link (live, or lost within the grace
+    /// window) in `scope`. A node publishes a record for a scope it has
+    /// links in so the graph can route over them; a record that does not
+    /// list a link makes that link invisible to the graph.
+    fn has_scope_links(&self, scope: Scope, now: u64) -> bool {
+        self.links
+            .values()
+            .any(|l| l.scope == scope && l.peer.is_some())
+            || self
+                .recently_lost
+                .iter()
+                .any(|l| l.scope == scope && now.saturating_sub(l.lost_at) <= LINK_GRACE_MS)
+    }
+
+    /// Which scopes this node publishes a record for. A hive member
+    /// publishes a hive record; it publishes a WAN record as well when it
+    /// has WAN endpoints, WAN links, or serves private ids (a gateway's
+    /// WAN record is what WAN clients use to route to the private ids it
+    /// serves, so it is published even with no WAN endpoints; a WAN link
+    /// must likewise be advertised or the graph cannot route over it). A
+    /// hive member with none of those publishes only the hive record. A
+    /// non-member publishes only the WAN record.
+    fn publish_scopes(&self, now: u64) -> Vec<Scope> {
+        let (wan_eps, _) = self.split_endpoints();
+        let member = self.is_hive_member();
+        let has_wan = !wan_eps.is_empty()
+            || !self.config.serves.is_empty()
+            || self.has_scope_links(Scope::Wan, now);
+        let mut scopes = Vec::with_capacity(2);
+        if !member || has_wan {
+            scopes.push(Scope::Wan);
+        }
+        if member {
+            scopes.push(Scope::Hive);
+        }
+        scopes
+    }
+
+    fn build_own_record(
+        &mut self,
+        scope: Scope,
+        prev_seq: u64,
+        now: u64,
+    ) -> Result<Vec<u8>, NodeError> {
         // Wire times are seconds.
         let now_secs = ms_to_secs(now);
         let exp = now_secs + RECORD_LIFETIME_SECS;
@@ -1096,20 +1252,17 @@ impl<S: Store> Node<S> {
         let links: Vec<Identifier> = if private {
             vec![]
         } else {
-            self.advertised_links(now)
+            self.advertised_links(now, scope)
         };
         let requested_links = links.len();
+        let (wan_endpoints, hive_endpoints) = self.split_endpoints();
         let endpoints: Vec<lattice_proto::record::Endpoint> = if private {
             Vec::new()
         } else {
-            self.config
-                .advertise
-                .iter()
-                .map(|url| lattice_proto::record::Endpoint {
-                    url: url.clone(),
-                    ips: self.config.advertise_ips.clone(),
-                })
-                .collect()
+            match scope {
+                Scope::Wan => wan_endpoints,
+                Scope::Hive => hive_endpoints,
+            }
         };
         let gateways = if private {
             self.config.gateways.clone()
@@ -1126,7 +1279,7 @@ impl<S: Store> Node<S> {
                 channel_seed: self.identity.channel_seed.clone(),
                 envelope_key: self.identity.xwing_public,
                 mode: self.config.mode,
-                scope: self.scope,
+                scope,
                 endpoints,
                 links,
                 gateways,
@@ -1167,23 +1320,29 @@ impl<S: Store> Node<S> {
         Ok(())
     }
 
-    /// The links to advertise, in preference order: live links first,
-    /// then pinned (anchor) links, then longest-lived, deduplicated by
-    /// peer and capped at the record link cap. Links that went down
-    /// within the grace window stay in the set. Callers pass the result
-    /// to `PeerRecord::build`, which drops from the tail if the record
-    /// would exceed the wire cap.
-    fn advertised_links(&mut self, now: u64) -> Vec<Identifier> {
+    /// The links to advertise in the given scope's record, in preference
+    /// order: live links first, then pinned (anchor) links, then
+    /// longest-lived, deduplicated by peer and capped at the record link
+    /// cap. Links that went down within the grace window stay in the set.
+    /// Callers pass the result to `PeerRecord::build`, which drops from
+    /// the tail if the record would exceed the wire cap.
+    fn advertised_links(&mut self, now: u64, scope: Scope) -> Vec<Identifier> {
         self.recently_lost
             .retain(|l| now.saturating_sub(l.lost_at) <= LINK_GRACE_MS);
         let mut cand: Vec<(bool, bool, u64, Identifier)> =
             Vec::with_capacity(self.links.len() + self.recently_lost.len());
         for l in self.links.values() {
+            if l.scope != scope {
+                continue;
+            }
             if let Some(peer) = l.peer {
                 cand.push((true, l.pinned, l.since, peer));
             }
         }
         for l in &self.recently_lost {
+            if l.scope != scope {
+                continue;
+            }
             if cand.iter().any(|c| c.3 == l.peer) {
                 continue;
             }
@@ -1214,7 +1373,10 @@ impl<S: Store> Node<S> {
     /// spacing floor allows. Called after every link event and on ticks
     /// (so grace-period expiry is noticed).
     fn note_link_set_changed(&mut self, now: u64) {
-        if self.advertised_links(now) != self.last_published_links {
+        let changed = self.publish_scopes(now).into_iter().any(|s| {
+            self.advertised_links(now, s) != self.own_records[scope_index(s)].last_published_links
+        });
+        if changed {
             self.publish_pending = true;
         }
         self.flush_pending_publish(now);
@@ -1245,16 +1407,39 @@ impl<S: Store> Node<S> {
         }
     }
 
+    /// Publish every scope this node publishes. Each scope's record is
+    /// built, stored and indexed independently: a failure on one scope is
+    /// reported but does not stop the other.
     fn publish_record(&mut self, now: u64) -> Result<(), NodeError> {
-        let bytes = self.build_own_record(self.own_seq, now)?;
+        let mut first_err = None;
+        for scope in self.publish_scopes(now) {
+            if let Err(e) = self.publish_one_scope(scope, now) {
+                self.diag("publish_record", &e);
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+        }
+        self.last_publish_at = Some(now);
+        self.publish_pending = false;
+        self.publish_retry_at = None;
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
+    fn publish_one_scope(&mut self, scope: Scope, now: u64) -> Result<(), NodeError> {
+        let prev_seq = self.own_records[scope_index(scope)].seq;
+        let bytes = self.build_own_record(scope, prev_seq, now)?;
         let id = self.own_id;
         // Adopt the seq the builder assigned (max(prev + 1, now)).
         if let Ok(parsed) = PeerRecord::parse(&bytes) {
-            self.own_seq = parsed.seq();
-            self.own_record_exp = parsed.exp();
+            let st = &mut self.own_records[scope_index(scope)];
+            st.seq = parsed.seq();
+            st.exp = parsed.exp();
         }
-        self.store
-            .record_put(&id, self.scope, &bytes, ms_to_secs(now))?;
+        self.store.record_put(&id, scope, &bytes, ms_to_secs(now))?;
         // The own record is validated here too, so the index only ever
         // holds records that passed full validation.
         match PeerRecord::parse(&bytes)
@@ -1263,10 +1448,8 @@ impl<S: Store> Node<S> {
             Ok(v) => self.index_record(&bytes, v.into_inner()),
             Err(e) => self.diag("own_record_validate", &e),
         }
-        self.last_publish_at = Some(now);
-        self.last_published_links = self.advertised_links(now);
-        self.publish_pending = false;
-        self.publish_retry_at = None;
+        let links = self.advertised_links(now, scope);
+        self.own_records[scope_index(scope)].last_published_links = links;
         Ok(())
     }
 
@@ -1276,11 +1459,14 @@ impl<S: Store> Node<S> {
         link: LinkId,
         peer: Option<Identifier>,
         remote_ck: X25519PublicKey,
+        scope: Scope,
     ) -> Vec<Action> {
         self.touch(at);
         // A core-initiated dial is recognized by the peer's channel key;
         // the link becomes an outbound link for cap accounting and
-        // eviction.
+        // eviction. The link's scope comes from the transport (the remote
+        // address), which is authoritative; keep the outbound entry's
+        // scope in step so cap accounting matches the link.
         if let Some(pos) = self.pending_dials.iter().position(|d| d.ck == remote_ck) {
             let d = self.pending_dials.remove(pos);
             self.dial_backoff.remove(&(d.peer, d.scope));
@@ -1288,15 +1474,17 @@ impl<S: Store> Node<S> {
                 link,
                 OutboundLink {
                     peer: d.peer,
-                    scope: d.scope,
+                    scope,
                     hash: d.hash,
                     evict_on_success: d.evict_on_success,
                     range: d.range,
                 },
             );
         }
-        self.links
-            .insert(link, LinkState::new(peer, remote_ck, peer.is_some(), at));
+        self.links.insert(
+            link,
+            LinkState::new(peer, remote_ck, peer.is_some(), at, scope),
+        );
         self.next_link_order.push(link);
         self.reconcile_sessions
             .insert(link, ReconcileSession::new());
@@ -1331,6 +1519,7 @@ impl<S: Store> Node<S> {
                     pinned: l.pinned,
                     since: l.since,
                     lost_at: at,
+                    scope: l.scope,
                 });
                 // Bound the grace list; the oldest entries age out first.
                 if self.recently_lost.len() > 128 {
@@ -1494,24 +1683,26 @@ impl<S: Store> Node<S> {
         dist
     }
 
-    /// Reconcile item list for the stored records. Memoized on the same
-    /// key as [`Self::build_graph`]. Returns `None` when the KEL head set
-    /// cannot be read: answering a reconcile with an incomplete set would
-    /// tell the peer we hold less than we do, so the round is skipped
-    /// instead.
-    fn record_items(&mut self) -> Option<Vec<reconcile::Item>> {
-        let key = (self.derived_version, self.now);
-        if let Some((v, t, items)) = &self.items_cache {
-            if (*v, *t) == key {
+    /// Reconcile item list for the stored records, filtered to one scope:
+    /// a hive link reconciles hive records, a WAN link WAN records. KELs
+    /// (scope 255) are scope-agnostic and ride on both. Memoized per
+    /// (version, now, scope). Returns `None` when the KEL head set cannot
+    /// be read: answering a reconcile with an incomplete set would tell
+    /// the peer we hold less than we do, so the round is skipped instead.
+    fn record_items(&mut self, scope: Scope) -> Option<Vec<reconcile::Item>> {
+        let scope_byte = scope_as_u8(scope);
+        let key = (self.derived_version, self.now, scope_byte);
+        if let Some((v, t, s, items)) = &self.items_cache {
+            if (*v, *t, *s) == key {
                 return Some(items.clone());
             }
         }
         let now_secs = ms_to_secs(self.now);
-        // Only unexpired records are advertised.
+        // Only unexpired records of this link's scope are advertised.
         let mut items: Vec<reconcile::Item> = self
             .record_index
             .values()
-            .filter(|e| e.record.exp > now_secs)
+            .filter(|e| e.record.exp > now_secs && e.record.scope == scope)
             .map(|e| reconcile::Item {
                 id: e.record.id,
                 scope: scope_as_u8(e.record.scope),
@@ -1544,15 +1735,23 @@ impl<S: Store> Node<S> {
         }
         items.sort();
         items.dedup();
-        self.items_cache = Some((key.0, key.1, items.clone()));
+        self.items_cache = Some((key.0, key.1, key.2, items.clone()));
         Some(items)
+    }
+
+    /// The scope of a link, if it is up.
+    fn link_scope(&self, link: LinkId) -> Option<Scope> {
+        self.links.get(&link).map(|l| l.scope)
     }
 
     // ---------- reconcile ----------
 
     fn reconcile_with(&mut self, link: LinkId) -> Vec<Action> {
         // Store unreadable: skip this round rather than advertise an empty set.
-        let Some(items) = self.record_items() else {
+        let Some(scope) = self.link_scope(link) else {
+            return Vec::new();
+        };
+        let Some(items) = self.record_items(scope) else {
             return Vec::new();
         };
         // a fresh round gets a fresh session so entries echo exactly once per range
@@ -1576,14 +1775,17 @@ impl<S: Store> Node<S> {
                 .insert(link, ReconcileSession::new());
         }
         // Store unreadable: say nothing rather than claim we hold nothing.
-        let Some(items) = self.record_items() else {
+        let Some(scope) = self.link_scope(link) else {
+            return Vec::new();
+        };
+        let Some(items) = self.record_items(scope) else {
             return Vec::new();
         };
         let session = self.reconcile_sessions.entry(link).or_default();
         let reconcile::ReconcileResponse {
             ranges: reply,
             wants,
-        } = reconcile::respond(&items, &frame.ranges, session);
+        } = reconcile::respond(&items, &frame.ranges, session, scope);
         // Chunk the reply so every frame fits a bucket and carries at most
         // MAX_RANGES_PER_MSG ranges; the remainder goes in follow-up frames
         // rather than being dropped. Per-item sizes come from encoding a
@@ -1629,8 +1831,11 @@ impl<S: Store> Node<S> {
 
     fn on_want(&mut self, link: LinkId, frame: &WantFrame) -> Vec<Action> {
         // Collect the wanted payloads, then emit frames that fit a bucket;
-        // a frame that does not fit cannot be sent at all.
+        // a frame that does not fit cannot be sent at all. A record is
+        // served only if its scope matches the link's scope; KELs ride on
+        // every link. A want for the other scope is ignored.
         const MAX_FRAME_PAYLOAD: usize = 30 * 1024;
+        let link_scope = self.link_scope(link);
         let mut records: Vec<Vec<u8>> = Vec::new();
         let mut kels: Vec<Vec<u8>> = Vec::new();
         for want in &frame.wants {
@@ -1642,6 +1847,9 @@ impl<S: Store> Node<S> {
                 }
             } else {
                 let scope = scope_from_u8(want.scope);
+                if link_scope != Some(scope) {
+                    continue;
+                }
                 match self.store.record_get(&want.id, scope) {
                     Ok(Some(stored)) => records.push(stored.bytes),
                     Ok(None) => {}
@@ -1710,22 +1918,17 @@ impl<S: Store> Node<S> {
         }]
     }
 
-    /// Ask `link` for the record for `id` in both scopes (WAN and hive).
-    /// Sent when an offer arrives from an unknown sender: the record is
-    /// needed to authenticate the sender (spec §5). Credits the link for
-    /// the wants, like the reconcile path, so the records are admitted
-    /// without spending the unsolicited-push budget.
+    /// Ask `link` for the record for `id` in the link's scope. Sent when
+    /// an offer arrives from an unknown sender: the record is needed to
+    /// authenticate the sender (spec §5). Credits the link for the want,
+    /// like the reconcile path, so the record is admitted without spending
+    /// the unsolicited-push budget.
     fn want_record(&mut self, link: LinkId, id: Identifier) -> Vec<Action> {
-        let wants = vec![
-            RecordRef {
-                id,
-                scope: scope_as_u8(Scope::Wan),
-            },
-            RecordRef {
-                id,
-                scope: scope_as_u8(Scope::Hive),
-            },
-        ];
+        let scope = self.link_scope(link).unwrap_or(Scope::Wan);
+        let wants = vec![RecordRef {
+            id,
+            scope: scope_as_u8(scope),
+        }];
         if let Some(l) = self.links.get_mut(&link) {
             l.want_credits = l
                 .want_credits
@@ -1742,7 +1945,20 @@ impl<S: Store> Node<S> {
     fn on_records(&mut self, at: u64, link: LinkId, records: Vec<Vec<u8>>) -> Vec<Action> {
         let mut actions = Vec::new();
         let mut dropped = 0usize;
+        let link_scope = self.link_scope(link);
         for bytes in records {
+            // A record whose scope does not match the link is not valid
+            // here at all: hive records never cross onto a WAN link and
+            // vice versa. Drop it before spending push budget or
+            // validation effort.
+            if let Some(ls) = link_scope {
+                if let Ok(parsed) = PeerRecord::parse(&bytes) {
+                    if parsed.scope() != ls {
+                        dropped += 1;
+                        continue;
+                    }
+                }
+            }
             // Records we asked for (a `want` is outstanding) are admitted
             // freely; anything else spends from the per-link push budget.
             // Unsolicited records past the budget are dropped before
@@ -2155,6 +2371,13 @@ impl<S: Store> Node<S> {
         let Ok(parsed) = PeerRecord::parse(bytes) else {
             return Vec::new();
         };
+        // Defense in depth: the caller (on_records) already drops records
+        // whose scope does not match the link; never admit one here either.
+        if let Some(ls) = self.link_scope(link) {
+            if parsed.scope() != ls {
+                return Vec::new();
+            }
+        }
         let id = parsed.id();
         let kel = match self.load_kel(&id) {
             Ok(Some(k)) => k,
@@ -3027,18 +3250,36 @@ impl<S: Store> Node<S> {
                 detail: None,
                 service: send.service.clone(),
             }];
-            let links: Vec<LinkId> = self.links.keys().copied().collect();
-            let chosen: Vec<LinkId> = if links.len() <= 2 {
-                links
-            } else {
-                let mut pool = links;
-                let mut picked = Vec::with_capacity(2);
-                while picked.len() < 2 && !pool.is_empty() {
-                    let idx = (self.rng.next_u64() as usize) % pool.len();
-                    picked.push(pool.swap_remove(idx));
+            // Ask on up to two links, preferring one of each scope so a
+            // recipient whose record lives in either scope is covered;
+            // fall back to a second link of the same scope when only one
+            // scope is available.
+            let mut chosen: Vec<LinkId> = Vec::new();
+            for scope in [Scope::Wan, Scope::Hive] {
+                let mut candidates: Vec<LinkId> = self
+                    .links
+                    .iter()
+                    .filter(|(_, s)| s.scope == scope)
+                    .map(|(l, _)| *l)
+                    .collect();
+                if !candidates.is_empty() {
+                    let idx = (self.rng.next_u64() as usize) % candidates.len();
+                    chosen.push(candidates.swap_remove(idx));
                 }
-                picked
-            };
+            }
+            if chosen.len() == 1 {
+                let scope = self.links[&chosen[0]].scope;
+                let rest: Vec<LinkId> = self
+                    .links
+                    .iter()
+                    .filter(|(l, s)| s.scope == scope && !chosen.contains(l))
+                    .map(|(l, _)| *l)
+                    .collect();
+                if !rest.is_empty() {
+                    let idx = (self.rng.next_u64() as usize) % rest.len();
+                    chosen.push(rest[idx]);
+                }
+            }
             for link in chosen {
                 actions.extend(self.want_record(link, send.to));
             }
@@ -4034,7 +4275,15 @@ impl<S: Store> Node<S> {
             // after the record arrives.
             actions.push(self.busy(link, leg));
             actions.extend(self.want_record(link, opened.from));
-            let others: Vec<LinkId> = self.links.keys().filter(|&&l| l != link).copied().collect();
+            // Ask one other link of the same scope; a link of the other
+            // scope cannot serve this record.
+            let scope = self.links.get(&link).map(|l| l.scope);
+            let others: Vec<LinkId> = self
+                .links
+                .iter()
+                .filter(|(l, s)| **l != link && Some(s.scope) == scope)
+                .map(|(l, _)| *l)
+                .collect();
             if let Some(&other) = self.rng.pick(&others) {
                 actions.extend(self.want_record(other, opened.from));
             }
@@ -4941,9 +5190,14 @@ impl<S: Store> Node<S> {
         }
         self.record_refresh_at =
             now + refresh_interval_ms(&mut self.rng, self.config.record_refresh_secs);
-        let changed = self.advertised_links(now) != self.last_published_links;
-        let exp_soon =
-            self.own_record_exp.saturating_sub(ms_to_secs(now)) < REFRESH_EXP_HORIZON_SECS;
+        let now_secs = ms_to_secs(now);
+        let changed = self.publish_scopes(now).into_iter().any(|s| {
+            self.advertised_links(now, s) != self.own_records[scope_index(s)].last_published_links
+        });
+        let exp_soon = self.publish_scopes(now).into_iter().any(|s| {
+            let exp = self.own_records[scope_index(s)].exp;
+            exp != 0 && exp.saturating_sub(now_secs) < REFRESH_EXP_HORIZON_SECS
+        });
         if changed || exp_soon {
             self.publish_pending = true;
             self.flush_pending_publish(now);
@@ -5555,6 +5809,22 @@ fn add_exclusion(list: &mut Vec<Exclusion>, link: LinkId, until: u64) {
     }
 }
 
+/// The IP literal host of a `ws://`/`wss://` URL, if the host is an IP
+/// literal. Used for hive-membership and endpoint classification; a
+/// hostname yields `None` (DNS is never resolved here).
+fn url_host_ip(url: &str) -> Option<std::net::IpAddr> {
+    let rest = url.split_once("://")?.1;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let host = if let Some(rest) = authority.strip_prefix('[') {
+        // [v6]:port
+        let end = rest.find(']')?;
+        &rest[..end]
+    } else {
+        authority.rsplit_once(':').map_or(authority, |(h, _)| h)
+    };
+    host.parse().ok()
+}
+
 fn scope_as_u8(s: Scope) -> u8 {
     match s {
         Scope::Wan => 0,
@@ -6009,6 +6279,315 @@ mod tests {
         );
     }
 
+    // ── Hive scope: membership, two records, scope-filtered gossip ──
+
+    fn dual_homed_config() -> Config {
+        Config {
+            snow_per_min: 0.0,
+            hive_cidrs: vec!["10.0.0.0/8".to_string()],
+            advertise: vec![
+                "ws://10.0.0.5:8443/".to_string(),
+                "ws://1.2.3.4:8443/".to_string(),
+            ],
+            advertise_ips: vec!["10.0.0.5".parse().unwrap(), "1.2.3.4".parse().unwrap()],
+            ..Config::default()
+        }
+    }
+
+    fn hive_only_config() -> Config {
+        Config {
+            snow_per_min: 0.0,
+            hive_cidrs: vec!["10.0.0.0/8".to_string()],
+            advertise: vec!["ws://10.0.0.5:8443/".to_string()],
+            advertise_ips: vec!["10.0.0.5".parse().unwrap()],
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn hive_member_publishes_both_records_with_split_endpoints() {
+        let node = Node::new(
+            dual_homed_config(),
+            Identity::from_seed(&[0xA5; 32]),
+            MemStore::new(),
+            1_000,
+        )
+        .expect("node construction");
+        let wan = stored_record(&node, &node.own_id, Scope::Wan).expect("wan record");
+        let hive = stored_record(&node, &node.own_id, Scope::Hive).expect("hive record");
+        // The WAN record carries only the WAN endpoint; the hive record
+        // only the hive endpoint.
+        assert_eq!(wan.endpoints.len(), 1);
+        assert_eq!(wan.endpoints[0].url, "ws://1.2.3.4:8443/");
+        assert_eq!(
+            wan.endpoints[0].ips,
+            vec!["1.2.3.4".parse::<std::net::IpAddr>().unwrap()]
+        );
+        assert_eq!(hive.endpoints.len(), 1);
+        assert_eq!(hive.endpoints[0].url, "ws://10.0.0.5:8443/");
+        assert_eq!(
+            hive.endpoints[0].ips,
+            vec!["10.0.0.5".parse::<std::net::IpAddr>().unwrap()]
+        );
+    }
+
+    #[test]
+    fn hive_only_member_publishes_only_hive_record() {
+        let node = Node::new(
+            hive_only_config(),
+            Identity::from_seed(&[0xA5; 32]),
+            MemStore::new(),
+            1_000,
+        )
+        .expect("node construction");
+        assert!(stored_record(&node, &node.own_id, Scope::Hive).is_some());
+        assert!(stored_record(&node, &node.own_id, Scope::Wan).is_none());
+    }
+
+    #[test]
+    fn non_member_publishes_only_wan_record() {
+        let cfg = Config {
+            snow_per_min: 0.0,
+            advertise: vec!["ws://1.2.3.4:8443/".to_string()],
+            advertise_ips: vec!["1.2.3.4".parse().unwrap()],
+            ..Config::default()
+        };
+        let node = Node::new(
+            cfg,
+            Identity::from_seed(&[0xA5; 32]),
+            MemStore::new(),
+            1_000,
+        )
+        .expect("node construction");
+        assert!(stored_record(&node, &node.own_id, Scope::Wan).is_some());
+        assert!(stored_record(&node, &node.own_id, Scope::Hive).is_none());
+    }
+
+    #[test]
+    fn hive_gateway_member_publishes_wan_record_without_endpoints() {
+        // A gateway with no WAN endpoints still publishes a WAN record:
+        // its `serves` list is what WAN clients use to route to the
+        // private ids it serves.
+        let served = Identifier::from_bytes([0x77; 32]);
+        let cfg = Config {
+            snow_per_min: 0.0,
+            hive_cidrs: vec!["10.0.0.0/8".to_string()],
+            advertise: vec!["ws://10.0.0.5:8443/".to_string()],
+            advertise_ips: vec!["10.0.0.5".parse().unwrap()],
+            serves: vec![served],
+            ..Config::default()
+        };
+        let node = Node::new(
+            cfg,
+            Identity::from_seed(&[0xA5; 32]),
+            MemStore::new(),
+            1_000,
+        )
+        .expect("node construction");
+        let wan =
+            stored_record(&node, &node.own_id, Scope::Wan).expect("gateway publishes a WAN record");
+        assert!(wan.endpoints.is_empty());
+        assert_eq!(wan.serves, vec![served]);
+        assert!(stored_record(&node, &node.own_id, Scope::Hive).is_some());
+    }
+
+    #[test]
+    fn listen_address_in_hive_cidr_makes_node_a_member() {
+        // No advertised addresses at all; membership comes from the
+        // listen address alone.
+        let cfg = Config {
+            snow_per_min: 0.0,
+            hive_cidrs: vec!["10.0.0.0/8".to_string()],
+            listen_ips: vec!["10.1.2.3".parse().unwrap()],
+            ..Config::default()
+        };
+        let node = Node::new(
+            cfg,
+            Identity::from_seed(&[0xA5; 32]),
+            MemStore::new(),
+            1_000,
+        )
+        .expect("node construction");
+        assert!(stored_record(&node, &node.own_id, Scope::Hive).is_some());
+        assert!(stored_record(&node, &node.own_id, Scope::Wan).is_none());
+    }
+
+    #[test]
+    fn advertised_links_split_by_scope() {
+        let mut node = test_node();
+        let wan_peer = Identifier::from_bytes([0xA1; 32]);
+        let hive_peer = Identifier::from_bytes([0xB2; 32]);
+        insert_link_scoped(&mut node, 1, Some(wan_peer), false, 1_000, Scope::Wan);
+        insert_link_scoped(&mut node, 2, Some(hive_peer), false, 1_000, Scope::Hive);
+        assert_eq!(node.advertised_links(2_000, Scope::Wan), vec![wan_peer]);
+        assert_eq!(node.advertised_links(2_000, Scope::Hive), vec![hive_peer]);
+    }
+
+    #[test]
+    fn reconcile_items_are_scope_filtered() {
+        let (owner, _next, _) = test_identity();
+        let id = owner.id();
+        let channel_seed = owner.channel_seed.clone();
+        let inception = owner.kel.events().to_vec();
+        let mut node = test_node();
+        admit_kel(
+            &mut node,
+            &ValidatedKel::validate(inception.clone()).unwrap(),
+            1_000,
+        );
+        let wan = build_record(
+            inception.clone(),
+            1,
+            Scope::Wan,
+            &owner.signing_seed,
+            &channel_seed,
+        );
+        let hive = build_record(
+            inception,
+            1,
+            Scope::Hive,
+            &owner.signing_seed,
+            &channel_seed,
+        );
+        node.admit_record(1_000, 999, &wan.encode());
+        node.admit_record(1_000, 999, &hive.encode());
+        let wan_items = node.record_items(Scope::Wan).unwrap();
+        let hive_items = node.record_items(Scope::Hive).unwrap();
+        // The WAN set carries the WAN record and the KEL, not the hive record.
+        assert!(wan_items.iter().any(|i| i.id == id && i.scope == 0));
+        assert!(!wan_items.iter().any(|i| i.id == id && i.scope == 1));
+        assert!(wan_items.iter().any(|i| i.id == id && i.scope == 255));
+        // The hive set carries the hive record and the KEL, not the WAN record.
+        assert!(hive_items.iter().any(|i| i.id == id && i.scope == 1));
+        assert!(!hive_items.iter().any(|i| i.id == id && i.scope == 0));
+        assert!(hive_items.iter().any(|i| i.id == id && i.scope == 255));
+    }
+
+    #[test]
+    fn want_is_served_only_on_a_matching_scope_link() {
+        let (owner, _next, _) = test_identity();
+        let id = owner.id();
+        let channel_seed = owner.channel_seed.clone();
+        let inception = owner.kel.events().to_vec();
+        let mut node = test_node();
+        admit_kel(
+            &mut node,
+            &ValidatedKel::validate(inception.clone()).unwrap(),
+            1_000,
+        );
+        let wan = build_record(
+            inception.clone(),
+            1,
+            Scope::Wan,
+            &owner.signing_seed,
+            &channel_seed,
+        );
+        node.admit_record(1_000, 999, &wan.encode());
+        insert_link_scoped(&mut node, 100, None, false, 1_000, Scope::Wan);
+        insert_link_scoped(&mut node, 200, None, false, 1_000, Scope::Hive);
+        let want = |scope: u8| {
+            Frame::Want(lattice_proto::frames::WantFrame {
+                wants: vec![lattice_proto::frames::RecordRef { id, scope }],
+            })
+        };
+        // A want for the WAN record on a WAN link is served.
+        let (actions, _) = node.handle(Event::Frame {
+            at: 2_000,
+            link: 100,
+            frame: want(0),
+            bucket: None,
+        });
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            Action::SendFrame {
+                frame: Frame::Records(_),
+                ..
+            }
+        )));
+        // The same want on a hive link is refused (no Records frame).
+        let (actions, _) = node.handle(Event::Frame {
+            at: 2_000,
+            link: 200,
+            frame: want(0),
+            bucket: None,
+        });
+        assert!(!actions.iter().any(|a| matches!(
+            a,
+            Action::SendFrame {
+                frame: Frame::Records(_),
+                ..
+            }
+        )));
+        // A want for the hive record on a hive link is refused too (no
+        // hive record is held), and on a WAN link it is refused as well.
+        let (actions, _) = node.handle(Event::Frame {
+            at: 2_000,
+            link: 200,
+            frame: want(1),
+            bucket: None,
+        });
+        assert!(!actions.iter().any(|a| matches!(
+            a,
+            Action::SendFrame {
+                frame: Frame::Records(_),
+                ..
+            }
+        )));
+        // A KEL want is served on both scopes.
+        for link in [100, 200] {
+            let (actions, _) = node.handle(Event::Frame {
+                at: 2_000,
+                link,
+                frame: want(255),
+                bucket: None,
+            });
+            assert!(actions.iter().any(|a| matches!(
+                a,
+                Action::SendFrame {
+                    frame: Frame::Kels(_),
+                    ..
+                }
+            )));
+        }
+    }
+
+    #[test]
+    fn record_arriving_on_wrong_scope_link_is_dropped() {
+        let (owner, _next, _) = test_identity();
+        let channel_seed = owner.channel_seed.clone();
+        let inception = owner.kel.events().to_vec();
+        let mut node = test_node();
+        admit_kel(
+            &mut node,
+            &ValidatedKel::validate(inception.clone()).unwrap(),
+            1_000,
+        );
+        let hive = build_record(
+            inception,
+            1,
+            Scope::Hive,
+            &owner.signing_seed,
+            &channel_seed,
+        );
+        insert_link_scoped(&mut node, 100, None, false, 1_000, Scope::Wan);
+        // A hive record arriving on a WAN link is dropped, not stored.
+        let (actions, _) = node.handle(Event::Frame {
+            at: 2_000,
+            link: 100,
+            frame: Frame::Records(lattice_proto::frames::RecordsFrame {
+                records: vec![hive.encode()],
+            }),
+            bucket: None,
+        });
+        let _ = actions;
+        assert!(
+            node.store
+                .record_get(&owner.id(), Scope::Hive)
+                .unwrap()
+                .is_none()
+        );
+    }
+
     // ── Record hygiene: advertised set, refresh, caps (R-11..R-13, R-17) ──
 
     fn insert_link(
@@ -6018,9 +6597,20 @@ mod tests {
         pinned: bool,
         since: u64,
     ) {
+        insert_link_scoped(node, link, peer, pinned, since, Scope::Wan);
+    }
+
+    fn insert_link_scoped(
+        node: &mut Node<MemStore>,
+        link: u64,
+        peer: Option<Identifier>,
+        pinned: bool,
+        since: u64,
+        scope: Scope,
+    ) {
         let ck = lattice_crypto::channel_x25519_public(&ChannelSeed::from_bytes([0x77; 32]));
         node.links
-            .insert(link, LinkState::new(peer, ck, pinned, since));
+            .insert(link, LinkState::new(peer, ck, pinned, since, scope));
     }
 
     #[test]
@@ -6029,7 +6619,7 @@ mod tests {
         let peer = Identifier::from_bytes([0xA1; 32]);
         insert_link(&mut node, 1, Some(peer), false, 1_000);
         insert_link(&mut node, 2, Some(peer), false, 2_000);
-        assert_eq!(node.advertised_links(3_000), vec![peer]);
+        assert_eq!(node.advertised_links(3_000, Scope::Wan), vec![peer]);
     }
 
     #[test]
@@ -6054,7 +6644,7 @@ mod tests {
                 9_000 + u64::from(i),
             );
         }
-        let advertised = node.advertised_links(10_000);
+        let advertised = node.advertised_links(10_000, Scope::Wan);
         assert_eq!(advertised.len(), lattice_proto::record::MAX_LINKS);
         // All 8 pinned links are kept despite being the newest.
         for i in 0..8u8 {
@@ -6074,12 +6664,18 @@ mod tests {
         let mut node = test_node();
         let peer = Identifier::from_bytes([0xA1; 32]);
         link_up(&mut node, 1, peer, 1_000);
-        assert_eq!(node.advertised_links(1_000), vec![peer]);
+        assert_eq!(node.advertised_links(1_000, Scope::Wan), vec![peer]);
         node.handle(Event::LinkDown { at: 2_000, link: 1 });
         // Still advertised inside the grace window...
-        assert_eq!(node.advertised_links(2_000 + LINK_GRACE_MS), vec![peer]);
+        assert_eq!(
+            node.advertised_links(2_000 + LINK_GRACE_MS, Scope::Wan),
+            vec![peer]
+        );
         // ...and gone once it elapses.
-        assert!(node.advertised_links(2_000 + LINK_GRACE_MS + 1).is_empty());
+        assert!(
+            node.advertised_links(2_000 + LINK_GRACE_MS + 1, Scope::Wan)
+                .is_empty()
+        );
     }
 
     #[test]
@@ -6175,7 +6771,7 @@ mod tests {
             .unwrap();
         assert_eq!(before.bytes, after.bytes);
         // With the record near expiry the refresh must republish.
-        node.own_record_exp = 1;
+        node.own_records[scope_index(Scope::Wan)].exp = 1;
         node.record_refresh_at = 3_000;
         node.handle(Event::Tick { at: 3_000 });
         let after = node
@@ -6519,7 +7115,7 @@ mod tests {
         assert!(!graph.distances(&node.own_id).contains_key(&id));
         // The KEL stays in the reconciliation set (scope 255) so the
         // abandonment propagates; no record for the id is advertised.
-        let items = node.record_items().unwrap();
+        let items = node.record_items(Scope::Wan).unwrap();
         assert!(items.iter().any(|i| i.id == id && i.scope == 255));
         assert!(!items.iter().any(|i| i.id == id && i.scope != 255));
     }
@@ -6577,7 +7173,12 @@ mod tests {
         node.sweep_expired_data(1_000 + RETENTION_GRACE_MS + 1);
         assert!(node.store.kel_head(&id).unwrap().is_some());
         assert!(node.store.kel_get(&id).unwrap().is_some());
-        assert!(node.record_items().unwrap().iter().any(|i| i.id == id));
+        assert!(
+            node.record_items(Scope::Wan)
+                .unwrap()
+                .iter()
+                .any(|i| i.id == id)
+        );
 
         // Once the head itself is stale, the KEL (and its head row) is swept.
         let head = node.store.kel_head(&id).unwrap().unwrap();
@@ -6597,7 +7198,13 @@ mod tests {
         node.sweep_expired_data(secs_to_ms(KEL_HEAD_MAX_AGE_SECS + 1));
         assert!(node.store.kel_head(&id).unwrap().is_none());
         assert!(node.store.kel_get(&id).unwrap().is_none());
-        assert!(!node.record_items().unwrap().iter().any(|i| i.id == id));
+        assert!(
+            !node
+                .record_items(Scope::Wan)
+                .unwrap()
+                .iter()
+                .any(|i| i.id == id)
+        );
     }
 
     #[test]
@@ -6655,6 +7262,7 @@ mod tests {
             link,
             peer: Some(peer),
             remote_ck,
+            scope: Scope::Wan,
         });
     }
 
@@ -7800,7 +8408,7 @@ mod tests {
             node.lookup(&ext_b.id()),
             LookupResult::Present { .. }
         ));
-        let items = node.record_items().expect("items");
+        let items = node.record_items(Scope::Wan).expect("items");
         assert!(items.iter().any(|i| i.id == ext_a.id()));
         let _ = node.build_graph();
         let _ = node.waypoint_candidates();
@@ -7855,7 +8463,7 @@ mod tests {
         // One second past expiry: filtered from every read path.
         node.handle(Event::Tick { at: 3_000 });
         assert!(matches!(node.lookup(&sender.id()), LookupResult::Absent));
-        let items = node.record_items().expect("items");
+        let items = node.record_items(Scope::Wan).expect("items");
         assert!(
             !items
                 .iter()
@@ -8945,8 +9553,9 @@ mod tests {
                 ..
             } if c.result == CUSTODY_BUSY
         )));
-        // A want for (sender, WAN) and (sender, hive) goes out on the
-        // offering link and on one other link.
+        // A want for (sender, WAN) goes out on the offering link and on
+        // one other link of the same scope; a WAN link never asks for a
+        // hive record.
         let mut want_links = Vec::new();
         for a in &actions {
             if let Action::SendFrame {
@@ -8957,7 +9566,7 @@ mod tests {
             {
                 assert!(w.wants.iter().all(|r| r.id == sender.id()));
                 let scopes: Vec<u8> = w.wants.iter().map(|r| r.scope).collect();
-                assert_eq!(scopes, vec![0, 1]);
+                assert_eq!(scopes, vec![0]);
                 want_links.push(*link);
             }
         }
@@ -8968,8 +9577,8 @@ mod tests {
         assert_eq!(want_links.len(), 2, "want must go on one other link too");
         assert!(want_links.contains(&200));
         // Both links are credited for the wants.
-        assert_eq!(node.links.get(&100).unwrap().want_credits, 2);
-        assert_eq!(node.links.get(&200).unwrap().want_credits, 2);
+        assert_eq!(node.links.get(&100).unwrap().want_credits, 1);
+        assert_eq!(node.links.get(&200).unwrap().want_credits, 1);
     }
 
     // ──────────── H-13: awaiting-record queue ────────────
@@ -9043,7 +9652,8 @@ mod tests {
                 ..
             }
         )));
-        // A want for both scopes went out on both links.
+        // A want for the WAN record went out on both links (both are WAN
+        // links; neither asks for a hive record).
         let mut want_links = Vec::new();
         for a in &actions {
             if let Action::SendFrame {
@@ -9054,7 +9664,7 @@ mod tests {
             {
                 assert!(w.wants.iter().all(|r| r.id == recipient.id()));
                 let scopes: Vec<u8> = w.wants.iter().map(|r| r.scope).collect();
-                assert_eq!(scopes, vec![0, 1]);
+                assert_eq!(scopes, vec![0]);
                 want_links.push(*link);
             }
         }
@@ -9729,6 +10339,7 @@ mod tests {
                     link,
                     peer: Some(*peer),
                     remote_ck: ck,
+                    scope: Scope::Wan,
                 });
                 out.push((*peer, link));
             }
@@ -9767,6 +10378,25 @@ mod tests {
             by_hash[..16].iter().map(|(_, id)| *id).collect();
         let actual: std::collections::HashSet<Identifier> = dialed.into_iter().collect();
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn neighbor_selection_hive_cap_is_128() {
+        let mut node = test_node();
+        // 130 hive candidates in distinct /24s (no per-group sub-cap hit).
+        for i in 0..130u16 {
+            admit_candidate(
+                &mut node,
+                (i % 250) as u8 + 1,
+                Scope::Hive,
+                &format!("ws://10.0.{i}.1/"),
+                &[],
+                1_000,
+            );
+        }
+        let (actions, _) = node.handle(Event::Tick { at: 2_000 });
+        let dialed = dialed_peers(&actions);
+        assert_eq!(dialed.len(), 128, "hive cap is 128 outbound hive links");
     }
 
     #[test]
@@ -9900,6 +10530,7 @@ mod tests {
             link: 9_000,
             peer: Some(better.id()),
             remote_ck: ck,
+            scope: Scope::Wan,
         });
         assert!(
             actions

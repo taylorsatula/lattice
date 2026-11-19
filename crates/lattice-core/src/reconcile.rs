@@ -25,7 +25,8 @@
 use std::collections::HashSet;
 
 use lattice_crypto::hash;
-use lattice_proto::frames::{Range, RangeBound, RangeBounds, RecordEntry, RecordRef};
+use lattice_proto::frames::{Range, RangeBound, RangeBounds, RecordEntry, RecordRef, SCOPE_KEL};
+use lattice_proto::record::Scope;
 use lattice_types::{Hash32, Identifier};
 
 pub const LEAF_LIMIT: usize = 32;
@@ -240,6 +241,22 @@ pub struct ReconcileResponse {
     pub wants: Vec<RecordRef>,
 }
 
+/// The scope byte for a link, matching the wire encoding of `Scope`.
+fn scope_byte(scope: Scope) -> u8 {
+    match scope {
+        Scope::Wan => 0,
+        Scope::Hive => 1,
+    }
+}
+
+/// Whether an entry from the peer may be processed on a link of
+/// `link_scope`: KELs (scope 255) ride on every link; records only on a
+/// link of their own scope. Anything else is dropped — a hive record must
+/// not be requested or echoed onto a WAN link, nor vice versa.
+fn entry_allowed(entry_scope: u8, link_scope: Scope) -> bool {
+    entry_scope == SCOPE_KEL || entry_scope == scope_byte(link_scope)
+}
+
 /// Compute our reply to a peer's reconcile ranges, and the (id, scope)
 /// pairs we want records for.
 ///
@@ -250,10 +267,16 @@ pub struct ReconcileResponse {
 /// only when both sides hold at most `LEAF_LIMIT` entries in it; otherwise
 /// it is split. An entries echo is never truncated: an over-full range is
 /// split instead, and an unsplittable one is listed in full.
+///
+/// `link_scope` is the scope of the link the reply goes out on: records
+/// whose scope does not match it are neither echoed nor wanted (KELs,
+/// scope 255, ride on every link). `items` must already be filtered to
+/// the same scope by the caller.
 pub fn respond(
     items: &[Item],
     msgs: &[Range],
     session: &mut ReconcileSession,
+    link_scope: Scope,
 ) -> ReconcileResponse {
     let mut out = Vec::new();
     let mut wants: Vec<RecordRef> = Vec::new();
@@ -312,6 +335,14 @@ pub fn respond(
                 upper,
                 entries,
             } => {
+                // Drop entries the peer was not entitled to send on this
+                // link (wrong scope). They are neither echoed nor wanted.
+                let entries: Vec<RecordEntry> = entries
+                    .iter()
+                    .filter(|e| entry_allowed(e.scope, link_scope))
+                    .cloned()
+                    .collect();
+                let entries = &entries;
                 let probe = Range::Entries {
                     lower: *lower,
                     upper: *upper,
@@ -446,7 +477,7 @@ mod tests {
         let mut ranges = Vec::new();
         let mut wants = Vec::new();
         for chunk in msgs.chunks(MAX_RANGES_PER_MSG) {
-            let resp = respond(items, chunk, session);
+            let resp = respond(items, chunk, session, Scope::Wan);
             ranges.extend(resp.ranges);
             wants.extend(resp.wants);
         }
@@ -698,7 +729,7 @@ mod adversarial_tests {
             })
             .collect();
         let mut session = ReconcileSession::new();
-        let resp = respond(&items, &msgs, &mut session);
+        let resp = respond(&items, &msgs, &mut session, Scope::Wan);
         // 64 processed ranges, one output each (all mismatch).
         assert_eq!(resp.ranges.len(), MAX_RANGES_PER_MSG);
     }
@@ -717,7 +748,7 @@ mod adversarial_tests {
             })
             .collect();
         let mut session = ReconcileSession::new();
-        let resp = respond(&items, &msgs, &mut session);
+        let resp = respond(&items, &msgs, &mut session, Scope::Wan);
         assert_eq!(resp.ranges.len(), MAX_RANGES_PER_MSG * 16);
     }
 
@@ -734,7 +765,7 @@ mod adversarial_tests {
             entries,
         }];
         let mut session = ReconcileSession::new();
-        let resp = respond(&items, &msgs, &mut session);
+        let resp = respond(&items, &msgs, &mut session, Scope::Wan);
         assert!(
             resp.ranges
                 .iter()
@@ -751,7 +782,7 @@ mod adversarial_tests {
             entries: small.clone(),
         }];
         let mut session = ReconcileSession::new();
-        let resp = respond(&small, &msgs, &mut session);
+        let resp = respond(&small, &msgs, &mut session, Scope::Wan);
         let echoed: usize = resp
             .ranges
             .iter()
@@ -785,7 +816,7 @@ mod adversarial_tests {
             entries,
         }];
         let mut session = ReconcileSession::new();
-        let resp = respond(&items, &msgs, &mut session);
+        let resp = respond(&items, &msgs, &mut session, Scope::Wan);
         assert_eq!(resp.wants.len(), 200);
     }
 

@@ -12,6 +12,7 @@ use std::collections::{BTreeMap, VecDeque};
 
 use lattice_core::{Action, AppSend, Config, Event, Node};
 use lattice_proto::frames::Frame;
+use lattice_proto::record::Scope;
 use lattice_store::{MemStore, Store};
 use lattice_types::{Identifier, MessageId, X25519PublicKey};
 
@@ -125,6 +126,9 @@ struct Link {
     state: LinkState,
     latency_ms: u64,
     behavior: LinkBehavior,
+    /// Scope of the link: WAN links carry WAN records, hive links carry
+    /// hive records. Set at creation; test-created links default to WAN.
+    scope: Scope,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -331,6 +335,12 @@ impl<S: Store> Sim<S> {
     }
 
     pub fn connect(&mut self, a: NodeIndex, b: NodeIndex) -> u64 {
+        self.connect_scoped(a, b, Scope::Wan)
+    }
+
+    /// Connect two nodes with an explicit link scope. Hive links carry
+    /// only hive records in each direction; WAN links only WAN records.
+    pub fn connect_scoped(&mut self, a: NodeIndex, b: NodeIndex, scope: Scope) -> u64 {
         let id = self.next_link;
         self.next_link += 1;
         self.links.push(Link {
@@ -340,15 +350,33 @@ impl<S: Store> Sim<S> {
             state: LinkState::Up,
             latency_ms: 0,
             behavior: LinkBehavior::default(),
+            scope,
         });
-        self.link_up(a, id, Some(self.ids[b]), self.channel_keys[&self.ids[b]]);
-        self.link_up(b, id, Some(self.ids[a]), self.channel_keys[&self.ids[a]]);
+        self.link_up(
+            a,
+            id,
+            Some(self.ids[b]),
+            self.channel_keys[&self.ids[b]],
+            scope,
+        );
+        self.link_up(
+            b,
+            id,
+            Some(self.ids[a]),
+            self.channel_keys[&self.ids[a]],
+            scope,
+        );
         id
     }
 
     /// Connect two nodes without pinning either side's peer id (as an
     /// inbound/unsolicited link behaves); attribution must come from records.
     pub fn connect_unpinned(&mut self, a: NodeIndex, b: NodeIndex) -> u64 {
+        self.connect_unpinned_scoped(a, b, Scope::Wan)
+    }
+
+    /// Like [`Sim::connect_unpinned`] with an explicit link scope.
+    pub fn connect_unpinned_scoped(&mut self, a: NodeIndex, b: NodeIndex, scope: Scope) -> u64 {
         let id = self.next_link;
         self.next_link += 1;
         self.links.push(Link {
@@ -358,9 +386,10 @@ impl<S: Store> Sim<S> {
             state: LinkState::Up,
             latency_ms: 0,
             behavior: LinkBehavior::default(),
+            scope,
         });
         for (from, to) in [(a, b), (b, a)] {
-            self.link_up(from, id, None, self.channel_keys[&self.ids[to]]);
+            self.link_up(from, id, None, self.channel_keys[&self.ids[to]], scope);
         }
         id
     }
@@ -374,12 +403,14 @@ impl<S: Store> Sim<S> {
         link: u64,
         peer: Option<Identifier>,
         remote_ck: X25519PublicKey,
+        scope: Scope,
     ) {
         let (actions, _diags) = self.nodes[node].handle(Event::LinkUp {
             at: self.now,
             link,
             peer,
             remote_ck,
+            scope,
         });
         self.apply_actions(node, actions);
         self.arm_wake(node);
@@ -397,17 +428,20 @@ impl<S: Store> Sim<S> {
         self.links[idx].state = state;
         let (a, b) = (self.links[idx].a, self.links[idx].b);
         if state == LinkState::Up {
+            let scope = self.links[idx].scope;
             self.link_up(
                 a,
                 link_id,
                 Some(self.ids[b]),
                 self.channel_keys[&self.ids[b]],
+                scope,
             );
             self.link_up(
                 b,
                 link_id,
                 Some(self.ids[a]),
                 self.channel_keys[&self.ids[a]],
+                scope,
             );
         } else {
             for end in [a, b] {
@@ -707,10 +741,12 @@ impl<S: Store> Sim<S> {
                 // The simulator tracks links itself; binding changes are a
                 // runtime concern.
                 Action::LinkBound { .. } => {}
-                Action::Dial { peer, .. } => {
+                Action::Dial { peer, scope, .. } => {
                     // Perform the dial: connect the two nodes if the
                     // target exists and the dial is not blocked, else
-                    // report the failure back to the dialing node.
+                    // report the failure back to the dialing node. The
+                    // link takes the scope of the candidate record the
+                    // dial came from.
                     let target = self.ids.iter().position(|id| *id == peer);
                     match target {
                         Some(t) if !self.dial_blocked.contains(&(from, t)) => {
@@ -723,13 +759,14 @@ impl<S: Store> Sim<S> {
                                 state: LinkState::Up,
                                 latency_ms: 0,
                                 behavior: LinkBehavior::default(),
+                                scope,
                             });
                             let ck_to = self.channel_keys[&self.ids[t]];
                             let ck_from = self.channel_keys[&self.ids[from]];
                             // The dialer pins the peer (IK dial); the
                             // callee sees an unsolicited inbound link.
-                            self.link_up(from, id, Some(self.ids[t]), ck_to);
-                            self.link_up(t, id, None, ck_from);
+                            self.link_up(from, id, Some(self.ids[t]), ck_to, scope);
+                            self.link_up(t, id, None, ck_from, scope);
                         }
                         _ => {
                             let (actions, _diags) =
@@ -818,19 +855,43 @@ impl<S: Store> Sim<S> {
         let node = Node::new(cfg, identity, store, self.now).expect("restore");
         self.nodes[idx] = node;
         // re-announce links
-        let up_links: Vec<(usize, usize, u64)> = self
+        let up_links: Vec<(usize, usize, u64, Scope)> = self
             .links
             .iter()
             .filter(|l| l.state == LinkState::Up)
-            .map(|l| (l.a, l.b, l.id))
+            .map(|l| (l.a, l.b, l.id, l.scope))
             .collect();
-        for (a, b, lid) in up_links {
+        for (a, b, lid, scope) in up_links {
             if a == idx {
-                self.link_up(a, lid, Some(self.ids[b]), self.channel_keys[&self.ids[b]]);
-                self.link_up(b, lid, Some(self.ids[a]), self.channel_keys[&self.ids[a]]);
+                self.link_up(
+                    a,
+                    lid,
+                    Some(self.ids[b]),
+                    self.channel_keys[&self.ids[b]],
+                    scope,
+                );
+                self.link_up(
+                    b,
+                    lid,
+                    Some(self.ids[a]),
+                    self.channel_keys[&self.ids[a]],
+                    scope,
+                );
             } else if b == idx {
-                self.link_up(b, lid, Some(self.ids[a]), self.channel_keys[&self.ids[a]]);
-                self.link_up(a, lid, Some(self.ids[b]), self.channel_keys[&self.ids[b]]);
+                self.link_up(
+                    b,
+                    lid,
+                    Some(self.ids[a]),
+                    self.channel_keys[&self.ids[a]],
+                    scope,
+                );
+                self.link_up(
+                    a,
+                    lid,
+                    Some(self.ids[b]),
+                    self.channel_keys[&self.ids[b]],
+                    scope,
+                );
             }
         }
         self.arm_wake(idx);

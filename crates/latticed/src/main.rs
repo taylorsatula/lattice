@@ -25,7 +25,6 @@
 #![forbid(unsafe_code)]
 
 mod api;
-mod cidr;
 mod config;
 mod keys;
 mod runtime;
@@ -358,17 +357,6 @@ fn record_self_test(cfg: &config::Config, identity: &lattice_core::Identity) -> 
                 .map_err(|_| format!("ips entry {s:?} is not an IP address"))
         })
         .collect::<Result<_, _>>()?;
-    let endpoints = if private {
-        Vec::new()
-    } else {
-        cfg.advertise
-            .iter()
-            .map(|url| lattice_proto::record::Endpoint {
-                url: url.clone(),
-                ips: advertise_ips.clone(),
-            })
-            .collect()
-    };
     let gateways = if private {
         cfg.gateways
             .iter()
@@ -385,25 +373,94 @@ fn record_self_test(cfg: &config::Config, identity: &lattice_core::Identity) -> 
             .map(|h| config::decode_hex32(h).map(lattice_types::Identifier::from_bytes))
             .collect::<Result<Vec<_>, _>>()?
     };
-    let params = lattice_proto::record::RecordParams {
-        kel: identity.kel.clone(),
-        prev_seq: 0,
-        now,
-        exp: now + 3600,
-        channel_key: lattice_crypto::channel_public(&identity.channel_seed),
-        channel_seed: identity.channel_seed.clone(),
-        envelope_key: identity.xwing_public,
-        mode,
-        scope: lattice_proto::record::Scope::Wan,
-        endpoints,
-        links: vec![],
-        gateways,
-        capabilities: 1,
-        serves,
+    // Split the advertised endpoints the same way the core does: an
+    // endpoint whose URL host is an IP literal inside a hive CIDR is a
+    // hive endpoint; the rest are WAN endpoints. Each endpoint keeps only
+    // the advertised IPs matching its scope.
+    let hive_cidrs: Vec<lattice_core::cidr::Cidr> = cfg
+        .hive
+        .iter()
+        .filter_map(|s| lattice_core::cidr::Cidr::parse(s).ok())
+        .collect();
+    let in_hive = |ip: &std::net::IpAddr| hive_cidrs.iter().any(|c| c.contains(*ip));
+    let url_host_ip = |url: &str| -> Option<std::net::IpAddr> {
+        let rest = url.split_once("://")?.1;
+        let authority = rest.split(['/', '?', '#']).next()?;
+        let host = if let Some(rest) = authority.strip_prefix('[') {
+            let end = rest.find(']')?;
+            &rest[..end]
+        } else {
+            authority.rsplit_once(':').map_or(authority, |(h, _)| h)
+        };
+        host.parse().ok()
     };
-    lattice_proto::record::PeerRecord::build(params, &identity.signing_seed)
-        .map(|_| ())
-        .map_err(|e| e.to_string())
+    let mut wan_endpoints = Vec::new();
+    let mut hive_endpoints = Vec::new();
+    if !private {
+        for url in &cfg.advertise {
+            let is_hive = url_host_ip(url).is_some_and(|ip| in_hive(&ip));
+            let ips: Vec<std::net::IpAddr> = advertise_ips
+                .iter()
+                .copied()
+                .filter(|ip| in_hive(ip) == is_hive)
+                .collect();
+            let ep = lattice_proto::record::Endpoint {
+                url: url.clone(),
+                ips,
+            };
+            if is_hive {
+                hive_endpoints.push(ep);
+            } else {
+                wan_endpoints.push(ep);
+            }
+        }
+    }
+    // Hive membership: any own address (listen, advertised IPs, or
+    // IP-literal advertise hosts) inside a hive CIDR.
+    let listen_ips: Vec<std::net::IpAddr> = cfg.listen.iter().map(|a| a.ip()).collect();
+    let is_member = !hive_cidrs.is_empty()
+        && (listen_ips.iter().any(&in_hive)
+            || advertise_ips.iter().any(&in_hive)
+            || cfg
+                .advertise
+                .iter()
+                .filter_map(|u| url_host_ip(u))
+                .any(|ip| in_hive(&ip)));
+    // The records the node will publish: a hive member publishes a hive
+    // record; it publishes a WAN record too when it has WAN endpoints or
+    // serves private ids (a gateway's WAN record carries `serves`).
+    let mut scopes = Vec::new();
+    if !is_member || !wan_endpoints.is_empty() || !serves.is_empty() {
+        scopes.push(lattice_proto::record::Scope::Wan);
+    }
+    if is_member {
+        scopes.push(lattice_proto::record::Scope::Hive);
+    }
+    for scope in scopes {
+        let endpoints = match scope {
+            lattice_proto::record::Scope::Wan => wan_endpoints.clone(),
+            lattice_proto::record::Scope::Hive => hive_endpoints.clone(),
+        };
+        let params = lattice_proto::record::RecordParams {
+            kel: identity.kel.clone(),
+            prev_seq: 0,
+            now,
+            exp: now + 3600,
+            channel_key: lattice_crypto::channel_public(&identity.channel_seed),
+            channel_seed: identity.channel_seed.clone(),
+            envelope_key: identity.xwing_public,
+            mode,
+            scope,
+            endpoints,
+            links: vec![],
+            gateways: gateways.clone(),
+            capabilities: 1,
+            serves: serves.clone(),
+        };
+        lattice_proto::record::PeerRecord::build(params, &identity.signing_seed)
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 /// Compare the stored own record (if any) against the loaded secrets.
@@ -487,7 +544,7 @@ fn load_and_verify(
     }
     if !cfg.hive.is_empty() {
         eprintln!(
-            "lattice: note: hive CIDRs are parsed but multicast discovery is not implemented yet; ignoring"
+            "lattice: hive mode: nodes whose addresses fall in the configured hive CIDRs publish a hive-scoped record and gossip it only on hive links"
         );
     }
     // Record self-test: the record we will publish must pass validation, or

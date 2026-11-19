@@ -15,8 +15,8 @@ use lattice_types::{
 };
 use tokio::sync::{broadcast, mpsc};
 
-use crate::cidr::Cidr;
 use crate::config::Config;
+use lattice_core::cidr::Cidr;
 
 /// Events coming up from links into the node.
 pub enum LinkEvent {
@@ -396,7 +396,7 @@ impl LinkStats {
 /// Which cap pool a link draws from. Hive membership is decided by the
 /// configured hive CIDRs (the only place scope is visible); everything
 /// else is WAN.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 enum LinkScope {
     Wan,
     Hive,
@@ -619,7 +619,29 @@ impl Runtime {
             .collect::<Result<_, lattice_core::NodeError>>()?;
         let mut services: Vec<String> = cfg.services.keys().cloned().collect();
         services.sort_unstable();
+        // The config validator already rejected malformed CIDRs; a parse
+        // failure here means the config was built by hand (tests), so skip
+        // the entry and treat those links as WAN (the tighter cap).
+        let hive_cidrs: Vec<Cidr> = cfg
+            .hive
+            .iter()
+            .filter_map(|s| match Cidr::parse(s) {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    eprintln!("lattice: ignoring hive CIDR {s:?}: {e}");
+                    None
+                }
+            })
+            .collect();
+        let listen_ips: Vec<std::net::IpAddr> = cfg.listen.iter().map(|a| a.ip()).collect();
         let core_cfg = lattice_core::Config {
+            hive_cidrs: cfg
+                .hive
+                .iter()
+                .filter(|s| Cidr::parse(s).is_ok())
+                .cloned()
+                .collect(),
+            listen_ips,
             services,
             snow_per_min: cfg.limits.snow_per_min,
             sideways_prob: cfg.limits.sideways_prob,
@@ -646,20 +668,6 @@ impl Runtime {
             mode,
             ..lattice_core::Config::default()
         };
-        // The config validator already rejected malformed CIDRs; a parse
-        // failure here means the config was built by hand (tests), so skip
-        // the entry and treat those links as WAN (the tighter cap).
-        let hive_cidrs: Vec<Cidr> = cfg
-            .hive
-            .iter()
-            .filter_map(|s| match Cidr::parse(s) {
-                Ok(c) => Some(c),
-                Err(e) => {
-                    eprintln!("lattice: ignoring hive CIDR {s:?}: {e}");
-                    None
-                }
-            })
-            .collect();
         let mut node = Node::new(core_cfg, identity, store, now)?;
         if draining.load(Ordering::Relaxed) {
             node.set_drain(DrainState::Draining);
@@ -826,12 +834,18 @@ impl Runtime {
             },
         );
         // The link is registered, so the actions returned by LinkUp can be
-        // routed to it.
+        // routed to it. The link's scope is classified from the remote
+        // address against the configured hive CIDRs.
+        let scope = match scope_of(addr.as_ref(), &self.hive_cidrs) {
+            LinkScope::Wan => lattice_proto::record::Scope::Wan,
+            LinkScope::Hive => lattice_proto::record::Scope::Hive,
+        };
         self.queue_event(Event::LinkUp {
             at: now_ms(),
             link: id,
             peer,
             remote_ck,
+            scope,
         });
         Some(id)
     }
@@ -1263,24 +1277,32 @@ impl Runtime {
                         };
                     }
                     if let Some(p) = peer {
-                        // One connection per peer: keep the newest link
-                        // bound to this peer, drop the rest.
-                        let mut bound: Vec<u64> = self
-                            .links
-                            .iter()
-                            .filter(|(_, l)| l.peer == Some(p))
-                            .map(|(id, _)| *id)
-                            .collect();
-                        if bound.len() > 1 {
-                            bound.sort_unstable();
-                            let keep = bound.pop().expect("len > 1");
-                            for dup in bound {
-                                if self.remove_link(dup) {
-                                    eprintln!(
-                                        "lattice: dropping duplicate link {dup} to peer {} (keeping link {keep})",
-                                        lattice_proto::text::encode_id(&p)
-                                    );
-                                    dropped.push(dup);
+                        // One connection per (peer, scope): keep the newest
+                        // link per scope bound to this peer, drop the rest.
+                        // A peer may hold both a WAN and a hive link; both
+                        // are legitimate and carry different records.
+                        let mut by_scope: std::collections::HashMap<LinkScope, Vec<u64>> =
+                            std::collections::HashMap::new();
+                        for (id, l) in self.links.iter() {
+                            if l.peer == Some(p) {
+                                by_scope
+                                    .entry(scope_of(l.addr.as_ref(), &self.hive_cidrs))
+                                    .or_default()
+                                    .push(*id);
+                            }
+                        }
+                        for (_scope, mut ids) in by_scope {
+                            if ids.len() > 1 {
+                                ids.sort_unstable();
+                                let keep = ids.pop().expect("len > 1");
+                                for dup in ids {
+                                    if self.remove_link(dup) {
+                                        eprintln!(
+                                            "lattice: dropping duplicate link {dup} to peer {} (keeping link {keep})",
+                                            lattice_proto::text::encode_id(&p)
+                                        );
+                                        dropped.push(dup);
+                                    }
                                 }
                             }
                         }

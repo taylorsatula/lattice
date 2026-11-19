@@ -59,6 +59,9 @@ impl Graph {
         let mut serves: BTreeMap<Identifier, BTreeSet<Identifier>> = BTreeMap::new();
         let mut private_gateways: Vec<(Identifier, Vec<Identifier>)> = Vec::new();
         for r in records {
+            // A node publishes one record per scope; union the links and
+            // serves across them so neither scope's record shadows the
+            // other's (keying by id alone would keep only the last).
             if r.private {
                 private.insert(r.id);
                 private_gateways.push((r.id, r.gateways));
@@ -66,8 +69,8 @@ impl Graph {
                 // (validation enforces both); it contributes no claims.
                 claims.entry(r.id).or_default();
             } else {
-                claims.insert(r.id, r.links.into_iter().collect());
-                serves.insert(r.id, r.serves.into_iter().collect());
+                claims.entry(r.id).or_default().extend(r.links);
+                serves.entry(r.id).or_default().extend(r.serves);
             }
         }
         let mut adjacency: BTreeMap<Identifier, BTreeSet<Identifier>> = BTreeMap::new();

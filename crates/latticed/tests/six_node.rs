@@ -1,18 +1,35 @@
 //! Phase 5 gate: the six-node end-to-end scenario.
 //!
-//! Topology (all on loopback, real daemons, real local API):
+//! Topology (all on loopback, real daemons, real local API). The hive is
+//! the IPv6 loopback `::1/128`; the WAN side is IPv4 `127.0.0.1`. (macOS
+//! only binds explicitly assigned loopback addresses, so a 127.x/16 hive
+//! is not available; ::1 is the one extra loopback address that is always
+//! present, and it is disjoint from 127.0.0.1, so the two scopes are
+//! genuinely distinct.)
 //!
 //! ```text
-//!   h2 ──┐
-//!   h3 ──┤
-//!   wan ─┼── h1                  (h1..h3 + gw are the hive)
-//!   gw ──┘
-//!   |
-//!   priv                         (private instance; no endpoints, no links)
+//!   h2 ──[hive]──┐
+//!   h3 ──[hive]──┤
+//!                h1 ──[wan]── gw ──[wan]── wan
+//!                              │
+//!                           [hive]
+//!                              │
+//!                             (gw is dual-homed: [::1] in the hive,
+//!                              127.0.0.1 on the WAN side)
+//!   priv ──[wan]── gw          (private instance; no endpoints)
 //! ```
 //!
-//! Every node roots to h1 (priv roots to gw); there is no h2–h3 or
-//! gw–h2 link. gw is a hive member and the gateway.
+//! h1, h2, h3 and gw are hive members (their listen addresses fall inside
+//! the hive CIDR) and publish hive records; h1, h2 and h3 are hive-only
+//! (no WAN endpoints) and publish only a hive record. gw is dual-homed
+//! and, as a gateway serving `priv`, also publishes a WAN record (a
+//! gateway's WAN record carries the `serves` list WAN clients need). The
+//! `wan` node is outside the hive and publishes only a WAN record.
+//!
+//! Links: h2 and h3 root to h1 over hive links; gw roots to h2 over a
+//! hive link; h1 roots to gw over a WAN link (so h1 can reach the WAN
+//! node, which it cannot do over a hive link); wan and priv root to gw
+//! over WAN links. There is no h2–h3 or gw–h2 link.
 //!
 //! Covers: a hive, a WAN link, a private instance behind a gateway, a
 //! partition that heals, a key rotation, and a drain — with applications
@@ -36,7 +53,11 @@ async fn six_node_gate() {
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).unwrap();
 
-    // Boot order matters: children need their parents' ids/keys for roots.
+    const HIVE: &str = "::1/128";
+    // gw's port is pre-allocated so h1 (which boots first) can root to
+    // gw's WAN address. gw's identity is pre-created for the same reason.
+    let gw_port = free_port();
+    let gw_wan_addr = format!("127.0.0.1:{gw_port}");
     // The private instance's identity is pre-created so the gateway can
     // name it in `serves` (spec §3, gateway consent): the gateway carries
     // traffic for the private instance only when both records name each
@@ -44,61 +65,109 @@ async fn six_node_gate() {
     let priv_dir = tmp.join("priv");
     let priv_keys = init_node(&priv_dir);
     let priv_id = priv_keys.id;
-    let h1 = boot_node(&tmp, "h1", None, SERVICES);
-    let h1_addr = format!("127.0.0.1:{}", h1.port);
-    let h2 = boot_node(
+    let gw_dir = tmp.join("gw");
+    let gw_keys = init_node(&gw_dir);
+    let gw_id = gw_keys.id;
+    let gw_channel_key = gw_keys.channel_key;
+
+    let hive_extras = |port: Option<u16>| NodeExtras {
+        port,
+        listen: vec!["[::1]:{port}".to_string()],
+        hive: vec![HIVE.to_string()],
+        advertise: vec!["ws://[::1]:{port}/".to_string()],
+        ips: vec!["::1".to_string()],
+        ..NodeExtras::default()
+    };
+
+    // h1: hive-only. Roots to gw's WAN address (a WAN link, so h1 can
+    // reach the WAN node; a hive link would carry no WAN records).
+    let h1 = boot_node_ex(
+        &tmp,
+        "h1",
+        None,
+        Some(PeerSpec {
+            addr: &gw_wan_addr,
+            channel_key: gw_channel_key,
+            id: gw_id,
+        }),
+        SERVICES,
+        hive_extras(None),
+    );
+    let h1_hive_addr = format!("[::1]:{}", h1.port);
+    let h2 = boot_node_ex(
         &tmp,
         "h2",
+        None,
         Some(PeerSpec {
-            addr: &h1_addr,
+            addr: &h1_hive_addr,
             channel_key: h1.channel_key,
             id: h1.id,
         }),
         SERVICES,
+        hive_extras(None),
     );
-    let h3 = boot_node(
+    let h2_hive_addr = format!("[::1]:{}", h2.port);
+    let h3 = boot_node_ex(
         &tmp,
         "h3",
+        None,
         Some(PeerSpec {
-            addr: &h1_addr,
+            addr: &h1_hive_addr,
             channel_key: h1.channel_key,
             id: h1.id,
         }),
         SERVICES,
+        hive_extras(None),
     );
-    let gw = boot_node_with_serves(
+    // gw: dual-homed (hive [::1] + WAN 127.0.0.1). Roots to h2 over a
+    // hive link. Serves the private instance, so it publishes a WAN
+    // record (a gateway's WAN record carries `serves`).
+    let gw = boot_node_ex(
         &tmp,
         "gw",
+        Some(gw_keys),
         Some(PeerSpec {
-            addr: &h1_addr,
-            channel_key: h1.channel_key,
-            id: h1.id,
+            addr: &h2_hive_addr,
+            channel_key: h2.channel_key,
+            id: h2.id,
         }),
         SERVICES,
-        vec![priv_id],
+        NodeExtras {
+            port: Some(gw_port),
+            listen: vec!["[::1]:{port}".to_string(), "127.0.0.1:{port}".to_string()],
+            hive: vec![HIVE.to_string()],
+            advertise: vec!["ws://[::1]:{port}/".to_string()],
+            ips: vec!["::1".to_string()],
+            serves: Some(vec![priv_id]),
+            ..NodeExtras::default()
+        },
     );
-    let wan = boot_node(
+    let wan = boot_node_ex(
         &tmp,
         "wan",
+        None,
         Some(PeerSpec {
-            addr: &h1_addr,
-            channel_key: h1.channel_key,
-            id: h1.id,
-        }),
-        SERVICES,
-    );
-    let gw_addr = format!("127.0.0.1:{}", gw.port);
-    let priv_node = boot_node_with_keys(
-        &tmp,
-        "priv",
-        priv_keys,
-        Some(PeerSpec {
-            addr: &gw_addr,
+            addr: &gw_wan_addr,
             channel_key: gw.channel_key,
             id: gw.id,
         }),
         SERVICES,
-        Some(vec![gw.id]),
+        NodeExtras::default(),
+    );
+    let priv_node = boot_node_ex(
+        &tmp,
+        "priv",
+        Some(priv_keys),
+        Some(PeerSpec {
+            addr: &gw_wan_addr,
+            channel_key: gw.channel_key,
+            id: gw.id,
+        }),
+        SERVICES,
+        NodeExtras {
+            private_gateways: Some(vec![gw.id]),
+            ..NodeExtras::default()
+        },
     );
 
     for n in [&h1, &h2, &h3, &gw, &wan, &priv_node] {
@@ -130,6 +199,10 @@ async fn six_node_gate() {
     wait_for_path(&mut c_priv, &wan.id, 60).await; // priv -> wan via gw
     wait_for_path(&mut c_h2, &h3.id, 60).await; // hive-internal
     wait_for_path(&mut c_h3, &h2.id, 60).await; // hive-internal (reverse)
+    // h1 reaches wan only via gw (h1 is hive-only and cannot learn wan's
+    // WAN record over a hive link), so wait for that path to converge
+    // before partitioning wan.
+    wait_for_path(&mut c_h1, &wan.id, 60).await; // h1 -> wan via gw
 
     // ---- 1. WAN -> private instance, through the gateway. ----
     let d = send_and_fetch(

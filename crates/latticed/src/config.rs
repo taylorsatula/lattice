@@ -18,7 +18,12 @@ pub struct Config {
     /// Listen addresses for the WebSocket transport. Empty = loopback only.
     #[serde(default = "default_listen")]
     pub listen: Vec<SocketAddr>,
-    /// CIDRs that make up the hive (informational for now).
+    /// CIDRs that make up the hive. A node whose own addresses (listen
+    /// addresses, `ips`, or IP-literal hosts in `advertise`) fall inside
+    /// one of these is a hive member: it publishes a hive-scoped record
+    /// (with its hive endpoints) in addition to its WAN record, and links
+    /// whose remote address falls inside a hive CIDR carry only hive
+    /// records. Empty means no hive.
     #[serde(default)]
     pub hive: Vec<String>,
     /// Peers to dial at startup.
@@ -275,7 +280,7 @@ pub fn validate(cfg: &Config) -> Result<(), String> {
             .map_err(|_| format!("ips[{i}] {ip:?} is not an IP address"))?;
     }
     for (i, cidr) in cfg.hive.iter().enumerate() {
-        parse_cidr(cidr).map_err(|e| format!("hive[{i}] {cidr:?}: {e}"))?;
+        lattice_core::cidr::Cidr::parse(cidr).map_err(|e| format!("hive[{i}] {cidr:?}: {e}"))?;
     }
     for (i, root) in cfg.roots.iter().enumerate() {
         root.addr.parse::<std::net::SocketAddr>().map_err(|e| {
@@ -373,25 +378,6 @@ fn valid_service_name(name: &str) -> bool {
         && name
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
-}
-
-/// Parse `addr/prefix` CIDR notation. The address may be v4 or v6; the
-/// prefix must fit the address family. Host bits need not be zero.
-fn parse_cidr(s: &str) -> Result<(), String> {
-    let (addr, prefix) = s
-        .split_once('/')
-        .ok_or_else(|| "expected CIDR notation `<ip>/<prefix>`".to_string())?;
-    let ip: std::net::IpAddr = addr
-        .parse()
-        .map_err(|_| format!("{addr:?} is not an IP address"))?;
-    let prefix: u8 = prefix
-        .parse()
-        .map_err(|_| format!("{prefix:?} is not a valid prefix length"))?;
-    let max = if ip.is_ipv4() { 32 } else { 128 };
-    if prefix > max {
-        return Err(format!("prefix length {prefix} exceeds {max} for {ip}"));
-    }
-    Ok(())
 }
 
 /// Hex-decode a 32-byte key/id, as printed in documentation and logs.

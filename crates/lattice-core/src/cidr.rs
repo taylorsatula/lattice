@@ -1,20 +1,20 @@
 //! Minimal CIDR matching for the configured hive ranges. Used to classify
-//! links as hive-scope vs WAN-scope for the established-link caps. Kept
-//! separate from `config.rs` (which only validates) so the matcher has one
-//! definition and can be unit-tested.
+//! links as hive-scope vs WAN-scope (established-link caps, gossip scope)
+//! and to decide hive membership from a node's own addresses. Kept in one
+//! place so the daemon and the core agree on what "in the hive" means.
 
 use std::net::IpAddr;
 
 /// A parsed `addr/prefix` range. IPv4-mapped IPv6 addresses match IPv4
 /// ranges, so a dual-stack peer cannot dodge hive classification.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Cidr {
+pub struct Cidr {
     network: IpAddr,
     prefix: u8,
 }
 
 impl Cidr {
-    pub(crate) fn parse(s: &str) -> Result<Cidr, String> {
+    pub fn parse(s: &str) -> Result<Cidr, String> {
         let (addr, prefix) = s
             .split_once('/')
             .ok_or_else(|| "expected CIDR notation `<ip>/<prefix>`".to_string())?;
@@ -34,7 +34,7 @@ impl Cidr {
         Ok(Cidr { network, prefix })
     }
 
-    pub(crate) fn contains(&self, ip: IpAddr) -> bool {
+    pub fn contains(&self, ip: IpAddr) -> bool {
         let ip = match ip {
             IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
                 Some(v4) => IpAddr::V4(v4),
