@@ -2,7 +2,7 @@
 //! redb-backed `RedbStore`. Behavior is contract-tested for equivalence
 //! with the redb backend.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use crate::*;
 use lattice_proto::local::DrainState;
@@ -10,17 +10,17 @@ use lattice_types::{DeliveryId, Hash32, Identifier, LegId, MessageId};
 
 #[derive(Default)]
 pub struct MemStore {
-    records: HashMap<(Identifier, u8), RecordBytes>,
-    kel_heads: HashMap<Identifier, KelHeadSeen>,
-    kels: HashMap<Identifier, Vec<u8>>,
-    outbound: HashMap<MessageId, OutboundMessage>,
-    custody: HashMap<LegId, CustodyEntry>,
-    shares: HashMap<(Identifier, u64), u64>,
-    seen: HashMap<Hash32, u64>,
-    seen_unheld: HashMap<Hash32, u64>,
-    delivered: HashMap<Hash32, u64>,
-    inbox: HashMap<String, Vec<InboxEntry>>,
-    status: HashMap<MessageId, (MessageStatus, u64)>,
+    records: BTreeMap<(Identifier, u8), RecordBytes>,
+    kel_heads: BTreeMap<Identifier, KelHeadSeen>,
+    kels: BTreeMap<Identifier, Vec<u8>>,
+    outbound: BTreeMap<MessageId, OutboundMessage>,
+    custody: BTreeMap<LegId, CustodyEntry>,
+    shares: BTreeMap<(Identifier, u64), u64>,
+    seen: BTreeMap<Hash32, u64>,
+    seen_unheld: BTreeMap<Hash32, u64>,
+    delivered: BTreeMap<Hash32, u64>,
+    inbox: BTreeMap<String, Vec<InboxEntry>>,
+    status: BTreeMap<MessageId, (MessageStatus, u64)>,
     buckets: [u64; 4],
     custody_bytes: u64,
     custody_class_bytes: [u64; 16],

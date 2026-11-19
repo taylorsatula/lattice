@@ -5,15 +5,18 @@
 //! implements the spec's randomized progress with opportunistic sideways
 //! turns.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 
 use lattice_types::Identifier;
 
 use crate::rng::Rng;
 
+/// Adjacency is ordered so that neighbor iteration — which feeds the
+/// randomized next-hop choice — is identical on every run with the same
+/// seed.
 #[derive(Default)]
 pub struct Graph {
-    adjacency: HashMap<Identifier, HashSet<Identifier>>,
+    adjacency: BTreeMap<Identifier, BTreeSet<Identifier>>,
 }
 
 impl Graph {
@@ -23,11 +26,11 @@ impl Graph {
     where
         I: IntoIterator<Item = (&'a Identifier, &'a [Identifier])>,
     {
-        let claims: HashMap<Identifier, HashSet<Identifier>> = records
+        let claims: BTreeMap<Identifier, BTreeSet<Identifier>> = records
             .into_iter()
             .map(|(id, links)| (*id, links.iter().copied().collect()))
             .collect();
-        let mut adjacency: HashMap<Identifier, HashSet<Identifier>> = HashMap::new();
+        let mut adjacency: BTreeMap<Identifier, BTreeSet<Identifier>> = BTreeMap::new();
         let ids: Vec<Identifier> = claims
             .keys()
             .copied()
@@ -59,8 +62,8 @@ impl Graph {
     }
 
     /// BFS distances from `from`.
-    pub fn distances(&self, from: &Identifier) -> HashMap<Identifier, u32> {
-        let mut dist = HashMap::new();
+    pub fn distances(&self, from: &Identifier) -> BTreeMap<Identifier, u32> {
+        let mut dist = BTreeMap::new();
         let mut q = VecDeque::new();
         dist.insert(*from, 0u32);
         q.push_back(*from);
@@ -90,7 +93,7 @@ impl Graph {
     pub fn next_hop(
         &self,
         from: &Identifier,
-        dist: &HashMap<Identifier, u32>,
+        dist: &BTreeMap<Identifier, u32>,
         sideways_prob: f64,
         exclude: &HashSet<Identifier>,
         up: &HashSet<Identifier>,

@@ -578,6 +578,7 @@ fn forged_envelope_is_not_delivered() {
         exp: 1_900_000_000,
         gateway: None,
         waypoint: None,
+        entropy: &mut |b: &mut [u8; 64]| b.fill(0x5A),
     })
     .unwrap();
 

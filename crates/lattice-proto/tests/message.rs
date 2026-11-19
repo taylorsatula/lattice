@@ -39,6 +39,7 @@ fn direct_roundtrip_full() {
         exp: EXP,
         gateway: None,
         waypoint: None,
+        entropy: &mut |b: &mut [u8; 64]| b.fill(0x5A),
     })
     .unwrap();
 
@@ -74,6 +75,7 @@ fn waypoint_route_roundtrip() {
             leg: LegId::from_bytes([2u8; 16]),
             exp: EXP,
         }),
+        entropy: &mut |b: &mut [u8; 64]| b.fill(0x5A),
     })
     .unwrap();
 
@@ -121,6 +123,7 @@ fn waypoint_gateway_route_roundtrip() {
             leg: LegId::from_bytes([4u8; 16]),
             exp: EXP,
         }),
+        entropy: &mut |b: &mut [u8; 64]| b.fill(0x5A),
     })
     .unwrap();
 
@@ -163,6 +166,7 @@ fn gateway_route_roundtrip_no_waypoint() {
             rcpt: recipient_id,
         }),
         waypoint: None,
+        entropy: &mut |b: &mut [u8; 64]| b.fill(0x5A),
     })
     .unwrap();
 
@@ -192,6 +196,7 @@ fn messages_land_in_exact_buckets() {
             exp: EXP,
             gateway: None,
             waypoint: None,
+                entropy: &mut |b: &mut [u8; 64]| b.fill(0x5A),
         })
         .unwrap();
         assert!(
@@ -219,6 +224,7 @@ fn oversized_message_refused() {
         exp: EXP,
         gateway: None,
         waypoint: None,
+        entropy: &mut |b: &mut [u8; 64]| b.fill(0x5A),
     });
     assert!(result.is_err());
 }
@@ -237,6 +243,7 @@ fn expired_message_rejected_at_parse() {
             exp: NOW - 1, // already expired
             gateway: None,
             waypoint: None,
+                entropy: &mut |b: &mut [u8; 64]| b.fill(0x5A),
         })
         .unwrap()
     };
@@ -256,6 +263,7 @@ fn horizon_violation_rejected_at_parse() {
         exp: NOW + MAX_MESSAGE_HORIZON + CLOCK_SKEW + 100,
         gateway: None,
         waypoint: None,
+        entropy: &mut |b: &mut [u8; 64]| b.fill(0x5A),
     })
     .unwrap();
     assert!(Message::parse(&bytes, NOW).is_err());
@@ -274,6 +282,7 @@ fn tampered_padding_rejected() {
         exp: EXP,
         gateway: None,
         waypoint: None,
+        entropy: &mut |b: &mut [u8; 64]| b.fill(0x5A),
     })
     .unwrap();
     let n = bytes.len();
@@ -314,6 +323,7 @@ fn receipt_roundtrip() {
         exp: EXP,
         gateway: None,
         waypoint: None,
+        entropy: &mut |b: &mut [u8; 64]| b.fill(0x5A),
     })
     .unwrap();
     let msg = Message::parse(&bytes, NOW).unwrap();
@@ -350,6 +360,7 @@ fn waypoint_repack_preserves_bucket() {
             leg: LegId::from_bytes([0x22; 16]),
             exp: EXP,
         }),
+        entropy: &mut |b: &mut [u8; 64]| b.fill(0x5A),
     })
     .unwrap();
     let bucket = built.len();

@@ -17,7 +17,7 @@ pub use lattice_types::{
     X25519PublicKey, X25519Secret, XWingPublicKey, XWingSecretKey,
 };
 pub use random::{os_bytes, os_fill};
-pub use seal::{ENVELOPE_CONTEXT, HOP_CONTEXT, Sealed, open, seal};
+pub use seal::{ENVELOPE_CONTEXT, HOP_CONTEXT, Sealed, open, seal, seal_with_entropy};
 pub use sign::generate_seed;
 pub use sign::{
     channel_public, channel_x25519_public, channel_x25519_public_from_ed25519, channel_x25519_seed,

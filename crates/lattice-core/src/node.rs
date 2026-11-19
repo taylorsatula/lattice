@@ -1,7 +1,7 @@
 //! The sans-IO node state machine. Events in, actions out; all time,
 //! randomness and persistence are injected.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
 
 use lattice_proto::frames::{
@@ -435,11 +435,11 @@ pub struct Node<S: Store> {
     pub own_id: Identifier,
     scope: Scope,
     own_seq: u64,
-    links: HashMap<LinkId, LinkState>,
+    links: BTreeMap<LinkId, LinkState>,
     next_link_order: Vec<LinkId>,
-    reconcile_sessions: HashMap<LinkId, ReconcileSession>,
-    pending: HashMap<LegId, PendingOffer>,
-    outbound_exclusions: HashMap<MessageId, Vec<Exclusion>>,
+    reconcile_sessions: BTreeMap<LinkId, ReconcileSession>,
+    pending: BTreeMap<LegId, PendingOffer>,
+    outbound_exclusions: BTreeMap<MessageId, Vec<Exclusion>>,
     snow_next: u64,
     frames_since_snow_tick: u32,
     snow_history: [u64; 4],
@@ -478,7 +478,7 @@ pub struct Node<S: Store> {
     /// channel_key -> set of node ids whose records claim that key.
     /// Attribution of a link to a peer is allowed only when exactly one id
     /// claims the link's channel key; more than one fails closed.
-    ck_claims: HashMap<X25519PublicKey, std::collections::HashSet<Identifier>>,
+    ck_claims: BTreeMap<X25519PublicKey, BTreeSet<Identifier>>,
     next_claim_sweep_at: u64,
     next_data_sweep_at: u64,
     contested: u64,
@@ -488,7 +488,7 @@ pub struct Node<S: Store> {
     /// Reads filter on `exp > now`; nothing here re-validates. The store
     /// remains the system of record for bytes; this index is the read
     /// path for routing, reconcile and waypoint selection.
-    record_index: HashMap<(Identifier, u8), IndexedRecord>,
+    record_index: BTreeMap<(Identifier, u8), IndexedRecord>,
     /// Bumped on every change to the index or to the KEL head set (KEL
     /// admission, KEL sweep). Keys the derived-data caches below; cheap
     /// to bump, so callers never have to reason about which cache a
@@ -553,11 +553,11 @@ impl<S: Store> Node<S> {
             own_id: id,
             scope: Scope::Wan,
             own_seq: 0,
-            links: HashMap::new(),
+            links: BTreeMap::new(),
             next_link_order: Vec::new(),
-            reconcile_sessions: HashMap::new(),
-            pending: HashMap::new(),
-            outbound_exclusions: HashMap::new(),
+            reconcile_sessions: BTreeMap::new(),
+            pending: BTreeMap::new(),
+            outbound_exclusions: BTreeMap::new(),
             snow_next: now,
             frames_since_snow_tick: 0,
             snow_history: [0; 4],
@@ -576,11 +576,11 @@ impl<S: Store> Node<S> {
             rng,
             now,
             draining: local::DrainState::Serving,
-            ck_claims: HashMap::new(),
+            ck_claims: BTreeMap::new(),
             next_claim_sweep_at: now + CLAIM_SWEEP_MS,
             next_data_sweep_at: now + DATA_SWEEP_MS,
             contested: 0,
-            record_index: HashMap::new(),
+            record_index: BTreeMap::new(),
             derived_version: 0,
             graph_cache: None,
             items_cache: None,
@@ -1641,8 +1641,7 @@ impl<S: Store> Node<S> {
     /// store reads and no re-validation.
     fn sweep_ck_claims(&mut self, now: u64) -> Vec<Action> {
         let now_secs = ms_to_secs(now);
-        let mut fresh: HashMap<X25519PublicKey, std::collections::HashSet<Identifier>> =
-            HashMap::new();
+        let mut fresh: BTreeMap<X25519PublicKey, BTreeSet<Identifier>> = BTreeMap::new();
         for entry in self.record_index.values() {
             if entry.record.exp <= now_secs {
                 continue;
@@ -2041,11 +2040,19 @@ fn kel_head_from_store(mut h: KelHeadSeen) -> KelHeadSeen {
 }
 
 impl<S: Store> Node<S> {
+    /// 16 bytes of core-RNG entropy for ids (mids, legs, delivery ids).
+    fn rand_id16(&mut self) -> [u8; 16] {
+        let mut b = [0u8; 16];
+        self.rng.fill_bytes(&mut b);
+        b
+    }
+
     fn on_app_send(&mut self, send: &AppSend) -> Vec<Action> {
         let now = self.now;
-        let mid: MessageId = send
-            .mid_hint
-            .unwrap_or_else(|| MessageId::from_bytes(lattice_crypto::os_bytes::<16>()));
+        let mid: MessageId = match send.mid_hint {
+            Some(mid) => mid,
+            None => MessageId::from_bytes(self.rand_id16()),
+        };
         if !self.has_record(&send.to) {
             return vec![Action::Status {
                 mid,
@@ -2206,22 +2213,25 @@ impl<S: Store> Node<S> {
             gateway_ek,
             rcpt: msg.recipient,
         });
+        let waypoint_leg = LegId::from_bytes(self.rand_id16());
         let waypoint = waypoint_choice.map(|choice| WaypointSeal {
             waypoint_id: choice.id,
             waypoint_ek: choice.envelope_key,
-            leg: LegId::from_bytes(lattice_crypto::os_bytes::<16>()),
+            leg: waypoint_leg,
             exp: ms_to_secs(msg.exp),
         });
         let used_waypoint_id = waypoint.as_ref().map(|w| w.waypoint_id);
+        let real_leg = LegId::from_bytes(self.rand_id16());
         let wire = Message::build(BuildParams {
             envelope: msg.envelope.clone(),
             sender_seed: &self.identity.signing_seed,
             recipient_ek: &recipient_ek,
             real_dst,
-            leg: LegId::from_bytes(lattice_crypto::os_bytes::<16>()),
+            leg: real_leg,
             exp: ms_to_secs(msg.exp),
             gateway,
             waypoint,
+            entropy: &mut |buf| self.rng.fill_bytes(buf),
         })
         .map_err(|_| BuildError::Crypto)?;
         Ok(BuildOutput {
@@ -2269,7 +2279,7 @@ impl<S: Store> Node<S> {
             }
         }
         let now_secs = ms_to_secs(self.now);
-        let candidates: WaypointCandidates = self
+        let mut candidates: WaypointCandidates = self
             .record_index
             .values()
             .filter(|e| e.record.exp > now_secs && e.record.mode == Mode::Public)
@@ -2278,6 +2288,7 @@ impl<S: Store> Node<S> {
                 envelope_key: e.record.envelope_key,
             })
             .collect();
+        candidates.sort_by(|a, b| a.id.cmp(&b.id));
         let candidates = Arc::new(candidates);
         self.waypoint_cache = Some((key.0, key.1, Arc::clone(&candidates)));
         candidates
@@ -2941,7 +2952,7 @@ impl<S: Store> Node<S> {
             return actions;
         }
         let entry = InboxEntry {
-            delivery_id: DeliveryId::from_bytes(lattice_crypto::os_bytes::<16>()),
+            delivery_id: DeliveryId::from_bytes(self.rand_id16()),
             mid: mid_bytes,
             from: opened.from,
             fsvc: opened.fsvc.clone(),
@@ -3392,7 +3403,7 @@ impl<S: Store> Node<S> {
     fn send_receipt(&mut self, now: u64, delivered: &Envelope) -> Vec<Action> {
         let envelope = Envelope {
             kind: KIND_RECEIPT,
-            mid: MessageId::from_bytes(lattice_crypto::os_bytes::<16>()),
+            mid: MessageId::from_bytes(self.rand_id16()),
             from: self.own_id,
             fsvc: delivered.tsvc.clone(),
             fmbx: delivered.tmbx.clone(),
@@ -3417,7 +3428,7 @@ impl<S: Store> Node<S> {
     ) -> Vec<Action> {
         let envelope = Envelope {
             kind: KIND_NEGATIVE_RECEIPT,
-            mid: MessageId::from_bytes(lattice_crypto::os_bytes::<16>()),
+            mid: MessageId::from_bytes(self.rand_id16()),
             from: self.own_id,
             fsvc: my_service.to_string(),
             fmbx: Vec::new(),
@@ -3539,7 +3550,8 @@ impl<S: Store> Node<S> {
     fn expire_outbound(&mut self, now: u64) -> Vec<Action> {
         let mut actions = Vec::new();
         match self.store.outbound_all() {
-            Ok(all) => {
+            Ok(mut all) => {
+                all.sort_by(|a, b| a.mid.cmp(&b.mid));
                 for msg in all {
                     let mut msg = outbound_from_store(msg);
                     if !msg.state.is_terminal() && msg.exp <= now {
@@ -3573,7 +3585,8 @@ impl<S: Store> Node<S> {
     fn sweep_receipt_deadlines(&mut self, now: u64) -> Vec<Action> {
         let mut actions = Vec::new();
         match self.store.outbound_all() {
-            Ok(all) => {
+            Ok(mut all) => {
+                all.sort_by(|a, b| a.mid.cmp(&b.mid));
                 for msg in all {
                     let mut msg = outbound_from_store(msg);
                     if msg.state != OutboundState::InFlight {
@@ -3689,7 +3702,7 @@ impl<S: Store> Node<S> {
         match self.store.custody_all() {
             Ok(all) => {
                 let mut all: Vec<_> = all.into_iter().map(custody_from_store).collect();
-                all.sort_by_key(|e| e.class);
+                all.sort_by(|a, b| a.class.cmp(&b.class).then(a.leg.cmp(&b.leg)));
                 for entry in all {
                     let offer_leg = lattice_proto::Message::parse(&entry.message, ms_to_secs(now))
                         .map_or(entry.leg, |m| m.header.leg);
@@ -3707,7 +3720,8 @@ impl<S: Store> Node<S> {
     /// Expire custody entries whose messages timed out.
     fn sweep_custody_expiry(&mut self, now: u64) {
         match self.store.custody_all() {
-            Ok(all) => {
+            Ok(mut all) => {
+                all.sort_by(|a, b| a.leg.cmp(&b.leg));
                 for entry in all.into_iter().map(custody_from_store) {
                     if entry.exp <= now {
                         match self.store.custody_remove(&entry.leg) {
@@ -4125,7 +4139,7 @@ mod tests {
         };
         Node::new(
             cfg,
-            Identity::from_seed(&lattice_crypto::os_bytes::<32>()),
+            Identity::from_seed(&[0xA5; 32]),
             MemStore::new(),
             1_000,
         )
@@ -4349,6 +4363,7 @@ mod tests {
             exp: 2_000_000,
             gateway: None,
             waypoint: None,
+            entropy: &mut |b: &mut [u8; 64]| b.fill(0x5A),
         })
         .unwrap();
         Message::parse(&bytes, 1_000_000).unwrap()
@@ -4396,7 +4411,7 @@ mod tests {
                 lattice_crypto::hash(lattice_crypto::public_key(&next_seed).as_ref()).into_bytes(),
             ),
         )];
-        let channel_seed = ChannelSeed::from_bytes(lattice_crypto::os_bytes::<32>());
+        let channel_seed = ChannelSeed::from_bytes([0x5A; 32]);
         let exp = 10_000u64;
         let kel = ValidatedKel::validate(kel).unwrap();
         let head = kel.head();
@@ -4538,7 +4553,7 @@ mod tests {
         };
         let node = Node::new(
             cfg,
-            Identity::from_seed(&lattice_crypto::os_bytes::<32>()),
+            Identity::from_seed(&[0xA5; 32]),
             MemStore::new(),
             1_000,
         )
@@ -5177,6 +5192,7 @@ mod tests {
             exp,
             gateway: None,
             waypoint: None,
+            entropy: &mut |b: &mut [u8; 64]| b.fill(0x5A),
         })
         .expect("wire message builds")
     }
@@ -5486,6 +5502,7 @@ mod tests {
             exp: now + 10_000,
             gateway: None,
             waypoint: None,
+            entropy: &mut |b: &mut [u8; 64]| b.fill(0x5A),
         })
         .expect("message builds")
     }
@@ -5644,7 +5661,7 @@ mod tests {
         };
         let mut node = Node::new(
             cfg,
-            Identity::from_seed(&lattice_crypto::os_bytes::<32>()),
+            Identity::from_seed(&[0xA5; 32]),
             MemStore::new(),
             1_000,
         )
@@ -5681,6 +5698,7 @@ mod tests {
             exp: now + 10_000,
             gateway: None,
             waypoint: None,
+            entropy: &mut |b: &mut [u8; 64]| b.fill(0x5A),
         })
         .expect("message builds");
         node.set_drain(local::DrainState::Draining);
@@ -5772,6 +5790,7 @@ mod tests {
             exp: now + 10_000,
             gateway: None,
             waypoint: None,
+            entropy: &mut |b: &mut [u8; 64]| b.fill(0x5A),
         })
         .expect("message builds");
         node.set_drain(local::DrainState::Draining);
