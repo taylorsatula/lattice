@@ -139,11 +139,21 @@ pub struct Config {
     pub custody_allowance: u64,
     /// Total transit storage cap, bytes.
     pub transit_cap: u64,
-    /// Per-service inbox cap, deliveries.
+    /// Per-service inbox reservation, deliveries. A service at or over its
+    /// reservation is answered `busy`; services under their reservation are
+    /// always admitted. Bounds each service's share of the inbox.
     pub inbox_max_deliveries: u64,
-    /// Global inbox cap across all services, deliveries. Bounds total
-    /// undelivered storage regardless of how senders label `tsvc`.
+    /// Global inbox cap across all services, deliveries. A memory backstop,
+    /// not a shared pool: it can only trip when the sum of the per-service
+    /// reservations exceeds it (each service is hard-capped at its
+    /// reservation, so the total can only reach this cap when the
+    /// reservations themselves over-commit memory). When it trips,
+    /// deliveries are refused regardless of service.
     pub inbox_max_total: u64,
+    /// How long a message addressed to an identity with no known record is
+    /// held in an "awaiting record" state before failing with ERR_NO_RECORD.
+    /// The message is dispatched as soon as the record arrives.
+    pub awaiting_record_grace_secs: u64,
     /// Daily record refresh interval, in seconds (spec §3; jittered ±10%).
     pub record_refresh_secs: u64,
     /// Minimum seconds between record publishes (spec §3: 2 minutes).
@@ -186,6 +196,7 @@ impl Default for Config {
             transit_cap: 256 * 1024 * 1024,
             inbox_max_deliveries: 1024,
             inbox_max_total: 4096,
+            awaiting_record_grace_secs: 600,
             record_refresh_secs: 86_400,
             republish_min_interval_secs: 120,
             reconcile_interval_secs: 60,

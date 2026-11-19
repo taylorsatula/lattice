@@ -49,6 +49,14 @@ fn ms_to_secs(ms: u64) -> u64 {
     ms / MS_PER_SEC
 }
 
+/// Receipts and negative receipts are control traffic: they are sealed,
+/// routed and stored like any other message, but the sender needs no
+/// status for them — they are terminal on their first custody ACCEPTED
+/// and carry no receipt of their own.
+fn is_receipt_envelope(kind: u64) -> bool {
+    kind == KIND_RECEIPT || kind == KIND_NEGATIVE_RECEIPT
+}
+
 /// The refresh interval with ±10% jitter, so a fleet does not republish in
 /// lockstep. `base_secs` is clamped to at least 60s so a misconfigured
 /// zero cannot spin the refresh loop.
@@ -520,6 +528,11 @@ pub struct Node<S: Store> {
     /// message with no current route. In-memory only: a restart resets the
     /// backoff to its base, which is harmless. Bounded; cleared when full.
     no_route_backoff: std::collections::HashMap<MessageId, u32>,
+    /// Messages queued while the recipient's record is unknown, keyed by
+    /// recipient. The grace deadline is persisted as the message's
+    /// `next_attempt`; this index only makes record admission able to
+    /// re-arm the waiters. Rebuilt at startup from the store.
+    awaiting_record: std::collections::HashMap<Identifier, HashSet<MessageId>>,
     /// Memoized distance maps, keyed by (records_version, now_secs,
     /// source). Bounded; cleared when full.
     distance_cache: std::collections::HashMap<
@@ -642,6 +655,7 @@ impl<S: Store> Node<S> {
             outbound_deadline: std::collections::BTreeMap::new(),
             outbound_expiry: std::collections::BTreeMap::new(),
             no_route_backoff: std::collections::HashMap::new(),
+            awaiting_record: std::collections::HashMap::new(),
             distance_cache: std::collections::HashMap::new(),
             record_refresh_at: first_refresh,
             recently_lost: Vec::new(),
@@ -737,11 +751,19 @@ impl<S: Store> Node<S> {
         }
         // Rebuild the in-memory due-time indexes and the per-upstream byte
         // counts from the store; neither is persisted. Custody entries are
-        // re-armed for immediate forwarding.
+        // re-armed for immediate forwarding. Queued messages whose recipient
+        // has no record are awaiting one; their grace deadline is the
+        // persisted `next_attempt`.
         match node.store.outbound_all() {
             Ok(all) => {
                 for msg in all {
                     let msg = outbound_from_store(msg);
+                    if msg.state == OutboundState::Queued && !node.has_record(&msg.recipient) {
+                        node.awaiting_record
+                            .entry(msg.recipient)
+                            .or_default()
+                            .insert(msg.mid);
+                    }
                     node.index_outbound(&msg);
                 }
             }
@@ -2021,8 +2043,14 @@ impl<S: Store> Node<S> {
             match self.store.record_put(&rec.id, scope, bytes, ms_to_secs(at)) {
                 Ok(()) => {
                     self.note_ck_claim(&rec);
+                    let id = rec.id;
                     self.index_record(bytes, rec);
                     self.enforce_record_cap(RECORD_CAP);
+                    // The record is in the index: messages that were
+                    // queued waiting for it can now be dispatched.
+                    let mut actions = self.release_awaiting_record(&id, at);
+                    actions.extend(self.reevaluate_link_bindings(at));
+                    return actions;
                 }
                 Err(e) => {
                     self.diag("record_put", &e);
@@ -2231,15 +2259,6 @@ impl<S: Store> Node<S> {
             Some(mid) => mid,
             None => MessageId::from_bytes(self.rand_id16()),
         };
-        if !self.has_record(&send.to) {
-            return vec![Action::Status {
-                mid,
-                status: local::MSG_STATUS_FAILED,
-                detail: Some(ERR_NO_RECORD),
-                service: send.service.clone(),
-            }];
-        }
-
         // `send.exp` is a wire time (Unix seconds); the core keeps ms.
         let exp = send
             .exp
@@ -2261,6 +2280,63 @@ impl<S: Store> Node<S> {
             reason: None,
             sig: Signature::from_bytes([0; 64]),
         };
+
+        if !self.has_record(&send.to) {
+            // No record for the recipient yet: hold the message in an
+            // "awaiting record" state for a bounded grace period instead of
+            // failing outright. The grace deadline is persisted as
+            // `next_attempt`; when the record arrives (admission path) the
+            // message is re-armed and dispatched, and when the grace
+            // expires the message fails with ERR_NO_RECORD. Ask for the
+            // record on up to two links so a single lost want does not
+            // stall the send.
+            let grace = secs_to_ms(self.config.awaiting_record_grace_secs);
+            let outbound = lattice_store::OutboundMessage {
+                mid,
+                recipient: send.to,
+                envelope,
+                priority: send.priority,
+                exp,
+                state: OutboundState::Queued,
+                waypoints_tried: Vec::new(),
+                receipt_deadline: None,
+                attempts: 0,
+                next_attempt: now + grace,
+                route: send.route,
+            };
+            if let Err(e) = self.push_outbound(&outbound) {
+                self.diag("outbound_push", &e);
+                return vec![Action::Status {
+                    mid,
+                    status: local::MSG_STATUS_FAILED,
+                    detail: Some(ERR_INTERNAL),
+                    service: send.service.clone(),
+                }];
+            }
+            self.awaiting_record.entry(send.to).or_default().insert(mid);
+            let mut actions = vec![Action::Status {
+                mid,
+                status: local::MSG_STATUS_QUEUED,
+                detail: None,
+                service: send.service.clone(),
+            }];
+            let links: Vec<LinkId> = self.links.keys().copied().collect();
+            let chosen: Vec<LinkId> = if links.len() <= 2 {
+                links
+            } else {
+                let mut pool = links;
+                let mut picked = Vec::with_capacity(2);
+                while picked.len() < 2 && !pool.is_empty() {
+                    let idx = (self.rng.next_u64() as usize) % pool.len();
+                    picked.push(pool.swap_remove(idx));
+                }
+                picked
+            };
+            for link in chosen {
+                actions.extend(self.want_record(link, send.to));
+            }
+            return actions;
+        }
 
         let receipt_timeout = if self.record_mode(&send.to) == Some(Mode::Private) {
             self.config.receipt_timeout_private
@@ -2553,6 +2629,39 @@ impl<S: Store> Node<S> {
             if msg.state != OutboundState::Queued {
                 continue;
             }
+            if !self.has_record(&msg.recipient) {
+                if self
+                    .awaiting_record
+                    .get(&msg.recipient)
+                    .is_some_and(|s| s.contains(&msg.mid))
+                {
+                    // Awaiting-record grace period elapsed with no record:
+                    // fail with ERR_NO_RECORD.
+                    self.awaiting_remove(&msg.recipient, &msg.mid);
+                    msg.mark_failed();
+                    self.clear_no_route(&msg.mid);
+                    self.store_outbound(&msg);
+                    if let Err(e) = self.store.status_set(
+                        &msg.mid,
+                        local::MSG_STATUS_FAILED,
+                        Some(ERR_NO_RECORD),
+                        ms_to_secs(now),
+                    ) {
+                        self.diag("status_set", &e);
+                    }
+                    actions.push(Action::Status {
+                        mid: msg.mid,
+                        status: local::MSG_STATUS_FAILED,
+                        detail: Some(ERR_NO_RECORD),
+                        service: msg.envelope.fsvc.clone(),
+                    });
+                    continue;
+                }
+                // The record vanished after the message was queued: treat
+                // it as no-route and back off rather than fail it.
+                self.requeue_no_route(now, &mut msg);
+                continue;
+            }
             match self.build_attempt(&mut msg) {
                 Ok(built) => {
                     match self.dispatch_wire(now, &built.wire, &msg, &mut actions) {
@@ -2560,11 +2669,18 @@ impl<S: Store> Node<S> {
                             // A first hop accepted the message: this is an attempt.
                             msg.attempts += 1;
                             self.clear_no_route(&msg.mid);
+                            self.awaiting_remove(&msg.recipient, &msg.mid);
                             msg.mark_in_flight();
                             msg.next_attempt = now + secs_to_ms(self.config.retry_base_secs);
                             // The receipt clock starts when the message
                             // actually goes on the wire, not at enqueue.
-                            msg.receipt_deadline = Some(now + self.receipt_timeout_for(&msg));
+                            // Receipts are fire-and-forget: nobody receipts
+                            // a receipt, so they carry no deadline.
+                            msg.receipt_deadline = if is_receipt_envelope(msg.envelope.kind) {
+                                None
+                            } else {
+                                Some(now + self.receipt_timeout_for(&msg))
+                            };
                             self.store_outbound(&msg);
                         }
                         DispatchResult::NoRoute => {
@@ -2578,6 +2694,12 @@ impl<S: Store> Node<S> {
                 Err(BuildError::Crypto) => {
                     // Deterministic failure: retrying cannot help.
                     self.clear_no_route(&msg.mid);
+                    self.awaiting_remove(&msg.recipient, &msg.mid);
+                    if is_receipt_envelope(msg.envelope.kind) {
+                        // Receipts fail silently: no status row, no event.
+                        self.drop_outbound(&msg.mid);
+                        continue;
+                    }
                     msg.mark_failed();
                     self.store_outbound(&msg);
                     if let Err(e) = self.store.status_set(
@@ -2628,6 +2750,53 @@ impl<S: Store> Node<S> {
 
     fn clear_no_route(&mut self, mid: &MessageId) {
         self.no_route_backoff.remove(mid);
+    }
+
+    /// Drop a message from the awaiting-record index.
+    fn awaiting_remove(&mut self, recipient: &Identifier, mid: &MessageId) {
+        if let Some(set) = self.awaiting_record.get_mut(recipient) {
+            set.remove(mid);
+            if set.is_empty() {
+                self.awaiting_record.remove(recipient);
+            }
+        }
+    }
+
+    /// Re-arm every message awaiting `id`'s record: their grace deadline is
+    /// replaced by `now` so the next pump dispatches them. Called when the
+    /// record is admitted.
+    fn release_awaiting_record(&mut self, id: &Identifier, now: u64) -> Vec<Action> {
+        let Some(mids) = self.awaiting_record.remove(id) else {
+            return Vec::new();
+        };
+        let mut rearmed = false;
+        for mid in mids {
+            match self.store.outbound_get(&mid) {
+                Ok(Some(stored)) => {
+                    let mut msg = outbound_from_store(stored);
+                    if msg.state == OutboundState::Queued && msg.recipient == *id {
+                        msg.next_attempt = now;
+                        self.store_outbound(&msg);
+                        rearmed = true;
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => self.diag("outbound_get", &e),
+            }
+        }
+        if rearmed {
+            self.pump_outbound(now)
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Remove an outbound message from the store and the in-memory index.
+    fn drop_outbound(&mut self, mid: &MessageId) {
+        if let Err(e) = self.store.outbound_remove(mid) {
+            self.diag("outbound_remove", &e);
+        }
+        self.unindex_outbound(mid);
     }
 
     /// A message with no route right now: wait with exponential backoff
@@ -3212,6 +3381,8 @@ impl<S: Store> Node<S> {
             actions.push(Self::already_have(link, leg));
             return actions;
         }
+        // Per-service reservation: a service at or over its reservation is
+        // answered busy; services under their reservation are admitted.
         // Fail closed on store error: treat the inbox as full rather than
         // accept a delivery we cannot account for.
         let inbox_len = match self.store.inbox_len(&opened.tsvc) {
@@ -3221,16 +3392,24 @@ impl<S: Store> Node<S> {
                 u64::MAX
             }
         };
-        let inbox_total = match self.store.inbox_len_total() {
-            Ok(v) => v,
-            Err(e) => {
-                self.diag("inbox_len_total", &e);
-                u64::MAX
-            }
-        };
-        if inbox_len >= self.config.inbox_max_deliveries
-            || inbox_total >= self.config.inbox_max_total
-        {
+        // The global cap is a memory backstop, not a shared pool: it can
+        // only trip when the sum of the configured reservations exceeds it
+        // (each service is hard-capped at its reservation, so the total can
+        // only reach the cap when the reservations themselves over-commit
+        // memory). When it trips, deliveries are refused regardless of
+        // service — that is what makes it a backstop.
+        let reservation = self.config.inbox_max_deliveries;
+        let reservations_total = reservation.saturating_mul(self.config.services.len() as u64);
+        let backstop_armed = reservations_total > self.config.inbox_max_total;
+        let backstop_tripped = backstop_armed
+            && match self.store.inbox_len_total() {
+                Ok(v) => v >= self.config.inbox_max_total,
+                Err(e) => {
+                    self.diag("inbox_len_total", &e);
+                    true
+                }
+            };
+        if inbox_len >= reservation || backstop_tripped {
             actions.push(self.busy(link, leg));
             return actions;
         }
@@ -3668,26 +3847,50 @@ impl<S: Store> Node<S> {
     fn custody_accepted_reply(&mut self, pending: Option<PendingOffer>, actions: &mut Vec<Action>) {
         match pending.map(|p| p.origin) {
             Some(PendingOrigin::Outbound { mid }) => {
-                let mut service = String::new();
-                if let Some(mut msg) = self.load_outbound(&mid) {
-                    msg.mark_in_flight();
-                    service.clone_from(&msg.envelope.fsvc);
-                    self.store_outbound(&msg);
+                match self.load_outbound(&mid) {
+                    Some(msg) if is_receipt_envelope(msg.envelope.kind) => {
+                        // A receipt is terminal on its first ACCEPTED:
+                        // custody of the receipt is all the sender needs.
+                        // Drop it; no status row, no status event.
+                        self.awaiting_remove(&msg.recipient, &msg.mid);
+                        self.drop_outbound(&msg.mid);
+                    }
+                    Some(mut msg) => {
+                        msg.mark_in_flight();
+                        let service = msg.envelope.fsvc.clone();
+                        self.store_outbound(&msg);
+                        if let Err(e) = self.store.status_set(
+                            &mid,
+                            local::MSG_STATUS_IN_TRANSIT,
+                            None,
+                            ms_to_secs(self.now),
+                        ) {
+                            self.diag("status_set", &e);
+                        }
+                        actions.push(Action::Status {
+                            mid,
+                            status: local::MSG_STATUS_IN_TRANSIT,
+                            detail: None,
+                            service,
+                        });
+                    }
+                    None => {
+                        if let Err(e) = self.store.status_set(
+                            &mid,
+                            local::MSG_STATUS_IN_TRANSIT,
+                            None,
+                            ms_to_secs(self.now),
+                        ) {
+                            self.diag("status_set", &e);
+                        }
+                        actions.push(Action::Status {
+                            mid,
+                            status: local::MSG_STATUS_IN_TRANSIT,
+                            detail: None,
+                            service: String::new(),
+                        });
+                    }
                 }
-                if let Err(e) = self.store.status_set(
-                    &mid,
-                    local::MSG_STATUS_IN_TRANSIT,
-                    None,
-                    ms_to_secs(self.now),
-                ) {
-                    self.diag("status_set", &e);
-                }
-                actions.push(Action::Status {
-                    mid,
-                    status: local::MSG_STATUS_IN_TRANSIT,
-                    detail: None,
-                    service,
-                });
             }
             Some(PendingOrigin::Relay { custody_leg }) => self.release_relay_custody(custody_leg),
             None => {}
@@ -3768,27 +3971,51 @@ impl<S: Store> Node<S> {
         let Some(p) = pending else { return };
         match p.origin {
             PendingOrigin::Outbound { mid } => {
-                let mut service = String::new();
-                if let Some(mut msg) = self.load_outbound(&mid) {
-                    msg.mark_failed();
-                    self.outbound_exclusions.remove(&msg.mid);
-                    service.clone_from(&msg.envelope.fsvc);
-                    self.store_outbound(&msg);
+                match self.load_outbound(&mid) {
+                    Some(msg) if is_receipt_envelope(msg.envelope.kind) => {
+                        // A refused receipt is dropped, not failed: no
+                        // status row, no status event.
+                        self.awaiting_remove(&msg.recipient, &msg.mid);
+                        self.outbound_exclusions.remove(&msg.mid);
+                        self.drop_outbound(&msg.mid);
+                    }
+                    Some(mut msg) => {
+                        msg.mark_failed();
+                        self.outbound_exclusions.remove(&msg.mid);
+                        let service = msg.envelope.fsvc.clone();
+                        self.store_outbound(&msg);
+                        if let Err(e) = self.store.status_set(
+                            &mid,
+                            local::MSG_STATUS_FAILED,
+                            Some(ERR_REFUSED),
+                            ms_to_secs(self.now),
+                        ) {
+                            self.diag("status_set", &e);
+                        }
+                        actions.push(Action::Status {
+                            mid,
+                            status: local::MSG_STATUS_FAILED,
+                            detail: Some(ERR_REFUSED),
+                            service,
+                        });
+                    }
+                    None => {
+                        if let Err(e) = self.store.status_set(
+                            &mid,
+                            local::MSG_STATUS_FAILED,
+                            Some(ERR_REFUSED),
+                            ms_to_secs(self.now),
+                        ) {
+                            self.diag("status_set", &e);
+                        }
+                        actions.push(Action::Status {
+                            mid,
+                            status: local::MSG_STATUS_FAILED,
+                            detail: Some(ERR_REFUSED),
+                            service: String::new(),
+                        });
+                    }
                 }
-                if let Err(e) = self.store.status_set(
-                    &mid,
-                    local::MSG_STATUS_FAILED,
-                    Some(ERR_REFUSED),
-                    ms_to_secs(self.now),
-                ) {
-                    self.diag("status_set", &e);
-                }
-                actions.push(Action::Status {
-                    mid,
-                    status: local::MSG_STATUS_FAILED,
-                    detail: Some(ERR_REFUSED),
-                    service,
-                });
             }
             PendingOrigin::Relay { custody_leg } => self.release_relay_custody(custody_leg),
         }
@@ -4043,6 +4270,13 @@ impl<S: Store> Node<S> {
                 self.index_outbound(&msg);
                 continue;
             }
+            self.awaiting_remove(&msg.recipient, &msg.mid);
+            if is_receipt_envelope(msg.envelope.kind) {
+                // Receipts expire silently: no status row, no event.
+                self.clear_no_route(&msg.mid);
+                self.drop_outbound(&msg.mid);
+                continue;
+            }
             msg.mark_expired();
             self.clear_no_route(&msg.mid);
             self.store_outbound(&msg);
@@ -4084,6 +4318,12 @@ impl<S: Store> Node<S> {
                     continue;
                 }
             };
+            if is_receipt_envelope(msg.envelope.kind) {
+                // Receipts carry no deadline; drop any legacy row.
+                self.awaiting_remove(&msg.recipient, &msg.mid);
+                self.drop_outbound(&msg.mid);
+                continue;
+            }
             if msg.state != OutboundState::InFlight {
                 self.index_outbound(&msg);
                 continue;
@@ -4990,7 +5230,7 @@ mod tests {
     }
 
     /// Feed a KEL to the node through the `kels` frame path.
-    fn admit_kel(node: &mut Node<MemStore>, kel: &ValidatedKel, at: u64) {
+    fn admit_kel<S: Store>(node: &mut Node<S>, kel: &ValidatedKel, at: u64) {
         let frame = Frame::Kels(lattice_proto::frames::KelsFrame {
             kels: vec![kel.to_object_bytes().unwrap()],
         });
@@ -5683,7 +5923,7 @@ mod tests {
         .expect("wire message builds")
     }
 
-    fn link_up(node: &mut Node<MemStore>, link: u64, peer: Identifier, at: u64) {
+    fn link_up<S: Store>(node: &mut Node<S>, link: u64, peer: Identifier, at: u64) {
         let remote_ck = lattice_crypto::channel_x25519_public(&ChannelSeed::from_bytes([0x77; 32]));
         node.handle(Event::LinkUp {
             at,
@@ -7731,5 +7971,597 @@ mod tests {
         // Both links are credited for the wants.
         assert_eq!(node.links.get(&100).unwrap().want_credits, 2);
         assert_eq!(node.links.get(&200).unwrap().want_credits, 2);
+    }
+
+    // ──────────── H-13: awaiting-record queue ────────────
+
+    fn app_send<S: Store>(node: &mut Node<S>, to: Identifier, tsvc: &str) -> Vec<Action> {
+        node.handle(Event::AppSend(AppSend {
+            service: "svc".to_string(),
+            mid_hint: None,
+            to,
+            tsvc: tsvc.to_string(),
+            tmbx: b"in".to_vec(),
+            fmbx: b"out".to_vec(),
+            body: b"hi".to_vec(),
+            exp: None,
+            priority: 1,
+            route: 0,
+        }))
+        .0
+    }
+
+    fn admit_identity<S: Store>(node: &mut Node<S>, id: &Identity, at: u64) -> Vec<Action> {
+        admit_kel(node, &id.kel, at);
+        let record = build_record(
+            id.kel.events().to_vec(),
+            1,
+            Scope::Wan,
+            &id.signing_seed,
+            &id.channel_seed,
+        );
+        node.admit_record(at, 999, &record.encode())
+    }
+
+    #[test]
+    fn send_to_unknown_record_queues_and_sends_want() {
+        let cfg = Config {
+            snow_per_min: 0.0,
+            awaiting_record_grace_secs: 600,
+            ..Config::default()
+        };
+        let mut node = Node::new(
+            cfg,
+            Identity::from_seed(&[0xA5; 32]),
+            MemStore::new(),
+            1_000,
+        )
+        .expect("node construction");
+        let recipient = Identity::from_seed(&[0xB1; 32]);
+        link_up(&mut node, 100, recipient.id(), 1_000);
+        link_up(&mut node, 200, Identifier::from_bytes([0x33; 32]), 1_000);
+        let actions = app_send(&mut node, recipient.id(), "svc");
+        // Queued, not failed.
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            Action::Status {
+                status: local::MSG_STATUS_QUEUED,
+                ..
+            }
+        )));
+        assert!(!actions.iter().any(|a| matches!(
+            a,
+            Action::Status {
+                status: local::MSG_STATUS_FAILED,
+                ..
+            }
+        )));
+        // No dispatch attempt yet.
+        assert!(!actions.iter().any(|a| matches!(
+            a,
+            Action::SendFrame {
+                frame: Frame::Offer(_),
+                ..
+            }
+        )));
+        // A want for both scopes went out on both links.
+        let mut want_links = Vec::new();
+        for a in &actions {
+            if let Action::SendFrame {
+                link,
+                frame: Frame::Want(w),
+                ..
+            } = a
+            {
+                assert!(w.wants.iter().all(|r| r.id == recipient.id()));
+                let scopes: Vec<u8> = w.wants.iter().map(|r| r.scope).collect();
+                assert_eq!(scopes, vec![0, 1]);
+                want_links.push(*link);
+            }
+        }
+        want_links.sort_unstable();
+        assert_eq!(want_links, vec![100, 200]);
+        // The message is persisted as queued with the grace deadline.
+        let rows: Vec<_> = node
+            .store
+            .outbound_all()
+            .unwrap()
+            .into_iter()
+            .map(outbound_from_store)
+            .collect();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].state, OutboundState::Queued);
+        assert_eq!(rows[0].next_attempt, 1_000 + 600_000);
+    }
+
+    #[test]
+    fn send_to_unknown_record_fails_with_err_no_record_after_grace() {
+        let cfg = Config {
+            snow_per_min: 0.0,
+            awaiting_record_grace_secs: 5,
+            ..Config::default()
+        };
+        let mut node = Node::new(
+            cfg,
+            Identity::from_seed(&[0xA5; 32]),
+            MemStore::new(),
+            1_000,
+        )
+        .expect("node construction");
+        let recipient = Identifier::from_bytes([0xB1; 32]);
+        link_up(&mut node, 100, recipient, 1_000);
+        let actions = app_send(&mut node, recipient, "svc");
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            Action::Status {
+                status: local::MSG_STATUS_QUEUED,
+                ..
+            }
+        )));
+        // Before the grace expires: no failure.
+        let (actions, _) = node.handle(Event::Tick { at: 5_999 });
+        assert!(!actions.iter().any(|a| matches!(
+            a,
+            Action::Status {
+                status: local::MSG_STATUS_FAILED,
+                ..
+            }
+        )));
+        // After the grace expires: failed with ERR_NO_RECORD.
+        let (actions, _) = node.handle(Event::Tick { at: 6_001 });
+        let failed = actions.iter().find_map(|a| match a {
+            Action::Status { status, detail, .. } if *status == local::MSG_STATUS_FAILED => {
+                Some(*detail)
+            }
+            _ => None,
+        });
+        assert_eq!(failed, Some(Some(ERR_NO_RECORD)));
+        let rows = node.store.outbound_all().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].state, OutboundState::Failed);
+    }
+
+    #[test]
+    fn send_to_unknown_record_dispatches_when_record_arrives() {
+        let cfg = Config {
+            snow_per_min: 0.0,
+            awaiting_record_grace_secs: 600,
+            ..Config::default()
+        };
+        let mut node = Node::new(
+            cfg,
+            Identity::from_seed(&[0xA5; 32]),
+            MemStore::new(),
+            1_000,
+        )
+        .expect("node construction");
+        let recipient = Identity::from_seed(&[0xB1; 32]);
+        link_up(&mut node, 100, recipient.id(), 1_000);
+        let actions = app_send(&mut node, recipient.id(), "svc");
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            Action::Status {
+                status: local::MSG_STATUS_QUEUED,
+                ..
+            }
+        )));
+        // The record arrives: the queued message must become dispatchable.
+        let actions = admit_identity(&mut node, &recipient, 1_001);
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::SendFrame {
+                    frame: Frame::Offer(_),
+                    ..
+                }
+            )),
+            "expected the queued message to be dispatched once the record arrives, got {actions:?}"
+        );
+        let rows = node.store.outbound_all().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].state, OutboundState::InFlight);
+    }
+
+    #[test]
+    fn awaiting_record_message_survives_restart() {
+        let dir = std::env::temp_dir().join(format!(
+            "lattice-awaiting-record-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("store.redb");
+        let recipient = Identity::from_seed(&[0xB1; 32]).id();
+        let cfg = || Config {
+            snow_per_min: 0.0,
+            awaiting_record_grace_secs: 600,
+            ..Config::default()
+        };
+        {
+            let store = lattice_store::RedbStore::open(&path).unwrap();
+            let mut node = Node::new(cfg(), Identity::from_seed(&[0xA5; 32]), store, 1_000)
+                .expect("node construction");
+            link_up(&mut node, 100, recipient, 1_000);
+            let actions = app_send(&mut node, recipient, "svc");
+            assert!(actions.iter().any(|a| matches!(
+                a,
+                Action::Status {
+                    status: local::MSG_STATUS_QUEUED,
+                    ..
+                }
+            )));
+        }
+        {
+            let store = lattice_store::RedbStore::open(&path).unwrap();
+            let mut node = Node::new(cfg(), Identity::from_seed(&[0xA5; 32]), store, 1_500)
+                .expect("node construction");
+            // The message is still queued, not failed, across the restart.
+            let rows: Vec<_> = node
+                .store
+                .outbound_all()
+                .unwrap()
+                .into_iter()
+                .map(outbound_from_store)
+                .collect();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].state, OutboundState::Queued);
+            assert_eq!(rows[0].next_attempt, 1_000 + 600_000);
+            // Admitting the record dispatches the message.
+            link_up(&mut node, 100, recipient, 1_500);
+            let recipient_identity = Identity::from_seed(&[0xB1; 32]);
+            let actions = admit_identity(&mut node, &recipient_identity, 1_500);
+            assert!(
+                actions.iter().any(|a| matches!(
+                    a,
+                    Action::SendFrame {
+                        frame: Frame::Offer(_),
+                        ..
+                    }
+                )),
+                "expected the queued message to be dispatched after restart, got {actions:?}"
+            );
+            let rows = node.store.outbound_all().unwrap();
+            assert_eq!(rows[0].state, OutboundState::InFlight);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ──────────── H-14: per-service inbox reservations ────────────
+
+    fn inbox_node(services: &[&str], reservation: u64, global_cap: u64) -> Node<MemStore> {
+        let cfg = Config {
+            snow_per_min: 0.0,
+            services: services.iter().map(|s| s.to_string()).collect(),
+            inbox_max_deliveries: reservation,
+            inbox_max_total: global_cap,
+            ..Config::default()
+        };
+        Node::new(
+            cfg,
+            Identity::from_seed(&[0xA5; 32]),
+            MemStore::new(),
+            1_000,
+        )
+        .expect("node construction")
+    }
+
+    fn sealed_to_node_svc(
+        node: &Node<MemStore>,
+        sender: &Identity,
+        mid_byte: u8,
+        tsvc: &str,
+        now: u64,
+    ) -> Vec<u8> {
+        Message::build(BuildParams {
+            envelope: Envelope {
+                kind: KIND_MESSAGE,
+                mid: MessageId::from_bytes([mid_byte; 16]),
+                from: sender.id(),
+                fsvc: "svc".into(),
+                fmbx: b"out".to_vec(),
+                tsvc: tsvc.into(),
+                tmbx: b"in".to_vec(),
+                created: now,
+                body: Some(b"hi".to_vec()),
+                reference: None,
+                reason: None,
+                sig: Signature::from_bytes([0; 64]),
+            },
+            sender_seed: &sender.signing_seed,
+            recipient_ek: &node.identity.xwing_public,
+            real_dst: node.own_id,
+            leg: LegId::from_bytes([mid_byte; 16]),
+            exp: now + 10_000,
+            gateway: None,
+            waypoint: None,
+            entropy: &mut |b: &mut [u8; 64]| b.fill(0x5A),
+        })
+        .expect("message builds")
+    }
+
+    fn offer_to(
+        node: &mut Node<MemStore>,
+        sender: &Identity,
+        mid_byte: u8,
+        tsvc: &str,
+        at: u64,
+    ) -> Vec<Action> {
+        let wire = sealed_to_node_svc(node, sender, mid_byte, tsvc, at);
+        node.handle(Event::Frame {
+            at,
+            link: 100,
+            frame: Frame::Offer(OfferFrame { message: wire }),
+            bucket: None,
+        })
+        .0
+    }
+
+    fn is_busy(actions: &[Action]) -> bool {
+        actions.iter().any(|a| {
+            matches!(
+                a,
+                Action::SendFrame {
+                    frame: Frame::Custody(c),
+                    ..
+                } if c.result == CUSTODY_BUSY
+            )
+        })
+    }
+
+    fn is_delivered(actions: &[Action]) -> bool {
+        actions.iter().any(|a| matches!(a, Action::Deliver { .. }))
+    }
+
+    #[test]
+    fn service_over_reservation_gets_busy_while_others_accept() {
+        let mut node = inbox_node(&["svc", "other"], 1, 4096);
+        let sender = Identity::from_seed(&[0x5A; 32]);
+        admit_sender(&mut node, &sender, 1_000);
+        link_up(&mut node, 100, sender.id(), 1_000);
+        // First message to "svc" fills its reservation.
+        let a = offer_to(&mut node, &sender, 0x01, "svc", 1_000);
+        assert!(is_delivered(&a), "first message must be delivered: {a:?}");
+        // Second message to "svc" is over the reservation: busy.
+        let a = offer_to(&mut node, &sender, 0x02, "svc", 1_001);
+        assert!(is_busy(&a), "over-reservation service must get busy: {a:?}");
+        assert!(!is_delivered(&a));
+        // A different service still accepts.
+        let a = offer_to(&mut node, &sender, 0x03, "other", 1_002);
+        assert!(is_delivered(&a), "other service must still accept: {a:?}");
+    }
+
+    #[test]
+    fn global_backstop_trips_only_when_reservations_exceed_it() {
+        // Three services, reservation 1 each: the reservations sum to 3.
+        // With a global cap of 2 the reservations over-commit memory, so
+        // the backstop is armed and refuses once the total reaches 2 —
+        // even a service under its own reservation.
+        let mut node = inbox_node(&["a", "b", "c"], 1, 2);
+        let sender = Identity::from_seed(&[0x5A; 32]);
+        admit_sender(&mut node, &sender, 1_000);
+        link_up(&mut node, 100, sender.id(), 1_000);
+        let a = offer_to(&mut node, &sender, 0x01, "a", 1_000);
+        assert!(is_delivered(&a));
+        let b = offer_to(&mut node, &sender, 0x02, "b", 1_001);
+        assert!(is_delivered(&b));
+        // Total is now 2 = the cap; "c" is under its reservation but the
+        // backstop is armed (sum of reservations 3 > cap 2).
+        let c = offer_to(&mut node, &sender, 0x03, "c", 1_002);
+        assert!(is_busy(&c), "armed backstop must refuse: {c:?}");
+        // Same shape, but the cap equals the sum of reservations: the
+        // backstop is not armed and "c" is admitted.
+        let mut node = inbox_node(&["a", "b", "c"], 1, 3);
+        let sender = Identity::from_seed(&[0x5A; 32]);
+        admit_sender(&mut node, &sender, 1_000);
+        link_up(&mut node, 100, sender.id(), 1_000);
+        let a = offer_to(&mut node, &sender, 0x01, "a", 1_000);
+        assert!(is_delivered(&a));
+        let b = offer_to(&mut node, &sender, 0x02, "b", 1_001);
+        assert!(is_delivered(&b));
+        let c = offer_to(&mut node, &sender, 0x03, "c", 1_002);
+        assert!(
+            is_delivered(&c),
+            "backstop must not trip when the sum of reservations does not exceed it: {c:?}"
+        );
+    }
+
+    #[test]
+    fn unknown_service_is_still_refused() {
+        let mut node = inbox_node(&["svc"], 1024, 4096);
+        let sender = Identity::from_seed(&[0x5A; 32]);
+        admit_sender(&mut node, &sender, 1_000);
+        link_up(&mut node, 100, sender.id(), 1_000);
+        let actions = offer_to(&mut node, &sender, 0x01, "nope", 1_000);
+        assert!(!is_delivered(&actions));
+        assert_eq!(node.store.inbox_len("nope").unwrap(), 0);
+        // A negative receipt is sent instead.
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::SendFrame {
+                    frame: Frame::Offer(_),
+                    ..
+                }
+            )),
+            "expected a negative receipt offer, got {actions:?}"
+        );
+        let rows = node.store.outbound_all().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].envelope.kind, KIND_NEGATIVE_RECEIPT);
+    }
+
+    // ──────────── H-15 / R-18: receipts are cheap ────────────
+
+    /// Offer a message to the node and return the receipt it sends back
+    /// (wire bytes), if any.
+    fn offer_and_take_receipt(
+        node: &mut Node<MemStore>,
+        sender: &Identity,
+        mid_byte: u8,
+        tsvc: &str,
+        at: u64,
+    ) -> (Vec<Action>, Option<Vec<u8>>) {
+        let actions = offer_to(node, sender, mid_byte, tsvc, at);
+        let receipt = actions.iter().find_map(|a| match a {
+            Action::SendFrame {
+                frame: Frame::Offer(o),
+                ..
+            } => Some(o.message.clone()),
+            _ => None,
+        });
+        (actions, receipt)
+    }
+
+    #[test]
+    fn receipt_is_dropped_on_first_accept_with_no_status() {
+        let cfg = Config {
+            snow_per_min: 0.0,
+            services: vec!["svc".to_string()],
+            ..Config::default()
+        };
+        let mut node = Node::new(
+            cfg,
+            Identity::from_seed(&[0xA5; 32]),
+            MemStore::new(),
+            1_000,
+        )
+        .expect("node construction");
+        let sender = Identity::from_seed(&[0x5A; 32]);
+        admit_sender(&mut node, &sender, 1_000);
+        link_up(&mut node, 100, sender.id(), 1_000);
+        let (actions, receipt) = offer_and_take_receipt(&mut node, &sender, 0x01, "svc", 1_000);
+        assert!(is_delivered(&actions));
+        let receipt_wire = receipt.expect("node must send a receipt");
+        let parsed = Message::parse(&receipt_wire, 1).expect("receipt parses");
+        let receipt_leg = parsed.header.leg;
+        // The receipt is the only outbound row; read its mid and kind from
+        // the store (the envelope is stored unsealed).
+        let rows = node.store.outbound_all().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].envelope.kind, KIND_RECEIPT);
+        let receipt_mid = rows[0].mid;
+        // The receipt is in flight with no receipt deadline.
+        let stored = node
+            .store
+            .outbound_get(&receipt_mid)
+            .unwrap()
+            .expect("receipt must be stored");
+        assert_eq!(stored.receipt_deadline, None);
+        // The first hop accepts the receipt.
+        let (actions, _) = node.handle(Event::Frame {
+            at: 1_001,
+            link: 100,
+            frame: custody_frame(receipt_leg, CUSTODY_ACCEPTED),
+            bucket: None,
+        });
+        assert!(
+            !actions.iter().any(|a| matches!(a, Action::Status { .. })),
+            "a receipt must never emit a status event: {actions:?}"
+        );
+        assert!(
+            node.store.outbound_get(&receipt_mid).unwrap().is_none(),
+            "the receipt must be dropped from the outbound table on ACCEPTED"
+        );
+        assert!(
+            node.store.status_get(&receipt_mid).unwrap().is_none(),
+            "the receipt must not get a status row"
+        );
+    }
+
+    #[test]
+    fn negative_receipt_is_dropped_on_first_accept_with_no_status() {
+        let cfg = Config {
+            snow_per_min: 0.0,
+            services: vec!["svc".to_string()],
+            ..Config::default()
+        };
+        let mut node = Node::new(
+            cfg,
+            Identity::from_seed(&[0xA5; 32]),
+            MemStore::new(),
+            1_000,
+        )
+        .expect("node construction");
+        let sender = Identity::from_seed(&[0x5A; 32]);
+        admit_sender(&mut node, &sender, 1_000);
+        link_up(&mut node, 100, sender.id(), 1_000);
+        // Unknown service: the node answers with a negative receipt.
+        let (actions, receipt) = offer_and_take_receipt(&mut node, &sender, 0x01, "nope", 1_000);
+        assert!(!is_delivered(&actions));
+        let receipt_wire = receipt.expect("node must send a negative receipt");
+        let parsed = Message::parse(&receipt_wire, 1).expect("receipt parses");
+        let receipt_leg = parsed.header.leg;
+        let rows = node.store.outbound_all().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].envelope.kind, KIND_NEGATIVE_RECEIPT);
+        let receipt_mid = rows[0].mid;
+        let (actions, _) = node.handle(Event::Frame {
+            at: 1_001,
+            link: 100,
+            frame: custody_frame(receipt_leg, CUSTODY_ACCEPTED),
+            bucket: None,
+        });
+        assert!(
+            !actions.iter().any(|a| matches!(a, Action::Status { .. })),
+            "a negative receipt must never emit a status event: {actions:?}"
+        );
+        assert!(node.store.outbound_get(&receipt_mid).unwrap().is_none());
+        assert!(node.store.status_get(&receipt_mid).unwrap().is_none());
+    }
+
+    #[test]
+    fn receipt_refusal_drops_it_without_status() {
+        let mut node = test_node();
+        let recipient = Identifier::from_bytes([0xB1; 32]);
+        let mid = MessageId::from_bytes([0x66; 16]);
+        let mut msg = outbound(mid, recipient, OutboundState::InFlight);
+        msg.envelope.kind = KIND_RECEIPT;
+        msg.receipt_deadline = None;
+        msg.exp = 10_000;
+        node.store_outbound(&msg);
+        let leg = LegId::from_bytes([0x77; 16]);
+        node.pending.insert(
+            leg,
+            PendingOffer {
+                origin: PendingOrigin::Outbound { mid },
+                sent_at: 1_000,
+                excluded: Vec::new(),
+                link: 100,
+            },
+        );
+        let (actions, _) = node.handle(Event::Frame {
+            at: 1_001,
+            link: 100,
+            frame: custody_frame(leg, CUSTODY_REFUSED),
+            bucket: None,
+        });
+        assert!(
+            !actions.iter().any(|a| matches!(a, Action::Status { .. })),
+            "a refused receipt must not emit a status event: {actions:?}"
+        );
+        assert!(node.store.outbound_get(&mid).unwrap().is_none());
+        assert!(node.store.status_get(&mid).unwrap().is_none());
+    }
+
+    #[test]
+    fn receipt_expiry_drops_it_without_status() {
+        let mut node = test_node();
+        let recipient = Identifier::from_bytes([0xB1; 32]);
+        let mid = MessageId::from_bytes([0x67; 16]);
+        let mut msg = outbound(mid, recipient, OutboundState::InFlight);
+        msg.envelope.kind = KIND_RECEIPT;
+        msg.receipt_deadline = None;
+        msg.exp = 2_000; // expires at t = 2s
+        node.store_outbound(&msg);
+        let (actions, _) = node.handle(Event::Tick { at: 3_000 });
+        assert!(
+            !actions.iter().any(|a| matches!(a, Action::Status { .. })),
+            "an expired receipt must not emit a status event: {actions:?}"
+        );
+        assert!(node.store.outbound_get(&mid).unwrap().is_none());
+        assert!(node.store.status_get(&mid).unwrap().is_none());
     }
 }
