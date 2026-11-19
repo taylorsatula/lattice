@@ -2694,8 +2694,7 @@ impl<S: Store> Node<S> {
         // itself on the next bind anyway, but there is no reason to drop
         // it first).
         while self.saved_peers.len() > neighbor::MAX_SAVED_PEERS {
-            let linked: HashSet<Identifier> =
-                self.links.values().filter_map(|l| l.peer).collect();
+            let linked: HashSet<Identifier> = self.links.values().filter_map(|l| l.peer).collect();
             let victim = self
                 .saved_peers
                 .values()
