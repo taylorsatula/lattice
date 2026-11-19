@@ -148,9 +148,7 @@ pub struct Config {
     pub record_refresh_secs: u64,
     /// Minimum seconds between record publishes (spec §3: 2 minutes).
     /// 0 disables the floor (publish on every advertised-set change).
-    /// Defaults to 0 because the convergence tests (simulator, end-to-end)
-    /// require records to propagate in seconds; set to 120 to enforce the
-    /// spec's spacing. The mechanism is enforced whenever non-zero.
+    /// Tests that need fast propagation set this to 0 explicitly.
     pub republish_min_interval_secs: u64,
     pub reconcile_interval_secs: u64,
     pub buffer_classes: u8,
@@ -189,7 +187,7 @@ impl Default for Config {
             inbox_max_deliveries: 1024,
             inbox_max_total: 4096,
             record_refresh_secs: 86_400,
-            republish_min_interval_secs: 0,
+            republish_min_interval_secs: 120,
             reconcile_interval_secs: 60,
             buffer_classes: 16,
             retry_base_secs: 30,

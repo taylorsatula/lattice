@@ -4693,6 +4693,7 @@ mod tests {
     #[test]
     fn refresh_republishes_only_when_something_changed() {
         let mut node = test_node();
+        node.config.republish_min_interval_secs = 0;
         // Make the refresh due immediately; nothing has changed and the
         // record is fresh, so nothing is republished.
         node.record_refresh_at = 2_000;

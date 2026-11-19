@@ -11,6 +11,7 @@ use lattice_types::{ChannelSeed, MessageId, XWingPublicKey};
 fn fast_config() -> Config {
     Config {
         reconcile_interval_secs: 1,
+        republish_min_interval_secs: 0,
         record_refresh_secs: 3600,
         snow_per_min: 0.0,
         receipt_timeout_public: 30,

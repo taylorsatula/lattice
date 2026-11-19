@@ -109,6 +109,9 @@ pub struct Limits {
     /// Anti-entropy (record gossip) interval, seconds.
     #[serde(default = "default_reconcile_interval_secs")]
     pub reconcile_interval_secs: u64,
+    /// Minimum seconds between record publishes (spec §3: 2 minutes).
+    #[serde(default = "default_republish_min_interval_secs")]
+    pub republish_min_interval_secs: u64,
 }
 
 impl Default for Limits {
@@ -122,6 +125,7 @@ impl Default for Limits {
             sideways_prob: default_sideways_prob(),
             waypoint_share: 0.0,
             reconcile_interval_secs: default_reconcile_interval_secs(),
+            republish_min_interval_secs: default_republish_min_interval_secs(),
         }
     }
 }
@@ -146,6 +150,9 @@ fn default_sideways_prob() -> f64 {
 }
 fn default_reconcile_interval_secs() -> u64 {
     60
+}
+fn default_republish_min_interval_secs() -> u64 {
+    120
 }
 
 // Validation ceilings. The defaults are far below these; they exist to catch
@@ -326,6 +333,12 @@ pub fn validate(cfg: &Config) -> Result<(), String> {
         return Err(format!(
             "limits.reconcile_interval_secs must be <= {MAX_RECONCILE_INTERVAL_SECS} (1 day), got {}",
             cfg.limits.reconcile_interval_secs
+        ));
+    }
+    if cfg.limits.republish_min_interval_secs > MAX_RECONCILE_INTERVAL_SECS {
+        return Err(format!(
+            "limits.republish_min_interval_secs must be <= {MAX_RECONCILE_INTERVAL_SECS} (1 day), got {}",
+            cfg.limits.republish_min_interval_secs
         ));
     }
     for (name, v) in [

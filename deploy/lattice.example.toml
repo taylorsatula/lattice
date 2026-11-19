@@ -60,3 +60,4 @@ mira = { secret = "change-me-0123456789abcdef" }
 # sideways_prob = 0.15
 # waypoint_share = 0.0
 # reconcile_interval_secs = 60    # anti-entropy (record gossip) interval
+# republish_min_interval_secs = 120 # minimum seconds between record publishes

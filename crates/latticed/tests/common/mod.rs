@@ -146,6 +146,7 @@ admin_socket = "{admin}"
 
 [limits]
 reconcile_interval_secs = 1
+republish_min_interval_secs = 0
 
 {roots}"#,
         dir = dir.display(),
