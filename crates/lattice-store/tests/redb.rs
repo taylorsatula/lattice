@@ -158,7 +158,7 @@ fn exercise<S: Store>(s: &mut S) -> String {
     assert_eq!(s.inbox_ack("svc", &[did(0xD1)]).unwrap(), 1);
     assert_eq!(s.inbox_len("svc").unwrap(), 0);
 
-    s.status_set(&mid(4), 3, None).unwrap();
+    s.status_set(&mid(4), 3, None, 1_000).unwrap();
     assert_eq!(
         s.status_get(&mid(4)).unwrap(),
         Some(MessageStatus {
@@ -588,7 +588,7 @@ fn rows_roundtrip_through_cbor() {
     assert_eq!(got, inbox);
 
     // Status: with and without detail.
-    s.status_set(&mid(7), 4, Some(77)).unwrap();
+    s.status_set(&mid(7), 4, Some(77), 1_000).unwrap();
     assert_eq!(
         s.status_get(&mid(7)).unwrap(),
         Some(MessageStatus {
@@ -596,7 +596,7 @@ fn rows_roundtrip_through_cbor() {
             detail: Some(77),
         })
     );
-    s.status_set(&mid(7), 3, None).unwrap();
+    s.status_set(&mid(7), 3, None, 1_000).unwrap();
     assert_eq!(
         s.status_get(&mid(7)).unwrap(),
         Some(MessageStatus {
@@ -823,4 +823,24 @@ fn inbox_sweep_expired_drops_old_entries() {
     assert_eq!(s.inbox_len("svc").unwrap(), 1);
     assert_eq!(s.inbox_len("other").unwrap(), 0);
     assert_eq!(s.inbox_fetch("svc", 10).unwrap()[0].delivery_id, did(0x02));
+}
+
+#[test]
+fn status_rows_are_swept_after_the_ttl() {
+    use lattice_store::STATUS_TTL_SECS;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut s = RedbStore::open(tmp.path().join("status_ttl.redb")).unwrap();
+    s.status_set(&mid(1), 3, None, 1_000).unwrap();
+    s.status_set(&mid(2), 3, None, 1_000 + STATUS_TTL_SECS)
+        .unwrap();
+
+    // Within the TTL both rows survive.
+    s.sweep_expired(1_000 + STATUS_TTL_SECS - 1).unwrap();
+    assert!(s.status_get(&mid(1)).unwrap().is_some());
+    assert!(s.status_get(&mid(2)).unwrap().is_some());
+
+    // Past the TTL the older row is dropped; the newer one survives.
+    s.sweep_expired(1_000 + STATUS_TTL_SECS + 1).unwrap();
+    assert!(s.status_get(&mid(1)).unwrap().is_none());
+    assert!(s.status_get(&mid(2)).unwrap().is_some());
 }

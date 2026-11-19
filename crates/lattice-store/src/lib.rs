@@ -19,6 +19,11 @@ use lattice_proto::local::{DrainState, MessageStatus};
 use lattice_proto::record::Scope;
 use lattice_types::{Commitment, DeliveryId, Hash32, Identifier, LegId, MessageId};
 
+/// How long a status row is kept before the retention sweep drops it.
+/// Matches the 7-day outbound retention: a status is only useful while
+/// the sender might still act on it.
+pub const STATUS_TTL_SECS: u64 = 7 * 24 * 3600;
+
 /// Error returned by every store operation.
 ///
 /// `Backend` preserves the underlying backend error as `source` and names the
@@ -262,6 +267,8 @@ pub trait Store {
     fn seen_unheld_contains(&self, hash: &Hash32, now: u64) -> Result<bool, StoreError>;
     fn delivered_contains(&self, hash: &Hash32, now: u64) -> Result<bool, StoreError>;
     fn delivered_add(&mut self, hash: Hash32, exp: u64) -> Result<(), StoreError>;
+    /// Drop expired dedup markers (`seen`, `seen_unheld`, `delivered`) and
+    /// status rows older than [`STATUS_TTL_SECS`]. `now` is unix seconds.
     fn sweep_expired(&mut self, now: u64) -> Result<(), StoreError>;
 
     // inbox (per service). Entries carry their target service in `tsvc`;
@@ -279,12 +286,15 @@ pub trait Store {
     /// Drop inbox entries older than `max_age_secs` (by `received`). Returns the count dropped.
     fn inbox_sweep_expired(&mut self, max_age_secs: u64, now: u64) -> Result<u64, StoreError>;
 
-    // per-service delivery status, for the local API
+    // per-service delivery status, for the local API. `now` is the unix
+    // time (seconds) of the write; rows older than [`STATUS_TTL_SECS`]
+    // are dropped by `sweep_expired`.
     fn status_set(
         &mut self,
         mid: &MessageId,
         status: u64,
         detail: Option<u64>,
+        now: u64,
     ) -> Result<(), StoreError>;
     fn status_get(&self, mid: &MessageId) -> Result<Option<MessageStatus>, StoreError>;
 

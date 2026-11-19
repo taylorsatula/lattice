@@ -337,26 +337,33 @@ fn inbox_from_value(v: &Value) -> Result<InboxEntry, ProtoError> {
     })
 }
 
-pub(crate) fn encode_status(status: &MessageStatus) -> Vec<u8> {
+pub(crate) fn encode_status(status: &MessageStatus, set_at: u64) -> Vec<u8> {
     cbor::encode(&Value::map(vec![
         (Value::UInt(0), Value::UInt(status.status)),
         (
             Value::UInt(1),
             status.detail.map_or(Value::Null, Value::UInt),
         ),
+        (Value::UInt(2), Value::UInt(set_at)),
     ]))
 }
 
-pub(crate) fn decode_status(bytes: &[u8]) -> Result<MessageStatus, StoreError> {
+/// Decode a status row. Returns the status and the unix time (seconds) the
+/// row was written; rows written before the timestamp was added decode
+/// with `set_at` 0, which the retention sweep treats as ancient.
+pub(crate) fn decode_status(bytes: &[u8]) -> Result<(MessageStatus, u64), StoreError> {
     const CTX: &str = "decode status";
     let v = cbor::decode(bytes).map_err(codec(CTX))?;
     status_from_value(&v).map_err(codec(CTX))
 }
 
-fn status_from_value(v: &Value) -> Result<MessageStatus, ProtoError> {
-    deny_unknown_keys(v, &[0, 1])?;
-    Ok(MessageStatus {
-        status: req_uint(v, 0)?,
-        detail: opt_uint(v, 1)?,
-    })
+fn status_from_value(v: &Value) -> Result<(MessageStatus, u64), ProtoError> {
+    deny_unknown_keys(v, &[0, 1, 2])?;
+    Ok((
+        MessageStatus {
+            status: req_uint(v, 0)?,
+            detail: opt_uint(v, 1)?,
+        },
+        opt_uint(v, 2)?.unwrap_or(0),
+    ))
 }

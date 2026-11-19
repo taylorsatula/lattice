@@ -11,8 +11,6 @@ use lattice_types::Identifier;
 
 use crate::rng::Rng;
 
-pub const MAX_LINKS_WAN: usize = 16;
-
 #[derive(Default)]
 pub struct Graph {
     adjacency: HashMap<Identifier, HashSet<Identifier>>,

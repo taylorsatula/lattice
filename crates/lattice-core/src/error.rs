@@ -6,8 +6,8 @@
 
 use lattice_store::StoreError;
 
-/// Errors from [`crate::Node::new`], [`crate::Node::restore`],
-/// [`crate::Node::reload_identity`] and [`crate::Identity::rotate`].
+/// Errors from [`crate::Node::new`], [`crate::Node::reload_identity`]
+/// and [`crate::Identity::rotate`].
 #[derive(Debug, thiserror::Error)]
 pub enum NodeError {
     /// Invalid node configuration (e.g. private mode without 1-3 gateways).

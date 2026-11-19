@@ -753,8 +753,8 @@ impl Runtime {
                             }
                             None => None,
                         };
-                        if let Some(peer) = admitted {
-                            self.apply(Event::Frame { at: now, link, from: peer.unwrap_or(Identifier::from_bytes([0u8; 32])), frame, bucket: Some(bucket) }).await;
+                        if admitted.is_some() {
+                            self.apply(Event::Frame { at: now, link, frame, bucket: Some(bucket) }).await;
                         }
                     }
                     LinkEvent::Down { link } => {
