@@ -524,12 +524,18 @@ frame carries KEL objects.
   message is held, `SEEN` if the leg was seen but is not held), then
   buffer class and fair share (answer `busy`), then durable storage (answer
   `accepted`).
-- **Buffer classes.** Transit storage is divided into classes 0 to *D*
-  (default *D* = 16), each with an equal slice of the transit cap. An offer
+- **Buffer classes.** Transit storage is a shared pool of the transit cap
+  with a small reserved minimum per class, not fixed equal slices. Classes
+  are phase-separated: a message whose hop layer is still attached (a
+  first leg, toward a waypoint or gateway) uses a different class slot than
+  a message whose hop layer has been removed (a second leg, toward the
+  destination), so a wait on a second leg never depends on space held by
+  first legs and vice versa; both phases draw on the shared pool. An offer
   for which this node would be *d* hops from the message's current
-  destination is stored in class min(*d*, *D*). Fair shares apply within each
-  class. A node waits only for room in a lower class at a progress neighbor,
-  never on a sideways neighbor, so waits can't form a cycle.
+  destination is stored in class min(*d*, *D*) of its phase (default
+  *D* = 16). Fair shares apply within each class. A node waits only for
+  room in a lower class at a progress neighbor, never on a sideways
+  neighbor, so waits can't form a cycle.
 - **Check order for a new connection:** frame size, then mac1, then mac2 when
   under load, then the Noise handshake.
 - **Next-hop choice** for a message held in custody, toward its current
