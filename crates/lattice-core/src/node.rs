@@ -18,6 +18,7 @@ use lattice_proto::message::{
 use lattice_proto::record::{Mode, PeerRecord, Scope, record_order_parts};
 use lattice_store::{
     CustodyAccept, CustodyEntry, Exclusion, InboxEntry, KelHeadSeen, OutboundState, Store,
+    StoreError,
 };
 
 use lattice_types::{
@@ -794,6 +795,46 @@ impl<S: Store> Node<S> {
         let actions = self.drop_oversize_frames(actions);
         self.note_outbound_frames(&actions);
         (actions, std::mem::take(&mut self.diagnostics))
+    }
+
+    /// Handle a batch of events inside one store transaction.
+    ///
+    /// The batch is the unit of durability: every store operation the
+    /// events trigger is staged in one transaction, committed once, and
+    /// the returned actions are released only after the commit succeeds.
+    /// If any store operation fails, or the commit itself fails, the
+    /// batch is discarded: no action is returned, so no
+    /// durability-dependent action (a custody `ACCEPTED`, an app send
+    /// acceptance) is released for work that did not become durable.
+    ///
+    /// The events are processed in order, exactly as if [`Node::handle`]
+    /// had been called on each in turn; only the commit boundary moves.
+    /// On error the node's in-memory state may reflect events whose
+    /// effects were rolled back; the caller must treat the node as
+    /// untrusted (the daemon exits and rebuilds from the store).
+    pub fn handle_batch(
+        &mut self,
+        events: Vec<Event>,
+    ) -> Result<(Vec<Action>, Vec<Diagnostic>), StoreError> {
+        self.store.begin_batch()?;
+        let mut actions = Vec::new();
+        let mut diagnostics = Vec::new();
+        for event in events {
+            let (a, d) = self.handle(event);
+            actions.extend(a);
+            diagnostics.extend(d);
+        }
+        match self.store.commit_batch() {
+            Ok(()) => Ok((actions, diagnostics)),
+            Err(e) => {
+                // The commit failed; the batch was discarded by the
+                // store. Drop the actions on the floor: none of them may
+                // be released. `abort_batch` is a no-op if the store
+                // already discarded the batch, and discards it otherwise.
+                self.store.abort_batch();
+                Err(e)
+            }
+        }
     }
 
     /// Drop any outbound frame that cannot be encoded into a bucket. An
@@ -8544,6 +8585,93 @@ mod tests {
         );
         assert!(node.store.outbound_get(&mid).unwrap().is_none());
         assert!(node.store.status_get(&mid).unwrap().is_none());
+    }
+
+    // ──────────── Group commit (handle_batch) ────────────
+
+    fn send_event(to: Identifier) -> Event {
+        Event::AppSend(AppSend {
+            service: "svc".to_string(),
+            mid_hint: None,
+            to,
+            tsvc: "svc".to_string(),
+            tmbx: b"in".to_vec(),
+            fmbx: b"out".to_vec(),
+            body: b"hi".to_vec(),
+            exp: None,
+            priority: 1,
+            route: 0,
+        })
+    }
+
+    #[test]
+    fn handle_batch_commits_once_for_many_events() {
+        let mut node = test_node();
+        let to = Identifier::from_bytes([0xA1; 32]);
+        let before = node.store.commit_count();
+        let events = vec![
+            send_event(to),
+            send_event(to),
+            send_event(to),
+            Event::Tick { at: 2_000 },
+        ];
+        let (actions, _diags) = node.handle_batch(events).expect("batch commits");
+        assert_eq!(node.store.commit_count(), before + 1);
+        let queued = actions
+            .iter()
+            .filter(|a| matches!(a, Action::Status { status, .. } if *status == local::MSG_STATUS_QUEUED))
+            .count();
+        assert_eq!(queued, 3);
+    }
+
+    #[test]
+    fn handle_batch_commit_failure_releases_no_actions() {
+        let mut node = test_node();
+        let to = Identifier::from_bytes([0xA2; 32]);
+        node.store.fail_next_commit();
+        let result = node.handle_batch(vec![send_event(to)]);
+        assert!(
+            result.is_err(),
+            "a failed commit must surface as an error, not as released actions"
+        );
+        // No action was released, and nothing the batch staged survived:
+        // the outbound row and the QUEUED status are gone with the batch.
+        assert!(node.store.outbound_all().unwrap().is_empty());
+        // The store is usable again afterwards.
+        let (actions, _) = node
+            .handle_batch(vec![send_event(to)])
+            .expect("a later batch commits");
+        assert!(actions.iter().any(
+            |a| matches!(a, Action::Status { status, .. } if *status == local::MSG_STATUS_QUEUED)
+        ));
+    }
+
+    #[test]
+    fn handle_batch_matches_sequential_handle() {
+        // A batch of events produces the same actions as handling them
+        // one by one (modulo the commit boundary).
+        let to = Identifier::from_bytes([0xA3; 32]);
+        let mut batched = test_node();
+        let mut sequential = test_node();
+        let events = vec![send_event(to), send_event(to), Event::Tick { at: 2_000 }];
+        let (batch_actions, _) = batched.handle_batch(events.clone()).expect("batch commits");
+        let mut seq_actions = Vec::new();
+        for event in events {
+            let (a, _) = sequential.handle(event);
+            seq_actions.extend(a);
+        }
+        let key = |a: &Action| match a {
+            Action::Status { mid, status, .. } => (0, mid.as_bytes().to_vec(), *status),
+            Action::Inbox { service, unread } => (1, service.as_bytes().to_vec(), *unread),
+            Action::SendFrame { .. } => (2, Vec::new(), 0),
+            Action::Deliver { .. } => (3, Vec::new(), 0),
+            Action::LinkBound { link, .. } => (4, link.to_be_bytes().to_vec(), 0),
+        };
+        let mut b: Vec<_> = batch_actions.iter().map(key).collect();
+        let mut s: Vec<_> = seq_actions.iter().map(key).collect();
+        b.sort();
+        s.sort();
+        assert_eq!(b, s);
     }
 
     #[test]

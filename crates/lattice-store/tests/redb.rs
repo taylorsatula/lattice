@@ -950,3 +950,108 @@ fn alloc_link_id_is_monotonic_across_reopens() {
     assert!(third > first + 1, "link ids must not restart after reopen");
     assert!(first >= lattice_store::LINK_ID_BASE);
 }
+
+#[test]
+fn redb_batch_commit_is_atomic_and_visible_inside() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut s = RedbStore::open(tmp.path().join("batch.redb")).unwrap();
+    s.begin_batch().unwrap();
+    s.outbound_push(&outbound(1)).unwrap();
+    s.custody_put(custody(1)).unwrap();
+    // Reads inside the batch observe the staged writes.
+    assert!(s.outbound_get(&mid(1)).unwrap().is_some());
+    assert_eq!(s.custody_all().unwrap().len(), 1);
+    assert_eq!(s.custody_bytes().unwrap(), 100);
+    s.commit_batch().unwrap();
+    // And they are durable after the commit.
+    assert!(s.outbound_get(&mid(1)).unwrap().is_some());
+    assert_eq!(s.custody_all().unwrap().len(), 1);
+}
+
+#[test]
+fn redb_batch_abort_discards_staged_writes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut s = RedbStore::open(tmp.path().join("abort.redb")).unwrap();
+    s.begin_batch().unwrap();
+    s.outbound_push(&outbound(1)).unwrap();
+    s.abort_batch();
+    assert!(s.outbound_get(&mid(1)).unwrap().is_none());
+}
+
+#[test]
+fn redb_batch_poisoned_by_failed_op_discards_everything() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut s = RedbStore::open(tmp.path().join("poison.redb")).unwrap();
+    s.begin_batch().unwrap();
+    s.outbound_push(&outbound(1)).unwrap();
+    // share_add with a huge negative delta underflows and fails inside
+    // the batch; the batch must not commit.
+    assert!(s.share_add(&id(9), 5, i64::MIN).is_err());
+    assert!(s.commit_batch().is_err());
+    assert!(s.outbound_get(&mid(1)).unwrap().is_none());
+    assert_eq!(s.share_get(&id(9), 5).unwrap(), 0);
+}
+
+#[test]
+fn redb_batch_counts_as_one_commit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut s = RedbStore::open(tmp.path().join("count.redb")).unwrap();
+    let before = s.commit_count();
+    s.begin_batch().unwrap();
+    for i in 0..10u8 {
+        s.outbound_push(&outbound(i)).unwrap();
+    }
+    s.commit_batch().unwrap();
+    assert_eq!(s.commit_count(), before + 1);
+}
+
+#[test]
+fn redb_failed_commit_leaves_store_unchanged() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("failed-commit.redb");
+    {
+        let mut s = RedbStore::open(&path).unwrap();
+        s.outbound_push(&outbound(1)).unwrap();
+    }
+    let mut s = RedbStore::open(&path).unwrap();
+    let before = s.commit_count();
+    s.begin_batch().unwrap();
+    s.outbound_push(&outbound(2)).unwrap();
+    // Poison the batch with a failing op, then attempt the commit.
+    assert!(s.share_add(&id(9), 5, i64::MIN).is_err());
+    assert!(s.commit_batch().is_err());
+    assert_eq!(s.commit_count(), before);
+    // The pre-batch state survived; the batch's write did not.
+    assert!(s.outbound_get(&mid(1)).unwrap().is_some());
+    assert!(s.outbound_get(&mid(2)).unwrap().is_none());
+}
+
+#[test]
+fn mem_batch_commit_failure_rolls_back() {
+    let mut s = MemStore::new();
+    s.begin_batch().unwrap();
+    s.outbound_push(&outbound(1)).unwrap();
+    s.fail_next_commit();
+    assert!(s.commit_batch().is_err());
+    assert!(s.outbound_get(&mid(1)).unwrap().is_none());
+}
+
+#[test]
+fn mem_batch_abort_discards() {
+    let mut s = MemStore::new();
+    s.begin_batch().unwrap();
+    s.outbound_push(&outbound(1)).unwrap();
+    s.abort_batch();
+    assert!(s.outbound_get(&mid(1)).unwrap().is_none());
+}
+
+#[test]
+fn mem_batch_sees_staged_writes_and_counts_one_commit() {
+    let mut s = MemStore::new();
+    s.begin_batch().unwrap();
+    s.outbound_push(&outbound(1)).unwrap();
+    assert!(s.outbound_get(&mid(1)).unwrap().is_some());
+    s.commit_batch().unwrap();
+    assert_eq!(s.commit_count(), 1);
+    assert!(s.outbound_get(&mid(1)).unwrap().is_some());
+}

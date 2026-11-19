@@ -8,7 +8,7 @@ use crate::*;
 use lattice_proto::local::DrainState;
 use lattice_types::{DeliveryId, Hash32, Identifier, LegId, MessageId};
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct MemStore {
     records: BTreeMap<(Identifier, u8), RecordBytes>,
     kel_heads: BTreeMap<Identifier, KelHeadSeen>,
@@ -26,6 +26,16 @@ pub struct MemStore {
     custody_class_bytes: [u64; CLASS_SLOTS],
     drain: DrainState,
     next_link_id: u64,
+    /// Snapshot taken at `begin_batch`; restored by `abort_batch` and by a
+    /// failed `commit_batch`, so a discarded batch leaves the store as it
+    /// was. `None` when no batch is active.
+    batch_snapshot: Option<Box<MemStore>>,
+    /// Test hook: when set, the next `commit_batch` fails and the batch is
+    /// rolled back, as if the durability layer refused the commit.
+    fail_commit: bool,
+    /// Number of batches committed. Test hook for asserting that a batch
+    /// of events produces exactly one commit.
+    commit_count: u64,
 }
 
 impl MemStore {
@@ -35,6 +45,18 @@ impl MemStore {
             next_link_id: LINK_ID_BASE,
             ..Self::default()
         }
+    }
+
+    /// Number of batches committed so far. Test hook.
+    #[must_use]
+    pub fn commit_count(&self) -> u64 {
+        self.commit_count
+    }
+
+    /// Test hook: make the next `commit_batch` fail and roll the batch
+    /// back, as if the durability layer refused the commit.
+    pub fn fail_next_commit(&mut self) {
+        self.fail_commit = true;
     }
 }
 
@@ -352,5 +374,42 @@ impl Store for MemStore {
     fn drain_set(&mut self, state: DrainState) -> Result<(), StoreError> {
         self.drain = state;
         Ok(())
+    }
+
+    fn begin_batch(&mut self) -> Result<(), StoreError> {
+        if self.batch_snapshot.is_some() {
+            return Err(StoreError::Backend {
+                op: "begin_batch",
+                source: "a batch is already active".into(),
+            });
+        }
+        self.batch_snapshot = Some(Box::new(self.clone()));
+        Ok(())
+    }
+
+    fn commit_batch(&mut self) -> Result<(), StoreError> {
+        let Some(snapshot) = self.batch_snapshot.take() else {
+            return Ok(());
+        };
+        if std::mem::take(&mut self.fail_commit) {
+            // The commit never became durable: roll the batch back.
+            *self = *snapshot;
+            self.fail_commit = false;
+            return Err(StoreError::Backend {
+                op: "commit_batch",
+                source: "injected commit failure".into(),
+            });
+        }
+        self.commit_count += 1;
+        Ok(())
+    }
+
+    fn abort_batch(&mut self) {
+        if let Some(snapshot) = self.batch_snapshot.take() {
+            let fail_commit = self.fail_commit;
+            *self = *snapshot;
+            // The hook is not part of the snapshot's purpose; keep it.
+            self.fail_commit = fail_commit;
+        }
     }
 }

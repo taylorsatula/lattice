@@ -5,6 +5,11 @@
 //! The trait is the contract the core depends on. The two backends are
 //! contract-tested for equivalence. All time is passed in by the caller
 //! (Unix seconds); the store never reads a clock.
+//!
+//! Batching: [`Store::begin_batch`] / [`Store::commit_batch`] /
+//! [`Store::abort_batch`] let a caller group many operations into one
+//! atomic, durable commit (the daemon's group commit). Outside a batch,
+//! every write is its own durable transaction, exactly as before.
 
 #![forbid(unsafe_code)]
 
@@ -334,4 +339,25 @@ pub trait Store {
     // Backends store it as 0/1; the enum is the in-memory form.
     fn drain_get(&self) -> Result<DrainState, StoreError>;
     fn drain_set(&mut self, state: DrainState) -> Result<(), StoreError>;
+
+    /// Begin a batch: subsequent reads and writes are staged and become
+    /// durable atomically at [`Store::commit_batch`]. Reads issued during
+    /// the batch observe the staged writes. If any operation fails inside
+    /// the batch, the batch is poisoned: [`Store::commit_batch`] discards
+    /// it and reports the error, so no staged write becomes durable.
+    ///
+    /// The default implementation does nothing; the in-memory store is
+    /// atomic per call. Backends with a real transaction override this.
+    fn begin_batch(&mut self) -> Result<(), StoreError> {
+        Ok(())
+    }
+    /// Commit the active batch atomically. On failure the batch is
+    /// discarded and the store is left as it was before the batch began.
+    /// With no batch active this is a no-op.
+    fn commit_batch(&mut self) -> Result<(), StoreError> {
+        Ok(())
+    }
+    /// Discard the active batch without committing. With no batch active
+    /// this is a no-op.
+    fn abort_batch(&mut self) {}
 }

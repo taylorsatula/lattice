@@ -5,6 +5,14 @@
 //! backend exists for the simulator; behavior is contract-tested for
 //! equivalence.
 //!
+//! Batching: `begin_batch` opens one write transaction that every
+//! subsequent read and write joins; `commit_batch` commits it once
+//! (one fsync for the whole batch) and `abort_batch` discards it. If any
+//! operation fails inside a batch, the batch is poisoned and
+//! `commit_batch` fails without committing, so a half-applied batch
+//! never becomes durable. Outside a batch, behavior is exactly as
+//! before: one transaction per write.
+//!
 //! Read-path validation policy: rows are CBOR bytes (see `row_codec`) and
 //! are never trusted as-is. On every decode, a row is re-validated where a
 //! validator exists (the outbound envelope, via `Envelope::from_value`); a
@@ -14,9 +22,15 @@
 //! valid ranges rather than rejected. Everything else is decode-trusted:
 //! if it decodes, it is accepted as-is.
 
+use std::borrow::Borrow;
+use std::cell::Cell;
+use std::ops::RangeBounds;
 use std::path::Path;
 
-use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
+use redb::{
+    AccessGuard, Database, Key, Range, ReadOnlyTable, ReadableTable, ReadableTableMetadata, Table,
+    TableDefinition, TableStats, Value,
+};
 
 use crate::row_codec::{
     decode_custody, decode_inbox, decode_outbound, decode_status, encode_custody, encode_inbox,
@@ -87,6 +101,92 @@ fn ctx<E: Into<StoreError>>(op: &'static str) -> impl FnOnce(E) -> StoreError {
 /// the daemon.
 fn fixed<const N: usize>(bytes: &[u8], context: &'static str) -> Result<[u8; N], StoreError> {
     bytes.try_into().map_err(|_| StoreError::Corrupt(context))
+}
+
+/// A read handle over either a standalone read transaction or the active
+/// batch's write transaction (which supports reads and observes the
+/// batch's staged writes). Lets the read helpers serve both cases without
+/// duplicating their bodies.
+enum ReadTx<'a> {
+    Read(&'a redb::ReadTransaction),
+    Write(&'a redb::WriteTransaction),
+}
+
+impl<'a> ReadTx<'a> {
+    fn open_table<K: Key + 'static, V: Value + 'static>(
+        &self,
+        definition: TableDefinition<'_, K, V>,
+    ) -> Result<AnyTable<'_, K, V>, StoreError> {
+        match self {
+            ReadTx::Read(t) => Ok(AnyTable::Read(t.open_table(definition)?)),
+            ReadTx::Write(t) => Ok(AnyTable::Write(t.open_table(definition)?)),
+        }
+    }
+}
+
+/// A table opened for reading from either transaction kind. Implements
+/// the `ReadableTable` traits by delegation so the read helpers are
+/// agnostic to which kind of transaction they run in.
+enum AnyTable<'a, K: Key + 'static, V: Value + 'static> {
+    Read(ReadOnlyTable<K, V>),
+    Write(Table<'a, K, V>),
+}
+
+impl<K: Key + 'static, V: Value + 'static> ReadableTableMetadata for AnyTable<'_, K, V> {
+    fn stats(&self) -> Result<TableStats, redb::StorageError> {
+        match self {
+            AnyTable::Read(t) => t.stats(),
+            AnyTable::Write(t) => t.stats(),
+        }
+    }
+
+    fn len(&self) -> Result<u64, redb::StorageError> {
+        match self {
+            AnyTable::Read(t) => t.len(),
+            AnyTable::Write(t) => t.len(),
+        }
+    }
+}
+
+impl<K: Key + 'static, V: Value + 'static> ReadableTable<K, V> for AnyTable<'_, K, V> {
+    fn get<'a>(
+        &self,
+        key: impl Borrow<K::SelfType<'a>>,
+    ) -> Result<Option<AccessGuard<'_, V>>, redb::StorageError> {
+        match self {
+            AnyTable::Read(t) => t.get(key),
+            AnyTable::Write(t) => t.get(key),
+        }
+    }
+
+    fn range<'a, KR>(
+        &self,
+        range: impl RangeBounds<KR> + 'a,
+    ) -> Result<Range<'_, K, V>, redb::StorageError>
+    where
+        KR: Borrow<K::SelfType<'a>> + 'a,
+    {
+        match self {
+            AnyTable::Read(t) => t.range(range),
+            AnyTable::Write(t) => t.range(range),
+        }
+    }
+
+    fn first(
+        &self,
+    ) -> Result<Option<(AccessGuard<'_, K>, AccessGuard<'_, V>)>, redb::StorageError> {
+        match self {
+            AnyTable::Read(t) => t.first(),
+            AnyTable::Write(t) => t.first(),
+        }
+    }
+
+    fn last(&self) -> Result<Option<(AccessGuard<'_, K>, AccessGuard<'_, V>)>, redb::StorageError> {
+        match self {
+            AnyTable::Read(t) => t.last(),
+            AnyTable::Write(t) => t.last(),
+        }
+    }
 }
 
 /// Open each listed table so reads never fail on a fresh database.
@@ -248,8 +348,22 @@ fn meta_add(txn: &redb::WriteTransaction, key: &str, delta: i64) -> Result<u64, 
     Ok(next as u64)
 }
 
+/// An active batch: one write transaction shared by every operation
+/// until `commit_batch` (or `abort_batch`). `poisoned` records the first
+/// operation that failed inside the batch; a poisoned batch is discarded,
+/// never committed, so a half-applied batch never becomes durable.
+struct BatchState {
+    txn: redb::WriteTransaction,
+    poisoned: Cell<Option<&'static str>>,
+}
+
 pub struct RedbStore {
     db: Database,
+    batch: Option<BatchState>,
+    /// Number of transactions committed (both standalone writes and
+    /// batches). Instrumentation for the group-commit work; not used by
+    /// the store itself.
+    commit_count: Cell<u64>,
 }
 
 impl RedbStore {
@@ -300,16 +414,42 @@ impl RedbStore {
         );
         rebuild_custody_counters(&txn, OP)?;
         txn.commit().map_err(ctx(OP))?;
-        Ok(Self { db })
+        Ok(Self {
+            db,
+            batch: None,
+            commit_count: Cell::new(0),
+        })
+    }
+
+    /// Number of transactions committed since the store was opened
+    /// (excluding the schema-setup transaction). Instrumentation for the
+    /// group-commit work.
+    #[must_use]
+    pub fn commit_count(&self) -> u64 {
+        self.commit_count.get()
     }
 
     fn read<R>(
         &self,
         op: &'static str,
-        f: impl FnOnce(&redb::ReadTransaction) -> Result<R, StoreError>,
+        f: impl FnOnce(ReadTx<'_>) -> Result<R, StoreError>,
     ) -> Result<R, StoreError> {
-        let txn = self.db.begin_read().map_err(ctx(op))?;
-        f(&txn).map_err(|e| e.at(op))
+        match &self.batch {
+            // Inside a batch, reads go through the batch's write
+            // transaction so they observe the staged writes. A failed read
+            // poisons the batch like any other store error.
+            Some(batch) => {
+                let result = f(ReadTx::Write(&batch.txn)).map_err(|e| e.at(op));
+                if result.is_err() && batch.poisoned.get().is_none() {
+                    batch.poisoned.set(Some(op));
+                }
+                result
+            }
+            None => {
+                let txn = self.db.begin_read().map_err(ctx(op))?;
+                f(ReadTx::Read(&txn)).map_err(|e| e.at(op))
+            }
+        }
     }
 
     fn write<R>(
@@ -317,11 +457,22 @@ impl RedbStore {
         op: &'static str,
         f: impl FnOnce(&redb::WriteTransaction) -> Result<R, StoreError>,
     ) -> Result<R, StoreError> {
+        if let Some(batch) = &self.batch {
+            // Inside a batch the write joins the batch's transaction; it
+            // becomes durable only when the batch commits. A failed write
+            // poisons the batch: commit_batch will discard it.
+            let result = f(&batch.txn).map_err(|e| e.at(op));
+            if result.is_err() && batch.poisoned.get().is_none() {
+                batch.poisoned.set(Some(op));
+            }
+            return result;
+        }
         let txn = self.db.begin_write().map_err(ctx(op))?;
         let mut txn = txn;
         txn.set_durability(redb::Durability::Immediate);
         let out = f(&txn).map_err(|e| e.at(op))?;
         txn.commit().map_err(ctx(op))?;
+        self.commit_count.set(self.commit_count.get() + 1);
         Ok(out)
     }
 
@@ -1119,6 +1270,46 @@ impl Store for RedbStore {
             meta.insert("drain", u64::from(state.is_draining()))?;
             Ok(())
         })
+    }
+
+    fn begin_batch(&mut self) -> Result<(), StoreError> {
+        if self.batch.is_some() {
+            return Err(StoreError::Backend {
+                op: "begin_batch",
+                source: "a batch is already active".into(),
+            });
+        }
+        let txn = self.db.begin_write().map_err(ctx("begin_batch"))?;
+        let mut txn = txn;
+        txn.set_durability(redb::Durability::Immediate);
+        self.batch = Some(BatchState {
+            txn,
+            poisoned: Cell::new(None),
+        });
+        Ok(())
+    }
+
+    fn commit_batch(&mut self) -> Result<(), StoreError> {
+        let Some(batch) = self.batch.take() else {
+            return Ok(());
+        };
+        if let Some(op) = batch.poisoned.get() {
+            // Discard the transaction without committing: nothing the
+            // batch staged becomes durable.
+            drop(batch.txn);
+            return Err(StoreError::Backend {
+                op: "commit_batch",
+                source: format!("batch discarded: store operation {op} failed").into(),
+            });
+        }
+        batch.txn.commit().map_err(ctx("commit_batch"))?;
+        self.commit_count.set(self.commit_count.get() + 1);
+        Ok(())
+    }
+
+    fn abort_batch(&mut self) {
+        // Dropping the write transaction discards it without committing.
+        self.batch.take();
     }
 }
 

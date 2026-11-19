@@ -209,6 +209,15 @@ const MAX_HIVE_LINKS_PER_PREFIX: usize = MAX_HIVE_LINKS;
 /// dropped. Binding normally completes within a reconcile round (~1s);
 /// 60s is generous headroom for a slow peer.
 const UNBOUND_LINK_DEADLINE_SECS: u64 = 60;
+/// Group-commit window: events arriving within this window are committed
+/// in one store transaction. Small enough that added latency is noise
+/// next to a network round trip; large enough to collapse a burst of
+/// frames (or an app send plus its reconcile traffic) into one fsync.
+const BATCH_WINDOW_MS: u64 = 2;
+/// Hard cap on events per batch. Under sustained load the batch is
+/// flushed at this size instead of waiting for the window, bounding
+/// memory and commit latency.
+const MAX_BATCH_EVENTS: usize = 256;
 
 /// Outbound/inbound frame classes for per-peer rate limiting and shedding.
 /// Custody is message custody (offers and custody replies): shed last.
@@ -454,6 +463,24 @@ pub struct Runtime {
     /// core's data-sweep cadence (`DATA_SWEEP_SECS` in lattice-core); the
     /// core drops expired keys from memory, this deletes the files.
     next_retired_key_sweep: u64,
+    /// Events waiting to be committed as one store transaction (the
+    /// group commit). Flushed when the batch window elapses, when the
+    /// batch reaches `MAX_BATCH_EVENTS`, or before any direct store
+    /// access that must observe them.
+    pending_events: Vec<Event>,
+    /// Responders for the `AppSend` events in `pending_events`, in the
+    /// same order. The app's send is acknowledged only after the batch
+    /// holding it commits, so a crash never acknowledges a message that
+    /// was not stored.
+    pending_sends: Vec<(MessageId, tokio::sync::oneshot::Sender<MessageId>)>,
+    /// When the pending batch must be flushed (unix ms), if any events
+    /// are pending.
+    batch_flush_at: Option<u64>,
+    /// Set when a batch commit fails. The store rolled the batch back,
+    /// so the node's in-memory state can no longer be trusted; the run
+    /// loop exits and the process exits nonzero so the supervisor
+    /// restarts into a node rebuilt from the store.
+    fatal: bool,
 }
 
 /// Milliseconds since the Unix epoch — the core's time base.
@@ -646,6 +673,10 @@ impl Runtime {
             // hour from now. (`now` is milliseconds; the sweep is tracked
             // in seconds.)
             next_retired_key_sweep: now / 1000 + RETIRED_KEY_SWEEP_SECS,
+            pending_events: Vec::new(),
+            pending_sends: Vec::new(),
+            batch_flush_at: None,
+            fatal: false,
         })
     }
 
@@ -737,6 +768,12 @@ impl Runtime {
             // response, consistent with the listener's other refusals.
             return None;
         }
+        // Flush any pending batch first: the link-id allocation below is a
+        // direct store write and must not join a batch that could roll
+        // back and reuse the id for a different link.
+        if !self.flush_pending().await {
+            return None;
+        }
         // Link ids come from a persisted counter so a custody entry's
         // `upstream` never aliases an unrelated peer after a restart.
         let id = match self.with_node(|n| n.store_mut().alloc_link_id()) {
@@ -766,13 +803,12 @@ impl Runtime {
         );
         // The link is registered, so the actions returned by LinkUp can be
         // routed to it.
-        self.apply(Event::LinkUp {
+        self.queue_event(Event::LinkUp {
             at: now_ms(),
             link: id,
             peer,
             remote_ck,
-        })
-        .await;
+        });
         Some(id)
     }
 
@@ -834,7 +870,10 @@ impl Runtime {
         eprintln!("lattice: draining (refusing new custody); exiting");
     }
 
-    pub async fn run(mut self, shutdown: impl std::future::Future<Output = ()>) {
+    /// Returns `true` on a clean shutdown (the shutdown signal fired),
+    /// `false` if a batch commit failed and the process must exit nonzero
+    /// so the supervisor restarts into a node rebuilt from the store.
+    pub async fn run(mut self, shutdown: impl std::future::Future<Output = ()>) -> bool {
         let mut link_rx = self.link_rx.take().expect("run once");
         let mut api_rx = self.api_rx.take().expect("run once");
         let mut peer_rx = self.peer_rx.take().expect("run once");
@@ -851,6 +890,11 @@ impl Runtime {
         let mut tick_deferrals = 0u32;
         tokio::pin!(shutdown);
         loop {
+            // A failed batch commit poisons the node's in-memory state;
+            // stop the loop and let the process exit nonzero.
+            if self.fatal {
+                break;
+            }
             let wake = async {
                 match wake_at {
                     Some(t) => tokio::time::sleep_until(t).await,
@@ -860,8 +904,12 @@ impl Runtime {
             tokio::select! {
                 biased;
                 _ = &mut shutdown => {
+                    // Flush anything pending so a clean shutdown does not
+                    // drop queued events; if the flush fails we are
+                    // exiting anyway.
+                    let _ = self.flush_pending().await;
                     self.begin_drain();
-                    return;
+                    return true;
                 }
                 Some(peer) = peer_rx.recv() => {
                     let ck = peer.remote_static;
@@ -898,24 +946,38 @@ impl Runtime {
                             None => None,
                         };
                         if admitted.is_some() {
-                            self.apply(Event::Frame { at: now, link, frame, bucket: Some(bucket) }).await;
+                            self.queue_event(Event::Frame { at: now, link, frame, bucket: Some(bucket) });
+                            if self.pending_events.len() >= MAX_BATCH_EVENTS
+                                && !self.flush_pending().await
+                            {
+                                break;
+                            }
                         }
                     }
                     LinkEvent::Down { link } => {
                         if self.remove_link(link) {
-                            self.apply(Event::LinkDown { at: now_ms(), link }).await;
+                            self.queue_event(Event::LinkDown { at: now_ms(), link });
+                            if self.pending_events.len() >= MAX_BATCH_EVENTS
+                                && !self.flush_pending().await
+                            {
+                                break;
+                            }
                         }
                     }
                 },
                 _ = wake => {
+                    // Flush any pending batch first: the checks below read
+                    // core state, which must reflect every queued event.
+                    if !self.flush_pending().await {
+                        break;
+                    }
                     // Drop links that have been unbound longer than the
                     // deadline; the core is told via LinkDown below.
                     for link in self.sweep_unbound_links() {
-                        self.apply(Event::LinkDown {
+                        self.queue_event(Event::LinkDown {
                             at: now_ms(),
                             link,
-                        })
-                        .await;
+                        });
                     }
                     // Attach any dials that completed since the last arm ran,
                     // then defer the core wake while a dial is still in
@@ -927,6 +989,9 @@ impl Runtime {
                     if self.dials_in_flight > 0 && tick_deferrals < MAX_WAKE_DEFERRALS {
                         tick_deferrals += 1;
                         wake_at = Some(tokio::time::Instant::now() + WAKE_DEFER_DELAY);
+                        if !self.flush_pending().await {
+                            break;
+                        }
                         continue;
                     }
                     tick_deferrals = 0;
@@ -939,7 +1004,7 @@ impl Runtime {
                         .with_node(|n| n.next_deadline())
                         .is_some_and(|d| now >= d);
                     if core_due {
-                        self.apply(Event::Tick { at: now }).await;
+                        self.queue_event(Event::Tick { at: now });
                     }
                     let now_s = now_secs();
                     if now_s >= self.next_retired_key_sweep {
@@ -948,6 +1013,9 @@ impl Runtime {
                             now_s,
                         );
                         self.next_retired_key_sweep = now_s + RETIRED_KEY_SWEEP_SECS;
+                    }
+                    if !self.flush_pending().await {
+                        break;
                     }
                 }
             }
@@ -960,6 +1028,7 @@ impl Runtime {
             // path above `continue`s and keeps its own short re-arm.)
             wake_at = self.next_wake_instant();
         }
+        !self.fatal
     }
 
     /// The next instant the daemon must wake for: the core's reported
@@ -985,6 +1054,11 @@ impl Runtime {
                 .saturating_add(UNBOUND_LINK_DEADLINE_SECS)
                 .saturating_mul(1000);
             best = Some(best.map_or(ms, |b| b.min(ms)));
+        }
+        // A pending batch must flush by its deadline even if nothing else
+        // is armed.
+        if let Some(f) = self.batch_flush_at {
+            best = Some(best.map_or(f, |b| b.min(f)));
         }
         best.map(instant_from_unix_ms)
     }
@@ -1013,39 +1087,92 @@ impl Runtime {
         expired
     }
 
-    /// Run one event through the core and apply the resulting actions.
-    /// The core performs synchronous store I/O (redb commits with fsync),
-    /// so `handle` runs on the blocking thread pool and the async loop
-    /// only awaits the outcome; the worker is never blocked on a commit.
-    /// Events are still processed strictly in order: each event's actions
-    /// are applied before the next event is dispatched. A link dropped or
-    /// force-closed while applying actions is fed back through the same
-    /// queue as a LinkDown, so the core observes it after the binding
-    /// change that caused it.
-    async fn apply(&mut self, event: Event) {
-        let mut queue = std::collections::VecDeque::from([event]);
-        while let Some(event) = queue.pop_front() {
-            let node = Arc::clone(&self.node);
-            let result = tokio::task::spawn_blocking(move || {
-                let mut node = node
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                node.handle(event)
-            })
-            .await;
-            let (actions, diags) = match result {
-                Ok(out) => out,
-                Err(e) => {
-                    // The core panicked. The mutex is poisoned but
-                    // recoverable (with_node takes the inner value), so
-                    // keep the daemon alive and say so.
-                    eprintln!("lattice: node task failed: {e}");
-                    continue;
+    /// Queue an event for the next batch. The batch is flushed when the
+    /// batching window elapses (see [`Runtime::flush_pending`]), when it
+    /// reaches `MAX_BATCH_EVENTS`, or before the daemon touches the store
+    /// directly. Events are processed strictly in FIFO order.
+    fn queue_event(&mut self, event: Event) {
+        self.pending_events.push(event);
+        if self.batch_flush_at.is_none() {
+            self.batch_flush_at = Some(now_ms().saturating_add(BATCH_WINDOW_MS));
+        }
+        if self.pending_events.len() >= MAX_BATCH_EVENTS {
+            // Mark the batch as due now; the next pass through the event
+            // loop flushes it instead of waiting for the window.
+            self.batch_flush_at = Some(now_ms());
+        }
+    }
+
+    /// Run all queued events through the core in one store transaction
+    /// and apply the resulting actions. Durability-dependent actions
+    /// (custody `ACCEPTED`, app send acceptances) are released only after
+    /// the commit succeeds; on commit failure no action is released and
+    /// the store is left as it was before the batch.
+    ///
+    /// Returns `false` if the batch could not be committed. The caller
+    /// must stop the daemon: the store rolled the batch back, so the
+    /// node's in-memory state can no longer be trusted, and the only safe
+    /// recovery is a restart (which rebuilds the node from the store).
+    async fn flush_pending(&mut self) -> bool {
+        if self.pending_events.is_empty() {
+            // Nothing to commit; drop any stray responders rather than
+            // leave an app waiting on a oneshot that will never fire.
+            // (pending_sends is only pushed alongside pending_events, so
+            // this should be empty here.)
+            self.pending_sends.clear();
+            self.batch_flush_at = None;
+            return true;
+        }
+        self.batch_flush_at = None;
+        let events = std::mem::take(&mut self.pending_events);
+        let sends = std::mem::take(&mut self.pending_sends);
+        let node = Arc::clone(&self.node);
+        // The core performs synchronous store I/O (redb commits with
+        // fsync), so the batch runs on the blocking thread pool and the
+        // async loop only awaits the outcome; the worker is never blocked
+        // on a commit.
+        let result = tokio::task::spawn_blocking(move || {
+            let mut node = node
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            node.handle_batch(events)
+        })
+        .await;
+        match result {
+            Ok(Ok((actions, diags))) => {
+                report_diagnostics(diags);
+                for link in self.apply_actions(actions) {
+                    // A link force-closed while applying actions is fed
+                    // back into the core as a LinkDown, so the core
+                    // observes it after the binding change that caused it.
+                    self.queue_event(Event::LinkDown { at: now_ms(), link });
                 }
-            };
-            report_diagnostics(diags);
-            for link in self.apply_actions(actions) {
-                queue.push_back(Event::LinkDown { at: now_ms(), link });
+                // The batch is durable: acknowledge the sends that rode
+                // it. A send is never acknowledged before its batch
+                // commits.
+                for (mid, respond) in sends {
+                    let _ = respond.send(mid);
+                }
+                true
+            }
+            Ok(Err(e)) => {
+                // The batch was discarded; no action was released. The
+                // node's in-memory state may reflect events whose effects
+                // were rolled back, so it cannot be trusted: exit and let
+                // the supervisor restart into a node rebuilt from the
+                // (consistent) store.
+                eprintln!("lattice: batch commit failed; the batch was discarded: {e}");
+                eprintln!("lattice: exiting; a restart rebuilds the node from the store");
+                self.fatal = true;
+                false
+            }
+            Err(e) => {
+                // The core panicked mid-batch. The store transaction was
+                // never committed, but the node's state is untrustworthy;
+                // exit and let the supervisor restart.
+                eprintln!("lattice: node task failed: {e}");
+                self.fatal = true;
+                false
             }
         }
     }
@@ -1235,6 +1362,18 @@ impl Runtime {
     }
 
     async fn handle_api(&mut self, api: ApiCmd) {
+        // Commands that read or write the store or the core directly must
+        // observe a committed state, so flush any pending batch first.
+        // AppSend only queues an event and Link only spawns a dial, so
+        // they skip the flush and join (or trigger) the next batch.
+        match &api {
+            ApiCmd::AppSend { .. } | ApiCmd::Link { .. } => {}
+            _ => {
+                if !self.flush_pending().await {
+                    return;
+                }
+            }
+        }
         match api {
             ApiCmd::AppSend { send, respond } => {
                 let mid = send
@@ -1244,8 +1383,17 @@ impl Runtime {
                     mid_hint: Some(mid),
                     ..send
                 };
-                self.apply(Event::AppSend(send)).await;
-                let _ = respond.send(mid);
+                self.queue_event(Event::AppSend(send));
+                // The app is told the message is accepted only after the
+                // batch holding it is durable; anything else would let a
+                // crash between the reply and the commit lose the message.
+                // The responder fires from `flush_pending` once the batch
+                // commits, so a burst of sends collapses into one commit.
+                self.pending_sends.push((mid, respond));
+                if self.pending_events.len() >= MAX_BATCH_EVENTS {
+                    // Flush now; on failure the process is exiting anyway.
+                    let _ = self.flush_pending().await;
+                }
             }
             ApiCmd::Status {
                 mid,
@@ -1487,11 +1635,10 @@ impl Runtime {
             .collect();
         for id in dead {
             if self.remove_link(id) {
-                self.apply(Event::LinkDown {
+                self.queue_event(Event::LinkDown {
                     at: now_ms(),
                     link: id,
-                })
-                .await;
+                });
             }
         }
     }
@@ -1934,6 +2081,85 @@ mod tests {
         assert!(!rt.links.contains_key(&1));
         assert!(rt.links.contains_key(&2));
         assert!(rt.links.contains_key(&3));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn test_app_send(to: u8) -> lattice_core::AppSend {
+        lattice_core::AppSend {
+            service: "test".to_string(),
+            mid_hint: None,
+            to: Identifier::from_bytes([to; 32]),
+            tsvc: "test".to_string(),
+            tmbx: b"in".to_vec(),
+            fmbx: b"out".to_vec(),
+            body: b"hello".to_vec(),
+            exp: None,
+            priority: 1,
+            route: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn app_send_is_acknowledged_only_after_commit() {
+        let dir = std::env::temp_dir().join(format!(
+            "latticed-appsend-ack-test-{}-{}",
+            std::process::id(),
+            now_secs()
+        ));
+        let mut rt = test_runtime(&dir);
+        let before = rt.node.lock().unwrap().store_ref().commit_count();
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        rt.handle_api(ApiCmd::AppSend {
+            send: test_app_send(0xA1),
+            respond: tx,
+        })
+        .await;
+        // The send is queued, not yet committed: nothing is acknowledged.
+        assert!(rx.try_recv().is_err());
+        assert_eq!(rt.pending_events.len(), 1);
+        assert_eq!(rt.pending_sends.len(), 1);
+        assert!(rt.flush_pending().await);
+        let mid = rx.await.expect("send acknowledged after commit");
+        let after = rt.node.lock().unwrap().store_ref().commit_count();
+        assert_eq!(after, before + 1, "the batch commits exactly once");
+        // The outbound row is durable before the app was told.
+        let found = rt
+            .node
+            .lock()
+            .unwrap()
+            .store_ref()
+            .outbound_get(&mid)
+            .unwrap();
+        assert!(found.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn app_sends_in_one_batch_share_one_commit() {
+        let dir = std::env::temp_dir().join(format!(
+            "latticed-appsend-batch-test-{}-{}",
+            std::process::id(),
+            now_secs()
+        ));
+        let mut rt = test_runtime(&dir);
+        let before = rt.node.lock().unwrap().store_ref().commit_count();
+        let mut responders = Vec::new();
+        for i in 0..3u8 {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            rt.handle_api(ApiCmd::AppSend {
+                send: test_app_send(0xB0 + i),
+                respond: tx,
+            })
+            .await;
+            responders.push(rx);
+        }
+        assert_eq!(rt.pending_events.len(), 3);
+        assert!(rt.flush_pending().await);
+        for rx in responders {
+            rx.await.expect("send acknowledged after the shared commit");
+        }
+        let after = rt.node.lock().unwrap().store_ref().commit_count();
+        assert_eq!(after, before + 1, "three sends commit as one batch");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

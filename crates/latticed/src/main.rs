@@ -695,8 +695,13 @@ async fn cmd_run(args: &[String]) -> std::process::ExitCode {
         }
     });
 
-    runtime.run(shutdown).await;
-    std::process::ExitCode::SUCCESS
+    if runtime.run(shutdown).await {
+        std::process::ExitCode::SUCCESS
+    } else {
+        // A batch commit failed; the store rolled the batch back and the
+        // node exits so the supervisor restarts it from a consistent store.
+        std::process::ExitCode::FAILURE
+    }
 }
 
 #[cfg(test)]
