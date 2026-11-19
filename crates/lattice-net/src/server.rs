@@ -23,9 +23,14 @@ use crate::cookie::{CookieState, mac1};
 use crate::errors::{HandshakeError, NetError};
 use crate::handshake::{Pending, XX_MSG1_LEN, encode_handshake_frame};
 use crate::peer::PeerIo;
+use crate::prefix::{PrefixBudget, prefix_of};
 
 const MAX_HEAD: usize = 8192;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Concurrent handshake DH operations (Noise state builds and message
+/// reads/writes) across all connections. Excess handshakes are dropped
+/// without a response rather than queued, consistent with the cookie path.
+const HANDSHAKE_DH_PERMITS: usize = 64;
 
 /// Connections above this many in flight (pre-auth) set the under-load
 /// flag; it clears only when the count drops below [`PREAUTH_LOW_WATER`].
@@ -61,6 +66,13 @@ struct LoadState {
     total_connections: std::sync::atomic::AtomicU64,
     under_load: std::sync::atomic::AtomicBool,
     force_under_load: bool,
+    /// Per-source-prefix handshake budgets, checked at accept time.
+    prefix_budget: Mutex<PrefixBudget>,
+    /// Bounds concurrent handshake DH work across all connections.
+    handshake_dh: tokio::sync::Semaphore,
+    budget_drops: std::sync::atomic::AtomicU64,
+    handshake_saturated: std::sync::atomic::AtomicU64,
+    prefix_evictions_logged: std::sync::atomic::AtomicU64,
 }
 
 impl LoadState {
@@ -70,7 +82,64 @@ impl LoadState {
             total_connections: std::sync::atomic::AtomicU64::new(0),
             under_load: std::sync::atomic::AtomicBool::new(force_under_load),
             force_under_load,
+            prefix_budget: Mutex::new(PrefixBudget::new()),
+            handshake_dh: tokio::sync::Semaphore::new(HANDSHAKE_DH_PERMITS),
+            budget_drops: std::sync::atomic::AtomicU64::new(0),
+            handshake_saturated: std::sync::atomic::AtomicU64::new(0),
+            prefix_evictions_logged: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// Take one handshake-DH permit, or fail without waiting. Callers drop
+    /// the connection on failure; queueing would only hold sockets open
+    /// behind an attacker who is already outpacing us.
+    fn try_dh_permit(&self) -> Result<tokio::sync::SemaphorePermit<'_>, NetError> {
+        self.handshake_dh.try_acquire().map_err(|_| {
+            let n = self
+                .handshake_saturated
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1;
+            if n == 1 || n.is_multiple_of(64) {
+                eprintln!("[lattice-net] handshake DH semaphore exhausted; dropping connection ({n} total)");
+            }
+            NetError::HandshakeSaturated
+        })
+    }
+
+    /// Check the per-prefix handshake budget for `peer`. Returns false when
+    /// the peer's prefix is over budget and the connection must be dropped
+    /// without a response.
+    fn prefix_budget_allow(&self, peer: &SocketAddr) -> bool {
+        let prefix = prefix_of(peer);
+        let mut budget = self
+            .prefix_budget
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let allowed = budget.allow(prefix, now_secs());
+        let evictions = budget.evictions();
+        drop(budget);
+        let logged = self
+            .prefix_evictions_logged
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if evictions > logged {
+            self.prefix_evictions_logged
+                .store(evictions, std::sync::atomic::Ordering::Relaxed);
+            eprintln!(
+                "[lattice-net] prefix budget table full; evicted least-recently-seen prefix ({evictions} total evictions)"
+            );
+        }
+        if !allowed {
+            let n = self
+                .budget_drops
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1;
+            if n == 1 || n.is_multiple_of(64) {
+                eprintln!(
+                    "[lattice-net] dropping handshake from {prefix}: prefix budget exhausted ({n} total drops)"
+                );
+            }
+        }
+        allowed
     }
     #[must_use]
     fn under_load(&self) -> bool {
@@ -250,6 +319,14 @@ pub async fn serve(cfg: ListenerConfig, bind: Vec<SocketAddr>) -> io::Result<Ser
             let Ok((stream, peer)) = listener.accept().await else {
                 continue;
             };
+            // Per-prefix handshake budget, checked before any other work:
+            // over-budget prefixes are dropped without a response, so a
+            // flood from one /24 (or /48) cannot consume handshake CPU.
+            // This also gates /status and probes from that prefix.
+            if !load.prefix_budget_allow(&peer) {
+                drop(stream);
+                continue;
+            }
             let _ = crate::set_tcp_keepalive(&stream);
             if !load.try_admit() {
                 // At capacity: close immediately rather than queue.
@@ -293,6 +370,8 @@ fn is_probe_noise(e: &NetError) -> bool {
     matches!(
         e,
         NetError::Timeout | NetError::Io(_) | NetError::InvalidInput(_)
+        // Logged throttled at the point of failure (see try_dh_permit).
+        | NetError::HandshakeSaturated
     )
 }
 
@@ -550,15 +629,21 @@ async fn handshake_server(
         )
     };
 
-    if let Err(e) = hs.read_message(&init.noise_msg) {
-        eprintln!("[lattice-net] responder read failed: {e:?}");
-        return Err(NetError::Handshake(HandshakeError::Snow(e)));
-    }
-    let resp_bytes = match hs.write_message(&[]) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("[lattice-net] responder write failed: {e:?}");
+    {
+        let _permit = load.try_dh_permit()?;
+        if let Err(e) = hs.read_message(&init.noise_msg) {
+            eprintln!("[lattice-net] responder read failed: {e:?}");
             return Err(NetError::Handshake(HandshakeError::Snow(e)));
+        }
+    }
+    let resp_bytes = {
+        let _permit = load.try_dh_permit()?;
+        match hs.write_message(&[]) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("[lattice-net] responder write failed: {e:?}");
+                return Err(NetError::Handshake(HandshakeError::Snow(e)));
+            }
         }
     };
     let resp = RespFrame {
@@ -576,6 +661,7 @@ async fn handshake_server(
         // initiator cannot know our channel key; Noise authenticates it.
         let msg3 = next_binary(&mut ws).await?;
         let init3 = parse_init(&msg3)?;
+        let _permit = load.try_dh_permit()?;
         let _ = hs
             .read_message(&init3.noise_msg)
             .map_err(|e| NetError::Handshake(HandshakeError::Snow(e)))?;
@@ -591,5 +677,48 @@ async fn handshake_server(
     let transport = hs
         .finish()
         .map_err(|e| NetError::Handshake(HandshakeError::Snow(e)))?;
-    Ok(PeerIo::new(ws, transport, remote_static))
+    Ok(PeerIo::new(ws, transport, remote_static, peer))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dh_semaphore_refuses_when_exhausted() {
+        let load = LoadState::new(false);
+        // Drain every permit; the next attempt must fail without waiting.
+        let permits: Vec<_> = (0..HANDSHAKE_DH_PERMITS)
+            .map(|_| load.try_dh_permit().expect("permit available"))
+            .collect();
+        let err = load.try_dh_permit().unwrap_err();
+        assert!(matches!(err, NetError::HandshakeSaturated));
+        assert_eq!(
+            load.handshake_saturated
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        drop(permits);
+        // Permits are returned on drop; the next attempt succeeds.
+        assert!(load.try_dh_permit().is_ok());
+    }
+
+    #[test]
+    fn prefix_budget_drops_over_budget_prefix() {
+        let load = LoadState::new(false);
+        let peer: SocketAddr = "203.0.113.7:9000".parse().unwrap();
+        // Burst is 32; at least one of the next 8 calls must be refused
+        // even if a 1s refill boundary is crossed mid-test (4 tokens/s).
+        for _ in 0..32 {
+            assert!(load.prefix_budget_allow(&peer));
+        }
+        let denied = (0..8).filter(|_| !load.prefix_budget_allow(&peer)).count();
+        assert!(
+            denied >= 1,
+            "prefix budget never refused an over-budget peer"
+        );
+        let other_prefix: SocketAddr = "203.0.114.7:9000".parse().unwrap();
+        assert!(load.prefix_budget_allow(&other_prefix));
+        assert!(load.budget_drops.load(std::sync::atomic::Ordering::Relaxed) >= 1);
+    }
 }

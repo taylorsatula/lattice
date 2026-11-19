@@ -205,7 +205,7 @@ pub async fn connect(contact: PeerContact, channel_seed: &ChannelSeed) -> Result
     let transport = hs
         .finish()
         .map_err(|e| NetError::Handshake(HandshakeError::Snow(e)))?;
-    Ok(PeerIo::new(ws, transport, remote_static))
+    Ok(PeerIo::new(ws, transport, remote_static, target.addr))
 }
 
 /// Build the upgrade request. The request-target path is `path` (the URL's

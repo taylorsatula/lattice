@@ -30,6 +30,11 @@ pub struct PeerIo {
     ws: WebSocketStream<BoxedStream>,
     transport: TransportState,
     pub remote_static: X25519PublicKey,
+    /// The peer's socket address: the source address for accepted
+    /// connections, the dial target for outbound ones. Used by the runtime
+    /// for per-prefix accounting; not authenticated beyond what the
+    /// transport proves.
+    pub remote_addr: std::net::SocketAddr,
     /// Set when a non-binary frame is received. tungstenite 0.30 queues an
     /// automatic Pong (on Ping) or Close reply (on Close) inside the socket
     /// and flushes it on the next read/write/flush; there is no config to
@@ -43,11 +48,13 @@ impl PeerIo {
         ws: WebSocketStream<BoxedStream>,
         transport: TransportState,
         remote_static: X25519PublicKey,
+        remote_addr: std::net::SocketAddr,
     ) -> Self {
         Self {
             ws,
             transport,
             remote_static,
+            remote_addr,
             poisoned: false,
         }
     }

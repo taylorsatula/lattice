@@ -13,6 +13,7 @@ pub mod frame;
 pub mod handshake;
 pub mod path;
 pub mod peer;
+pub mod prefix;
 pub mod server;
 
 pub use client::{DialTarget, PeerContact, connect};
@@ -21,6 +22,7 @@ pub use errors::NetError;
 pub use frame::{FRAME_BUCKETS, FrameError, decode_wire, encode_wire, encode_wire_to_bucket};
 pub use path::{upgrade_path, validate_upgrade_path};
 pub use peer::PeerIo;
+pub use prefix::{SourcePrefix, prefix_of};
 pub use server::{ListenerConfig, ServeHandle, serve};
 
 /// Largest post-handshake wire message: the 32768-byte bucket plus the

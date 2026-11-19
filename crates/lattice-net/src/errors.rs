@@ -83,6 +83,9 @@ pub enum NetError {
     /// connection was attempted — e.g. every record IP was private-scoped
     /// for a WAN record.
     NoUsableAddress,
+    /// The handshake DH semaphore was exhausted; the connection was dropped
+    /// without a response, consistent with the cookie path under load.
+    HandshakeSaturated,
 }
 
 impl From<std::io::Error> for NetError {
@@ -109,6 +112,9 @@ impl core::fmt::Display for NetError {
             NetError::Timeout => write!(f, "operation timed out"),
             NetError::InvalidInput(m) => write!(f, "invalid input: {m}"),
             NetError::NoUsableAddress => write!(f, "no usable address for this endpoint"),
+            NetError::HandshakeSaturated => {
+                write!(f, "handshake DH semaphore exhausted; connection dropped")
+            }
         }
     }
 }
@@ -130,7 +136,8 @@ impl std::error::Error for NetError {
             | NetError::Closed
             | NetError::Timeout
             | NetError::InvalidInput(_)
-            | NetError::NoUsableAddress => None,
+            | NetError::NoUsableAddress
+            | NetError::HandshakeSaturated => None,
         }
     }
 }
