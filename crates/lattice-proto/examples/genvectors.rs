@@ -283,6 +283,7 @@ fn main() {
         exp: NOW + 86_400,
         gateway: None,
         waypoint: None,
+        entropy: &mut |b: &mut [u8; 64]| b.fill(0x5A),
     })
     .unwrap();
     vectors.push(serde_json::json!({

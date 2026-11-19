@@ -8,7 +8,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 
 use lattice_core::{Action, AppSend, Config, Event, Node};
 use lattice_proto::frames::Frame;
@@ -76,12 +76,55 @@ pub enum LinkState {
     Down,
 }
 
+/// Per-link fault model. The default is a perfect link.
+///
+/// All probabilities are drawn from the simulator's seeded RNG, so a run
+/// with a given seed and configuration is exactly reproducible.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LinkBehavior {
+    /// Probability in [0, 1] that a frame traversing the link is dropped.
+    pub loss: f64,
+    /// Probability in [0, 1] that a frame is delivered twice.
+    pub duplicate: f64,
+    /// Extra per-frame one-way delay drawn uniformly from [0, jitter_ms].
+    /// Nonzero values let frames overtake each other (reordering).
+    pub jitter_ms: u64,
+}
+
+impl Default for LinkBehavior {
+    fn default() -> Self {
+        Self {
+            loss: 0.0,
+            duplicate: 0.0,
+            jitter_ms: 0,
+        }
+    }
+}
+
+/// Adversarial behavior for one node. Default is an honest node.
+///
+/// The adversary acts on frames the node sends or receives; it does not
+/// get to forge identities (it has no keys it does not own).
+#[derive(Clone, Debug, Default)]
+pub struct Adversary {
+    /// Drop each outgoing frame with this probability.
+    pub drop_outgoing: f64,
+    /// Drop each incoming frame with this probability.
+    pub drop_incoming: f64,
+    /// Add this fixed delay to every outgoing frame.
+    pub delay_outgoing_ms: u64,
+    /// If set, inject `frame` on every link the node has, every
+    /// `interval_ms`. Models a spamming or garbage-spewing peer.
+    pub inject: Option<(Frame, u64)>,
+}
+
 struct Link {
     id: u64,
     a: NodeIndex,
     b: NodeIndex,
     state: LinkState,
     latency_ms: u64,
+    behavior: LinkBehavior,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,6 +140,8 @@ pub enum SimEvent {
     /// has arrived. `gen` invalidates stale wakes scheduled before the
     /// node's deadline moved.
     Wake { node: NodeIndex, generation: u64 },
+    /// An adversary's periodic injection tick for `node`.
+    Inject { node: NodeIndex },
 }
 
 pub struct Delivery {
@@ -122,10 +167,20 @@ struct ScheduledEvent {
     event: SimEvent,
 }
 
+/// Default seed for `Sim::new`. Node `i` draws its identity and RNG seed
+/// from `DEFAULT_SEED + i * GOLDEN`, so `Sim::new` runs are reproducible.
+pub const DEFAULT_SEED: u64 = 0x5EED_0000;
+const GOLDEN: u64 = 0x9E37_79B9_7F4A_7C15;
+
+/// Hard cap on events processed in one `run_for` call. A healthy scenario
+/// processes orders of magnitude fewer; exceeding this means an event is
+/// re-arming itself without the clock advancing.
+const MAX_EVENTS_PER_RUN: u64 = 1_000_000;
+
 pub struct Sim<S: Store = MemStore> {
     pub nodes: Vec<Node<S>>,
     pub ids: Vec<Identifier>,
-    pub channel_keys: std::collections::HashMap<Identifier, X25519PublicKey>,
+    pub channel_keys: BTreeMap<Identifier, X25519PublicKey>,
     links: Vec<Link>,
     next_link: u64,
     now: u64,
@@ -133,7 +188,13 @@ pub struct Sim<S: Store = MemStore> {
     seq: u64,
     pub deliveries: Vec<Delivery>,
     pub statuses: Vec<StatusObservation>,
-    pub frame_counts: std::collections::HashMap<&'static str, u64>,
+    pub frame_counts: BTreeMap<&'static str, u64>,
+    /// Frames dropped by link loss or an adversary.
+    pub dropped_frames: u64,
+    /// Extra frame copies delivered by link duplication.
+    pub duplicated_frames: u64,
+    /// Frames injected by adversaries.
+    pub injected_frames: u64,
     configs: Vec<Config>,
     prototype: Config,
     store_factory: Box<dyn FnMut(usize) -> S>,
@@ -143,11 +204,25 @@ pub struct Sim<S: Store = MemStore> {
     /// The deadline the currently pending wake is for, per node. Avoids
     /// queueing a duplicate wake when the deadline has not moved.
     wake_armed: Vec<Option<u64>>,
+    /// Per-node adversary; `None` (the default) is an honest node.
+    adversaries: Vec<Option<Adversary>>,
+    /// Seed the whole run derives from. `Sim::new` uses [`DEFAULT_SEED`].
+    seed: u64,
+    /// Simulator-side randomness (link loss/jitter/duplication, adversary
+    /// decisions). Independent of the nodes' own streams.
+    rng: lattice_core::Rng,
+    /// Per-instance counter behind `app_send`'s default message ids.
+    mid_counter: u64,
 }
 
 impl Sim<MemStore> {
     pub fn new(config: Config) -> Self {
-        Self::with_stores(config, |_| MemStore::new())
+        Self::with_seed(config, DEFAULT_SEED)
+    }
+
+    /// A simulator whose every random draw derives from `seed`.
+    pub fn with_seed(config: Config, seed: u64) -> Self {
+        Self::with_stores_and_seed(config, seed, |_| MemStore::new())
     }
 }
 
@@ -155,6 +230,15 @@ impl<S: Store> Sim<S> {
     /// A simulator whose nodes are backed by stores from `factory`
     /// (called once per added node, with the node index).
     pub fn with_stores(config: Config, factory: impl FnMut(usize) -> S + 'static) -> Self {
+        Self::with_stores_and_seed(config, DEFAULT_SEED, factory)
+    }
+
+    /// A simulator with a caller-chosen seed and store factory.
+    pub fn with_stores_and_seed(
+        config: Config,
+        seed: u64,
+        factory: impl FnMut(usize) -> S + 'static,
+    ) -> Self {
         let prototype = config;
         Sim {
             nodes: Vec::new(),
@@ -166,13 +250,20 @@ impl<S: Store> Sim<S> {
             seq: 0,
             deliveries: Vec::new(),
             statuses: Vec::new(),
-            channel_keys: std::collections::HashMap::new(),
-            frame_counts: std::collections::HashMap::new(),
+            frame_counts: BTreeMap::new(),
+            dropped_frames: 0,
+            duplicated_frames: 0,
+            injected_frames: 0,
             configs: Vec::new(),
             prototype,
             store_factory: Box::new(factory),
             wake_gen: Vec::new(),
             wake_armed: Vec::new(),
+            adversaries: Vec::new(),
+            seed,
+            rng: lattice_core::Rng::new(seed ^ 0xD1B5_4A32_D192_ED03),
+            mid_counter: 0x9E37_79B9_7F4A_7C15,
+            channel_keys: BTreeMap::new(),
         }
     }
 
@@ -184,8 +275,9 @@ impl<S: Store> Sim<S> {
     pub fn add_node_with(&mut self, f: impl FnOnce(&mut Config)) -> NodeIndex {
         let mut cfg = self.configs_prototype();
         f(&mut cfg);
-        let seed = 0x5EED_0000u64
-            .wrapping_add((self.nodes.len() as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        let seed = self
+            .seed
+            .wrapping_add((self.nodes.len() as u64).wrapping_mul(GOLDEN));
         cfg.rng_seed = seed;
         let store = (self.store_factory)(self.nodes.len());
         let idx = self.nodes.len() as u64;
@@ -203,6 +295,7 @@ impl<S: Store> Sim<S> {
         self.configs.push(cfg);
         self.wake_gen.push(0);
         self.wake_armed.push(None);
+        self.adversaries.push(None);
         self.arm_wake(node_idx);
         node_idx
     }
@@ -242,6 +335,7 @@ impl<S: Store> Sim<S> {
             b,
             state: LinkState::Up,
             latency_ms: 0,
+            behavior: LinkBehavior::default(),
         });
         self.link_up(a, id, Some(self.ids[b]), self.channel_keys[&self.ids[b]]);
         self.link_up(b, id, Some(self.ids[a]), self.channel_keys[&self.ids[a]]);
@@ -259,6 +353,7 @@ impl<S: Store> Sim<S> {
             b,
             state: LinkState::Up,
             latency_ms: 0,
+            behavior: LinkBehavior::default(),
         });
         for (from, to) in [(a, b), (b, a)] {
             self.link_up(from, id, None, self.channel_keys[&self.ids[to]]);
@@ -331,6 +426,30 @@ impl<S: Store> Sim<S> {
         }
     }
 
+    /// Set the loss/duplication/jitter behavior of a link.
+    pub fn set_link_behavior(&mut self, link: u64, behavior: LinkBehavior) {
+        if let Some(l) = self.links.iter_mut().find(|l| l.id == link) {
+            l.behavior = behavior;
+        }
+    }
+
+    /// Install (or clear, with the default) an adversary on a node.
+    ///
+    /// If the adversary injects frames, the first injection is scheduled
+    /// one interval from now and repeats until the adversary is cleared.
+    pub fn set_adversary(&mut self, node: NodeIndex, adversary: Adversary) {
+        let inject = adversary.inject.clone();
+        self.adversaries[node] = Some(adversary);
+        if let Some((_, interval_ms)) = inject {
+            self.push_event(self.now + interval_ms, SimEvent::Inject { node });
+        }
+    }
+
+    /// Ids of all links (up or down), in creation order.
+    pub fn link_ids(&self) -> Vec<u64> {
+        self.links.iter().map(|l| l.id).collect()
+    }
+
     pub fn link_between(&self, a: NodeIndex, b: NodeIndex) -> Option<u64> {
         self.links
             .iter()
@@ -384,7 +503,7 @@ impl<S: Store> Sim<S> {
         let to_id = self.ids[to];
         let send = AppSend {
             service: "test".to_string(),
-            mid_hint: Some(crate::test_mid()),
+            mid_hint: Some(self.next_mid()),
             to: to_id,
             tsvc: "test".to_string(),
             tmbx: b"inbox".to_vec(),
@@ -400,9 +519,21 @@ impl<S: Store> Sim<S> {
     }
 
     /// Run the simulation for `secs` virtual seconds.
+    ///
+    /// Panics if more than [`MAX_EVENTS_PER_RUN`] events are processed in a
+    /// single call: that means some event keeps re-arming itself at a time
+    /// the clock never advances past, which is a bug, not a slow scenario.
     pub fn run_for(&mut self, secs: u64) {
         let end = self.now + secs.saturating_mul(1000);
+        let mut events: u64 = 0;
         while let Some(ev) = self.pop_event() {
+            events += 1;
+            assert!(
+                events <= MAX_EVENTS_PER_RUN,
+                "sim: exceeded {MAX_EVENTS_PER_RUN} events in run_for({secs}) at t={}; \
+                 an event is re-arming without the clock advancing",
+                self.now
+            );
             if ev.at > end {
                 let seq = self.next_seq();
                 self.queue.push_front(ScheduledEvent {
@@ -442,6 +573,13 @@ impl<S: Store> Sim<S> {
                 from,
                 wire,
             } => {
+                // Adversarial receiver: drop the frame before the node sees it.
+                if let Some(adv) = &self.adversaries[to] {
+                    if adv.drop_incoming > 0.0 && self.rng.chance(adv.drop_incoming) {
+                        self.dropped_frames += 1;
+                        return;
+                    }
+                }
                 let bucket = lattice_net::FRAME_BUCKETS
                     .iter()
                     .position(|&b| b == wire.len());
@@ -456,6 +594,31 @@ impl<S: Store> Sim<S> {
                 });
                 self.apply_actions(to, actions);
                 self.arm_wake(to);
+            }
+            SimEvent::Inject { node } => {
+                let Some(adv) = self.adversaries[node].clone() else {
+                    return;
+                };
+                let Some((frame, interval_ms)) = adv.inject else {
+                    return;
+                };
+                // Encode once; the frame rides every up link the node has.
+                match encode_frame_wire(&frame, None) {
+                    Ok(wire) => {
+                        let links: Vec<u64> = self
+                            .links
+                            .iter()
+                            .filter(|l| l.state == LinkState::Up && (l.a == node || l.b == node))
+                            .map(|l| l.id)
+                            .collect();
+                        for link in links {
+                            self.injected_frames += 1;
+                            self.route_frame(node, link, wire.clone());
+                        }
+                    }
+                    Err(e) => panic!("sim: adversary frame failed wire encoding: {e}"),
+                }
+                self.push_event(self.now + interval_ms, SimEvent::Inject { node });
             }
             SimEvent::Wake { node, generation } => {
                 // A newer wake was armed after this one was queued; skip.
@@ -528,23 +691,56 @@ impl<S: Store> Sim<S> {
     }
 
     fn route_frame(&mut self, from: NodeIndex, link_id: u64, wire: Vec<u8>) {
+        // Adversarial sender: drop or delay before the link sees the frame.
+        if let Some(adv) = &self.adversaries[from] {
+            if adv.drop_outgoing > 0.0 && self.rng.chance(adv.drop_outgoing) {
+                self.dropped_frames += 1;
+                return;
+            }
+        }
         let Some(link) = self.links.iter().find(|l| l.id == link_id) else {
             return;
         };
         if link.state == LinkState::Down {
             return; // dropped: link down
         }
+        let behavior = link.behavior;
         let to = if link.a == from { link.b } else { link.a };
-        let at = self.now + link.latency_ms;
+        let mut at = self.now + link.latency_ms;
+        if let Some(adv) = &self.adversaries[from] {
+            at += adv.delay_outgoing_ms;
+        }
+        if behavior.jitter_ms > 0 {
+            at += self.rng.below(behavior.jitter_ms + 1);
+        }
+        if behavior.loss > 0.0 && self.rng.chance(behavior.loss) {
+            self.dropped_frames += 1;
+            return;
+        }
+        let duplicate = behavior.duplicate > 0.0 && self.rng.chance(behavior.duplicate);
+        if duplicate {
+            self.duplicated_frames += 1;
+        }
         self.push_event(
             at,
             SimEvent::Deliver {
                 to,
                 link: link_id,
                 from,
-                wire,
+                wire: wire.clone(),
             },
         );
+        if duplicate {
+            self.push_event(
+                at,
+                SimEvent::Deliver {
+                    to,
+                    link: link_id,
+                    from,
+                    wire,
+                },
+            );
+        }
     }
 
     /// Crash a node: drop its in-memory state, keep the store, rebuild.
@@ -617,17 +813,21 @@ impl<S: Store> Sim<S> {
         self.nodes[node].debug_custody_count()
     }
 
+    /// Bytes held in custody by a node (debug).
+    pub fn custody_bytes(&mut self, node: NodeIndex) -> u64 {
+        self.nodes[node].custody_bytes()
+    }
+
+    fn next_mid(&mut self) -> MessageId {
+        let v = self.mid_counter;
+        self.mid_counter = self.mid_counter.wrapping_add(GOLDEN);
+        let mut mid = [0u8; 16];
+        mid[..8].copy_from_slice(&v.to_le_bytes());
+        mid[8..].copy_from_slice(&v.rotate_left(32).to_le_bytes());
+        MessageId::from_bytes(mid)
+    }
+
     pub fn node_ids(&self) -> &[Identifier] {
         &self.ids
     }
-}
-
-fn test_mid() -> MessageId {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0x9e37_79b9_7f4a_7c15);
-    let mut mid = [0u8; 16];
-    let v = COUNTER.fetch_add(0x9E37_79B9_7F4A_7C15, Ordering::Relaxed);
-    mid[..8].copy_from_slice(&v.to_le_bytes());
-    mid[8..].copy_from_slice(&v.rotate_left(32).to_le_bytes());
-    MessageId::from_bytes(mid)
 }

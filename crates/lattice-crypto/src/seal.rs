@@ -37,7 +37,22 @@ pub fn seal(
     aad: &[u8],
     plaintext: &[u8],
 ) -> Result<Sealed, SealError> {
-    let (kem_ct, shared) = xwing::encapsulate(public)?;
+    seal_with_entropy(context, public, aad, plaintext, &mut |buf| {
+        crate::random::os_fill(buf)
+    })
+}
+
+/// Seal with caller-supplied entropy for the KEM (64 bytes, drawn fresh per
+/// call). The simulator passes its seeded stream; production callers use
+/// [`seal`], which draws from the OS.
+pub fn seal_with_entropy(
+    context: &str,
+    public: &XWingPublicKey,
+    aad: &[u8],
+    plaintext: &[u8],
+    entropy: &mut dyn FnMut(&mut [u8; 64]),
+) -> Result<Sealed, SealError> {
+    let (kem_ct, shared) = xwing::encapsulate_with_entropy(public, entropy)?;
     let key = Zeroizing::new(aead_key(context, &shared));
     let cipher = ChaCha20Poly1305::new_from_slice(key.as_ref()).expect("32-byte key");
     let ciphertext = cipher

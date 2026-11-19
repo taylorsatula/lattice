@@ -42,6 +42,13 @@ impl Rng {
         self.cipher.apply_keystream(&mut out);
         u64::from_le_bytes(out)
     }
+    /// Fill `buf` with stream bytes. Used for KEM entropy and id material.
+    pub fn fill_bytes(&mut self, buf: &mut [u8]) {
+        for chunk in buf.chunks_mut(8) {
+            let block = self.next_u64().to_le_bytes();
+            chunk.copy_from_slice(&block[..chunk.len()]);
+        }
+    }
     /// Uniform value in [0, n). n must be > 0.
     pub fn below(&mut self, n: u64) -> u64 {
         self.next_u64() % n

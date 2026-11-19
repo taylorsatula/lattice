@@ -9,7 +9,7 @@
 
 use lattice_types::{KemCiphertext, SharedSecret, XWingPublicKey, XWingSecretKey};
 use x_wing::{
-    DecapsulationKeyRejectNonContrib, Decapsulator, Encapsulate, EncapsulationKey, Kem, KeyExport,
+    DecapsulationKeyRejectNonContrib, Decapsulator, EncapsulationKey, Kem, KeyExport,
     TryDecapsulate, XWingKem, kem,
 };
 
@@ -37,12 +37,20 @@ pub fn generate_keypair() -> XWingKeypair {
     }
 }
 
-pub(crate) fn encapsulate(
+/// Encapsulate with caller-supplied entropy (64 bytes, used exactly as the
+/// X-Wing encapsulation randomness). `encapsulate_deterministic` is the
+/// crate's public hook for exactly this: the bytes are consumed as the
+/// ML-KEM and X25519 randomness, so they must be uniform and never reused.
+/// The daemon passes OS entropy; the simulator passes its seeded stream.
+pub(crate) fn encapsulate_with_entropy(
     public: &XWingPublicKey,
+    entropy: &mut dyn FnMut(&mut [u8; 64]),
 ) -> Result<(KemCiphertext, SharedSecret), SealError> {
     let ek = EncapsulationKey::try_from(public.as_bytes().as_slice())
         .map_err(|_| SealError::BadPublicKey)?;
-    let (ct, ss) = ek.encapsulate();
+    let mut randomness = [0u8; 64];
+    entropy(&mut randomness);
+    let (ct, ss) = ek.encapsulate_deterministic(&randomness.into());
     Ok((
         KemCiphertext::from_bytes(ct.into()),
         SharedSecret::from_bytes(ss.into()),

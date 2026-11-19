@@ -7,9 +7,7 @@
 //! so the outer header of a waypoint-routed message is never signed and never
 //! needs to be secret.
 
-use lattice_crypto::{
-    ENVELOPE_CONTEXT, HOP_CONTEXT, RECEIPT_CONTEXT, open, seal, signing_preimage,
-};
+use lattice_crypto::{ENVELOPE_CONTEXT, HOP_CONTEXT, RECEIPT_CONTEXT, open, signing_preimage};
 use lattice_types::{
     Identifier, KemCiphertext, LegId, MessageId, Signature, SigningPublicKey, SigningSeed,
     XWingPublicKey, XWingSecretKey,
@@ -97,8 +95,9 @@ impl SealedLayer {
         public: &XWingPublicKey,
         aad: &[u8],
         plaintext: &[u8],
+        entropy: &mut dyn FnMut(&mut [u8; 64]),
     ) -> Result<Self, ProtoError> {
-        let s = seal(context, public, aad, plaintext)?;
+        let s = lattice_crypto::seal_with_entropy(context, public, aad, plaintext, entropy)?;
         Ok(Self {
             kem: s.kem_ciphertext,
             ct: s.ciphertext,
@@ -374,6 +373,10 @@ pub struct BuildParams<'a> {
     pub exp: u64,
     pub gateway: Option<GatewaySeal>,
     pub waypoint: Option<WaypointSeal>,
+    /// Entropy for the KEM encapsulations (64 bytes per sealed layer).
+    /// The daemon passes OS entropy; the simulator passes its seeded
+    /// stream. Never reuse bytes across calls.
+    pub entropy: &'a mut dyn FnMut(&mut [u8; 64]),
 }
 
 /// Assemble the 4-element message array with exactly `bucket` bytes of
@@ -429,8 +432,13 @@ impl Message {
 
         envelope.sign(params.sender_seed, &real_bytes);
         let env_pt = encode(&envelope.to_value());
-        let env_layer =
-            SealedLayer::seal_to(ENVELOPE_CONTEXT, params.recipient_ek, &real_bytes, &env_pt)?;
+        let env_layer = SealedLayer::seal_to(
+            ENVELOPE_CONTEXT,
+            params.recipient_ek,
+            &real_bytes,
+            &env_pt,
+            params.entropy,
+        )?;
 
         // A gateway layer, when present, travels adjacent to the real header.
         let gateway_layer = match &params.gateway {
@@ -441,6 +449,7 @@ impl Message {
                     &gw.gateway_ek,
                     &real_bytes,
                     &pt,
+                    params.entropy,
                 )?)
             }
             None => None,
@@ -459,8 +468,13 @@ impl Message {
                     inner: gateway_layer.map(Box::new),
                 };
                 let wp_pt = encode(&inner.to_value());
-                let layer =
-                    SealedLayer::seal_to(HOP_CONTEXT, &wp.waypoint_ek, &outer_bytes, &wp_pt)?;
+                let layer = SealedLayer::seal_to(
+                    HOP_CONTEXT,
+                    &wp.waypoint_ek,
+                    &outer_bytes,
+                    &wp_pt,
+                    params.entropy,
+                )?;
                 (outer, Some(layer))
             }
             None => (real, gateway_layer),
