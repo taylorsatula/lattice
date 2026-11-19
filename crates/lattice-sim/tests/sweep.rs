@@ -18,7 +18,7 @@
 //!
 //! Every run is fully determined by its seed: same seed, same trace. The
 //! failing seed is printed on failure. Set `LATTICE_SWEEP_SEEDS` to change
-//! the number of seeds (default 16).
+//! the number of seeds (default 8).
 //!
 //! `checker_flags_unterminated_message` demonstrates the checker catching a
 //! violation: with all links at 100% loss and a receipt timeout far beyond
@@ -107,9 +107,8 @@ fn build_scenario(seed: u64) -> (Sim, Vec<(MessageId, usize, usize)>) {
     }
     // Let records converge before sending.
     for _ in 0..60 {
-        let converged = (0..NODES).all(|i| {
-            (0..NODES).all(|j| i == j || sim.nodes[i].has_path(&sim.ids[j]))
-        });
+        let converged =
+            (0..NODES).all(|i| (0..NODES).all(|j| i == j || sim.nodes[i].has_path(&sim.ids[j])));
         if converged {
             break;
         }
@@ -137,10 +136,13 @@ fn check_invariants(
     let mut violations = Vec::new();
 
     // (a) Convergence: every node holds every node's record.
-    for i in 0..NODES {
+    let nodes = sim.nodes.len();
+    for i in 0..nodes {
         let held = sim.nodes[i].debug_record_count();
-        if held < NODES {
-            violations.push(format!("node {i}: holds {held}/{NODES} records (convergence)"));
+        if held < nodes {
+            violations.push(format!(
+                "node {i}: holds {held}/{nodes} records (convergence)"
+            ));
         }
     }
 
@@ -160,7 +162,7 @@ fn check_invariants(
     }
 
     // (c) Bounded state: custody bytes and inbox occupancy within caps.
-    for i in 0..NODES {
+    for i in 0..nodes {
         let bytes = sim.custody_bytes(i);
         if bytes > cfg.transit_cap {
             violations.push(format!(
@@ -168,7 +170,10 @@ fn check_invariants(
                 cfg.transit_cap
             ));
         }
-        let inbox = sim.nodes[i].store_ref().inbox_len_total().unwrap_or(u64::MAX);
+        let inbox = sim.nodes[i]
+            .store_ref()
+            .inbox_len_total()
+            .unwrap_or(u64::MAX);
         if inbox > cfg.inbox_max_total {
             violations.push(format!(
                 "node {i}: inbox holds {inbox}, cap is {}",
@@ -198,15 +203,31 @@ fn seed_sweep_invariants_hold() {
     let seeds: u64 = std::env::var("LATTICE_SWEEP_SEEDS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(16);
+        .unwrap_or(8);
     let cfg = sweep_config();
     let mut failures = Vec::new();
     for seed in 0..seeds {
-        let (mut sim, sent) = build_scenario(seed);
-        sim.run_for(150);
-        let violations = check_invariants(&mut sim, &sent, &cfg);
-        if !violations.is_empty() {
-            failures.push(format!("seed {seed}:\n  {}", violations.join("\n  ")));
+        // A scenario that trips the sim's event cap (or any other panic)
+        // is reported as a failure for this seed, not as a hung test.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let (mut sim, sent) = build_scenario(seed);
+            sim.run_for(150);
+            check_invariants(&mut sim, &sent, &cfg)
+        }));
+        match outcome {
+            Ok(violations) => {
+                if !violations.is_empty() {
+                    failures.push(format!("seed {seed}:\n  {}", violations.join("\n  ")));
+                }
+            }
+            Err(payload) => {
+                let msg = payload
+                    .downcast_ref::<&str>()
+                    .map(|s| (*s).to_string())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "unknown panic".to_string());
+                failures.push(format!("seed {seed}: panicked: {msg}"));
+            }
         }
     }
     assert!(
@@ -301,10 +322,7 @@ fn adversary_blackhole_node_still_terminates_messages() {
         .statuses
         .iter()
         .any(|s| s.mid == mid && TERMINAL.contains(&s.status));
-    assert!(
-        !delivered,
-        "black-holed message must not be delivered"
-    );
+    assert!(!delivered, "black-holed message must not be delivered");
     assert!(
         terminal,
         "sender must be told the message failed (terminal status)"

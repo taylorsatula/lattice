@@ -7,9 +7,7 @@
 //! so the outer header of a waypoint-routed message is never signed and never
 //! needs to be secret.
 
-use lattice_crypto::{
-    ENVELOPE_CONTEXT, HOP_CONTEXT, RECEIPT_CONTEXT, open, signing_preimage,
-};
+use lattice_crypto::{ENVELOPE_CONTEXT, HOP_CONTEXT, RECEIPT_CONTEXT, open, signing_preimage};
 use lattice_types::{
     Identifier, KemCiphertext, LegId, MessageId, Signature, SigningPublicKey, SigningSeed,
     XWingPublicKey, XWingSecretKey,

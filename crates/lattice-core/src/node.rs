@@ -2288,7 +2288,7 @@ impl<S: Store> Node<S> {
                 envelope_key: e.record.envelope_key,
             })
             .collect();
-        candidates.sort_by(|a, b| a.id.cmp(&b.id));
+        candidates.sort_by_key(|c| c.id);
         let candidates = Arc::new(candidates);
         self.waypoint_cache = Some((key.0, key.1, Arc::clone(&candidates)));
         candidates
@@ -3551,7 +3551,7 @@ impl<S: Store> Node<S> {
         let mut actions = Vec::new();
         match self.store.outbound_all() {
             Ok(mut all) => {
-                all.sort_by(|a, b| a.mid.cmp(&b.mid));
+                all.sort_by_key(|m| m.mid);
                 for msg in all {
                     let mut msg = outbound_from_store(msg);
                     if !msg.state.is_terminal() && msg.exp <= now {
@@ -3586,7 +3586,7 @@ impl<S: Store> Node<S> {
         let mut actions = Vec::new();
         match self.store.outbound_all() {
             Ok(mut all) => {
-                all.sort_by(|a, b| a.mid.cmp(&b.mid));
+                all.sort_by_key(|m| m.mid);
                 for msg in all {
                     let mut msg = outbound_from_store(msg);
                     if msg.state != OutboundState::InFlight {
@@ -3636,7 +3636,7 @@ impl<S: Store> Node<S> {
         let stale: Vec<LegId> = self
             .pending
             .iter()
-            .filter(|(_, p)| now.saturating_sub(p.sent_at) > CUSTODY_TIMEOUT_MS)
+            .filter(|(_, p)| now.saturating_sub(p.sent_at) >= CUSTODY_TIMEOUT_MS)
             .map(|(leg, _)| *leg)
             .collect();
         for leg in stale {
@@ -3721,7 +3721,7 @@ impl<S: Store> Node<S> {
     fn sweep_custody_expiry(&mut self, now: u64) {
         match self.store.custody_all() {
             Ok(mut all) => {
-                all.sort_by(|a, b| a.leg.cmp(&b.leg));
+                all.sort_by_key(|e| e.leg);
                 for entry in all.into_iter().map(custody_from_store) {
                     if entry.exp <= now {
                         match self.store.custody_remove(&entry.leg) {

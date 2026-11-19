@@ -172,6 +172,11 @@ struct ScheduledEvent {
 pub const DEFAULT_SEED: u64 = 0x5EED_0000;
 const GOLDEN: u64 = 0x9E37_79B9_7F4A_7C15;
 
+/// Hard cap on events processed in one `run_for` call. A healthy scenario
+/// processes orders of magnitude fewer; exceeding this means an event is
+/// re-arming itself without the clock advancing.
+const MAX_EVENTS_PER_RUN: u64 = 1_000_000;
+
 pub struct Sim<S: Store = MemStore> {
     pub nodes: Vec<Node<S>>,
     pub ids: Vec<Identifier>,
@@ -514,9 +519,21 @@ impl<S: Store> Sim<S> {
     }
 
     /// Run the simulation for `secs` virtual seconds.
+    ///
+    /// Panics if more than [`MAX_EVENTS_PER_RUN`] events are processed in a
+    /// single call: that means some event keeps re-arming itself at a time
+    /// the clock never advances past, which is a bug, not a slow scenario.
     pub fn run_for(&mut self, secs: u64) {
         let end = self.now + secs.saturating_mul(1000);
+        let mut events: u64 = 0;
         while let Some(ev) = self.pop_event() {
+            events += 1;
+            assert!(
+                events <= MAX_EVENTS_PER_RUN,
+                "sim: exceeded {MAX_EVENTS_PER_RUN} events in run_for({secs}) at t={}; \
+                 an event is re-arming without the clock advancing",
+                self.now
+            );
             if ev.at > end {
                 let seq = self.next_seq();
                 self.queue.push_front(ScheduledEvent {
@@ -814,5 +831,3 @@ impl<S: Store> Sim<S> {
         &self.ids
     }
 }
-
-

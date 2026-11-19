@@ -196,7 +196,7 @@ fn messages_land_in_exact_buckets() {
             exp: EXP,
             gateway: None,
             waypoint: None,
-                entropy: &mut |b: &mut [u8; 64]| b.fill(0x5A),
+            entropy: &mut |b: &mut [u8; 64]| b.fill(0x5A),
         })
         .unwrap();
         assert!(
@@ -243,7 +243,7 @@ fn expired_message_rejected_at_parse() {
             exp: NOW - 1, // already expired
             gateway: None,
             waypoint: None,
-                entropy: &mut |b: &mut [u8; 64]| b.fill(0x5A),
+            entropy: &mut |b: &mut [u8; 64]| b.fill(0x5A),
         })
         .unwrap()
     };
