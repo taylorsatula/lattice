@@ -211,6 +211,9 @@ pub struct Sim<S: Store = MemStore> {
     /// Simulator-side randomness (link loss/jitter/duplication, adversary
     /// decisions). Independent of the nodes' own streams.
     rng: lattice_core::Rng,
+    /// (from, to) pairs whose dials always fail. Used to exercise
+    /// dial-failure paths (e.g. test-before-evict).
+    dial_blocked: std::collections::HashSet<(NodeIndex, NodeIndex)>,
     /// Per-instance counter behind `app_send`'s default message ids.
     mid_counter: u64,
 }
@@ -260,6 +263,7 @@ impl<S: Store> Sim<S> {
             wake_gen: Vec::new(),
             wake_armed: Vec::new(),
             adversaries: Vec::new(),
+            dial_blocked: std::collections::HashSet::new(),
             seed,
             rng: lattice_core::Rng::new(seed ^ 0xD1B5_4A32_D192_ED03),
             mid_counter: 0x9E37_79B9_7F4A_7C15,
@@ -406,16 +410,14 @@ impl<S: Store> Sim<S> {
                 self.channel_keys[&self.ids[a]],
             );
         } else {
-            let _ = self.nodes[a].handle(Event::LinkDown {
-                at: self.now,
-                link: link_id,
-            });
-            let _ = self.nodes[b].handle(Event::LinkDown {
-                at: self.now,
-                link: link_id,
-            });
-            self.arm_wake(a);
-            self.arm_wake(b);
+            for end in [a, b] {
+                let (actions, _diags) = self.nodes[end].handle(Event::LinkDown {
+                    at: self.now,
+                    link: link_id,
+                });
+                self.apply_actions(end, actions);
+                self.arm_wake(end);
+            }
         }
     }
 
@@ -455,6 +457,25 @@ impl<S: Store> Sim<S> {
             .iter()
             .find(|l| (l.a == a && l.b == b) || (l.a == b && l.b == a))
             .map(|l| l.id)
+    }
+
+    /// The id of the *up* link between `a` and `b`, if any.
+    pub fn up_link_between(&self, a: NodeIndex, b: NodeIndex) -> Option<u64> {
+        self.links
+            .iter()
+            .find(|l| {
+                l.state == LinkState::Up && ((l.a == a && l.b == b) || (l.a == b && l.b == a))
+            })
+            .map(|l| l.id)
+    }
+
+    /// Block or unblock dials from `from` to `to` (dial-failure injection).
+    pub fn set_dial_blocked(&mut self, from: NodeIndex, to: NodeIndex, blocked: bool) {
+        if blocked {
+            self.dial_blocked.insert((from, to));
+        } else {
+            self.dial_blocked.remove(&(from, to));
+        }
     }
 
     /// Full-control send used by tests that need a custom AppSend.
@@ -686,6 +707,51 @@ impl<S: Store> Sim<S> {
                 // The simulator tracks links itself; binding changes are a
                 // runtime concern.
                 Action::LinkBound { .. } => {}
+                Action::Dial { peer, .. } => {
+                    // Perform the dial: connect the two nodes if the
+                    // target exists and the dial is not blocked, else
+                    // report the failure back to the dialing node.
+                    let target = self.ids.iter().position(|id| *id == peer);
+                    match target {
+                        Some(t) if !self.dial_blocked.contains(&(from, t)) => {
+                            let id = self.next_link;
+                            self.next_link += 1;
+                            self.links.push(Link {
+                                id,
+                                a: from,
+                                b: t,
+                                state: LinkState::Up,
+                                latency_ms: 0,
+                                behavior: LinkBehavior::default(),
+                            });
+                            let ck_to = self.channel_keys[&self.ids[t]];
+                            let ck_from = self.channel_keys[&self.ids[from]];
+                            // The dialer pins the peer (IK dial); the
+                            // callee sees an unsolicited inbound link.
+                            self.link_up(from, id, Some(self.ids[t]), ck_to);
+                            self.link_up(t, id, None, ck_from);
+                        }
+                        _ => {
+                            let (actions, _diags) =
+                                self.nodes[from].handle(Event::DialFailed { at: self.now, peer });
+                            self.apply_actions(from, actions);
+                        }
+                    }
+                }
+                Action::CloseLink { link } => {
+                    if let Some(idx) = self.links.iter().position(|l| l.id == link) {
+                        if self.links[idx].state == LinkState::Up {
+                            self.links[idx].state = LinkState::Down;
+                            let (a, b) = (self.links[idx].a, self.links[idx].b);
+                            for end in [a, b] {
+                                let (actions, _diags) =
+                                    self.nodes[end].handle(Event::LinkDown { at: self.now, link });
+                                self.apply_actions(end, actions);
+                                self.arm_wake(end);
+                            }
+                        }
+                    }
+                }
             }
         }
     }

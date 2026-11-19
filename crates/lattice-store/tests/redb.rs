@@ -157,6 +157,35 @@ fn exercise<S: Store>(s: &mut S) -> String {
     assert_eq!(s.inbox_ack("svc", &[did(0xD1)]).unwrap(), 1);
     assert_eq!(s.inbox_len("svc").unwrap(), 0);
 
+    s.saved_peer_put(&lattice_store::SavedPeer {
+        id: id(21),
+        scope: Scope::Wan,
+        endpoint: "ws://peer.example.com/".into(),
+        ips: vec!["203.0.113.7".parse().unwrap()],
+        channel_key: lattice_types::ChannelPublicKey::from_bytes([0x5A; 32]),
+        saved_at: 1_234,
+        anchor: true,
+    })
+    .unwrap();
+    s.saved_peer_put(&lattice_store::SavedPeer {
+        id: id(22),
+        scope: Scope::Hive,
+        endpoint: "ws://hive.example.com/".into(),
+        ips: vec![],
+        channel_key: lattice_types::ChannelPublicKey::from_bytes([0x5B; 32]),
+        saved_at: 1_235,
+        anchor: false,
+    })
+    .unwrap();
+    let mut peers = s.saved_peer_all().unwrap();
+    peers.sort_by_key(|p| (p.id, matches!(p.scope, Scope::Hive) as u8));
+    assert_eq!(peers.len(), 2);
+    assert_eq!(peers[0].endpoint, "ws://peer.example.com/");
+    assert!(peers[0].anchor);
+    assert_eq!(peers[1].scope, Scope::Hive);
+    s.saved_peer_remove(&id(22), Scope::Hive).unwrap();
+    assert_eq!(s.saved_peer_all().unwrap().len(), 1);
+
     s.status_set(&mid(4), 3, None, 1_000).unwrap();
     assert_eq!(
         s.status_get(&mid(4)).unwrap(),
@@ -309,6 +338,30 @@ fn schema_v1_database_fails_loudly() {
     assert!(
         matches!(err, lattice_store::StoreError::NoMigration { from: 1 }),
         "expected NoMigration {{ from: 1 }}, got {err}"
+    );
+}
+
+#[test]
+fn schema_v3_database_fails_loudly() {
+    // v4 added the saved_peers table; a v3 database must not open
+    // silently.
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("v3.redb");
+    {
+        let db = redb::Database::create(&path).unwrap();
+        let txn = db.begin_write().unwrap();
+        {
+            let mut meta = txn
+                .open_table(redb::TableDefinition::<&str, u64>::new("meta"))
+                .unwrap();
+            meta.insert("schema_version", 3).unwrap();
+        }
+        txn.commit().unwrap();
+    }
+    let err = RedbStore::open(&path).map(|_| ()).unwrap_err();
+    assert!(
+        matches!(err, lattice_store::StoreError::NoMigration { from: 3 }),
+        "expected NoMigration {{ from: 3 }}, got {err}"
     );
 }
 

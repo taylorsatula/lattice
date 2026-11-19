@@ -21,7 +21,9 @@ use lattice_proto::local::MessageStatus;
 use lattice_proto::message::Envelope;
 use lattice_types::{DeliveryId, Identifier, LegId, MessageId};
 
-use crate::{CustodyEntry, Exclusion, InboxEntry, OutboundMessage, OutboundState, StoreError};
+use crate::{
+    CustodyEntry, Exclusion, InboxEntry, OutboundMessage, OutboundState, SavedPeer, StoreError,
+};
 
 fn codec<E: Into<ProtoError>>(context: &'static str) -> impl FnOnce(E) -> StoreError {
     move |e| StoreError::Codec {
@@ -366,4 +368,62 @@ fn status_from_value(v: &Value) -> Result<(MessageStatus, u64), ProtoError> {
         },
         opt_uint(v, 2)?.unwrap_or(0),
     ))
+}
+
+pub(crate) fn encode_saved_peer(peer: &SavedPeer) -> Vec<u8> {
+    cbor::encode(&Value::map(vec![
+        (Value::UInt(0), Value::Text(peer.endpoint.clone())),
+        (
+            Value::UInt(1),
+            Value::Array(
+                peer.ips
+                    .iter()
+                    .map(|ip| Value::Text(ip.to_string()))
+                    .collect(),
+            ),
+        ),
+        (Value::UInt(2), Value::UInt(peer.saved_at)),
+        (Value::UInt(3), Value::Bool(peer.anchor)),
+        (Value::UInt(4), bytes_value(peer.channel_key.as_bytes())),
+    ]))
+}
+
+pub(crate) fn decode_saved_peer(
+    bytes: &[u8],
+    id: lattice_types::Identifier,
+    scope: lattice_proto::record::Scope,
+) -> Result<SavedPeer, StoreError> {
+    const CTX: &str = "decode saved peer";
+    let v = cbor::decode(bytes).map_err(codec(CTX))?;
+    saved_peer_from_value(&v, id, scope).map_err(codec(CTX))
+}
+
+fn saved_peer_from_value(
+    v: &Value,
+    id: lattice_types::Identifier,
+    scope: lattice_proto::record::Scope,
+) -> Result<SavedPeer, ProtoError> {
+    deny_unknown_keys(v, &[0, 1, 2, 3, 4])?;
+    let ips = req_array(v, 1)?
+        .iter()
+        .map(|ip| {
+            ip.as_text()
+                .ok_or(ProtoError::WrongType(1, "text"))?
+                .parse::<std::net::IpAddr>()
+                .map_err(|_| ProtoError::Invalid("bad ip in saved peer"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let anchor = match cbor::map_get(v, 3) {
+        Some(Value::Bool(b)) => *b,
+        _ => return Err(ProtoError::WrongType(3, "bool")),
+    };
+    Ok(SavedPeer {
+        id,
+        scope,
+        endpoint: req_text(v, 0)?.to_string(),
+        ips,
+        saved_at: req_uint(v, 2)?,
+        anchor,
+        channel_key: lattice_types::ChannelPublicKey::from_bytes(fixed(v, 4)?),
+    })
 }

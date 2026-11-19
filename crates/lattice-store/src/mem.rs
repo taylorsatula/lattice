@@ -26,6 +26,7 @@ pub struct MemStore {
     custody_class_bytes: [u64; CLASS_SLOTS],
     drain: DrainState,
     next_link_id: u64,
+    saved_peers: BTreeMap<(Identifier, u8), SavedPeer>,
     /// Snapshot taken at `begin_batch`; restored by `abort_batch` and by a
     /// failed `commit_batch`, so a discarded batch leaves the store as it
     /// was. `None` when no batch is active.
@@ -252,6 +253,19 @@ impl Store for MemStore {
     fn share_upstream_count(&self, dest: &Identifier) -> Result<u64, StoreError> {
         Ok(self.shares.keys().filter(|(d, _)| d == dest).count() as u64)
     }
+    fn saved_peer_put(&mut self, peer: &SavedPeer) -> Result<(), StoreError> {
+        self.saved_peers
+            .insert((peer.id, scope_key(peer.scope)), peer.clone());
+        Ok(())
+    }
+    fn saved_peer_remove(&mut self, id: &Identifier, scope: Scope) -> Result<(), StoreError> {
+        self.saved_peers.remove(&(*id, scope_key(scope)));
+        Ok(())
+    }
+    fn saved_peer_all(&self) -> Result<Vec<SavedPeer>, StoreError> {
+        Ok(self.saved_peers.values().cloned().collect())
+    }
+
     fn alloc_link_id(&mut self) -> Result<u64, StoreError> {
         let id = self.next_link_id;
         self.next_link_id = self

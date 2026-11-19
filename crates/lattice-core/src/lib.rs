@@ -17,6 +17,7 @@
 mod error;
 mod frame_budget;
 pub mod graph;
+mod neighbor;
 pub mod node;
 mod outbound;
 pub mod reconcile;

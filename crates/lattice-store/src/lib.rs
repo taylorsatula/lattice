@@ -22,7 +22,11 @@ pub use redb_store::RedbStore;
 
 use lattice_proto::local::{DrainState, MessageStatus};
 use lattice_proto::record::Scope;
-use lattice_types::{Commitment, DeliveryId, Hash32, Identifier, LegId, MessageId};
+use std::net::IpAddr;
+
+use lattice_types::{
+    ChannelPublicKey, Commitment, DeliveryId, Hash32, Identifier, LegId, MessageId,
+};
 
 /// How long a status row is kept before the retention sweep drops it.
 /// Matches the 7-day outbound retention: a status is only useful while
@@ -125,6 +129,29 @@ pub struct KelHeadSeen {
     pub commitment: Commitment,
     pub seen: u64,
     pub abandoned: bool,
+}
+
+/// A peer the node has connected to, kept so it can be re-dialed at boot
+/// even after its record has expired. Written when a link binds to the
+/// peer; refreshed on every re-bind. `anchor` marks the few peers the
+/// neighbor selection treats as anchors (never evicted).
+///
+/// Encoded as a CBOR map `{0: endpoint, 1: [ips], 2: saved_at, 3: anchor,
+/// 4: channel_key}`; the table key is `id || scope byte`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SavedPeer {
+    pub id: Identifier,
+    pub scope: Scope,
+    /// Endpoint URL from the peer's record (or the dialed endpoint).
+    pub endpoint: String,
+    /// Literal IPs from the record; preferred over DNS at dial time.
+    pub ips: Vec<IpAddr>,
+    /// The peer's channel key from its record; used for the IK dial.
+    pub channel_key: ChannelPublicKey,
+    /// Unix seconds when this entry was last refreshed.
+    pub saved_at: u64,
+    /// Anchor peers are never evicted by the neighbor selection.
+    pub anchor: bool,
 }
 
 /// A neighbor excluded from custody forwarding until `until` (unix time).
@@ -289,6 +316,13 @@ pub trait Store {
     /// persisted counter starting at [`LINK_ID_BASE`], so an id never
     /// aliases a link id recorded in a custody row by an earlier run.
     fn alloc_link_id(&mut self) -> Result<u64, StoreError>;
+
+    // saved peers: the neighbor set persisted across restarts, so a node
+    // that was offline longer than record lifetime can still re-dial its
+    // former neighbors. Keyed by (id, scope).
+    fn saved_peer_put(&mut self, peer: &SavedPeer) -> Result<(), StoreError>;
+    fn saved_peer_remove(&mut self, id: &Identifier, scope: Scope) -> Result<(), StoreError>;
+    fn saved_peer_all(&self) -> Result<Vec<SavedPeer>, StoreError>;
 
     // dedup
     fn seen_contains(&self, hash: &Hash32, now: u64) -> Result<bool, StoreError>;

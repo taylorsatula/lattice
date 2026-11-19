@@ -42,10 +42,16 @@ pub enum Cmd {
 
 /// Outcome of a dial spawned off the event loop, delivered back over a
 /// channel the loop selects on. `pinned` is the peer id to attribute the
-/// link to (IK dials only), resolved before the dial was spawned.
+/// link to (IK dials only), resolved before the dial was spawned. `addr`
+/// is the dialed address for configured roots; `None` for core-initiated
+/// candidate dials (the endpoint may be a hostname that resolved to
+/// several addresses). `from_core` marks dials the core's neighbor
+/// selection asked for; their failures are reported back to the core as
+/// `Event::DialFailed`.
 pub struct DialOutcome {
-    addr: std::net::SocketAddr,
+    addr: Option<std::net::SocketAddr>,
     pinned: Option<Identifier>,
+    from_core: bool,
     result: Result<lattice_net::PeerIo, lattice_net::NetError>,
 }
 
@@ -164,6 +170,12 @@ struct RootDial {
     next_attempt: u64,
     attempts: u32,
     in_flight: bool,
+    /// Set once the root has been contacted successfully. A contacted
+    /// root is demoted to an ordinary peer: it is no longer redialed by
+    /// the root logic (the core's saved-peer/candidate logic re-dials it
+    /// like any other peer). Roots remain in the config as bootstrap
+    /// hints for the next start.
+    contacted: bool,
 }
 
 /// Overall deadline for one dial (connect, WebSocket upgrade, handshake).
@@ -825,9 +837,17 @@ impl Runtime {
     }
 
     /// Register the configured roots. Each is dialed immediately and then
-    /// retried with exponential backoff (capped at 60s) until a link to it
-    /// is established; if the link later drops, dialing resumes.
+    /// retried with exponential backoff (capped at 60s) until the first
+    /// successful contact; after that the root is demoted to an ordinary
+    /// peer and is never redialed by this logic (the core's
+    /// saved-peer/candidate logic re-dials it like any other peer).
+    ///
+    /// Before the roots are dialed, the core's saved neighbor set is
+    /// re-dialed (anchors first): a node that was connected before a
+    /// restart re-forms its mesh before falling back to bootstrap hints.
     pub fn set_roots(&mut self, roots: Vec<RootSpec>) {
+        let startup = self.with_node(|n| n.startup_dials());
+        let _ = self.apply_actions(startup);
         self.roots = roots
             .into_iter()
             .map(|r| RootDial {
@@ -838,15 +858,22 @@ impl Runtime {
                 next_attempt: 0,
                 attempts: 0,
                 in_flight: false,
+                contacted: false,
             })
             .collect();
         self.redial_roots();
     }
 
     /// Queue a dial for every root that is due and not currently connected.
+    /// Roots that have been contacted at least once are demoted to
+    /// ordinary peers: they are no longer redialed here. The core's
+    /// saved-peer/candidate logic re-dials them like any other peer.
     fn redial_roots(&mut self) {
         let now = now_secs();
         for root in &mut self.roots {
+            if root.contacted {
+                continue;
+            }
             let connected = self.links.values().any(|l| l.addr == Some(root.addr));
             if connected {
                 root.attempts = 0;
@@ -1259,6 +1286,26 @@ impl Runtime {
                         }
                     }
                 }
+                Action::Dial {
+                    endpoint,
+                    ips,
+                    scope,
+                    channel_key,
+                    peer,
+                    // The core handles eviction once the new link binds;
+                    // the daemon only executes the dial.
+                    evict_on_success: _,
+                } => {
+                    self.spawn_candidate_dial(endpoint, ips, scope, channel_key, peer);
+                }
+                Action::CloseLink { link } => {
+                    // Test-before-evict: the replacement proved itself;
+                    // drop the incumbent. The caller feeds LinkDown back
+                    // into the core.
+                    if self.remove_link(link) {
+                        dropped.push(link);
+                    }
+                }
             }
         }
         dropped
@@ -1597,11 +1644,62 @@ impl Runtime {
                 .await
                 .unwrap_or(Err(lattice_net::NetError::Timeout));
             let _ = tx.send(DialOutcome {
-                addr,
+                addr: Some(addr),
                 pinned,
+                from_core: false,
                 result,
             });
         });
+    }
+
+    /// Spawn a dial the core's neighbor selection asked for. Unlike root
+    /// dials these go through `connect_scoped`, which enforces the
+    /// record's scope (a WAN candidate is never dialed at a private
+    /// address), and they always use IK against the record's channel key.
+    fn spawn_candidate_dial(
+        &mut self,
+        endpoint: String,
+        ips: Vec<std::net::IpAddr>,
+        scope: lattice_proto::record::Scope,
+        channel_key: ChannelPublicKey,
+        peer: Identifier,
+    ) {
+        let url = match lattice_net::parse_endpoint(&endpoint) {
+            Ok(u) => u,
+            Err(e) => {
+                eprintln!("lattice: candidate dial to {endpoint:?} refused: {e}");
+                self.queue_event(Event::DialFailed { at: now_ms(), peer });
+                return;
+            }
+        };
+        let seed = self.channel_seed.clone();
+        let tx = self.dial_tx.clone();
+        self.dials_in_flight += 1;
+        tokio::spawn(async move {
+            let result = tokio::time::timeout(
+                DIAL_DEADLINE,
+                lattice_net::connect_scoped(&seed, &url, &ips, scope, Some(channel_key), None),
+            )
+            .await
+            .unwrap_or(Err(lattice_net::NetError::Timeout));
+            let _ = tx.send(DialOutcome {
+                addr: None,
+                pinned: Some(peer),
+                from_core: true,
+                result,
+            });
+        });
+    }
+
+    /// Mark a root as contacted: it is demoted to an ordinary peer and
+    /// never redialed by the root logic again. The core's saved-peer /
+    /// candidate logic re-dials it like any other peer.
+    fn mark_root_contacted(&mut self, addr: std::net::SocketAddr) {
+        if let Some(root) = self.roots.iter_mut().find(|r| r.addr == addr) {
+            root.attempts = 0;
+            root.next_attempt = now_secs() + 60;
+            root.contacted = true;
+        }
     }
 
     fn clear_root_in_flight(&mut self, addr: std::net::SocketAddr) {
@@ -1612,8 +1710,15 @@ impl Runtime {
 
     /// Apply the outcome of a spawned dial: attach the link on success,
     /// log on failure, and release the root's in-flight slot either way.
+    /// A successful root dial demotes the root to an ordinary peer: it is
+    /// never redialed by the root logic again (the core re-dials it like
+    /// any other peer once it has a record).
     async fn handle_dial_outcome(&mut self, outcome: DialOutcome) {
         self.dials_in_flight = self.dials_in_flight.saturating_sub(1);
+        let target = outcome
+            .addr
+            .map(|a| a.to_string())
+            .unwrap_or_else(|| "candidate".to_string());
         match outcome.result {
             Ok(io) => {
                 let remote_ck = io.remote_static;
@@ -1625,17 +1730,29 @@ impl Runtime {
                     .await
                     .is_some()
                 {
-                    if let Some(root) = self.roots.iter_mut().find(|r| r.addr == outcome.addr) {
-                        root.attempts = 0;
-                        root.next_attempt = now_secs() + 60;
+                    if let Some(addr) = outcome.addr {
+                        self.mark_root_contacted(addr);
+                    }
+                } else if outcome.from_core {
+                    // The caps refused the link; tell the core so it can
+                    // clear the pending dial and back off.
+                    if let Some(peer) = outcome.pinned {
+                        self.queue_event(Event::DialFailed { at: now_ms(), peer });
                     }
                 }
             }
             Err(e) => {
-                eprintln!("lattice: dial {} failed: {e}", outcome.addr);
+                eprintln!("lattice: dial {target} failed: {e}");
+                if outcome.from_core {
+                    if let Some(peer) = outcome.pinned {
+                        self.queue_event(Event::DialFailed { at: now_ms(), peer });
+                    }
+                }
             }
         }
-        self.clear_root_in_flight(outcome.addr);
+        if let Some(addr) = outcome.addr {
+            self.clear_root_in_flight(addr);
+        }
     }
 
     async fn unlink(&mut self, peer: Identifier) {
@@ -2199,6 +2316,80 @@ mod tests {
             peer: None,
         }]);
         assert!(rt.links.get(&1).unwrap().unbound_since.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn contacted_root_is_not_redialed() {
+        let dir = std::env::temp_dir().join(format!(
+            "latticed-root-demote-{}-{}",
+            std::process::id(),
+            now_secs()
+        ));
+        let mut rt = test_runtime(&dir);
+        let addr: std::net::SocketAddr = "203.0.113.10:4000".parse().unwrap();
+        rt.set_roots(vec![RootSpec {
+            addr,
+            ik_key: None,
+            path: Some("/x".to_string()),
+            peer_id: None,
+        }]);
+        // The root is dialed once at registration.
+        assert!(matches!(rt.cmd_rx.try_recv(), Ok(Cmd::Dial { .. })));
+        // Before contact, the root is redialed once its backoff elapses
+        // and the previous dial is no longer in flight.
+        rt.roots[0].in_flight = false;
+        rt.roots[0].next_attempt = 0;
+        rt.redial_roots();
+        assert!(matches!(rt.cmd_rx.try_recv(), Ok(Cmd::Dial { .. })));
+        // After a successful contact the root is demoted: no more redials.
+        rt.mark_root_contacted(addr);
+        rt.roots[0].in_flight = false;
+        rt.roots[0].next_attempt = 0;
+        rt.redial_roots();
+        assert!(
+            rt.cmd_rx.try_recv().is_err(),
+            "a contacted root must not be redialed"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn saved_peers_are_dialed_before_roots() {
+        let dir = std::env::temp_dir().join(format!(
+            "latticed-saved-peers-{}-{}",
+            std::process::id(),
+            now_secs()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Pre-populate the store with a saved peer, as a previous run
+        // would have left it.
+        {
+            let mut store = lattice_store::RedbStore::open(dir.join("node.redb")).unwrap();
+            store
+                .saved_peer_put(&lattice_store::SavedPeer {
+                    id: Identifier::from_bytes([0x5A; 32]),
+                    scope: lattice_proto::record::Scope::Wan,
+                    endpoint: "ws://127.0.0.1:1/".to_string(),
+                    ips: vec![],
+                    channel_key: ChannelPublicKey::from_bytes([0x5B; 32]),
+                    saved_at: 1_000,
+                    anchor: false,
+                })
+                .unwrap();
+        }
+        let mut rt = test_runtime(&dir);
+        let addr: std::net::SocketAddr = "203.0.113.10:4000".parse().unwrap();
+        rt.set_roots(vec![RootSpec {
+            addr,
+            ik_key: None,
+            path: Some("/x".to_string()),
+            peer_id: None,
+        }]);
+        // The saved peer's dial was spawned (it counts as in flight)
+        // before the root was queued on the command channel.
+        assert_eq!(rt.dials_in_flight, 1);
+        assert!(matches!(rt.cmd_rx.try_recv(), Ok(Cmd::Dial { .. })));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

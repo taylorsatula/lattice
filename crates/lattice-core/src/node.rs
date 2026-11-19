@@ -17,8 +17,8 @@ use lattice_proto::message::{
 };
 use lattice_proto::record::{Mode, PeerRecord, Scope, record_order_parts};
 use lattice_store::{
-    CustodyAccept, CustodyEntry, Exclusion, InboxEntry, KelHeadSeen, OutboundState, Store,
-    StoreError,
+    CustodyAccept, CustodyEntry, Exclusion, InboxEntry, KelHeadSeen, OutboundState, SavedPeer,
+    Store, StoreError,
 };
 
 use lattice_types::{
@@ -29,6 +29,7 @@ use lattice_types::{
 use crate::error::NodeError;
 use crate::frame_budget;
 use crate::graph::{Graph, GraphRecord};
+use crate::neighbor::{self, Candidate};
 use crate::outbound::{OutboundMessageExt, OutboundStateExt};
 use crate::reconcile::{self, ReconcileSession};
 use crate::rng::Rng;
@@ -434,6 +435,40 @@ impl LinkState {
     }
 }
 
+/// A dial the core asked the daemon to make, not yet resolved. Matched
+/// to a link on `LinkUp` by the peer's channel key; matched to a failure
+/// by peer id on `DialFailed`.
+struct PendingDial {
+    peer: Identifier,
+    scope: Scope,
+    /// X25519 form of the candidate's channel key; how the link is
+    /// matched to this dial.
+    ck: X25519PublicKey,
+    /// Salted selection hash of the candidate.
+    hash: u64,
+    /// Incumbent link to evict once this dial binds (test-before-evict).
+    evict_on_success: Option<LinkId>,
+    /// When the dial was emitted (ms); pending dials that never resolve
+    /// are dropped after `PENDING_DIAL_TIMEOUT_MS`.
+    since: u64,
+    /// Range group of the candidate; counts toward the per-group sub-cap.
+    range: neighbor::RangeKey,
+}
+
+/// An outbound (core-dialed) link. Tracked so the selection can count
+/// outbound links against the per-scope cap and pick an eviction victim.
+struct OutboundLink {
+    peer: Identifier,
+    scope: Scope,
+    /// Salted selection hash of the candidate this link was dialed from.
+    hash: u64,
+    /// Incumbent to evict once this link binds; cleared once evicted
+    /// (or once the link binds without an eviction pending).
+    evict_on_success: Option<LinkId>,
+    /// Range group of the peer; counts toward the per-group sub-cap.
+    range: neighbor::RangeKey,
+}
+
 /// A dummy frame scheduled to be sent after a short random delay.
 #[derive(Clone, Copy)]
 struct PendingEcho {
@@ -556,6 +591,24 @@ pub struct Node<S: Store> {
     /// startup. Makes the eviction order unpredictable to a peer that
     /// chooses which records to push.
     record_salt: [u8; 32],
+    /// Per-node salt for neighbor selection, derived from the channel
+    /// seed (see `neighbor::selection_salt`). Stable across restarts so
+    /// saved anchors keep their meaning; unpredictable to anyone who
+    /// does not hold the seed.
+    neighbor_salt: [u8; 32],
+    /// Dials the core asked the daemon to make, not yet resolved.
+    pending_dials: Vec<PendingDial>,
+    /// Per-(peer, scope) dial backoff: consecutive failures and the time
+    /// before which the candidate must not be dialed again.
+    dial_backoff: std::collections::HashMap<(Identifier, Scope), (u32, u64)>,
+    /// Set when a record with endpoints was admitted; the next tick
+    /// (scheduled at this time) runs neighbor selection.
+    neighbor_check_at: Option<u64>,
+    /// Outbound (core-dialed) links, by link id.
+    outbound_links: std::collections::HashMap<LinkId, OutboundLink>,
+    /// Saved peers, keyed by (id, scope). Mirrors the `saved_peers`
+    /// store table; loaded at startup, written through on change.
+    saved_peers: std::collections::HashMap<(Identifier, Scope), SavedPeer>,
     /// Expiry (unix seconds) of our current record; drives the refresh.
     own_record_exp: u64,
     next_reconcile_at: u64,
@@ -634,6 +687,7 @@ impl<S: Store> Node<S> {
         for chunk in record_salt.chunks_mut(8) {
             chunk.copy_from_slice(&salt_rng.next_u64().to_le_bytes());
         }
+        let neighbor_salt = neighbor::selection_salt(identity.channel_seed.as_bytes());
         let mut rng = Rng::new(rng_seed);
         let first_refresh = now + refresh_interval_ms(&mut rng, config.record_refresh_secs);
         // Publish our own record if absent.
@@ -673,6 +727,12 @@ impl<S: Store> Node<S> {
             publish_pending: false,
             publish_retry_at: None,
             record_salt,
+            neighbor_salt,
+            pending_dials: Vec::new(),
+            dial_backoff: std::collections::HashMap::new(),
+            neighbor_check_at: None,
+            outbound_links: std::collections::HashMap::new(),
+            saved_peers: std::collections::HashMap::new(),
             own_record_exp: 0,
             next_reconcile_at: now + secs_to_ms(1),
             rng,
@@ -710,6 +770,16 @@ impl<S: Store> Node<S> {
                 }
             }
             Err(e) => node.diag("record_all", &e),
+        }
+        // Load the saved neighbor set; `startup_dials` re-dials them
+        // (anchors first) before the daemon dials its configured roots.
+        match node.store.saved_peer_all() {
+            Ok(peers) => {
+                for p in peers {
+                    node.saved_peers.insert((p.id, p.scope), p);
+                }
+            }
+            Err(e) => node.diag("saved_peer_all", &e),
         }
         if !own_exists {
             node.publish_record(now)?;
@@ -915,6 +985,7 @@ impl<S: Store> Node<S> {
                 remote_ck,
             } => self.on_link_up(at, link, peer, remote_ck),
             Event::LinkDown { at, link } => self.on_link_down(at, link),
+            Event::DialFailed { at, peer } => self.on_dial_failed(at, peer),
             Event::Frame {
                 at,
                 link,
@@ -975,6 +1046,18 @@ impl<S: Store> Node<S> {
         }
         if let Some(t) = self.custody_retry.keys().next() {
             consider(*t);
+        }
+        if let Some(t) = self
+            .dial_backoff
+            .values()
+            .map(|(_, t)| *t)
+            .filter(|t| *t > self.now)
+            .min()
+        {
+            consider(t);
+        }
+        if let Some(t) = self.neighbor_check_at {
+            consider(t);
         }
         if let Some(t) = self
             .pending
@@ -1195,6 +1278,23 @@ impl<S: Store> Node<S> {
         remote_ck: X25519PublicKey,
     ) -> Vec<Action> {
         self.touch(at);
+        // A core-initiated dial is recognized by the peer's channel key;
+        // the link becomes an outbound link for cap accounting and
+        // eviction.
+        if let Some(pos) = self.pending_dials.iter().position(|d| d.ck == remote_ck) {
+            let d = self.pending_dials.remove(pos);
+            self.dial_backoff.remove(&(d.peer, d.scope));
+            self.outbound_links.insert(
+                link,
+                OutboundLink {
+                    peer: d.peer,
+                    scope: d.scope,
+                    hash: d.hash,
+                    evict_on_success: d.evict_on_success,
+                    range: d.range,
+                },
+            );
+        }
         self.links
             .insert(link, LinkState::new(peer, remote_ck, peer.is_some(), at));
         self.next_link_order.push(link);
@@ -1204,6 +1304,7 @@ impl<S: Store> Node<S> {
         // for routing to work at all; waiting a full interval stalls delivery.
         self.next_reconcile_at = self.next_reconcile_at.min(at + secs_to_ms(1));
         let mut actions = self.reevaluate_link_bindings(at);
+        actions.extend(self.maybe_evict_after_bind(link));
         // Publish if the advertised set changed (spaced; see
         // `flush_pending_publish`).
         self.note_link_set_changed(at);
@@ -1214,6 +1315,14 @@ impl<S: Store> Node<S> {
 
     fn on_link_down(&mut self, at: u64, link: LinkId) -> Vec<Action> {
         self.touch(at);
+        if let Some(ob) = self.outbound_links.remove(&link) {
+            // A dropped outbound link frees a slot; back off briefly so a
+            // flapping peer is not redialed in a tight loop.
+            self.dial_backoff.insert(
+                (ob.peer, ob.scope),
+                (1, at.saturating_add(neighbor::LINK_DOWN_BACKOFF_MS)),
+            );
+        }
         if let Some(l) = self.links.remove(&link) {
             if let Some(peer) = l.peer {
                 // Keep the peer in the advertised set for the grace window.
@@ -1232,6 +1341,11 @@ impl<S: Store> Node<S> {
         self.next_link_order.retain(|l| *l != link);
         self.reconcile_sessions.remove(&link);
         self.note_link_set_changed(at);
+        // A freed slot may fit a candidate; re-run the selection on the
+        // next tick rather than inline, so a burst of link drops is
+        // re-filled in one batched pass (the per-range sub-caps are only
+        // meaningful when the whole candidate set is considered at once).
+        self.set_neighbor_check(at);
         Vec::new()
     }
 
@@ -2017,6 +2131,18 @@ impl<S: Store> Node<S> {
             self.note_link_set_changed(at);
             self.next_reconcile_at = self.next_reconcile_at.min(at + secs_to_ms(1));
         }
+        // Test-before-evict: a candidate that just bound evicts its
+        // incumbent.
+        let outbound: Vec<LinkId> = self.outbound_links.keys().copied().collect();
+        for link in outbound {
+            actions.extend(self.maybe_evict_after_bind(link));
+        }
+        // Refresh saved peers for every bound peer (cheap: writes only
+        // when something changed or the entry is stale).
+        let bound: Vec<Identifier> = self.links.values().filter_map(|l| l.peer).collect();
+        for peer in bound {
+            self.note_saved_peer(peer, at);
+        }
         actions
     }
 
@@ -2092,12 +2218,19 @@ impl<S: Store> Node<S> {
                 Ok(()) => {
                     self.note_ck_claim(&rec);
                     let id = rec.id;
+                    let has_endpoints = !rec.endpoints.is_empty();
                     self.index_record(bytes, rec);
                     self.enforce_record_cap(RECORD_CAP);
                     // The record is in the index: messages that were
                     // queued waiting for it can now be dispatched.
                     let mut actions = self.release_awaiting_record(&id, at);
                     actions.extend(self.reevaluate_link_bindings(at));
+                    if has_endpoints {
+                        // A new candidate may have appeared; ask for a
+                        // near-term neighbor pass rather than running one
+                        // per record in a gossip burst.
+                        self.set_neighbor_check(at);
+                    }
                     return actions;
                 }
                 Err(e) => {
@@ -2107,6 +2240,512 @@ impl<S: Store> Node<S> {
             }
             return self.reevaluate_link_bindings(at);
         }
+        Vec::new()
+    }
+
+    // ============================================================
+    // Neighbor selection (design §5)
+    // ============================================================
+
+    /// Dial actions for the saved neighbor set, anchors first. Called by
+    /// the daemon once at startup, before it dials configured roots: a
+    /// node that was connected before a restart re-forms its mesh before
+    /// falling back to bootstrap hints.
+    pub fn startup_dials(&mut self) -> Vec<Action> {
+        let now = self.now;
+        let mut actions = Vec::new();
+        for scope in [Scope::Wan, Scope::Hive] {
+            let cap = neighbor::scope_cap(scope);
+            let mut outbound = self.outbound_count(scope);
+            let mut group_counts = self.group_counts(scope);
+            actions.extend(self.dial_saved_peers(
+                now,
+                scope,
+                cap,
+                &mut outbound,
+                &mut group_counts,
+            ));
+        }
+        actions
+    }
+
+    /// Ask for a neighbor-selection pass shortly after `now`. Keeps the
+    /// earliest pending request.
+    fn set_neighbor_check(&mut self, now: u64) {
+        let at = now.saturating_add(NEIGHBOR_CHECK_DELAY_MS);
+        self.neighbor_check_at = Some(self.neighbor_check_at.map_or(at, |t| t.min(at)));
+    }
+
+    /// Candidates derived from the record index: validated, unexpired
+    /// records with endpoints, excluding our own record.
+    fn neighbor_candidates(&self) -> Vec<Candidate> {
+        self.record_index
+            .values()
+            .filter(|e| e.record.id != self.own_id && !e.record.endpoints.is_empty())
+            .map(|e| {
+                let rec = &e.record;
+                let mut ips = Vec::new();
+                for ep in &rec.endpoints {
+                    ips.extend_from_slice(&ep.ips);
+                }
+                Candidate {
+                    id: rec.id,
+                    scope: rec.scope,
+                    endpoint: rec.endpoints[0].url.clone(),
+                    ips,
+                    channel_key: rec.channel_key,
+                    range: neighbor::range_key(&rec.endpoints),
+                    hash: neighbor::candidate_hash(&self.neighbor_salt, rec.scope, &rec.id),
+                }
+            })
+            .collect()
+    }
+
+    fn outbound_count(&self, scope: Scope) -> usize {
+        let links = self
+            .outbound_links
+            .values()
+            .filter(|l| l.scope == scope)
+            .count();
+        let pending = self
+            .pending_dials
+            .iter()
+            .filter(|d| d.scope == scope)
+            .count();
+        links + pending
+    }
+
+    fn peer_linked(&self, id: &Identifier) -> bool {
+        self.links.values().any(|l| l.peer.as_ref() == Some(id))
+    }
+
+    fn pending_peer(&self, id: &Identifier) -> bool {
+        self.pending_dials.iter().any(|d| &d.peer == id)
+    }
+
+    fn in_backoff(&self, id: &Identifier, scope: Scope, now: u64) -> bool {
+        self.dial_backoff
+            .get(&(*id, scope))
+            .is_some_and(|(_, until)| now < *until)
+    }
+
+    fn is_anchor(&self, id: &Identifier, scope: Scope) -> bool {
+        self.saved_peers
+            .get(&(*id, scope))
+            .is_some_and(|p| p.anchor)
+    }
+
+    /// The worst (highest-hash) evictable outbound link in `scope`:
+    /// not an anchor and not already targeted by a pending eviction.
+    fn worst_evictable(&self, scope: Scope, reserved: &HashSet<LinkId>) -> Option<(LinkId, u64)> {
+        self.outbound_links
+            .iter()
+            .filter(|(link, l)| {
+                l.scope == scope && !reserved.contains(*link) && !self.is_anchor(&l.peer, scope)
+            })
+            .max_by_key(|(_, l)| l.hash)
+            .map(|(link, l)| (*link, l.hash))
+    }
+
+    /// Emit a Dial action for a candidate and record the pending dial.
+    /// Returns `None` (and skips the candidate) if the channel key does
+    /// not convert to X25519.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_dial(
+        &mut self,
+        id: Identifier,
+        scope: Scope,
+        endpoint: String,
+        ips: Vec<std::net::IpAddr>,
+        channel_key: lattice_types::ChannelPublicKey,
+        hash: u64,
+        evict_on_success: Option<LinkId>,
+        now: u64,
+        range: neighbor::RangeKey,
+    ) -> Option<Action> {
+        let Some(ck) = lattice_crypto::channel_x25519_public_from_ed25519(&channel_key) else {
+            self.diag(
+                "neighbor",
+                "candidate channel key does not convert to X25519; skipping",
+            );
+            return None;
+        };
+        self.pending_dials.push(PendingDial {
+            peer: id,
+            scope,
+            ck,
+            hash,
+            evict_on_success,
+            since: now,
+            range,
+        });
+        Some(Action::Dial {
+            endpoint,
+            ips,
+            scope,
+            channel_key,
+            peer: id,
+            evict_on_success,
+        })
+    }
+
+    /// Per-range-group occupancy (outbound links + pending dials) for a
+    /// scope. The per-group sub-cap is enforced against this count across
+    /// both the saved-peer and the candidate dial paths.
+    fn group_counts(&self, scope: Scope) -> std::collections::HashMap<neighbor::RangeKey, usize> {
+        let mut counts = std::collections::HashMap::new();
+        for l in self.outbound_links.values().filter(|l| l.scope == scope) {
+            *counts.entry(l.range.clone()).or_default() += 1;
+        }
+        for d in self.pending_dials.iter().filter(|d| d.scope == scope) {
+            *counts.entry(d.range.clone()).or_default() += 1;
+        }
+        counts
+    }
+
+    /// Dial saved peers (anchors first, then most recently saved), up to
+    /// the per-scope cap and the per-group sub-cap. Used at startup and
+    /// on every maintenance pass.
+    fn dial_saved_peers(
+        &mut self,
+        now: u64,
+        scope: Scope,
+        cap: usize,
+        outbound: &mut usize,
+        group_counts: &mut std::collections::HashMap<neighbor::RangeKey, usize>,
+    ) -> Vec<Action> {
+        let mut actions = Vec::new();
+        let mut peers: Vec<SavedPeer> = self
+            .saved_peers
+            .values()
+            .filter(|p| p.scope == scope)
+            .cloned()
+            .collect();
+        peers.sort_by(|a, b| {
+            b.anchor
+                .cmp(&a.anchor)
+                .then_with(|| b.saved_at.cmp(&a.saved_at))
+        });
+        for p in peers {
+            if *outbound >= cap {
+                break;
+            }
+            if self.peer_linked(&p.id) || self.pending_peer(&p.id) {
+                continue;
+            }
+            if self.in_backoff(&p.id, scope, now) {
+                continue;
+            }
+            let rk = neighbor::range_key_of(&p.endpoint, &p.ips);
+            if group_counts.get(&rk).copied().unwrap_or(0) >= rk.sub_cap() {
+                continue;
+            }
+            let hash = neighbor::candidate_hash(&self.neighbor_salt, scope, &p.id);
+            if let Some(a) = self.emit_dial(
+                p.id,
+                scope,
+                p.endpoint.clone(),
+                p.ips.clone(),
+                p.channel_key,
+                hash,
+                None,
+                now,
+                rk.clone(),
+            ) {
+                actions.push(a);
+                *group_counts.entry(rk).or_default() += 1;
+                *outbound += 1;
+            }
+        }
+        actions
+    }
+
+    /// One maintenance pass: drop stale pending dials, re-dial saved
+    /// peers, then fill remaining slots from the candidate set — or, when
+    /// at cap, dial a strictly better candidate to replace the worst
+    /// incumbent (test-before-evict). The per-range sub-cap is shared
+    /// across both paths.
+    fn maintain_neighbors(&mut self, now: u64) -> Vec<Action> {
+        let before = self.pending_dials.len();
+        self.pending_dials
+            .retain(|d| now.saturating_sub(d.since) < PENDING_DIAL_TIMEOUT_MS);
+        if self.pending_dials.len() != before {
+            self.diag("neighbor", "dropped stale pending dials");
+        }
+        // Expired backoff entries have done their job; drop them so they
+        // do not linger as stale deadlines.
+        self.dial_backoff.retain(|_, (_, until)| *until > now);
+
+        let candidates = self.neighbor_candidates();
+        let mut actions = Vec::new();
+        for scope in [Scope::Wan, Scope::Hive] {
+            let cap = neighbor::scope_cap(scope);
+            let mut outbound = self.outbound_count(scope);
+            let mut group_counts = self.group_counts(scope);
+            actions.extend(self.dial_saved_peers(
+                now,
+                scope,
+                cap,
+                &mut outbound,
+                &mut group_counts,
+            ));
+            // Candidates in hash order.
+            let mut idx: Vec<usize> = (0..candidates.len())
+                .filter(|&i| candidates[i].scope == scope)
+                .collect();
+            idx.sort_by(|&a, &b| {
+                candidates[a]
+                    .hash
+                    .cmp(&candidates[b].hash)
+                    .then_with(|| candidates[a].id.as_bytes().cmp(candidates[b].id.as_bytes()))
+            });
+            // Incumbents already targeted by a pending eviction; a second
+            // eviction dial must pick a different victim.
+            let mut reserved: HashSet<LinkId> = self
+                .pending_dials
+                .iter()
+                .filter_map(|d| d.evict_on_success)
+                .collect();
+            for i in idx {
+                let c = &candidates[i];
+                if self.peer_linked(&c.id)
+                    || self.pending_peer(&c.id)
+                    || self.in_backoff(&c.id, scope, now)
+                {
+                    continue;
+                }
+                let rk = &c.range;
+                let used = group_counts.get(rk).copied().unwrap_or(0);
+                if outbound < cap {
+                    if used >= rk.sub_cap() {
+                        continue;
+                    }
+                    if let Some(a) = self.emit_dial(
+                        c.id,
+                        scope,
+                        c.endpoint.clone(),
+                        c.ips.clone(),
+                        c.channel_key,
+                        c.hash,
+                        None,
+                        now,
+                        rk.clone(),
+                    ) {
+                        actions.push(a);
+                        *group_counts.entry(rk.clone()).or_default() += 1;
+                        outbound += 1;
+                    }
+                    continue;
+                }
+                // At cap: test-before-evict. Dial the better candidate;
+                // the incumbent is evicted only after the candidate binds.
+                if let Some((inc, inc_hash)) = self.worst_evictable(scope, &reserved) {
+                    if c.hash >= inc_hash {
+                        continue;
+                    }
+                    // The sub-cap still applies, unless the eviction
+                    // victim is in the same group (a straight swap).
+                    let same_group = self
+                        .outbound_links
+                        .get(&inc)
+                        .is_some_and(|l| &l.range == rk);
+                    if used < rk.sub_cap() || same_group {
+                        if let Some(a) = self.emit_dial(
+                            c.id,
+                            scope,
+                            c.endpoint.clone(),
+                            c.ips.clone(),
+                            c.channel_key,
+                            c.hash,
+                            Some(inc),
+                            now,
+                            rk.clone(),
+                        ) {
+                            reserved.insert(inc);
+                            actions.push(a);
+                            *group_counts.entry(rk.clone()).or_default() += 1;
+                        }
+                    }
+                }
+            }
+        }
+        self.maintain_anchors(&candidates, now);
+        actions
+    }
+
+    /// Designate anchors: keep existing anchors that are still linked or
+    /// still known (record present), drop the rest, and fill free slots
+    /// from the best-hashed linked candidates. Anchors are persisted in
+    /// the saved-peer table and are never evicted by selection.
+    fn maintain_anchors(&mut self, candidates: &[Candidate], now: u64) {
+        let linked: HashSet<Identifier> = self.outbound_links.values().map(|l| l.peer).collect();
+        let known: HashSet<(Identifier, Scope)> =
+            candidates.iter().map(|c| (c.id, c.scope)).collect();
+        let mut changed: Vec<(Identifier, Scope)> = Vec::new();
+        for p in self.saved_peers.values_mut() {
+            if p.anchor && !linked.contains(&p.id) && !known.contains(&(p.id, p.scope)) {
+                p.anchor = false;
+                changed.push((p.id, p.scope));
+            }
+        }
+        let mut anchors = self.saved_peers.values().filter(|p| p.anchor).count();
+        if anchors < neighbor::ANCHOR_COUNT {
+            let mut linked_cands: Vec<&Candidate> = candidates
+                .iter()
+                .filter(|c| linked.contains(&c.id))
+                .filter(|c| {
+                    !self
+                        .saved_peers
+                        .get(&(c.id, c.scope))
+                        .is_some_and(|p| p.anchor)
+                })
+                .collect();
+            linked_cands.sort_by(|a, b| {
+                a.hash
+                    .cmp(&b.hash)
+                    .then_with(|| a.id.as_bytes().cmp(b.id.as_bytes()))
+            });
+            for c in linked_cands {
+                if anchors >= neighbor::ANCHOR_COUNT {
+                    break;
+                }
+                let entry = self
+                    .saved_peers
+                    .entry((c.id, c.scope))
+                    .or_insert_with(|| SavedPeer {
+                        id: c.id,
+                        scope: c.scope,
+                        endpoint: c.endpoint.clone(),
+                        ips: c.ips.clone(),
+                        channel_key: c.channel_key,
+                        saved_at: ms_to_secs(now),
+                        anchor: false,
+                    });
+                if !entry.anchor {
+                    entry.anchor = true;
+                    changed.push((c.id, c.scope));
+                    anchors += 1;
+                }
+            }
+        }
+        for (id, scope) in changed {
+            if let Some(p) = self.saved_peers.get(&(id, scope)) {
+                let p = p.clone();
+                if let Err(e) = self.store.saved_peer_put(&p) {
+                    self.diag("saved_peer_put", &e);
+                }
+            }
+        }
+    }
+
+    /// Persist (or refresh) the saved-peer entry for `peer` from its
+    /// record, if it has endpoints. Called when a link binds and when a
+    /// record is admitted for a linked peer.
+    fn note_saved_peer(&mut self, peer: Identifier, now: u64) {
+        for scope in [Scope::Wan, Scope::Hive] {
+            let Some(rec) = self
+                .record_index
+                .get(&(peer, scope_as_u8(scope)))
+                .map(|e| &e.record)
+            else {
+                continue;
+            };
+            if rec.endpoints.is_empty() {
+                continue;
+            }
+            let endpoint = rec.endpoints[0].url.clone();
+            let ips: Vec<std::net::IpAddr> = rec
+                .endpoints
+                .iter()
+                .flat_map(|e| e.ips.iter().copied())
+                .collect();
+            let now_secs = ms_to_secs(now);
+            let existed = self.saved_peers.contains_key(&(peer, scope));
+            let entry = self
+                .saved_peers
+                .entry((peer, scope))
+                .or_insert_with(|| SavedPeer {
+                    id: peer,
+                    scope,
+                    endpoint: endpoint.clone(),
+                    ips: ips.clone(),
+                    channel_key: rec.channel_key,
+                    saved_at: now_secs,
+                    anchor: false,
+                });
+            let stale = now_secs.saturating_sub(entry.saved_at) >= SAVED_PEER_REFRESH_SECS;
+            let changed = !existed
+                || entry.endpoint != endpoint
+                || entry.ips != ips
+                || entry.channel_key != rec.channel_key;
+            if changed || stale {
+                entry.endpoint = endpoint;
+                entry.ips = ips;
+                entry.channel_key = rec.channel_key;
+                entry.saved_at = now_secs;
+                let p = entry.clone();
+                if let Err(e) = self.store.saved_peer_put(&p) {
+                    self.diag("saved_peer_put", &e);
+                }
+            }
+        }
+        // Bound the table: evict the oldest non-anchor entries.
+        while self.saved_peers.len() > neighbor::MAX_SAVED_PEERS {
+            let victim = self
+                .saved_peers
+                .values()
+                .filter(|p| !p.anchor)
+                .min_by_key(|p| p.saved_at)
+                .map(|p| (p.id, p.scope));
+            let Some((id, scope)) = victim else { break };
+            self.saved_peers.remove(&(id, scope));
+            if let Err(e) = self.store.saved_peer_remove(&id, scope) {
+                self.diag("saved_peer_remove", &e);
+            }
+        }
+    }
+
+    /// If `link` was dialed to replace an incumbent and is now bound to
+    /// the candidate, close the incumbent (test-before-evict).
+    fn maybe_evict_after_bind(&mut self, link: LinkId) -> Vec<Action> {
+        let Some(ob) = self.outbound_links.get(&link) else {
+            return Vec::new();
+        };
+        let Some(incumbent) = ob.evict_on_success else {
+            return Vec::new();
+        };
+        let bound = self.links.get(&link).and_then(|l| l.peer);
+        if bound != Some(ob.peer) {
+            return Vec::new();
+        }
+        if let Some(ob) = self.outbound_links.get_mut(&link) {
+            ob.evict_on_success = None;
+        }
+        vec![Action::CloseLink { link: incumbent }]
+    }
+
+    /// Handle a failed candidate dial: clear the pending entry and back
+    /// off. The incumbent (if any) is untouched — that is the point of
+    /// test-before-evict.
+    fn on_dial_failed(&mut self, at: u64, peer: Identifier) -> Vec<Action> {
+        if let Some(pos) = self.pending_dials.iter().position(|d| d.peer == peer) {
+            let d = self.pending_dials.remove(pos);
+            let attempts = self
+                .dial_backoff
+                .get(&(peer, d.scope))
+                .map(|(n, _)| *n)
+                .unwrap_or(0);
+            let shift = attempts.min(6);
+            let delay = neighbor::DIAL_BACKOFF_BASE_MS
+                .saturating_mul(1u64 << shift)
+                .min(neighbor::DIAL_BACKOFF_MAX_MS);
+            self.dial_backoff
+                .insert((peer, d.scope), (attempts + 1, at.saturating_add(delay)));
+        }
+        // A slot may have freed up; re-run the selection on the next
+        // tick rather than inline, so a burst of dial failures is
+        // handled in one batched pass.
+        self.set_neighbor_check(at);
         Vec::new()
     }
 }
@@ -2164,6 +2803,16 @@ const CLAIM_SWEEP_MS: u64 = 60_000;
 const MAX_PENDING_ECHOES: usize = 256;
 /// How long a lost link stays in the advertised set (spec §3 grace).
 const LINK_GRACE_MS: u64 = 5 * 60 * 1000;
+/// How long a pending dial may go unresolved before it is dropped and the
+/// candidate becomes dialable again. The daemon's dial deadline is 15s;
+/// this is the backstop for a lost outcome.
+const PENDING_DIAL_TIMEOUT_MS: u64 = 30_000;
+/// How soon after a record with endpoints is admitted the neighbor
+/// selection runs. Batches a gossip burst into one selection pass.
+const NEIGHBOR_CHECK_DELAY_MS: u64 = 1_000;
+/// How often a saved peer's stored entry is refreshed even if nothing
+/// changed (keeps `saved_at` roughly current for eviction ordering).
+const SAVED_PEER_REFRESH_SECS: u64 = 3600;
 /// Cap on stored records; eviction is by salted hash (see `record_salt`).
 const RECORD_CAP: usize = 4096;
 /// Republish the record when its expiry is this close, even if nothing
@@ -4253,6 +4902,8 @@ impl<S: Store> Node<S> {
         actions.extend(self.drain_custody(now));
         self.sweep_custody_expiry(now);
         actions.extend(self.pump_outbound(now));
+        self.neighbor_check_at = None;
+        actions.extend(self.maintain_neighbors(now));
         actions
     }
 
@@ -8963,12 +9614,449 @@ mod tests {
             Action::SendFrame { .. } => (2, Vec::new(), 0),
             Action::Deliver { .. } => (3, Vec::new(), 0),
             Action::LinkBound { link, .. } => (4, link.to_be_bytes().to_vec(), 0),
+            Action::Dial { peer, .. } => (5, peer.as_bytes().to_vec(), 0),
+            Action::CloseLink { link } => (6, link.to_be_bytes().to_vec(), 0),
         };
         let mut b: Vec<_> = batch_actions.iter().map(key).collect();
         let mut s: Vec<_> = seq_actions.iter().map(key).collect();
         b.sort();
         s.sort();
         assert_eq!(b, s);
+    }
+
+    // ── Neighbor selection (design §5) ─────────────────────────────
+
+    fn build_record_ep(
+        kel: Vec<KeyEvent>,
+        seq: u64,
+        scope: Scope,
+        signing_seed: &SigningSeed,
+        channel_seed: &ChannelSeed,
+        endpoint: &str,
+        ips: &[&str],
+    ) -> lattice_proto::record::PeerRecord {
+        let kel = ValidatedKel::validate(kel).unwrap();
+        lattice_proto::record::PeerRecord::build(
+            lattice_proto::record::RecordParams {
+                kel,
+                prev_seq: seq.saturating_sub(1),
+                now: 1,
+                exp: 1_000 + 86_400,
+                channel_key: lattice_crypto::channel_public(channel_seed),
+                channel_seed: channel_seed.clone(),
+                envelope_key: XWingPublicKey::from_bytes([7u8; 1216]),
+                mode: Mode::Public,
+                scope,
+                endpoints: vec![lattice_proto::record::Endpoint {
+                    url: endpoint.into(),
+                    ips: ips.iter().map(|s| s.parse().unwrap()).collect(),
+                }],
+                links: vec![],
+                gateways: vec![],
+                capabilities: 0,
+                serves: vec![],
+            },
+            signing_seed,
+        )
+        .unwrap()
+    }
+
+    /// Admit a candidate identity's KEL and record (one endpoint).
+    /// Returns the identity.
+    fn admit_candidate<S: Store>(
+        node: &mut Node<S>,
+        seed: u8,
+        scope: Scope,
+        endpoint: &str,
+        ips: &[&str],
+        at: u64,
+    ) -> Identity {
+        let identity = Identity::from_seed(&[seed; 32]);
+        admit_kel(node, &identity.kel, at);
+        let record = build_record_ep(
+            identity.kel.events().to_vec(),
+            1,
+            scope,
+            &identity.signing_seed,
+            &identity.channel_seed,
+            endpoint,
+            ips,
+        );
+        node.admit_record(at, 999, &record.encode());
+        identity
+    }
+
+    fn dialed_peers(actions: &[Action]) -> Vec<Identifier> {
+        actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Dial { peer, .. } => Some(*peer),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Link up every dialed candidate, returning peer -> link id.
+    fn link_dialed<S: Store>(
+        node: &mut Node<S>,
+        actions: &[Action],
+        identities: &[Identity],
+        at: u64,
+        next_link: &mut u64,
+    ) -> Vec<(Identifier, u64)> {
+        let mut out = Vec::new();
+        for a in actions {
+            if let Action::Dial { peer, .. } = a {
+                let id = identities
+                    .iter()
+                    .find(|i| i.id() == *peer)
+                    .expect("dialed peer is a known candidate");
+                let ck = lattice_crypto::channel_x25519_public(&id.channel_seed);
+                let link = *next_link;
+                *next_link += 1;
+                node.handle(Event::LinkUp {
+                    at,
+                    link,
+                    peer: Some(*peer),
+                    remote_ck: ck,
+                });
+                out.push((*peer, link));
+            }
+        }
+        out
+    }
+
+    fn candidate_hash<S: Store>(node: &Node<S>, id: &Identifier) -> u64 {
+        crate::neighbor::candidate_hash(&node.neighbor_salt, Scope::Wan, id)
+    }
+
+    #[test]
+    fn neighbor_selection_dials_best_candidates_up_to_cap() {
+        let mut node = test_node();
+        let mut identities = Vec::new();
+        for i in 1..=20u8 {
+            identities.push(admit_candidate(
+                &mut node,
+                i,
+                Scope::Wan,
+                &format!("ws://203.0.{i}.1/"),
+                &[],
+                1_000,
+            ));
+        }
+        let (actions, _) = node.handle(Event::Tick { at: 2_000 });
+        let dialed = dialed_peers(&actions);
+        assert_eq!(dialed.len(), 16, "cap is 16 outbound WAN links");
+        // The selected set is the 16 lowest-hash candidates.
+        let mut by_hash: Vec<(u64, Identifier)> = identities
+            .iter()
+            .map(|id| (candidate_hash(&node, &id.id()), id.id()))
+            .collect();
+        by_hash.sort();
+        let expected: std::collections::HashSet<Identifier> =
+            by_hash[..16].iter().map(|(_, id)| *id).collect();
+        let actual: std::collections::HashSet<Identifier> = dialed.into_iter().collect();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn neighbor_selection_respects_per_group_sub_cap() {
+        let mut node = test_node();
+        let mut identities = Vec::new();
+        // Six candidates in one /24, fourteen elsewhere.
+        for i in 1..=6u8 {
+            identities.push(admit_candidate(
+                &mut node,
+                i,
+                Scope::Wan,
+                &format!("ws://203.0.77.{i}/"),
+                &[],
+                1_000,
+            ));
+        }
+        for i in 7..=20u8 {
+            identities.push(admit_candidate(
+                &mut node,
+                i,
+                Scope::Wan,
+                &format!("ws://198.51.{i}.1/"),
+                &[],
+                1_000,
+            ));
+        }
+        let (actions, _) = node.handle(Event::Tick { at: 2_000 });
+        let dialed = dialed_peers(&actions);
+        assert_eq!(dialed.len(), 16);
+        let shared = dialed
+            .iter()
+            .filter(|id| identities[..6].iter().any(|i| i.id() == **id))
+            .count();
+        assert!(shared <= 2, "at most 2 links per /24, got {shared}");
+    }
+
+    #[test]
+    fn neighbor_selection_is_stable_for_same_salt() {
+        let run = || {
+            let mut node = test_node();
+            let mut identities = Vec::new();
+            for i in 1..=20u8 {
+                identities.push(admit_candidate(
+                    &mut node,
+                    i,
+                    Scope::Wan,
+                    &format!("ws://203.0.{i}.1/"),
+                    &[],
+                    1_000,
+                ));
+            }
+            let (actions, _) = node.handle(Event::Tick { at: 2_000 });
+            let mut dialed = dialed_peers(&actions);
+            dialed.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+            dialed
+        };
+        assert_eq!(run(), run());
+    }
+
+    /// Fill the node to the WAN cap and return the linked (peer, link)
+    /// pairs plus the identities.
+    fn fill_to_cap(node: &mut Node<MemStore>, at: u64) -> (Vec<(Identifier, u64)>, Vec<Identity>) {
+        let mut identities = Vec::new();
+        for i in 1..=16u8 {
+            identities.push(admit_candidate(
+                node,
+                i,
+                Scope::Wan,
+                &format!("ws://203.0.{i}.1/"),
+                &[],
+                at,
+            ));
+        }
+        let (actions, _) = node.handle(Event::Tick { at: at + 1_000 });
+        let mut next_link = 1_000;
+        let linked = link_dialed(node, &actions, &identities, at + 1_000, &mut next_link);
+        assert_eq!(linked.len(), 16);
+        (linked, identities)
+    }
+
+    /// Find a seed whose candidate hash is below `ceiling`.
+    fn seed_below(node: &Node<MemStore>, ceiling: u64) -> u8 {
+        for seed in 100..=250u8 {
+            let id = Identity::from_seed(&[seed; 32]).id();
+            if candidate_hash(node, &id) < ceiling {
+                return seed;
+            }
+        }
+        panic!("no seed below the ceiling");
+    }
+
+    #[test]
+    fn test_before_evict_evicts_only_after_bind() {
+        let mut node = test_node();
+        let (linked, identities) = fill_to_cap(&mut node, 1_000);
+        // The worst incumbent (highest hash) is the eviction target.
+        let worst = linked
+            .iter()
+            .max_by_key(|(peer, _)| candidate_hash(&node, peer))
+            .copied()
+            .unwrap();
+        let worst_hash = candidate_hash(&node, &worst.0);
+        // A strictly better candidate appears.
+        let seed = seed_below(&node, worst_hash);
+        let better = admit_candidate(
+            &mut node,
+            seed,
+            Scope::Wan,
+            &format!("ws://203.0.200.{seed}/"),
+            &[],
+            5_000,
+        );
+        let (actions, _) = node.handle(Event::Tick { at: 6_000 });
+        let eviction = actions.iter().find_map(|a| match a {
+            Action::Dial {
+                peer,
+                evict_on_success,
+                ..
+            } if *peer == better.id() => evict_on_success.map(|l| (*peer, l)),
+            _ => None,
+        });
+        let (dialed_peer, incumbent) =
+            eviction.expect("a better candidate at cap must be dialed with an eviction target");
+        assert_eq!(incumbent, worst.1);
+        assert_eq!(dialed_peer, better.id());
+        // The candidate binds: the incumbent is evicted.
+        let ck = lattice_crypto::channel_x25519_public(&better.channel_seed);
+        let (actions, _) = node.handle(Event::LinkUp {
+            at: 6_100,
+            link: 9_000,
+            peer: Some(better.id()),
+            remote_ck: ck,
+        });
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::CloseLink { link } if *link == incumbent)),
+            "the incumbent must be closed once the candidate binds: {actions:?}"
+        );
+        let _ = identities;
+    }
+
+    #[test]
+    fn test_before_evict_failed_dial_keeps_incumbent() {
+        let mut node = test_node();
+        let (linked, _) = fill_to_cap(&mut node, 1_000);
+        let worst = linked
+            .iter()
+            .max_by_key(|(peer, _)| candidate_hash(&node, peer))
+            .copied()
+            .unwrap();
+        let worst_hash = candidate_hash(&node, &worst.0);
+        let seed = seed_below(&node, worst_hash);
+        let better = admit_candidate(
+            &mut node,
+            seed,
+            Scope::Wan,
+            &format!("ws://203.0.200.{seed}/"),
+            &[],
+            5_000,
+        );
+        let (actions, _) = node.handle(Event::Tick { at: 6_000 });
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            Action::Dial { peer, evict_on_success: Some(_), .. } if *peer == better.id()
+        )));
+        // The dial fails: the incumbent must survive.
+        let (actions, _) = node.handle(Event::DialFailed {
+            at: 6_100,
+            peer: better.id(),
+        });
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::CloseLink { .. })),
+            "a failed dial must not evict the incumbent"
+        );
+        assert!(
+            node.links.contains_key(&worst.1),
+            "the incumbent link must still be present"
+        );
+    }
+
+    #[test]
+    fn anchors_are_designated_and_never_evicted() {
+        let mut node = test_node();
+        let (linked, _) = fill_to_cap(&mut node, 1_000);
+        // A tick designates anchors from the linked candidates.
+        let _ = node.handle(Event::Tick { at: 2_000 });
+        let anchors: Vec<Identifier> = node
+            .saved_peers
+            .values()
+            .filter(|p| p.anchor)
+            .map(|p| p.id)
+            .collect();
+        assert_eq!(anchors.len(), 3, "three anchors are designated");
+        // A better candidate appears; the eviction target must not be an anchor.
+        let non_anchor_worst = linked
+            .iter()
+            .filter(|(peer, _)| !anchors.contains(peer))
+            .max_by_key(|(peer, _)| candidate_hash(&node, peer))
+            .copied()
+            .unwrap();
+        let worst_hash = candidate_hash(&node, &non_anchor_worst.0);
+        let seed = seed_below(&node, worst_hash);
+        let better = admit_candidate(
+            &mut node,
+            seed,
+            Scope::Wan,
+            &format!("ws://203.0.200.{seed}/"),
+            &[],
+            5_000,
+        );
+        let (actions, _) = node.handle(Event::Tick { at: 6_000 });
+        let evicted = actions.iter().find_map(|a| match a {
+            Action::Dial {
+                peer,
+                evict_on_success: Some(link),
+                ..
+            } if *peer == better.id() => Some(*link),
+            _ => None,
+        });
+        let evicted = evicted.expect("a better candidate must be dialed for eviction");
+        let evicted_peer = linked.iter().find(|(_, l)| *l == evicted).unwrap().0;
+        assert!(
+            !anchors.contains(&evicted_peer),
+            "an anchor must never be the eviction target"
+        );
+    }
+
+    #[test]
+    fn saved_peers_are_persisted_and_redialed_at_boot() {
+        let dir = std::env::temp_dir().join(format!(
+            "lattice-saved-peers-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store_path = dir.join("node.redb");
+        let peer_id;
+        {
+            let store = lattice_store::RedbStore::open(&store_path).unwrap();
+            let cfg = Config {
+                snow_per_min: 0.0,
+                ..Config::default()
+            };
+            let mut node = Node::new(cfg, Identity::from_seed(&[0xA5; 32]), store, 1_000)
+                .expect("node construction");
+            let candidate =
+                admit_candidate(&mut node, 7, Scope::Wan, "ws://203.0.201.7/", &[], 1_000);
+            peer_id = candidate.id();
+            let (actions, _) = node.handle(Event::Tick { at: 2_000 });
+            let mut next_link = 1;
+            let _ = link_dialed(&mut node, &actions, &[candidate], 2_000, &mut next_link);
+            // The link bound; the peer must be in the saved-peer table.
+            let saved = node.store.saved_peer_all().unwrap();
+            assert!(
+                saved.iter().any(|p| p.id == peer_id),
+                "the bound peer must be saved: {saved:?}"
+            );
+        }
+        // A fresh node over the same store re-dials the saved peer at boot.
+        let store = lattice_store::RedbStore::open(&store_path).unwrap();
+        let cfg = Config {
+            snow_per_min: 0.0,
+            ..Config::default()
+        };
+        let mut node = Node::new(cfg, Identity::from_seed(&[0xA5; 32]), store, 10_000)
+            .expect("node construction");
+        let actions = node.startup_dials();
+        let dialed = dialed_peers(&actions);
+        assert!(
+            dialed.contains(&peer_id),
+            "the saved peer must be re-dialed at boot: {dialed:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dial_failure_backs_off_and_recovers() {
+        let mut node = test_node();
+        let candidate = admit_candidate(&mut node, 7, Scope::Wan, "ws://203.0.201.7/", &[], 1_000);
+        let (actions, _) = node.handle(Event::Tick { at: 2_000 });
+        assert_eq!(dialed_peers(&actions), vec![candidate.id()]);
+        // The dial fails: no immediate redial.
+        let (actions, _) = node.handle(Event::DialFailed {
+            at: 2_100,
+            peer: candidate.id(),
+        });
+        assert!(dialed_peers(&actions).is_empty());
+        // Still in backoff shortly after.
+        let (actions, _) = node.handle(Event::Tick { at: 3_000 });
+        assert!(dialed_peers(&actions).is_empty());
+        // After the backoff expires the candidate is dialed again.
+        let (actions, _) = node.handle(Event::Tick { at: 2_100 + 5_001 });
+        assert_eq!(dialed_peers(&actions), vec![candidate.id()]);
     }
 
     #[test]

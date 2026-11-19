@@ -33,8 +33,8 @@ use redb::{
 };
 
 use crate::row_codec::{
-    decode_custody, decode_inbox, decode_outbound, decode_status, encode_custody, encode_inbox,
-    encode_outbound, encode_status,
+    decode_custody, decode_inbox, decode_outbound, decode_saved_peer, decode_status,
+    encode_custody, encode_inbox, encode_outbound, encode_saved_peer, encode_status,
 };
 use crate::*;
 use lattice_proto::local::DrainState;
@@ -206,7 +206,10 @@ macro_rules! ensure_tables {
 // bucket index stored in custody rows changed meaning. There is no
 // migration from v2: pre-release, no deployed base, so a v2 database fails
 // loudly at open (see `migrate`).
-const SCHEMA_VERSION: u64 = 3;
+// v4: the `saved_peers` table (neighbor set persisted across restarts).
+// There is no migration from v3: pre-release, no deployed base, so a v3
+// database fails loudly at open (see `migrate`).
+const SCHEMA_VERSION: u64 = 4;
 
 const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
 const RECORDS: TableDefinition<[u8; 33], Vec<u8>> = TableDefinition::new("records");
@@ -220,6 +223,7 @@ const SEEN: TableDefinition<[u8; 32], u64> = TableDefinition::new("seen");
 const SEEN_UNHELD: TableDefinition<[u8; 32], u64> = TableDefinition::new("seen_unheld");
 const DELIVERED: TableDefinition<[u8; 32], u64> = TableDefinition::new("delivered");
 const INBOX: TableDefinition<&[u8], Vec<u8>> = TableDefinition::new("inbox");
+const SAVED_PEERS: TableDefinition<[u8; 33], Vec<u8>> = TableDefinition::new("saved_peers");
 
 /// Custody buffer-class slots; `class` is clamped to `< CLASS_SLOTS` on
 /// read. Two leg phases of 16 classes each share the byte.
@@ -244,6 +248,13 @@ fn share_key(dest: &Identifier, upstream: u64) -> [u8; 40] {
     let mut k = [0u8; 40];
     k[..32].copy_from_slice(dest.as_bytes());
     k[32..].copy_from_slice(&upstream.to_be_bytes());
+    k
+}
+
+fn saved_peer_key(id: &Identifier, scope: Scope) -> [u8; 33] {
+    let mut k = [0u8; 33];
+    k[..32].copy_from_slice(id.as_bytes());
+    k[32] = scope_byte(scope);
     k
 }
 
@@ -411,6 +422,7 @@ impl RedbStore {
             DELIVERED,
             INBOX,
             STATUS,
+            SAVED_PEERS,
         );
         rebuild_custody_counters(&txn, OP)?;
         txn.commit().map_err(ctx(OP))?;
@@ -1253,6 +1265,49 @@ impl Store for RedbStore {
 
     fn size_bucket_counts(&self) -> Result<[u64; 4], StoreError> {
         self.bucket_counts()
+    }
+
+    fn saved_peer_put(&mut self, peer: &SavedPeer) -> Result<(), StoreError> {
+        let key = saved_peer_key(&peer.id, peer.scope);
+        let bytes = encode_saved_peer(peer);
+        self.write("saved_peer_put", |txn| {
+            let mut t = txn.open_table(SAVED_PEERS)?;
+            t.insert(key, bytes)?;
+            Ok(())
+        })
+    }
+
+    fn saved_peer_remove(&mut self, id: &Identifier, scope: Scope) -> Result<(), StoreError> {
+        let key = saved_peer_key(id, scope);
+        self.write("saved_peer_remove", |txn| {
+            let mut t = txn.open_table(SAVED_PEERS)?;
+            t.remove(key)?;
+            Ok(())
+        })
+    }
+
+    fn saved_peer_all(&self) -> Result<Vec<SavedPeer>, StoreError> {
+        self.read("saved_peer_all", |txn| {
+            let t = txn.open_table(SAVED_PEERS)?;
+            let mut out = Vec::new();
+            for entry in t.iter()? {
+                let (k, v) = entry?;
+                let key = k.value();
+                let mut id = [0u8; 32];
+                id.copy_from_slice(&key[..32]);
+                let scope = if key[32] == 0 {
+                    Scope::Wan
+                } else {
+                    Scope::Hive
+                };
+                out.push(decode_saved_peer(
+                    &v.value(),
+                    Identifier::from_bytes(id),
+                    scope,
+                )?);
+            }
+            Ok(out)
+        })
     }
 
     fn drain_get(&self) -> Result<DrainState, StoreError> {

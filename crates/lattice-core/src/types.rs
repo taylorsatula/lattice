@@ -56,6 +56,14 @@ pub enum Event {
         at: u64,
         link: LinkId,
     },
+    /// A dial the core asked for (via [`Action::Dial`]) failed before a
+    /// link came up. The daemon reports this so the core can clear the
+    /// pending dial and back off; without it the pending entry would
+    /// leak and the candidate would never be retried.
+    DialFailed {
+        at: u64,
+        peer: Identifier,
+    },
     Frame {
         at: u64,
         link: LinkId,
@@ -125,6 +133,34 @@ pub enum Action {
         link: LinkId,
         peer: Option<Identifier>,
     },
+    /// Dial a candidate peer selected by the neighbor selection. The
+    /// daemon executes the dial (via `connect_scoped`, which enforces the
+    /// scope check) and reports the outcome: a successful dial surfaces as
+    /// [`Event::LinkUp`] (the core recognizes it by the peer's channel
+    /// key), a failure as [`Event::DialFailed`]. `evict_on_success` names
+    /// the incumbent link to close once this dial binds — the
+    /// test-before-evict rule: the incumbent is only evicted after the
+    /// candidate proves itself.
+    Dial {
+        /// Endpoint URL from the peer's record.
+        endpoint: String,
+        /// Literal IPs from the record; preferred over DNS.
+        ips: Vec<std::net::IpAddr>,
+        /// Scope of the record the candidate came from.
+        scope: lattice_proto::record::Scope,
+        /// The record's channel key; the dial is an IK handshake against
+        /// it, which also pins the peer.
+        channel_key: lattice_types::ChannelPublicKey,
+        /// The candidate's identifier.
+        peer: Identifier,
+        /// Incumbent to evict once this dial binds (test-before-evict).
+        evict_on_success: Option<LinkId>,
+    },
+    /// Close a link. Emitted when a replacement candidate has proven
+    /// itself (handshake completed and the link bound) and the incumbent
+    /// lost the salted-hash comparison. The daemon drops the link and
+    /// feeds [`Event::LinkDown`] back.
+    CloseLink { link: LinkId },
 }
 
 #[derive(Clone, Debug)]

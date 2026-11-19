@@ -30,6 +30,19 @@ pub fn hash(data: &[u8]) -> Hash32 {
     Hash32::from_bytes(*blake3::hash(data).as_bytes())
 }
 
+/// BLAKE3 keyed hash (a PRF). Used where a secret key must select among
+/// public inputs unpredictably (e.g. neighbor-selection salts).
+pub fn keyed_hash(key: &[u8; 32], data: &[u8]) -> Hash32 {
+    Hash32::from_bytes(*blake3::keyed_hash(key, data).as_bytes())
+}
+
+/// BLAKE3 KDF: derive a 32-byte subkey from `key_material` under
+/// `context`. The context string is the domain separator; two derivations
+/// with different contexts are independent.
+pub fn derive_key(context: &str, key_material: &[u8]) -> [u8; 32] {
+    blake3::derive_key(context, key_material)
+}
+
 /// Constant-time equality for fixed-size secrets and commitments.
 #[must_use]
 pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {

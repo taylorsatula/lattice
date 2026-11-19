@@ -29,7 +29,7 @@ const MAX_ENDPOINTS: usize = 16;
 /// Most ids a public record may name in `serves` (spec §3).
 pub const MAX_SERVES: usize = 16;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Scope {
     Wan,
     Hive,
