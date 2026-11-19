@@ -878,12 +878,19 @@ fn private_instance_receives_via_gateway() {
     });
     let priv_id = sim.ids[priv_node];
     let sender_id = sim.ids[sender];
+    // The gateway consents to serve the private instance (spec §3, gateway
+    // consent): its record must list the private id in `serves` or no
+    // private↔gateway pseudo-edge exists and the private instance is
+    // unreachable. Set before the first connect so the republish triggered
+    // by link-up carries it.
+    sim.nodes[gw].config.serves = vec![priv_id];
     sim.connect(sender, gw);
     sim.connect(gw, priv_node);
     // Wait for records to converge: the sender needs the private instance's
     // record (to learn it is private and which gateway to use) and the
     // gateway's record; the private instance needs the sender's record to
-    // verify the envelope signature.
+    // verify the envelope signature and the gateway's record (with its
+    // `serves`) to route back through the gateway.
     for _ in 0..30 {
         let s = sim.nodes[sender].debug_record_ids();
         let g = sim.nodes[gw].debug_record_ids();
@@ -892,6 +899,7 @@ fn private_instance_receives_via_gateway() {
             && s.contains(&gw_id)
             && g.contains(&sender_id)
             && p.contains(&sender_id)
+            && p.contains(&gw_id)
         {
             break;
         }

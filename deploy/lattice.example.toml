@@ -33,6 +33,12 @@ listen = ["0.0.0.0:8443"]
 # Private mode only: 1-3 gateway node ids this node is reachable through.
 # gateways = ["<64 hex>"]
 
+# Public mode only: private ids (hex, 32 bytes) this node serves as a
+# gateway. A private instance is reachable through this node only when both
+# sides name each other: the private record lists this node in `gateways`
+# and this record lists the private id here. At most 16.
+# serves = ["<64 hex>"]
+
 # CIDRs making up the hive. Multicast discovery is not implemented yet;
 # this is parsed and reserved.
 # hive = ["10.0.0.0/8"]

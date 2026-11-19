@@ -47,6 +47,10 @@ pub struct Config {
     /// Gateway node ids (hex, 32 bytes). Required in private mode; forbidden otherwise.
     #[serde(default)]
     pub gateways: Vec<String>,
+    /// Private ids (hex, 32 bytes) this public node serves as a gateway
+    /// (spec §3, "Gateway consent"). At most 16. Forbidden in private mode.
+    #[serde(default)]
+    pub serves: Vec<String>,
     /// Envelope/record limits override.
     #[serde(default)]
     pub limits: Limits,
@@ -238,6 +242,12 @@ pub fn validate(cfg: &Config) -> Result<(), String> {
             if !cfg.gateways.is_empty() {
                 return Err("gateways are only valid in private mode".into());
             }
+            if cfg.serves.len() > 16 {
+                return Err("serves is limited to 16 ids".into());
+            }
+            for (i, id) in cfg.serves.iter().enumerate() {
+                decode_hex32(id).map_err(|e| format!("serves[{i}]: {e}"))?;
+            }
         }
         "private" => {
             if cfg.gateways.is_empty() || cfg.gateways.len() > 3 {
@@ -245,6 +255,9 @@ pub fn validate(cfg: &Config) -> Result<(), String> {
             }
             for (i, gw) in cfg.gateways.iter().enumerate() {
                 decode_hex32(gw).map_err(|e| format!("gateways[{i}]: {e}"))?;
+            }
+            if !cfg.serves.is_empty() {
+                return Err("serves is only valid in public mode".into());
             }
         }
         _ => unreachable!("mode checked above"),

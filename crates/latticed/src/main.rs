@@ -377,6 +377,14 @@ fn record_self_test(cfg: &config::Config, identity: &lattice_core::Identity) -> 
     } else {
         Vec::new()
     };
+    let serves = if private {
+        Vec::new()
+    } else {
+        cfg.serves
+            .iter()
+            .map(|h| config::decode_hex32(h).map(lattice_types::Identifier::from_bytes))
+            .collect::<Result<Vec<_>, _>>()?
+    };
     let params = lattice_proto::record::RecordParams {
         kel: identity.kel.clone(),
         prev_seq: 0,
@@ -391,7 +399,7 @@ fn record_self_test(cfg: &config::Config, identity: &lattice_core::Identity) -> 
         links: vec![],
         gateways,
         capabilities: 1,
-        serves: vec![],
+        serves,
     };
     lattice_proto::record::PeerRecord::build(params, &identity.signing_seed)
         .map(|_| ())

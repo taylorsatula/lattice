@@ -28,7 +28,7 @@ use lattice_types::{
 
 use crate::error::NodeError;
 use crate::frame_budget;
-use crate::graph::Graph;
+use crate::graph::{Graph, GraphRecord};
 use crate::outbound::{OutboundMessageExt, OutboundStateExt};
 use crate::reconcile::{self, ReconcileSession};
 use crate::rng::Rng;
@@ -617,6 +617,14 @@ impl<S: Store> Node<S> {
                 "gateways are only valid in private mode".to_string(),
             ));
         }
+        if config.mode == Mode::Private && !config.serves.is_empty() {
+            return Err(NodeError::Config(
+                "serves is only valid in public mode".to_string(),
+            ));
+        }
+        if config.serves.len() > 16 {
+            return Err(NodeError::Config("serves is limited to 16 ids".to_string()));
+        }
         let rng_seed = config.rng_seed;
         let id = identity.id();
         // Per-node salt for record eviction, drawn from a separate stream
@@ -1040,7 +1048,11 @@ impl<S: Store> Node<S> {
                 links,
                 gateways,
                 capabilities: 1,
-                serves: Vec::new(),
+                serves: if private {
+                    Vec::new()
+                } else {
+                    self.config.serves.clone()
+                },
             },
             &self.identity.signing_seed,
         )?;
@@ -1326,31 +1338,26 @@ impl<S: Store> Node<S> {
                 return Arc::clone(g);
             }
         }
-        type RecordParts = (Identifier, Vec<Identifier>, Vec<Identifier>);
         let now_secs = ms_to_secs(self.now);
-        let mut records: Vec<RecordParts> = Vec::with_capacity(self.record_index.len());
+        let mut records: Vec<GraphRecord> = Vec::with_capacity(self.record_index.len());
         for entry in self.record_index.values() {
             if entry.record.exp <= now_secs {
                 continue;
             }
-            records.push((
-                entry.record.id,
-                entry.record.links.clone(),
-                entry.record.gateways.clone(),
-            ));
+            records.push(GraphRecord {
+                id: entry.record.id,
+                links: entry.record.links.clone(),
+                private: entry.record.mode == Mode::Private,
+                gateways: entry.record.gateways.clone(),
+                serves: entry.record.serves.clone(),
+            });
         }
-        let mut graph = Graph::build(
-            &self.own_id,
-            records.iter().map(|(i, l, _)| (i, l.as_slice())),
-        );
         // A private instance publishes no links, so the mutual-claim rule
-        // would leave it unreachable. Its record names its gateways; add a
-        // pseudo-edge to each so the graph can route to (and from) it.
-        for (id, _, gateways) in &records {
-            for gw in gateways {
-                graph.add_edge(*id, *gw);
-            }
-        }
+        // would leave it unreachable. Its record names its gateways; the
+        // graph adds a pseudo-edge to a gateway only when the gateway's
+        // record names the private id in `serves` (spec §3, gateway
+        // consent). Private nodes are leaves: reachable, never transit.
+        let graph = Graph::build(&self.own_id, records);
         let graph = Arc::new(graph);
         self.graph_cache = Some((key.0, key.1, Arc::clone(&graph)));
         graph
@@ -2879,6 +2886,7 @@ impl<S: Store> Node<S> {
         let up: HashSet<Identifier> = self.links.values().filter_map(|l| l.peer).collect();
         let peer = graph.next_hop(
             &self.own_id,
+            dst,
             dist.as_ref(),
             self.config.sideways_prob,
             &excluded_peers,
@@ -3189,6 +3197,14 @@ impl<S: Store> Node<S> {
             leg_hash,
             has_hop_layer,
         } = offer;
+        // A private instance never carries transit traffic (R-23): custody
+        // is accepted only when the message's destination is this node
+        // itself. This covers the relay path, the waypoint path and the
+        // gateway path alike.
+        if self.config.mode == Mode::Private && destination != self.own_id {
+            actions.push(Self::refuse(link, leg));
+            return;
+        }
         let msg_len = message.len() as u64;
         // Fair-share accounting is per (destination, upstream link), with
         // the allowance divided among the upstreams currently active for
@@ -3293,6 +3309,13 @@ impl<S: Store> Node<S> {
                     return actions;
                 }
                 Ok(HopLayerPlain::Gateway { rcpt }) => {
+                    // H-21: a gateway carries traffic only for the private
+                    // ids it serves (its record's `serves`). Anything else
+                    // is refused.
+                    if !self.config.serves.contains(&rcpt) {
+                        actions.push(Self::refuse(link, leg));
+                        return actions;
+                    }
                     // The private recipient cannot open the gateway layer
                     // (it is sealed to us), so it is stripped before the
                     // message is stored and forwarded. Header and envelope
@@ -7375,8 +7398,22 @@ mod tests {
         gateways: Vec<Identifier>,
         at: u64,
     ) -> Identifier {
+        admit_peer_serves(node, identity, mode, links, gateways, Vec::new(), at)
+    }
+
+    /// As [`admit_peer`], with an explicit `serves` list (public records
+    /// only; private records carry none).
+    fn admit_peer_serves(
+        node: &mut Node<MemStore>,
+        identity: &Identity,
+        mode: Mode,
+        links: Vec<Identifier>,
+        gateways: Vec<Identifier>,
+        serves: Vec<Identifier>,
+        at: u64,
+    ) -> Identifier {
         admit_kel(node, &identity.kel, at);
-        let (endpoints, links, gateways) = match mode {
+        let (endpoints, links, gateways, serves) = match mode {
             Mode::Public => (
                 vec![lattice_proto::record::Endpoint {
                     url: "ws://mesh.example.com/".into(),
@@ -7384,8 +7421,9 @@ mod tests {
                 }],
                 links,
                 Vec::new(),
+                serves,
             ),
-            Mode::Private => (Vec::new(), Vec::new(), gateways),
+            Mode::Private => (Vec::new(), Vec::new(), gateways, Vec::new()),
         };
         let record = lattice_proto::record::PeerRecord::build(
             lattice_proto::record::RecordParams {
@@ -7402,7 +7440,7 @@ mod tests {
                 links,
                 gateways,
                 capabilities: 0,
-                serves: vec![],
+                serves,
             },
             &identity.signing_seed,
         )
@@ -7527,6 +7565,253 @@ mod tests {
             2,
             "both gateways should be chosen over 32 draws"
         );
+    }
+
+    // ── H-21 / R-23: gateway consent and private leaves ─────────────
+
+    /// Build a message addressed to `dst` (not this node), sealed to
+    /// `dst_ek`. Used to offer the node a relay custody candidate.
+    fn sealed_to_foreign(
+        dst: Identifier,
+        dst_ek: &XWingPublicKey,
+        sender: &Identity,
+        leg_byte: u8,
+        now: u64,
+    ) -> Vec<u8> {
+        Message::build(BuildParams {
+            envelope: Envelope {
+                kind: KIND_MESSAGE,
+                mid: MessageId::from_bytes([leg_byte; 16]),
+                from: sender.id(),
+                fsvc: "svc".into(),
+                fmbx: b"out".to_vec(),
+                tsvc: "svc".into(),
+                tmbx: b"in".to_vec(),
+                created: now,
+                body: Some(b"hi".to_vec()),
+                reference: None,
+                reason: None,
+                sig: Signature::from_bytes([0; 64]),
+            },
+            sender_seed: &sender.signing_seed,
+            recipient_ek: dst_ek,
+            real_dst: dst,
+            leg: LegId::from_bytes([leg_byte; 16]),
+            exp: now + 10_000,
+            gateway: None,
+            waypoint: None,
+            entropy: &mut |b: &mut [u8; 64]| b.fill(0x5A),
+        })
+        .expect("message builds")
+    }
+
+    fn private_test_node() -> Node<MemStore> {
+        let gw = Identifier::from_bytes([0xE7; 32]);
+        Node::new(
+            Config {
+                snow_per_min: 0.0,
+                mode: Mode::Private,
+                gateways: vec![gw],
+                ..Config::default()
+            },
+            Identity::from_seed(&[0xA5; 32]),
+            MemStore::new(),
+            1_000,
+        )
+        .expect("node construction")
+    }
+
+    #[test]
+    fn private_node_refuses_relay_custody() {
+        let mut node = private_test_node();
+        let sender = Identity::from_seed(&[0x5A; 32]);
+        admit_sender(&mut node, &sender, 1_000);
+        link_up(&mut node, 100, sender.id(), 1_000);
+        let now = 1_000u64;
+        let foreign = Identity::from_seed(&[0x5B; 32]);
+        let wire = sealed_to_foreign(foreign.id(), &foreign.xwing_public, &sender, 0x61, now);
+        let (actions, _) = node.handle(Event::Frame {
+            at: now,
+            link: 100,
+            frame: Frame::Offer(OfferFrame { message: wire }),
+            bucket: None,
+        });
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::SendFrame {
+                    frame: Frame::Custody(c),
+                    ..
+                } if c.result == CUSTODY_REFUSED
+            )),
+            "a private node must refuse relay custody for a foreign destination, got {actions:?}"
+        );
+        assert_eq!(node.debug_custody_count(), 0);
+    }
+
+    #[test]
+    fn public_node_accepts_relay_custody() {
+        // Control: the same offer is accepted by a public node.
+        let mut node = test_node();
+        let sender = Identity::from_seed(&[0x5A; 32]);
+        admit_sender(&mut node, &sender, 1_000);
+        link_up(&mut node, 100, sender.id(), 1_000);
+        let now = 1_000u64;
+        let foreign = Identity::from_seed(&[0x5B; 32]);
+        let wire = sealed_to_foreign(foreign.id(), &foreign.xwing_public, &sender, 0x62, now);
+        let (actions, _) = node.handle(Event::Frame {
+            at: now,
+            link: 100,
+            frame: Frame::Offer(OfferFrame { message: wire }),
+            bucket: None,
+        });
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::SendFrame {
+                    frame: Frame::Custody(c),
+                    ..
+                } if c.result == CUSTODY_ACCEPTED
+            )),
+            "a public node accepts relay custody, got {actions:?}"
+        );
+    }
+
+    #[test]
+    fn pseudo_edge_requires_gateway_consent() {
+        // Gateway without `serves`: no edge, no route to the private node.
+        let mut node = test_node();
+        let now = 1_000u64;
+        let gw_id = Identity::from_seed(&[0xE1; 32]);
+        let priv_id = Identity::from_seed(&[0xB1; 32]);
+        let gw = admit_peer_serves(&mut node, &gw_id, Mode::Public, vec![], vec![], vec![], now);
+        let p = admit_peer(&mut node, &priv_id, Mode::Private, vec![], vec![gw], now);
+        let graph = node.build_graph();
+        assert!(!graph.distances(&gw).contains_key(&p));
+        assert!(!graph.distances(&p).contains_key(&gw));
+
+        // Same topology, but the gateway lists the private id in `serves`:
+        // the edge exists in both directions.
+        let mut node = test_node();
+        let priv_id2 = Identity::from_seed(&[0xB1; 32]);
+        let priv_id2_id = priv_id2.id();
+        let gw = admit_peer_serves(
+            &mut node,
+            &gw_id,
+            Mode::Public,
+            vec![],
+            vec![],
+            vec![priv_id2_id],
+            now,
+        );
+        let p = admit_peer(&mut node, &priv_id2, Mode::Private, vec![], vec![gw], now);
+        let graph = node.build_graph();
+        assert_eq!(graph.distances(&gw).get(&p), Some(&1));
+        assert_eq!(graph.distances(&p).get(&gw), Some(&1));
+    }
+
+    #[test]
+    fn gateway_consent_is_per_private_id() {
+        // The gateway serves a *different* private id: no edge to this one.
+        let mut node = test_node();
+        let now = 1_000u64;
+        let gw_id = Identity::from_seed(&[0xE1; 32]);
+        let priv_id = Identity::from_seed(&[0xB1; 32]);
+        let other = Identity::from_seed(&[0xB2; 32]);
+        let gw = admit_peer_serves(
+            &mut node,
+            &gw_id,
+            Mode::Public,
+            vec![],
+            vec![],
+            vec![other.id()],
+            now,
+        );
+        let p = admit_peer(&mut node, &priv_id, Mode::Private, vec![], vec![gw], now);
+        let graph = node.build_graph();
+        assert!(!graph.distances(&gw).contains_key(&p));
+    }
+
+    #[test]
+    fn gateway_layer_refused_without_serves_accepted_with() {
+        let recipient = Identifier::from_bytes([0xD1; 32]);
+        let sender = Identity::from_seed(&[0x5C; 32]);
+        for serves in [vec![], vec![recipient]] {
+            let mut node = Node::new(
+                Config {
+                    snow_per_min: 0.0,
+                    serves: serves.clone(),
+                    ..Config::default()
+                },
+                Identity::from_seed(&[0xA5; 32]),
+                MemStore::new(),
+                1_000,
+            )
+            .expect("node construction");
+            let now = 1_000u64;
+            let wire = Message::build(BuildParams {
+                envelope: Envelope {
+                    kind: KIND_MESSAGE,
+                    mid: MessageId::from_bytes([0x53; 16]),
+                    from: sender.id(),
+                    fsvc: "svc".into(),
+                    fmbx: b"out".to_vec(),
+                    tsvc: "svc".into(),
+                    tmbx: b"in".to_vec(),
+                    created: now,
+                    body: Some(b"hi".to_vec()),
+                    reference: None,
+                    reason: None,
+                    sig: Signature::from_bytes([0; 64]),
+                },
+                sender_seed: &sender.signing_seed,
+                recipient_ek: &XWingPublicKey::from_bytes([7u8; 1216]),
+                real_dst: node.own_id,
+                leg: LegId::from_bytes([0x53; 16]),
+                exp: now + 10_000,
+                gateway: Some(GatewaySeal {
+                    gateway_ek: node.identity.xwing_public,
+                    rcpt: recipient,
+                }),
+                waypoint: None,
+                entropy: &mut |b: &mut [u8; 64]| b.fill(0x5A),
+            })
+            .expect("message builds");
+            link_up(&mut node, 100, sender.id(), now);
+            let (actions, _) = node.handle(Event::Frame {
+                at: now,
+                link: 100,
+                frame: Frame::Offer(OfferFrame { message: wire }),
+                bucket: None,
+            });
+            let accepted = actions.iter().any(|a| {
+                matches!(
+                    a,
+                    Action::SendFrame {
+                        frame: Frame::Custody(c),
+                        ..
+                    } if c.result == CUSTODY_ACCEPTED
+                )
+            });
+            let refused = actions.iter().any(|a| {
+                matches!(
+                    a,
+                    Action::SendFrame {
+                        frame: Frame::Custody(c),
+                        ..
+                    } if c.result == CUSTODY_REFUSED
+                )
+            });
+            if serves.is_empty() {
+                assert!(refused, "a gateway without the id in serves must refuse");
+                assert!(!accepted);
+            } else {
+                assert!(
+                    accepted,
+                    "a gateway serving the id must accept, got {actions:?}"
+                );
+            }
+        }
     }
 
     // ── R-39: attempt accounting and no-route backoff ───────────────
@@ -7900,12 +8185,24 @@ mod tests {
 
     #[test]
     fn gateway_layer_sealed_to_retired_key_is_opened() {
-        let mut node = test_node();
+        let recipient = Identifier::from_bytes([0xD1; 32]);
+        // The node serves `recipient` as a gateway (spec §3, gateway
+        // consent); without that, the gateway layer is refused.
+        let mut node = Node::new(
+            Config {
+                snow_per_min: 0.0,
+                serves: vec![recipient],
+                ..Config::default()
+            },
+            Identity::from_seed(&[0xA5; 32]),
+            MemStore::new(),
+            1_000,
+        )
+        .expect("node construction");
         let now = 1_000u64;
         let old_ek = node.identity.xwing_public;
         node.identity.rotate_envelope(now + 100_000);
         let sender = Identity::from_seed(&[0x5C; 32]);
-        let recipient = Identifier::from_bytes([0xD1; 32]);
         let wire = Message::build(BuildParams {
             envelope: Envelope {
                 kind: KIND_MESSAGE,

@@ -594,6 +594,17 @@ impl Runtime {
                 ))
             })
             .collect::<Result<_, lattice_core::NodeError>>()?;
+        let serves: Vec<Identifier> = cfg
+            .serves
+            .iter()
+            .map(|h| {
+                Ok(Identifier::from_bytes(
+                    crate::config::decode_hex32(h).map_err(|e| {
+                        lattice_core::NodeError::Config(format!("serves {h:?}: {e}"))
+                    })?,
+                ))
+            })
+            .collect::<Result<_, lattice_core::NodeError>>()?;
         let mut services: Vec<String> = cfg.services.keys().cloned().collect();
         services.sort_unstable();
         let core_cfg = lattice_core::Config {
@@ -619,6 +630,7 @@ impl Runtime {
                 })
                 .collect::<Result<Vec<_>, _>>()?,
             gateways,
+            serves,
             mode,
             ..lattice_core::Config::default()
         };
@@ -1717,6 +1729,7 @@ mod tests {
             advertise: vec![],
             ips: vec![],
             gateways: vec![],
+            serves: vec![],
             limits: crate::config::Limits::default(),
         };
         let (_peer_tx, peer_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1947,6 +1960,7 @@ mod tests {
             advertise: vec![],
             ips: vec![],
             gateways: vec![],
+            serves: vec![],
             limits: crate::config::Limits::default(),
         };
         let (_peer_tx, peer_rx) = tokio::sync::mpsc::unbounded_channel();

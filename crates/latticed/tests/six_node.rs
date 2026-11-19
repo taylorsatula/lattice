@@ -37,6 +37,13 @@ async fn six_node_gate() {
     std::fs::create_dir_all(&tmp).unwrap();
 
     // Boot order matters: children need their parents' ids/keys for roots.
+    // The private instance's identity is pre-created so the gateway can
+    // name it in `serves` (spec §3, gateway consent): the gateway carries
+    // traffic for the private instance only when both records name each
+    // other.
+    let priv_dir = tmp.join("priv");
+    let priv_keys = init_node(&priv_dir);
+    let priv_id = priv_keys.id;
     let h1 = boot_node(&tmp, "h1", None, SERVICES);
     let h1_addr = format!("127.0.0.1:{}", h1.port);
     let h2 = boot_node(
@@ -59,7 +66,7 @@ async fn six_node_gate() {
         }),
         SERVICES,
     );
-    let gw = boot_node(
+    let gw = boot_node_with_serves(
         &tmp,
         "gw",
         Some(PeerSpec {
@@ -68,6 +75,7 @@ async fn six_node_gate() {
             id: h1.id,
         }),
         SERVICES,
+        vec![priv_id],
     );
     let wan = boot_node(
         &tmp,
@@ -80,9 +88,10 @@ async fn six_node_gate() {
         SERVICES,
     );
     let gw_addr = format!("127.0.0.1:{}", gw.port);
-    let priv_node = boot_node_full(
+    let priv_node = boot_node_with_keys(
         &tmp,
         "priv",
+        priv_keys,
         Some(PeerSpec {
             addr: &gw_addr,
             channel_key: gw.channel_key,

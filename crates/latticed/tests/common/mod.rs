@@ -95,7 +95,8 @@ pub fn init_node(dir: &Path) -> NodeKeys {
 }
 
 /// Config knobs for a test node. `private` switches the node to private
-/// mode and names its gateways (hex ids).
+/// mode and names its gateways (hex ids). `serves` lists the private ids a
+/// public node consents to serve as a gateway (spec §3).
 pub struct NodeSpec<'a> {
     pub port: u16,
     pub app: &'a Path,
@@ -103,6 +104,7 @@ pub struct NodeSpec<'a> {
     pub peer: Option<PeerSpec<'a>>,
     pub services: &'a [ServiceSpec],
     pub private_gateways: Option<Vec<Identifier>>,
+    pub serves: Option<Vec<Identifier>>,
 }
 
 pub fn write_config(dir: &Path, spec: &NodeSpec) {
@@ -134,13 +136,24 @@ pub fn write_config(dir: &Path, spec: &NodeSpec) {
         ),
         None => ("public", String::new()),
     };
+    let serves = match (&spec.serves, &spec.private_gateways) {
+        (Some(ids), None) => format!(
+            "serves = [{}]\n",
+            ids.iter()
+                .map(|i| format!("\"{}\"", hex_encode(i.as_ref())))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        (Some(_), Some(_)) => panic!("serves is only valid for public nodes"),
+        (None, _) => String::new(),
+    };
     let toml = format!(
         r#"identity_dir = "{dir}"
 mode = "{mode}"
 listen = ["127.0.0.1:{port}"]
 app_socket = "{app}"
 admin_socket = "{admin}"
-{gateways}
+{gateways}{serves}
 [services]
 {services_toml}
 
@@ -208,11 +221,56 @@ pub fn boot_node_full(
     private_gateways: Option<Vec<Identifier>>,
 ) -> TestNode {
     let dir = tmp.join(name);
+    let keys = init_node(&dir);
+    boot_initialized(tmp, name, dir, keys, peer, services, private_gateways, None)
+}
+
+/// Boot a public node that consents to serve `serves` as a gateway
+/// (spec §3, gateway consent). The ids must be known before boot, so the
+/// caller pre-creates the private instance's identity with `init_node`.
+pub fn boot_node_with_serves(
+    tmp: &Path,
+    name: &str,
+    peer: Option<PeerSpec<'_>>,
+    services: &[ServiceSpec],
+    serves: Vec<Identifier>,
+) -> TestNode {
+    let dir = tmp.join(name);
+    let keys = init_node(&dir);
+    boot_initialized(tmp, name, dir, keys, peer, services, None, Some(serves))
+}
+
+/// Boot a node whose identity was already created with `init_node`
+/// (used when another node must name this one's id in its own config
+/// before this node boots — e.g. a gateway consenting to serve it).
+pub fn boot_node_with_keys(
+    tmp: &Path,
+    name: &str,
+    keys: NodeKeys,
+    peer: Option<PeerSpec<'_>>,
+    services: &[ServiceSpec],
+    private_gateways: Option<Vec<Identifier>>,
+) -> TestNode {
+    let dir = tmp.join(name);
+    boot_initialized(tmp, name, dir, keys, peer, services, private_gateways, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn boot_initialized(
+    tmp: &Path,
+    name: &str,
+    dir: PathBuf,
+    keys: NodeKeys,
+    peer: Option<PeerSpec<'_>>,
+    services: &[ServiceSpec],
+    private_gateways: Option<Vec<Identifier>>,
+    serves: Option<Vec<Identifier>>,
+) -> TestNode {
     let NodeKeys {
         id,
         channel_key,
         next_key,
-    } = init_node(&dir);
+    } = keys;
     let app = tmp.join(format!("{name}.app.sock"));
     let admin = tmp.join(format!("{name}.admin.sock"));
     let mut attempt = 0;
@@ -226,6 +284,7 @@ pub fn boot_node_full(
             peer,
             services,
             private_gateways: private_gateways.clone(),
+            serves: serves.clone(),
         };
         write_config(&dir, &spec);
         let mut child = start_node(&dir);

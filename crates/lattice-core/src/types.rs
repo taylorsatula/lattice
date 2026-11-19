@@ -175,6 +175,11 @@ pub struct Config {
     pub advertise_ips: Vec<std::net::IpAddr>,
     /// Gateway node ids for a private node's record (1-3, private mode only).
     pub gateways: Vec<Identifier>,
+    /// Private ids this public node serves as a gateway (spec §3, "Gateway
+    /// consent"). Published in the record's `serves`; at most 16. A private
+    /// instance names its gateways in `gateways`; the gateway consents by
+    /// listing the private id here. Public mode only.
+    pub serves: Vec<Identifier>,
     /// Public or private record mode.
     pub mode: Mode,
     /// Names of the services this node serves. A message addressed to any
@@ -209,6 +214,7 @@ impl Default for Config {
             advertise: Vec::new(),
             advertise_ips: Vec::new(),
             gateways: Vec::new(),
+            serves: Vec::new(),
             mode: Mode::Public,
             services: Vec::new(),
         }
