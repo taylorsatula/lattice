@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use lattice_proto::frames::{
     CUSTODY_ACCEPTED, CUSTODY_ALREADY_HAVE, CUSTODY_BUSY, CUSTODY_REFUSED, CUSTODY_SEEN,
-    CustodyFrame, DummyFrame, Frame, KelsFrame, OfferFrame, PingFrame, ReconcileFrame,
+    CustodyFrame, DummyFrame, Frame, KelsFrame, OfferFrame, PingFrame, ReconcileFrame, RecordRef,
     RecordsFrame, SCOPE_KEL, WantFrame,
 };
 use lattice_proto::kel::{KeyEvent, ValidatedKel};
@@ -214,6 +214,27 @@ impl Identity {
                 for retired in &self.retired_xwing {
                     if let Ok(e) = msg.open_envelope(&retired.secret) {
                         return Ok(e);
+                    }
+                }
+                Err(first_err)
+            }
+        }
+    }
+
+    /// Try to open a hop layer with the current key, then any retired keys
+    /// still within their grace period. Hop layers are sealed to the same
+    /// X-Wing key as envelopes, so a rotation must not strand a waypoint
+    /// or gateway layer that was sealed just before it.
+    pub fn open_hop_layer_any(
+        &self,
+        msg: &lattice_proto::message::Message,
+    ) -> Result<lattice_proto::message::HopLayerPlain, lattice_proto::ProtoError> {
+        match msg.open_hop_layer(&self.xwing_secret) {
+            Ok(h) => Ok(h),
+            Err(first_err) => {
+                for retired in &self.retired_xwing {
+                    if let Ok(h) = msg.open_hop_layer(&retired.secret) {
+                        return Ok(h);
                     }
                 }
                 Err(first_err)
@@ -495,6 +516,10 @@ pub struct Node<S: Store> {
     outbound_deadline: std::collections::BTreeMap<u64, std::collections::HashSet<MessageId>>,
     /// Non-terminal outbound messages by expiry (ms).
     outbound_expiry: std::collections::BTreeMap<u64, std::collections::HashSet<MessageId>>,
+    /// Consecutive no-route waits per message, driving the backoff for a
+    /// message with no current route. In-memory only: a restart resets the
+    /// backoff to its base, which is harmless. Bounded; cleared when full.
+    no_route_backoff: std::collections::HashMap<MessageId, u32>,
     /// Memoized distance maps, keyed by (records_version, now_secs,
     /// source). Bounded; cleared when full.
     distance_cache: std::collections::HashMap<
@@ -616,6 +641,7 @@ impl<S: Store> Node<S> {
             outbound_due: std::collections::BTreeMap::new(),
             outbound_deadline: std::collections::BTreeMap::new(),
             outbound_expiry: std::collections::BTreeMap::new(),
+            no_route_backoff: std::collections::HashMap::new(),
             distance_cache: std::collections::HashMap::new(),
             record_refresh_at: first_refresh,
             recently_lost: Vec::new(),
@@ -1492,11 +1518,40 @@ impl<S: Store> Node<S> {
             pad_to: None,
             link,
             frame: Frame::Want(WantFrame {
-                wants: vec![lattice_proto::frames::RecordRef {
+                wants: vec![RecordRef {
                     id,
                     scope: SCOPE_KEL,
                 }],
             }),
+        }]
+    }
+
+    /// Ask `link` for the record for `id` in both scopes (WAN and hive).
+    /// Sent when an offer arrives from an unknown sender: the record is
+    /// needed to authenticate the sender (spec §5). Credits the link for
+    /// the wants, like the reconcile path, so the records are admitted
+    /// without spending the unsolicited-push budget.
+    fn want_record(&mut self, link: LinkId, id: Identifier) -> Vec<Action> {
+        let wants = vec![
+            RecordRef {
+                id,
+                scope: scope_as_u8(Scope::Wan),
+            },
+            RecordRef {
+                id,
+                scope: scope_as_u8(Scope::Hive),
+            },
+        ];
+        if let Some(l) = self.links.get_mut(&link) {
+            l.want_credits = l
+                .want_credits
+                .saturating_add(wants.len() as u32)
+                .min(MAX_WANT_CREDITS);
+        }
+        vec![Action::SendFrame {
+            pad_to: None,
+            link,
+            frame: Frame::Want(WantFrame { wants }),
         }]
     }
 
@@ -1984,10 +2039,9 @@ impl<S: Store> Node<S> {
 // Messaging engine
 // ============================================================
 
-/// The wire bytes of a built message and the waypoint it was sealed to, if any.
+/// The wire bytes of a built message.
 struct BuildOutput {
     wire: Vec<u8>,
-    waypoint: Option<Identifier>,
 }
 
 /// The next hop for a message: the link to send on and the peer at the
@@ -2287,30 +2341,66 @@ impl<S: Store> Node<S> {
             .unwrap_or_default()
     }
 
-    /// Build a wire message for one attempt. Returns (bytes, routing destination, waypoint used).
+    /// Choose a gateway for a private recipient: uniformly at random
+    /// among the gateways with a known record, preferring ones not yet
+    /// tried for this message. When every known gateway has been tried
+    /// without a receipt, fall back to the full set rather than strand
+    /// the message — a gateway that failed once may deliver on retry.
+    fn pick_gateway(
+        &mut self,
+        gateways: &[Identifier],
+        tried: &[Identifier],
+    ) -> Option<(Identifier, XWingPublicKey)> {
+        let known: Vec<(Identifier, XWingPublicKey)> = gateways
+            .iter()
+            .filter_map(|g| self.record_envelope_key(g).map(|ek| (*g, ek)))
+            .collect();
+        if known.is_empty() {
+            return None;
+        }
+        let mut pool: Vec<(Identifier, XWingPublicKey)> = known
+            .into_iter()
+            .filter(|(g, _)| !tried.contains(g))
+            .collect();
+        if pool.is_empty() {
+            // Every known gateway was tried without a receipt; fall back
+            // to the full set rather than strand the message.
+            pool = gateways
+                .iter()
+                .filter_map(|g| self.record_envelope_key(g).map(|ek| (*g, ek)))
+                .collect();
+        }
+        let idx = (self.rng.next_u64() as usize) % pool.len();
+        Some(pool.swap_remove(idx))
+    }
+
+    /// Build a wire message for one attempt. Returns the wire bytes.
     /// A retry (`attempts > 0` on entry) forces waypoint routing: the direct
-    /// path already failed once. Counts the attempt, so this is the one
-    /// place `attempts` is incremented.
+    /// path already failed once. `attempts` is NOT incremented here; the
+    /// caller increments it when a first hop accepts the message.
     fn build_attempt(
         &mut self,
         msg: &mut lattice_store::OutboundMessage,
     ) -> Result<BuildOutput, BuildError> {
         let force_waypoint = msg.attempts > 0;
-        msg.attempts += 1;
         let recipient_rec = self.lookup_validated(&msg.recipient);
         let recipient_private = recipient_rec
             .as_ref()
             .is_some_and(|r| r.mode == Mode::Private);
         let gateway_choice = if recipient_private {
-            recipient_rec
+            let gateways = recipient_rec
                 .as_ref()
                 .map(|r| r.gateways.clone())
-                .unwrap_or_default()
-                .into_iter()
-                .find_map(|g| self.record_envelope_key(&g).map(|ek| (g, ek)))
+                .unwrap_or_default();
+            self.pick_gateway(&gateways, &msg.waypoints_tried)
         } else {
             None
         };
+        if let Some((g, _)) = &gateway_choice {
+            // Record the gateway as tried at selection time, so a dispatch
+            // that finds no route still burns it (same rule as waypoints).
+            msg.waypoints_tried.push(*g);
+        }
         if recipient_private && gateway_choice.is_none() {
             return Err(BuildError::NoRoute);
         }
@@ -2328,6 +2418,11 @@ impl<S: Store> Node<S> {
         } else {
             None
         };
+        if let Some(choice) = &waypoint_choice {
+            // Record the waypoint as tried at selection time, so a dispatch
+            // that finds no route does not select it again next attempt.
+            msg.waypoints_tried.push(choice.id);
+        }
 
         let recipient_ek = recipient_rec
             .map(|r| r.envelope_key)
@@ -2344,7 +2439,6 @@ impl<S: Store> Node<S> {
             leg: waypoint_leg,
             exp: ms_to_secs(msg.exp),
         });
-        let used_waypoint_id = waypoint.as_ref().map(|w| w.waypoint_id);
         let real_leg = LegId::from_bytes(self.rand_id16());
         let wire = Message::build(BuildParams {
             envelope: msg.envelope.clone(),
@@ -2358,10 +2452,7 @@ impl<S: Store> Node<S> {
             entropy: &mut |buf| self.rng.fill_bytes(buf),
         })
         .map_err(|_| BuildError::Crypto)?;
-        Ok(BuildOutput {
-            wire,
-            waypoint: used_waypoint_id,
-        })
+        Ok(BuildOutput { wire })
     }
 
     fn pick_waypoint(
@@ -2374,6 +2465,12 @@ impl<S: Store> Node<S> {
         let own_links: HashSet<Identifier> = self.links.values().filter_map(|l| l.peer).collect();
         let recipient_gateways: HashSet<Identifier> =
             self.record_gateways(recipient).into_iter().collect();
+        // A waypoint we cannot reach cannot carry the message; drop
+        // candidates with no path from here. The graph is undirected, so
+        // reachability from here is the same component membership the
+        // waypoint would need to reach the destination.
+        let own = self.own_id;
+        let reachable = self.distances_cached(&own);
         let cached = self.waypoint_candidates();
         let mut candidates: Vec<WaypointChoice> = cached
             .iter()
@@ -2383,6 +2480,7 @@ impl<S: Store> Node<S> {
                     && !exclude.contains(&c.id)
                     && !own_links.contains(&c.id)
                     && !recipient_gateways.contains(&c.id)
+                    && reachable.contains_key(&c.id)
             })
             .cloned()
             .collect();
@@ -2459,9 +2557,9 @@ impl<S: Store> Node<S> {
                 Ok(built) => {
                     match self.dispatch_wire(now, &built.wire, &msg, &mut actions) {
                         DispatchResult::Sent => {
-                            if let Some(wp) = built.waypoint {
-                                msg.waypoints_tried.push(wp);
-                            }
+                            // A first hop accepted the message: this is an attempt.
+                            msg.attempts += 1;
+                            self.clear_no_route(&msg.mid);
                             msg.mark_in_flight();
                             msg.next_attempt = now + secs_to_ms(self.config.retry_base_secs);
                             // The receipt clock starts when the message
@@ -2470,36 +2568,16 @@ impl<S: Store> Node<S> {
                             self.store_outbound(&msg);
                         }
                         DispatchResult::NoRoute => {
-                            msg.requeue(now + self.backoff(msg.attempts));
-                            self.store_outbound(&msg);
+                            self.requeue_no_route(now, &mut msg);
                         }
                     }
                 }
                 Err(BuildError::NoRoute) => {
-                    if msg.attempts > self.config.fresh_waypoint_retries + 1 {
-                        msg.mark_failed();
-                        self.store_outbound(&msg);
-                        if let Err(e) = self.store.status_set(
-                            &msg.mid,
-                            local::MSG_STATUS_FAILED,
-                            Some(ERR_NO_ROUTE),
-                            ms_to_secs(now),
-                        ) {
-                            self.diag("status_set", &e);
-                        }
-                        actions.push(Action::Status {
-                            mid: msg.mid,
-                            status: local::MSG_STATUS_FAILED,
-                            detail: Some(ERR_NO_ROUTE),
-                            service: msg.envelope.fsvc.clone(),
-                        });
-                    } else {
-                        msg.next_attempt = now + secs_to_ms(self.config.retry_base_secs);
-                        self.store_outbound(&msg);
-                    }
+                    self.requeue_no_route(now, &mut msg);
                 }
                 Err(BuildError::Crypto) => {
                     // Deterministic failure: retrying cannot help.
+                    self.clear_no_route(&msg.mid);
                     msg.mark_failed();
                     self.store_outbound(&msg);
                     if let Err(e) = self.store.status_set(
@@ -2534,6 +2612,32 @@ impl<S: Store> Node<S> {
         let shift = attempts.min(16);
         let base = secs_to_ms(self.config.retry_base_secs).saturating_mul(1u64 << shift);
         base.min(secs_to_ms(self.config.retry_max_secs))
+    }
+
+    /// Note a no-route wait for `mid` and return the consecutive count
+    /// (0-based) to feed the backoff. Bounded; the map clears itself
+    /// when full.
+    fn note_no_route(&mut self, mid: &MessageId) -> u32 {
+        if self.no_route_backoff.len() >= 1024 {
+            self.no_route_backoff.clear();
+        }
+        let n = self.no_route_backoff.get(mid).copied().unwrap_or(0);
+        self.no_route_backoff.insert(*mid, n.saturating_add(1));
+        n
+    }
+
+    fn clear_no_route(&mut self, mid: &MessageId) {
+        self.no_route_backoff.remove(mid);
+    }
+
+    /// A message with no route right now: wait with exponential backoff
+    /// until the message expires (or its receipt deadline passes, for a
+    /// message already in flight). This is not an attempt and does not
+    /// consume the fresh-waypoint-retry budget.
+    fn requeue_no_route(&mut self, now: u64, msg: &mut lattice_store::OutboundMessage) {
+        let n = self.note_no_route(&msg.mid);
+        msg.requeue(now + self.backoff(n));
+        self.store_outbound(msg);
     }
 
     fn pick_next_hop(
@@ -2935,7 +3039,7 @@ impl<S: Store> Node<S> {
         let leg = msg.header.leg;
 
         if msg.hop_layer.is_some() {
-            match msg.open_hop_layer(&self.identity.xwing_secret) {
+            match self.identity.open_hop_layer_any(msg) {
                 Ok(HopLayerPlain::Waypoint { hdr, inner }) => {
                     // The outer header's expiry is checked in Message::parse;
                     // the inner header's is not, so enforce the same horizon
@@ -3032,10 +3136,16 @@ impl<S: Store> Node<S> {
             return actions;
         }
         let Some(key) = self.signing_key_for(&opened.from) else {
-            // No record for the sender; cannot verify. Ask for it via the
-            // normal path by refusing softly (busy): the sender retries
-            // after gossip delivers the record.
+            // No record for the sender; cannot verify. Ask for it through
+            // gossip (spec §5): a want on the offering link and on one
+            // other link, then refuse softly (busy) so the sender retries
+            // after the record arrives.
             actions.push(self.busy(link, leg));
+            actions.extend(self.want_record(link, opened.from));
+            let others: Vec<LinkId> = self.links.keys().filter(|&&l| l != link).copied().collect();
+            if let Some(&other) = self.rng.pick(&others) {
+                actions.extend(self.want_record(other, opened.from));
+            }
             return actions;
         };
         if !opened.verify_signature(&key, msg.routing_header_bytes()) {
@@ -3723,6 +3833,7 @@ impl<S: Store> Node<S> {
                 }
                 let was_active = !msg.state.is_terminal();
                 if was_active {
+                    self.clear_no_route(&msg.mid);
                     if envelope.kind == KIND_RECEIPT {
                         msg.mark_delivered();
                     } else {
@@ -3933,6 +4044,7 @@ impl<S: Store> Node<S> {
                 continue;
             }
             msg.mark_expired();
+            self.clear_no_route(&msg.mid);
             self.store_outbound(&msg);
             if let Err(e) = self.store.status_set(
                 &msg.mid,
@@ -3984,6 +4096,7 @@ impl<S: Store> Node<S> {
                 self.index_outbound(&msg);
                 continue;
             }
+            self.clear_no_route(&msg.mid);
             if msg.attempts > self.config.fresh_waypoint_retries {
                 msg.mark_failed();
                 self.store_outbound(&msg);
@@ -6969,5 +7082,654 @@ mod tests {
         assert!(node.share_exceeded(&dst2, 100, 1));
         // Upstream 200 is unaffected.
         assert!(!node.share_exceeded(&dst1, 200, 1));
+    }
+
+    /// Admit a record for `identity` with the given mode, links and
+    /// gateways; returns the identity's id.
+    fn admit_peer(
+        node: &mut Node<MemStore>,
+        identity: &Identity,
+        mode: Mode,
+        links: Vec<Identifier>,
+        gateways: Vec<Identifier>,
+        at: u64,
+    ) -> Identifier {
+        admit_kel(node, &identity.kel, at);
+        let (endpoints, links, gateways) = match mode {
+            Mode::Public => (
+                vec![lattice_proto::record::Endpoint {
+                    url: "ws://mesh.example.com/".into(),
+                    ips: vec![],
+                }],
+                links,
+                Vec::new(),
+            ),
+            Mode::Private => (Vec::new(), Vec::new(), gateways),
+        };
+        let record = lattice_proto::record::PeerRecord::build(
+            lattice_proto::record::RecordParams {
+                kel: ValidatedKel::validate(identity.kel.events().to_vec()).unwrap(),
+                prev_seq: 0,
+                now: 1,
+                exp: 1_000 + 86_400,
+                channel_key: lattice_crypto::channel_public(&identity.channel_seed),
+                channel_seed: identity.channel_seed.clone(),
+                envelope_key: identity.xwing_public,
+                mode,
+                scope: Scope::Wan,
+                endpoints,
+                links,
+                gateways,
+                capabilities: 0,
+                serves: vec![],
+            },
+            &identity.signing_seed,
+        )
+        .unwrap();
+        node.admit_record(at, 999, &record.encode());
+        identity.id()
+    }
+
+    /// The `dst` of the offer carried by `actions`, if any.
+    fn sent_dst(actions: &[Action], now: u64) -> Option<Identifier> {
+        actions.iter().find_map(|a| match a {
+            Action::SendFrame {
+                frame: Frame::Offer(o),
+                ..
+            } => Message::parse(&o.message, ms_to_secs(now))
+                .ok()
+                .map(|m| m.header.dst),
+            _ => None,
+        })
+    }
+
+    // ── R-36: gateway selection ─────────────────────────────────────
+
+    #[test]
+    fn gateway_selection_prefers_untried_gateways() {
+        let mut node = test_node();
+        let now = 1_000u64;
+        let gw1 = admit_peer(
+            &mut node,
+            &Identity::from_seed(&[0xE1; 32]),
+            Mode::Public,
+            vec![],
+            vec![],
+            now,
+        );
+        let gw2 = admit_peer(
+            &mut node,
+            &Identity::from_seed(&[0xE2; 32]),
+            Mode::Public,
+            vec![],
+            vec![],
+            now,
+        );
+        let recipient = admit_peer(
+            &mut node,
+            &Identity::from_seed(&[0xE3; 32]),
+            Mode::Private,
+            vec![],
+            vec![gw1, gw2],
+            now,
+        );
+        link_up(&mut node, 100, gw1, now);
+        link_up(&mut node, 200, gw2, now);
+
+        let mid = MessageId::from_bytes([0x71; 16]);
+        let mut msg = outbound(mid, recipient, OutboundState::Queued);
+        msg.exp = now + 100_000;
+        msg.next_attempt = now;
+        node.push_outbound(&msg).unwrap();
+
+        // First attempt: one of the two gateways is chosen and recorded.
+        let actions = node.pump_outbound(now);
+        let first = sent_dst(&actions, now).expect("message must be sent");
+        assert!(first == gw1 || first == gw2);
+        let stored = node.store.outbound_get(&mid).unwrap().unwrap();
+        assert_eq!(stored.waypoints_tried, vec![first]);
+        assert_eq!(stored.attempts, 1);
+
+        // Force a requeue (as the receipt-deadline sweep would) and pump
+        // again: the untried gateway must be chosen.
+        let mut stored = outbound_from_store(stored);
+        stored.state = OutboundState::Queued;
+        stored.next_attempt = now + 1;
+        node.store_outbound(&stored);
+        let actions = node.pump_outbound(now + 1);
+        let second = sent_dst(&actions, now + 1).expect("second attempt must be sent");
+        assert_ne!(first, second, "the tried gateway must not be chosen again");
+        let stored = node.store.outbound_get(&mid).unwrap().unwrap();
+        assert_eq!(stored.waypoints_tried, vec![first, second]);
+        assert_eq!(stored.attempts, 2);
+
+        // Both gateways tried: the fallback still sends (to one of them)
+        // rather than stranding the message.
+        let mut stored = outbound_from_store(stored);
+        stored.state = OutboundState::Queued;
+        stored.next_attempt = now + 2;
+        node.store_outbound(&stored);
+        let actions = node.pump_outbound(now + 2);
+        let third = sent_dst(&actions, now + 2).expect("third attempt must still be sent");
+        assert!(third == gw1 || third == gw2);
+        let stored = node.store.outbound_get(&mid).unwrap().unwrap();
+        assert_eq!(stored.attempts, 3);
+    }
+
+    #[test]
+    fn gateway_choice_is_not_always_the_first_listed() {
+        let mut node = test_node();
+        let now = 1_000u64;
+        let gw1 = admit_peer(
+            &mut node,
+            &Identity::from_seed(&[0xE1; 32]),
+            Mode::Public,
+            vec![],
+            vec![],
+            now,
+        );
+        let gw2 = admit_peer(
+            &mut node,
+            &Identity::from_seed(&[0xE2; 32]),
+            Mode::Public,
+            vec![],
+            vec![],
+            now,
+        );
+        let mut picks = std::collections::HashSet::new();
+        for _ in 0..32 {
+            let picked = node.pick_gateway(&[gw1, gw2], &[]).expect("a gateway").0;
+            picks.insert(picked);
+        }
+        assert_eq!(
+            picks.len(),
+            2,
+            "both gateways should be chosen over 32 draws"
+        );
+    }
+
+    // ── R-39: attempt accounting and no-route backoff ───────────────
+
+    #[test]
+    fn no_route_waits_with_backoff_and_expires_without_failing() {
+        let cfg = Config {
+            snow_per_min: 0.0,
+            retry_base_secs: 10,
+            retry_max_secs: 1_000,
+            ..Config::default()
+        };
+        let mut node = Node::new(
+            cfg,
+            Identity::from_seed(&[0xA5; 32]),
+            MemStore::new(),
+            1_000,
+        )
+        .expect("node construction");
+        let now = 1_000u64;
+        // A recipient with a record but no path: the build succeeds, the
+        // dispatch finds no route.
+        let recipient = admit_peer(
+            &mut node,
+            &Identity::from_seed(&[0xE5; 32]),
+            Mode::Public,
+            vec![],
+            vec![],
+            now,
+        );
+        let mid = MessageId::from_bytes([0x72; 16]);
+        let mut msg = outbound(mid, recipient, OutboundState::Queued);
+        msg.exp = now + 45_000;
+        msg.next_attempt = now;
+        node.push_outbound(&msg).unwrap();
+
+        // First pump: no route; backs off by retry_base, attempts stay 0.
+        let actions = node.pump_outbound(now);
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::SendFrame { .. }))
+        );
+        let stored = outbound_from_store(node.store.outbound_get(&mid).unwrap().unwrap());
+        assert_eq!(stored.attempts, 0);
+        assert_eq!(stored.state, OutboundState::Queued);
+        assert_eq!(stored.next_attempt, now + 10_000);
+
+        // Second pump: backoff doubles.
+        let _ = node.pump_outbound(now + 10_000);
+        let stored = outbound_from_store(node.store.outbound_get(&mid).unwrap().unwrap());
+        assert_eq!(stored.attempts, 0);
+        assert_eq!(stored.next_attempt, now + 10_000 + 20_000);
+
+        // Third pump: still waiting, still not failed.
+        let _ = node.pump_outbound(now + 30_000);
+        let stored = outbound_from_store(node.store.outbound_get(&mid).unwrap().unwrap());
+        assert_eq!(stored.attempts, 0);
+        assert_eq!(stored.state, OutboundState::Queued);
+        assert_eq!(stored.next_attempt, now + 30_000 + 40_000);
+
+        // The message is not failed early; it expires at its horizon.
+        node.expire_outbound(now + 45_001);
+        let stored = node.store.outbound_get(&mid).unwrap().unwrap();
+        assert_eq!(stored.state, OutboundState::Expired);
+        let status = node.store.status_get(&mid).unwrap().unwrap();
+        assert_eq!(status.status, local::MSG_STATUS_EXPIRED);
+        assert_eq!(status.detail, Some(ERR_EXPIRED));
+    }
+
+    #[test]
+    fn missing_recipient_record_waits_instead_of_failing() {
+        let cfg = Config {
+            snow_per_min: 0.0,
+            retry_base_secs: 1,
+            retry_max_secs: 10,
+            ..Config::default()
+        };
+        let mut node = Node::new(
+            cfg,
+            Identity::from_seed(&[0xA5; 32]),
+            MemStore::new(),
+            1_000,
+        )
+        .expect("node construction");
+        let now = 1_000u64;
+        // No record for the recipient at all: the build itself finds no
+        // route. The message must wait, not fail.
+        let ghost = Identifier::from_bytes([0xE6; 32]);
+        let mid = MessageId::from_bytes([0x73; 16]);
+        let mut msg = outbound(mid, ghost, OutboundState::Queued);
+        msg.exp = now + 30_000;
+        msg.next_attempt = now;
+        node.push_outbound(&msg).unwrap();
+        for tick in 0..6 {
+            let at = now + tick * 1_000;
+            let actions = node.pump_outbound(at);
+            assert!(
+                !actions.iter().any(|a| matches!(
+                    a,
+                    Action::Status {
+                        status: local::MSG_STATUS_FAILED,
+                        ..
+                    }
+                )),
+                "a no-route message must not fail early"
+            );
+        }
+        let stored = node.store.outbound_get(&mid).unwrap().unwrap();
+        assert_eq!(stored.state, OutboundState::Queued);
+        assert_eq!(stored.attempts, 0);
+        node.expire_outbound(now + 30_001);
+        let stored = node.store.outbound_get(&mid).unwrap().unwrap();
+        assert_eq!(stored.state, OutboundState::Expired);
+    }
+
+    #[test]
+    fn receipt_deadline_fails_after_fresh_waypoint_retries_are_spent() {
+        let mut node = test_node();
+        let now = 1_000u64;
+        let recipient = admit_peer(
+            &mut node,
+            &Identity::from_seed(&[0xE7; 32]),
+            Mode::Public,
+            vec![],
+            vec![],
+            now,
+        );
+        let mid = MessageId::from_bytes([0x74; 16]);
+        let mut msg = outbound(mid, recipient, OutboundState::InFlight);
+        msg.attempts = 4; // > fresh_waypoint_retries (3)
+        msg.exp = now + 100_000;
+        msg.receipt_deadline = Some(now - 1);
+        node.store_outbound(&msg);
+        let actions = node.sweep_receipt_deadlines(now);
+        let stored = node.store.outbound_get(&mid).unwrap().unwrap();
+        assert_eq!(stored.state, OutboundState::Failed);
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            Action::Status {
+                status: local::MSG_STATUS_FAILED,
+                detail: Some(ERR_NO_ROUTE),
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn receipt_deadline_requeues_while_retries_remain() {
+        let mut node = test_node();
+        let now = 1_000u64;
+        let recipient = admit_peer(
+            &mut node,
+            &Identity::from_seed(&[0xE7; 32]),
+            Mode::Public,
+            vec![],
+            vec![],
+            now,
+        );
+        let mid = MessageId::from_bytes([0x75; 16]);
+        let mut msg = outbound(mid, recipient, OutboundState::InFlight);
+        msg.attempts = 2; // <= fresh_waypoint_retries (3)
+        msg.exp = now + 100_000;
+        msg.receipt_deadline = Some(now - 1);
+        node.store_outbound(&msg);
+        let actions = node.sweep_receipt_deadlines(now);
+        assert!(actions.is_empty());
+        let stored = outbound_from_store(node.store.outbound_get(&mid).unwrap().unwrap());
+        assert_eq!(stored.state, OutboundState::Queued);
+        assert_eq!(stored.next_attempt, now);
+    }
+
+    // ── R-40: waypoint candidates ───────────────────────────────────
+
+    #[test]
+    fn waypoint_candidates_must_be_reachable() {
+        let mut node = test_node();
+        let now = 1_000u64;
+        // w1 is reachable via x (A—x—w1); w2 has no path from here.
+        let own_id = node.own_id;
+        let x_id = Identity::from_seed(&[0xE8; 32]);
+        let w1_id = Identity::from_seed(&[0xE9; 32]);
+        let w1 = admit_peer(
+            &mut node,
+            &w1_id,
+            Mode::Public,
+            vec![x_id.id()],
+            vec![],
+            now,
+        );
+        let _w2 = admit_peer(
+            &mut node,
+            &Identity::from_seed(&[0xEA; 32]),
+            Mode::Public,
+            vec![],
+            vec![],
+            now,
+        );
+        let _x = admit_peer(
+            &mut node,
+            &x_id,
+            Mode::Public,
+            vec![own_id, w1],
+            vec![],
+            now,
+        );
+        link_up(&mut node, 100, x_id.id(), now);
+        let recipient = admit_peer(
+            &mut node,
+            &Identity::from_seed(&[0xEB; 32]),
+            Mode::Public,
+            vec![],
+            vec![],
+            now,
+        );
+        let mid = MessageId::from_bytes([0x76; 16]);
+        let mut msg = outbound(mid, recipient, OutboundState::Queued);
+        msg.route = 1; // force waypoint
+        msg.exp = now + 100_000;
+        msg.next_attempt = now;
+        node.push_outbound(&msg).unwrap();
+        let actions = node.pump_outbound(now);
+        let dst = sent_dst(&actions, now).expect("message must be sent via a waypoint");
+        assert_eq!(dst, w1, "the unreachable waypoint must not be chosen");
+        let stored = node.store.outbound_get(&mid).unwrap().unwrap();
+        assert_eq!(stored.waypoints_tried, vec![w1]);
+    }
+
+    #[test]
+    fn waypoint_chosen_for_no_route_dispatch_is_recorded_as_tried() {
+        let mut node = test_node();
+        let now = 1_000u64;
+        // w1 is reachable via x (A—x—w1); the link to x goes down, so
+        // dispatch finds no route. The waypoint must still be recorded
+        // as tried.
+        let own_id = node.own_id;
+        let x_id = Identity::from_seed(&[0xE8; 32]);
+        let w1_id = Identity::from_seed(&[0xE9; 32]);
+        let w1 = admit_peer(
+            &mut node,
+            &w1_id,
+            Mode::Public,
+            vec![x_id.id()],
+            vec![],
+            now,
+        );
+        let _x = admit_peer(
+            &mut node,
+            &x_id,
+            Mode::Public,
+            vec![own_id, w1],
+            vec![],
+            now,
+        );
+        link_up(&mut node, 100, x_id.id(), now);
+        node.handle(Event::LinkDown {
+            at: now + 1,
+            link: 100,
+        });
+        let recipient = admit_peer(
+            &mut node,
+            &Identity::from_seed(&[0xEA; 32]),
+            Mode::Public,
+            vec![],
+            vec![],
+            now,
+        );
+        let mid = MessageId::from_bytes([0x77; 16]);
+        let mut msg = outbound(mid, recipient, OutboundState::Queued);
+        msg.route = 1; // force waypoint
+        msg.exp = now + 100_000;
+        msg.next_attempt = now + 2;
+        node.push_outbound(&msg).unwrap();
+        let actions = node.pump_outbound(now + 2);
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::SendFrame { .. }))
+        );
+        let stored = node.store.outbound_get(&mid).unwrap().unwrap();
+        assert_eq!(stored.waypoints_tried, vec![w1]);
+        assert_eq!(stored.attempts, 0);
+        assert_eq!(stored.state, OutboundState::Queued);
+    }
+
+    // ── R-37: hop layers sealed to retired keys ─────────────────────
+
+    #[test]
+    fn hop_layer_sealed_to_retired_key_is_opened() {
+        let mut node = test_node();
+        let now = 1_000u64;
+        let old_ek = node.identity.xwing_public;
+        // Rotate: the current key is retired (grace period), a fresh key
+        // becomes current.
+        node.identity.rotate_envelope(now + 100_000);
+        let sender = Identity::from_seed(&[0x5C; 32]);
+        let recipient = Identifier::from_bytes([0xD1; 32]);
+        let own_id = node.own_id;
+        let build = |leg: u8| {
+            Message::build(BuildParams {
+                envelope: Envelope {
+                    kind: KIND_MESSAGE,
+                    mid: MessageId::from_bytes([leg; 16]),
+                    from: sender.id(),
+                    fsvc: "svc".into(),
+                    fmbx: b"out".to_vec(),
+                    tsvc: "svc".into(),
+                    tmbx: b"in".to_vec(),
+                    created: 1,
+                    body: Some(b"hi".to_vec()),
+                    reference: None,
+                    reason: None,
+                    sig: Signature::from_bytes([0; 64]),
+                },
+                sender_seed: &sender.signing_seed,
+                recipient_ek: &XWingPublicKey::from_bytes([7u8; 1216]),
+                real_dst: recipient,
+                leg: LegId::from_bytes([leg; 16]),
+                exp: 10_000,
+                gateway: None,
+                waypoint: Some(WaypointSeal {
+                    waypoint_id: own_id,
+                    waypoint_ek: old_ek,
+                    leg: LegId::from_bytes([leg; 16]),
+                    exp: 10_000,
+                }),
+                entropy: &mut |b: &mut [u8; 64]| b.fill(0x5A),
+            })
+            .expect("message builds")
+        };
+        link_up(&mut node, 100, sender.id(), now);
+        // A waypoint layer sealed to the retired key is accepted.
+        let wire = build(0x51);
+        let (actions, _) = node.handle(Event::Frame {
+            at: now,
+            link: 100,
+            frame: Frame::Offer(OfferFrame { message: wire }),
+            bucket: None,
+        });
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::SendFrame {
+                    frame: Frame::Custody(c),
+                    ..
+                } if c.result == CUSTODY_ACCEPTED
+            )),
+            "waypoint layer sealed to a retired key must open, got {actions:?}"
+        );
+        // After the grace period the retired key is gone; the same layer
+        // is refused.
+        node.identity.sweep_retired_envelope_keys(now + 100_001);
+        let wire = build(0x52);
+        let (actions, _) = node.handle(Event::Frame {
+            at: now + 100_001,
+            link: 100,
+            frame: Frame::Offer(OfferFrame { message: wire }),
+            bucket: None,
+        });
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::SendFrame {
+                    frame: Frame::Custody(c),
+                    ..
+                } if c.result == CUSTODY_REFUSED
+            )),
+            "waypoint layer sealed to a swept key must be refused, got {actions:?}"
+        );
+    }
+
+    #[test]
+    fn gateway_layer_sealed_to_retired_key_is_opened() {
+        let mut node = test_node();
+        let now = 1_000u64;
+        let old_ek = node.identity.xwing_public;
+        node.identity.rotate_envelope(now + 100_000);
+        let sender = Identity::from_seed(&[0x5C; 32]);
+        let recipient = Identifier::from_bytes([0xD1; 32]);
+        let wire = Message::build(BuildParams {
+            envelope: Envelope {
+                kind: KIND_MESSAGE,
+                mid: MessageId::from_bytes([0x53; 16]),
+                from: sender.id(),
+                fsvc: "svc".into(),
+                fmbx: b"out".to_vec(),
+                tsvc: "svc".into(),
+                tmbx: b"in".to_vec(),
+                created: 1,
+                body: Some(b"hi".to_vec()),
+                reference: None,
+                reason: None,
+                sig: Signature::from_bytes([0; 64]),
+            },
+            sender_seed: &sender.signing_seed,
+            recipient_ek: &XWingPublicKey::from_bytes([7u8; 1216]),
+            real_dst: node.own_id,
+            leg: LegId::from_bytes([0x53; 16]),
+            exp: 10_000,
+            gateway: Some(GatewaySeal {
+                gateway_ek: old_ek,
+                rcpt: recipient,
+            }),
+            waypoint: None,
+            entropy: &mut |b: &mut [u8; 64]| b.fill(0x5A),
+        })
+        .expect("message builds");
+        link_up(&mut node, 100, sender.id(), now);
+        let (actions, _) = node.handle(Event::Frame {
+            at: now,
+            link: 100,
+            frame: Frame::Offer(OfferFrame { message: wire }),
+            bucket: None,
+        });
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::SendFrame {
+                    frame: Frame::Custody(c),
+                    ..
+                } if c.result == CUSTODY_ACCEPTED
+            )),
+            "gateway layer sealed to a retired key must open, got {actions:?}"
+        );
+    }
+
+    // ── R-38: unknown sender elicits a want for their record ────────
+
+    #[test]
+    fn unknown_sender_gets_busy_and_a_want_on_two_links() {
+        let mut node = test_node();
+        let now = 1_000u64;
+        let sender = Identity::from_seed(&[0x5A; 32]);
+        // No record for the sender is admitted.
+        link_up(&mut node, 100, sender.id(), now);
+        link_up(&mut node, 200, Identifier::from_bytes([0x33; 32]), now);
+        let wire = sealed_to_node(
+            &node,
+            &sender,
+            &sender.signing_seed,
+            KIND_MESSAGE,
+            None,
+            LegId::from_bytes([0x66; 16]),
+            now,
+        );
+        let (actions, _) = node.handle(Event::Frame {
+            at: now,
+            link: 100,
+            frame: Frame::Offer(OfferFrame { message: wire }),
+            bucket: None,
+        });
+        // The offer is answered with busy.
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            Action::SendFrame {
+                link: 100,
+                frame: Frame::Custody(c),
+                ..
+            } if c.result == CUSTODY_BUSY
+        )));
+        // A want for (sender, WAN) and (sender, hive) goes out on the
+        // offering link and on one other link.
+        let mut want_links = Vec::new();
+        for a in &actions {
+            if let Action::SendFrame {
+                link,
+                frame: Frame::Want(w),
+                ..
+            } = a
+            {
+                assert!(w.wants.iter().all(|r| r.id == sender.id()));
+                let scopes: Vec<u8> = w.wants.iter().map(|r| r.scope).collect();
+                assert_eq!(scopes, vec![0, 1]);
+                want_links.push(*link);
+            }
+        }
+        assert!(
+            want_links.contains(&100),
+            "want must go on the offering link"
+        );
+        assert_eq!(want_links.len(), 2, "want must go on one other link too");
+        assert!(want_links.contains(&200));
+        // Both links are credited for the wants.
+        assert_eq!(node.links.get(&100).unwrap().want_credits, 2);
+        assert_eq!(node.links.get(&200).unwrap().want_credits, 2);
     }
 }
