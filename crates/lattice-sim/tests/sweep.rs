@@ -41,6 +41,11 @@ const TERMINAL: [u64; 3] = [
 fn sweep_config() -> Config {
     Config {
         reconcile_interval_secs: 1,
+        // Fast convergence: the mutual-claim graph needs both sides of an
+        // edge to publish, and the production 120 s republish floor would
+        // starve multi-hop edges inside the test window. The floor itself
+        // is unit-tested in lattice-core.
+        republish_min_interval_secs: 0,
         record_refresh_secs: 3600,
         snow_per_min: 0.0,
         receipt_timeout_public: 5,

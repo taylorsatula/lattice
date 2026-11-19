@@ -612,6 +612,10 @@ impl<S: Store> Node<S> {
         }
         if !own_exists {
             node.publish_record(now)?;
+            // The startup publish does not arm the republish floor: the
+            // first link-triggered publish must go out immediately, or a
+            // fresh node stays unroutable for a whole republish interval.
+            node.last_publish_at = None;
         } else if let Some(stored) = node.store.record_get(&id, Scope::Wan)? {
             // Seed the change detector from the stored record so the first
             // tick does not see a spurious difference against an empty
@@ -4678,19 +4682,29 @@ mod tests {
         let mut node = test_node();
         node.config.republish_min_interval_secs = 120;
         let peer = Identifier::from_bytes([0xA1; 32]);
+        let peer2 = Identifier::from_bytes([0xB2; 32]);
         let before = node
             .store
             .record_get(&node.own_id, Scope::Wan)
             .unwrap()
             .unwrap();
+        // The first link-triggered publish goes out immediately: the
+        // startup publish does not arm the floor.
         link_up(&mut node, 1, peer, 1_001);
-        // Within the spacing window: no republish.
+        let first = node
+            .store
+            .record_get(&node.own_id, Scope::Wan)
+            .unwrap()
+            .unwrap();
+        assert_ne!(before.bytes, first.bytes);
+        // A second change within the spacing window: no republish yet.
+        link_up(&mut node, 2, peer2, 1_002);
         let during = node
             .store
             .record_get(&node.own_id, Scope::Wan)
             .unwrap()
             .unwrap();
-        assert_eq!(before.bytes, during.bytes);
+        assert_eq!(first.bytes, during.bytes);
         // After the window elapses, the pending publish flushes on a tick.
         node.handle(Event::Tick {
             at: 1_001 + 120_000 + 1,
@@ -4700,9 +4714,9 @@ mod tests {
             .record_get(&node.own_id, Scope::Wan)
             .unwrap()
             .unwrap();
-        assert_ne!(before.bytes, after.bytes);
+        assert_ne!(during.bytes, after.bytes);
         let rec = stored_record(&node, &node.own_id, Scope::Wan).unwrap();
-        assert_eq!(rec.links, vec![peer]);
+        assert_eq!(rec.links, vec![peer, peer2]);
     }
 
     #[test]
