@@ -22,7 +22,8 @@ pub const SCOPE_HIVE: u64 = 1;
 pub const MODE_PUBLIC: u64 = 0;
 pub const MODE_PRIVATE: u64 = 1;
 
-const MAX_LINKS: usize = 32;
+/// Maximum links a record may carry. Enforced on build and on validate.
+pub const MAX_LINKS: usize = 32;
 const MAX_GATEWAYS: usize = 3;
 const MAX_ENDPOINTS: usize = 16;
 /// Most ids a public record may name in `serves` (spec §3).
@@ -169,6 +170,9 @@ pub struct RecordParams {
     pub mode: Mode,
     pub scope: Scope,
     pub endpoints: Vec<Endpoint>,
+    /// Links to advertise. The caller passes them in preference order
+    /// (anchors and longest-lived links first); [`PeerRecord::build`]
+    /// drops from the tail to stay within the link and size caps.
     pub links: Vec<Identifier>,
     pub gateways: Vec<Identifier>,
     pub capabilities: u64,
@@ -254,6 +258,13 @@ impl PeerRecord {
     ///
     /// The KEL is validated before anything is signed; a record is never
     /// produced from an unverifiable chain.
+    ///
+    /// The record is guaranteed to fit the wire caps: at most
+    /// [`MAX_LINKS`] links, and at most [`RECORD_MAX`] bytes encoded.
+    /// Links are dropped from the tail of the caller's preference order
+    /// until the record fits; if it still does not fit with no links at
+    /// all, the build is refused rather than emitting a record peers
+    /// would reject at parse time.
     pub fn build(
         params: RecordParams,
         signing_seed: &SigningSeed,
@@ -306,6 +317,13 @@ impl PeerRecord {
                 "signing seed does not match the KEL head key",
             ));
         }
+        // Drop links from the tail of the caller's preference order to
+        // stay within the link cap; the size check below drops more if
+        // the record still does not fit.
+        let mut links = links;
+        if links.len() > MAX_LINKS {
+            links.truncate(MAX_LINKS);
+        }
         let seq = prev_seq.saturating_add(1).max(now);
         let head = kel.head();
         let id = kel.identifier();
@@ -328,11 +346,19 @@ impl PeerRecord {
             sig: Signature::from_bytes([0; 64]),
             channel_sig: Signature::from_bytes([0; 64]),
         };
-        let preimage =
-            lattice_crypto::signing_preimage(RECORD_CONTEXT, &encode(&rec.unsigned_value()));
-        rec.sig = sign(signing_seed, &preimage);
-        rec.channel_sig = sign(&channel_seed, &preimage);
-        Ok(rec)
+        loop {
+            let preimage =
+                lattice_crypto::signing_preimage(RECORD_CONTEXT, &encode(&rec.unsigned_value()));
+            rec.sig = sign(signing_seed, &preimage);
+            rec.channel_sig = sign(&channel_seed, &preimage);
+            if rec.encode().len() <= RECORD_MAX {
+                return Ok(rec);
+            }
+            if rec.links.is_empty() {
+                return Err(ProtoError::Invalid("record exceeds RECORD_MAX"));
+            }
+            rec.links.pop();
+        }
     }
 }
 
@@ -412,6 +438,16 @@ impl ParsedRecord {
     /// decisions.
     pub fn seq(&self) -> u64 {
         self.seq
+    }
+
+    /// The record's expiry (unix seconds).
+    pub fn exp(&self) -> u64 {
+        self.exp
+    }
+
+    /// The record's advertised links, in the order they were built.
+    pub fn links(&self) -> &[Identifier] {
+        &self.links
     }
 
     /// The KEL head sn the record cites. Only meaningful for deciding

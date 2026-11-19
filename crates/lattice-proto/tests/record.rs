@@ -1,7 +1,7 @@
 use lattice_crypto::generate_seed;
 use lattice_proto::kel::{KeyEvent, ValidatedKel};
 use lattice_proto::record::*;
-use lattice_proto::{CLOCK_SKEW, MAX_RECORD_HORIZON};
+use lattice_proto::{CLOCK_SKEW, MAX_RECORD_HORIZON, RECORD_MAX};
 use lattice_types::{
     ChannelPublicKey, ChannelSeed, Commitment, Identifier, SigningSeed, XWingPublicKey,
 };
@@ -449,4 +449,62 @@ fn wss_scheme_required_exactly() {
             "{url} must be rejected"
         );
     }
+}
+
+#[test]
+fn build_truncates_links_to_max_links() {
+    let f = fixture();
+    let mut params = f.params();
+    params.links = (0..40u8)
+        .map(|i| Identifier::from_bytes([i + 1; 32]))
+        .collect();
+    let rec = PeerRecord::build(params, &f.seed).unwrap();
+    assert_eq!(rec.links.len(), MAX_LINKS);
+    // The surviving links are the first MAX_LINKS of the input order.
+    for (i, l) in rec.links.iter().enumerate() {
+        assert_eq!(*l, Identifier::from_bytes([i as u8 + 1; 32]));
+    }
+}
+
+#[test]
+fn build_drops_links_to_fit_record_max() {
+    let f = fixture();
+    let mut params = f.params();
+    // Inflate the fixed part of the record so 32 links do not fit.
+    params.endpoints = (0..4)
+        .map(|i| Endpoint {
+            url: format!("ws://{}.example.com/{}", "a".repeat(180), i),
+            ips: vec![],
+        })
+        .collect();
+    let links: Vec<Identifier> = (0..32u8)
+        .map(|i| Identifier::from_bytes([i + 1; 32]))
+        .collect();
+    params.links = links.clone();
+    let rec = PeerRecord::build(params, &f.seed).unwrap();
+    assert!(
+        rec.encode().len() <= RECORD_MAX,
+        "record exceeds RECORD_MAX"
+    );
+    assert!(
+        rec.links.len() < links.len(),
+        "expected some links to be dropped"
+    );
+    // The surviving links are a prefix of the input order (preference order).
+    assert_eq!(rec.links, links[..rec.links.len()]);
+}
+
+#[test]
+fn build_refuses_when_record_cannot_fit_even_without_links() {
+    let f = fixture();
+    let mut params = f.params();
+    // Endpoints alone exceed RECORD_MAX; no amount of link dropping helps.
+    params.endpoints = (0..16)
+        .map(|i| Endpoint {
+            url: format!("ws://{}.example.com/{}", "a".repeat(200), i),
+            ips: vec![],
+        })
+        .collect();
+    params.links = vec![Identifier::from_bytes([0x11; 32])];
+    assert!(PeerRecord::build(params, &f.seed).is_err());
 }

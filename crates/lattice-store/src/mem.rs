@@ -20,7 +20,7 @@ pub struct MemStore {
     seen_unheld: HashMap<Hash32, u64>,
     delivered: HashMap<Hash32, u64>,
     inbox: HashMap<String, Vec<InboxEntry>>,
-    status: HashMap<MessageId, MessageStatus>,
+    status: HashMap<MessageId, (MessageStatus, u64)>,
     buckets: [u64; 4],
     custody_bytes: u64,
     custody_class_bytes: [u64; 16],
@@ -253,6 +253,8 @@ impl Store for MemStore {
         self.seen.retain(|_, exp| *exp > now);
         self.seen_unheld.retain(|_, exp| *exp > now);
         self.delivered.retain(|_, exp| *exp > now);
+        self.status
+            .retain(|_, (_, set_at)| set_at.saturating_add(STATUS_TTL_SECS) > now);
         Ok(())
     }
 
@@ -315,12 +317,14 @@ impl Store for MemStore {
         mid: &MessageId,
         status: u64,
         detail: Option<u64>,
+        now: u64,
     ) -> Result<(), StoreError> {
-        self.status.insert(*mid, MessageStatus { status, detail });
+        self.status
+            .insert(*mid, (MessageStatus { status, detail }, now));
         Ok(())
     }
     fn status_get(&self, mid: &MessageId) -> Result<Option<MessageStatus>, StoreError> {
-        Ok(self.status.get(mid).copied())
+        Ok(self.status.get(mid).map(|(s, _)| *s))
     }
 
     fn size_bucket_sample(&mut self, bucket: u8) -> Result<(), StoreError> {

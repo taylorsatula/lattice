@@ -122,12 +122,6 @@ struct ScheduledEvent {
     event: SimEvent,
 }
 
-/// The two endpoints of a link, as node indices.
-struct LinkEndpoints {
-    a: NodeIndex,
-    b: NodeIndex,
-}
-
 pub struct Sim<S: Store = MemStore> {
     pub nodes: Vec<Node<S>>,
     pub ids: Vec<Identifier>,
@@ -358,8 +352,6 @@ impl<S: Store> Sim<S> {
         link: u64,
         frame: lattice_proto::frames::Frame,
     ) {
-        let LinkEndpoints { a, b } = self.link_endpoints(link);
-        let from = if a == target { b } else { a };
         let wire = encode_frame_wire(&frame, None)
             .unwrap_or_else(|e| panic!("sim: injected frame failed wire encoding: {e}"));
         let bucket = lattice_net::FRAME_BUCKETS
@@ -372,7 +364,6 @@ impl<S: Store> Sim<S> {
             Event::Frame {
                 at: self.now,
                 link,
-                from: self.ids[from],
                 frame,
                 bucket,
             },
@@ -386,15 +377,6 @@ impl<S: Store> Sim<S> {
             link,
             lattice_proto::frames::Frame::Offer(lattice_proto::frames::OfferFrame { message }),
         );
-    }
-
-    fn link_endpoints(&self, link: u64) -> LinkEndpoints {
-        let l = self
-            .links
-            .iter()
-            .find(|l| l.id == link)
-            .expect("link exists");
-        LinkEndpoints { a: l.a, b: l.b }
     }
 
     /// Send a message from node `from` to the *identity* of node `to`.
@@ -460,7 +442,6 @@ impl<S: Store> Sim<S> {
                 from,
                 wire,
             } => {
-                let from_id = self.ids[from];
                 let bucket = lattice_net::FRAME_BUCKETS
                     .iter()
                     .position(|&b| b == wire.len());
@@ -470,7 +451,6 @@ impl<S: Store> Sim<S> {
                 let (actions, _diags) = self.nodes[to].handle(Event::Frame {
                     at: self.now,
                     link,
-                    from: from_id,
                     frame,
                     bucket,
                 });
@@ -573,7 +553,7 @@ impl<S: Store> Sim<S> {
         let old = std::mem::replace(&mut self.nodes[idx], placeholder);
         let (identity, store) = old.into_parts();
         let cfg = self.configs[idx].clone();
-        let node = Node::restore(cfg, identity, store, self.now).expect("restore");
+        let node = Node::new(cfg, identity, store, self.now).expect("restore");
         self.nodes[idx] = node;
         // re-announce links
         let up_links: Vec<(usize, usize, u64)> = self

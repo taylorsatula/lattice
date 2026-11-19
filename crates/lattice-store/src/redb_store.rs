@@ -854,6 +854,25 @@ impl Store for RedbStore {
                     t.remove(k)?;
                 }
             }
+            // Status rows carry their write time; drop rows older than the
+            // TTL. Rows written before the timestamp existed decode with
+            // set_at = 0 and are treated as ancient.
+            let mut t = txn.open_table(STATUS)?;
+            let expired: Vec<[u8; 16]> = t
+                .iter()?
+                .map(|e| e.map(|(k, v)| (k.value(), v.value())))
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .filter(|(_, v)| match decode_status(v) {
+                    Ok((_, set_at)) => set_at.saturating_add(STATUS_TTL_SECS) <= now,
+                    // Undecodable rows are dropped rather than kept forever.
+                    Err(_) => true,
+                })
+                .map(|(k, _)| k)
+                .collect();
+            for k in expired {
+                t.remove(k)?;
+            }
             Ok(())
         })
     }
@@ -971,8 +990,9 @@ impl Store for RedbStore {
         mid: &MessageId,
         status: u64,
         detail: Option<u64>,
+        now: u64,
     ) -> Result<(), StoreError> {
-        let bytes = encode_status(&MessageStatus { status, detail });
+        let bytes = encode_status(&MessageStatus { status, detail }, now);
         self.write("status_set", |txn| {
             let mut t = txn.open_table(STATUS)?;
             t.insert(*mid.as_bytes(), bytes)?;
@@ -985,7 +1005,7 @@ impl Store for RedbStore {
             let t = txn.open_table(STATUS)?;
             match t.get(mid.as_bytes())? {
                 None => Ok(None),
-                Some(v) => decode_status(&v.value()).map(Some),
+                Some(v) => decode_status(&v.value()).map(|(s, _)| Some(s)),
             }
         })
     }

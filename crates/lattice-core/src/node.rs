@@ -49,6 +49,16 @@ fn ms_to_secs(ms: u64) -> u64 {
     ms / MS_PER_SEC
 }
 
+/// The refresh interval with ±10% jitter, so a fleet does not republish in
+/// lockstep. `base_secs` is clamped to at least 60s so a misconfigured
+/// zero cannot spin the refresh loop.
+fn refresh_interval_ms(rng: &mut Rng, base_secs: u64) -> u64 {
+    let base = base_secs.max(60);
+    let spread = base / 10;
+    let jitter = rng.below(2 * spread + 1);
+    secs_to_ms(base - spread + jitter)
+}
+
 /// Map a payload size to its frame bucket index (2048/4096/8192/32768).
 fn bucket_index(len: usize) -> usize {
     if len <= 2048 {
@@ -291,11 +301,30 @@ struct LinkState {
     /// True when the peer id was pinned by operator config (root `id`); pinned
     /// bindings are never re-derived from records or revoked by contest.
     pinned: bool,
+    /// When the link came up (ms). Orders the advertised set by longevity.
+    since: u64,
     /// Token bucket for echo replies (R-29): a peer cannot make us emit
     /// more than a small burst plus a slow trickle of echo replies per
     /// link. Refilled lazily from the clock.
     echo_tokens: f64,
     echo_refilled_at: u64,
+    /// Record-wants we have sent on this link that no `Records` frame has
+    /// answered yet. Records arriving with no credit are unsolicited and
+    /// spend the push budget instead.
+    want_credits: u32,
+    /// Token bucket for unsolicited records (records no `want` asked
+    /// for). Refilled lazily from the clock.
+    push_tokens: f64,
+    push_refilled_at: u64,
+}
+
+/// A link that went down but is still inside the grace window; the peer
+/// stays in the advertised set until the grace elapses.
+struct LostLink {
+    peer: Identifier,
+    pinned: bool,
+    since: u64,
+    lost_at: u64,
 }
 
 impl LinkState {
@@ -304,8 +333,12 @@ impl LinkState {
             peer,
             remote_ck,
             pinned,
+            since: now,
             echo_tokens: ECHO_BUDGET_CAPACITY,
             echo_refilled_at: now,
+            want_credits: 0,
+            push_tokens: PUSH_BUDGET_CAPACITY,
+            push_refilled_at: now,
         }
     }
 
@@ -320,6 +353,24 @@ impl LinkState {
         }
         if self.echo_tokens >= 1.0 {
             self.echo_tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Take one unsolicited-record token, refilling from the elapsed time
+    /// first. Returns false when the bucket is empty (the record is
+    /// dropped without validation).
+    fn push_budget_take(&mut self, now: u64) -> bool {
+        let elapsed_ms = now.saturating_sub(self.push_refilled_at);
+        if elapsed_ms > 0 {
+            let refill = elapsed_ms as f64 * (PUSH_BUDGET_REFILL_PER_SEC / 1000.0);
+            self.push_tokens = (self.push_tokens + refill).min(PUSH_BUDGET_CAPACITY);
+            self.push_refilled_at = now;
+        }
+        if self.push_tokens >= 1.0 {
+            self.push_tokens -= 1.0;
             true
         } else {
             false
@@ -403,6 +454,23 @@ pub struct Node<S: Store> {
     /// `drain_custody`.
     custody_retry_at: Option<u64>,
     record_refresh_at: u64,
+    /// Links that went down within the grace window; still advertised.
+    recently_lost: Vec<LostLink>,
+    /// The link list as last published, in published order; used for
+    /// change detection. Empty until the first publish.
+    last_published_links: Vec<Identifier>,
+    /// When the last record publish happened (ms); `None` until the first.
+    last_publish_at: Option<u64>,
+    /// A republish is owed but the spacing floor has not elapsed.
+    publish_pending: bool,
+    /// After a failed publish, the earliest time to retry (backoff).
+    publish_retry_at: Option<u64>,
+    /// Per-node salt for record-eviction hashing, drawn from the RNG at
+    /// startup. Makes the eviction order unpredictable to a peer that
+    /// chooses which records to push.
+    record_salt: [u8; 32],
+    /// Expiry (unix seconds) of our current record; drives the refresh.
+    own_record_exp: u64,
     next_reconcile_at: u64,
     rng: Rng,
     now: u64,
@@ -467,6 +535,15 @@ impl<S: Store> Node<S> {
         }
         let rng_seed = config.rng_seed;
         let id = identity.id();
+        // Per-node salt for record eviction, drawn from a separate stream
+        // so the main stream is undisturbed.
+        let mut salt_rng = Rng::new(rng_seed ^ 0x9E37_79B9_7F4A_7C15);
+        let mut record_salt = [0u8; 32];
+        for chunk in record_salt.chunks_mut(8) {
+            chunk.copy_from_slice(&salt_rng.next_u64().to_le_bytes());
+        }
+        let mut rng = Rng::new(rng_seed);
+        let first_refresh = now + refresh_interval_ms(&mut rng, config.record_refresh_secs);
         // Publish our own record if absent.
         let own_exists = store.record_get(&id, Scope::Wan)?.is_some();
         let mut node = Node {
@@ -487,9 +564,16 @@ impl<S: Store> Node<S> {
             inner_pending_echo: Vec::new(),
             custody_rtt_ema_ms: None,
             custody_retry_at: None,
-            record_refresh_at: now + secs_to_ms(3600),
+            record_refresh_at: first_refresh,
+            recently_lost: Vec::new(),
+            last_published_links: Vec::new(),
+            last_publish_at: None,
+            publish_pending: false,
+            publish_retry_at: None,
+            record_salt,
+            own_record_exp: 0,
             next_reconcile_at: now + secs_to_ms(1),
-            rng: Rng::new(rng_seed),
+            rng,
             now,
             draining: local::DrainState::Serving,
             ck_claims: HashMap::new(),
@@ -529,9 +613,25 @@ impl<S: Store> Node<S> {
         if !own_exists {
             node.publish_record(now)?;
         } else if let Some(stored) = node.store.record_get(&id, Scope::Wan)? {
-            node.own_seq = lattice_proto::record::PeerRecord::parse(&stored.bytes)
-                .map(|p| p.seq())
-                .unwrap_or(0);
+            // Seed the change detector from the stored record so the first
+            // tick does not see a spurious difference against an empty
+            // advertised set.
+            match lattice_proto::record::PeerRecord::parse(&stored.bytes) {
+                Ok(p) => {
+                    node.own_seq = p.seq();
+                    node.own_record_exp = p.exp();
+                    node.last_published_links = p.links().to_vec();
+                }
+                Err(_) => {
+                    node.own_seq = 0;
+                    node.own_record_exp = 0;
+                }
+            }
+            // A stored record nearing expiry is refreshed on the first
+            // tick rather than after a full refresh interval.
+            if node.own_record_exp.saturating_sub(ms_to_secs(now)) < REFRESH_EXP_HORIZON_SECS {
+                node.record_refresh_at = now;
+            }
         }
         // Serve our own KEL to peers: store it so the `kels` frame can
         // carry it. Unconditional — cheap, and covers stores written by
@@ -685,6 +785,20 @@ impl<S: Store> Node<S> {
         consider(self.record_refresh_at);
         consider(self.next_claim_sweep_at);
         consider(self.next_data_sweep_at);
+        // A spaced-out republish comes due at the end of the spacing
+        // window; a lost link leaves the advertised set when its grace expires.
+        if self.publish_pending {
+            if let Some(t) = self.publish_retry_at {
+                consider(t);
+            } else if let Some(t) = self.last_publish_at {
+                consider(t.saturating_add(secs_to_ms(self.config.republish_min_interval_secs)));
+            }
+        }
+        if let Some(t) = self.recently_lost.iter().map(|l| l.lost_at).min() {
+            // Wake one tick past the grace boundary, when the entry is
+            // actually pruned and the advertised set changes.
+            consider(t.saturating_add(LINK_GRACE_MS).saturating_add(1));
+        }
         if let Some(t) = self.custody_retry_at {
             consider(t);
         }
@@ -727,16 +841,17 @@ impl<S: Store> Node<S> {
 
     // ---------- records ----------
 
-    fn build_own_record(&self, prev_seq: u64, now: u64) -> Result<Vec<u8>, NodeError> {
+    fn build_own_record(&mut self, prev_seq: u64, now: u64) -> Result<Vec<u8>, NodeError> {
         // Wire times are seconds.
         let now_secs = ms_to_secs(now);
-        let exp = now_secs + 7 * 24 * 3600;
+        let exp = now_secs + RECORD_LIFETIME_SECS;
         let private = self.config.mode == Mode::Private;
         let links: Vec<Identifier> = if private {
             vec![]
         } else {
-            self.links.values().filter_map(|l| l.peer).collect()
+            self.advertised_links(now)
         };
+        let requested_links = links.len();
         let endpoints: Vec<lattice_proto::record::Endpoint> = if private {
             Vec::new()
         } else {
@@ -773,6 +888,15 @@ impl<S: Store> Node<S> {
             },
             &self.identity.signing_seed,
         )?;
+        if rec.links.len() < requested_links {
+            self.diag(
+                "record_links_dropped",
+                format!(
+                    "record exceeded the size cap; dropped {} link(s)",
+                    requested_links - rec.links.len()
+                ),
+            );
+        }
         Ok(rec.encode())
     }
 
@@ -792,12 +916,91 @@ impl<S: Store> Node<S> {
         Ok(())
     }
 
+    /// The links to advertise, in preference order: live links first,
+    /// then pinned (anchor) links, then longest-lived, deduplicated by
+    /// peer and capped at the record link cap. Links that went down
+    /// within the grace window stay in the set. Callers pass the result
+    /// to `PeerRecord::build`, which drops from the tail if the record
+    /// would exceed the wire cap.
+    fn advertised_links(&mut self, now: u64) -> Vec<Identifier> {
+        self.recently_lost
+            .retain(|l| now.saturating_sub(l.lost_at) <= LINK_GRACE_MS);
+        let mut cand: Vec<(bool, bool, u64, Identifier)> =
+            Vec::with_capacity(self.links.len() + self.recently_lost.len());
+        for l in self.links.values() {
+            if let Some(peer) = l.peer {
+                cand.push((true, l.pinned, l.since, peer));
+            }
+        }
+        for l in &self.recently_lost {
+            if cand.iter().any(|c| c.3 == l.peer) {
+                continue;
+            }
+            cand.push((false, l.pinned, l.since, l.peer));
+        }
+        // Live links first, then anchors, then longest-lived, then id for
+        // a deterministic order.
+        cand.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then(b.1.cmp(&a.1))
+                .then(a.2.cmp(&b.2))
+                .then(a.3.cmp(&b.3))
+        });
+        let mut seen = HashSet::with_capacity(cand.len());
+        let mut out = Vec::with_capacity(lattice_proto::record::MAX_LINKS);
+        for (_, _, _, id) in cand {
+            if seen.insert(id) {
+                out.push(id);
+                if out.len() >= lattice_proto::record::MAX_LINKS {
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    /// Mark the advertised set dirty if it changed, and publish if the
+    /// spacing floor allows. Called after every link event and on ticks
+    /// (so grace-period expiry is noticed).
+    fn note_link_set_changed(&mut self, now: u64) {
+        if self.advertised_links(now) != self.last_published_links {
+            self.publish_pending = true;
+        }
+        self.flush_pending_publish(now);
+    }
+
+    /// Publish if a republish is owed and the spacing floor has elapsed.
+    fn flush_pending_publish(&mut self, now: u64) {
+        if !self.publish_pending {
+            return;
+        }
+        if let Some(t) = self.publish_retry_at {
+            if now < t {
+                return;
+            }
+        }
+        if let Some(t) = self.last_publish_at {
+            if now < t.saturating_add(secs_to_ms(self.config.republish_min_interval_secs)) {
+                return;
+            }
+        }
+        if let Err(e) = self.publish_record(now) {
+            self.diag("publish_record", &e);
+            // Back off before retrying so a persistent failure cannot
+            // spin the event loop.
+            self.publish_retry_at = Some(now + PUBLISH_RETRY_MS);
+        } else {
+            self.publish_retry_at = None;
+        }
+    }
+
     fn publish_record(&mut self, now: u64) -> Result<(), NodeError> {
         let bytes = self.build_own_record(self.own_seq, now)?;
         let id = self.own_id;
         // Adopt the seq the builder assigned (max(prev + 1, now)).
         if let Ok(parsed) = PeerRecord::parse(&bytes) {
             self.own_seq = parsed.seq();
+            self.own_record_exp = parsed.exp();
         }
         self.store
             .record_put(&id, self.scope, &bytes, ms_to_secs(now))?;
@@ -809,6 +1012,10 @@ impl<S: Store> Node<S> {
             Ok(v) => self.index_record(&bytes, v.into_inner()),
             Err(e) => self.diag("own_record_validate", &e),
         }
+        self.last_publish_at = Some(now);
+        self.last_published_links = self.advertised_links(now);
+        self.publish_pending = false;
+        self.publish_retry_at = None;
         Ok(())
     }
 
@@ -828,11 +1035,10 @@ impl<S: Store> Node<S> {
         // Reconcile promptly: the peer needs our record (and we need theirs)
         // for routing to work at all; waiting a full interval stalls delivery.
         self.next_reconcile_at = self.next_reconcile_at.min(at + secs_to_ms(1));
-        // Publish the new link set immediately so peers can route via us.
-        if let Err(e) = self.publish_record(at) {
-            self.diag("publish_record", &e);
-        }
         let mut actions = self.reevaluate_link_bindings(at);
+        // Publish if the advertised set changed (spaced; see
+        // `flush_pending_publish`).
+        self.note_link_set_changed(at);
         // A new link may open routes for custody entries that had none.
         actions.extend(self.drain_custody(at));
         actions
@@ -840,12 +1046,24 @@ impl<S: Store> Node<S> {
 
     fn on_link_down(&mut self, at: u64, link: LinkId) -> Vec<Action> {
         self.touch(at);
-        self.links.remove(&link);
+        if let Some(l) = self.links.remove(&link) {
+            if let Some(peer) = l.peer {
+                // Keep the peer in the advertised set for the grace window.
+                self.recently_lost.push(LostLink {
+                    peer,
+                    pinned: l.pinned,
+                    since: l.since,
+                    lost_at: at,
+                });
+                // Bound the grace list; the oldest entries age out first.
+                if self.recently_lost.len() > 128 {
+                    self.recently_lost.remove(0);
+                }
+            }
+        }
         self.next_link_order.retain(|l| *l != link);
         self.reconcile_sessions.remove(&link);
-        if let Err(e) = self.publish_record(at) {
-            self.diag("publish_record", &e);
-        }
+        self.note_link_set_changed(at);
         Vec::new()
     }
 
@@ -883,6 +1101,58 @@ impl<S: Store> Node<S> {
         self.record_index.retain(|_, e| e.record.exp > now_secs);
         if self.record_index.len() != before {
             self.derived_version += 1;
+        }
+    }
+
+    /// Salted eviction key for a stored record. The salt is per-node and
+    /// drawn from the RNG at startup, so a peer choosing which records to
+    /// push cannot predict which will be evicted.
+    fn record_eviction_key(&self, id: &Identifier, scope: Scope) -> Hash32 {
+        let mut buf = Vec::with_capacity(32 + 1 + 32);
+        buf.extend_from_slice(&self.record_salt);
+        buf.extend_from_slice(id.as_bytes());
+        buf.push(scope_as_u8(scope));
+        lattice_crypto::hash(&buf)
+    }
+
+    /// Enforce the record cap: evict the lowest-salted-hash records until
+    /// at most `cap` remain. Our own record is never evicted.
+    fn enforce_record_cap(&mut self, cap: usize) {
+        let count = match self.store.record_count() {
+            Ok(c) => c,
+            Err(e) => {
+                self.diag("record_count", &e);
+                return;
+            }
+        };
+        if count <= cap {
+            return;
+        }
+        let all = match self.store.record_all() {
+            Ok(a) => a,
+            Err(e) => {
+                self.diag("record_all", &e);
+                return;
+            }
+        };
+        let mut keyed: Vec<(Hash32, Identifier, Scope)> = all
+            .into_iter()
+            .filter(|r| r.id != self.own_id)
+            .map(|r| (self.record_eviction_key(&r.id, r.scope), r.id, r.scope))
+            .collect();
+        keyed.sort_by_key(|k| k.0);
+        let mut to_remove = count - cap;
+        for (_, id, scope) in keyed {
+            if to_remove == 0 {
+                break;
+            }
+            match self.store.record_remove(&id, scope) {
+                Ok(()) => {
+                    self.unindex_record(&id, scope);
+                    to_remove -= 1;
+                }
+                Err(e) => self.diag("record_remove", &e),
+            }
         }
     }
 
@@ -1040,6 +1310,18 @@ impl<S: Store> Node<S> {
                 frame: Frame::Reconcile(ReconcileFrame { ranges: chunk }),
             });
         }
+        // Credit the link for the record-wants we send: records that
+        // arrive against these credits are solicited and bypass the
+        // unsolicited-push budget. KEL wants (scope 255) are not records.
+        let record_wants = wants.iter().filter(|w| w.scope != SCOPE_KEL).count() as u32;
+        if record_wants > 0 {
+            if let Some(l) = self.links.get_mut(&link) {
+                l.want_credits = l
+                    .want_credits
+                    .saturating_add(record_wants)
+                    .min(MAX_WANT_CREDITS);
+            }
+        }
         for chunk in frame_budget::chunk_by_budget(wants, usize::MAX, |w| {
             Frame::Want(WantFrame { wants: vec![*w] }).encode().len()
         }) {
@@ -1137,8 +1419,35 @@ impl<S: Store> Node<S> {
 
     fn on_records(&mut self, at: u64, link: LinkId, records: Vec<Vec<u8>>) -> Vec<Action> {
         let mut actions = Vec::new();
+        let mut dropped = 0usize;
         for bytes in records {
+            // Records we asked for (a `want` is outstanding) are admitted
+            // freely; anything else spends from the per-link push budget.
+            // Unsolicited records past the budget are dropped before
+            // validation — they cost the sender nothing to forge, so they
+            // must not cost us a validation and an fsync each.
+            let admitted = match self.links.get_mut(&link) {
+                Some(l) => {
+                    if l.want_credits > 0 {
+                        l.want_credits -= 1;
+                        true
+                    } else {
+                        l.push_budget_take(at)
+                    }
+                }
+                None => false,
+            };
+            if !admitted {
+                dropped += 1;
+                continue;
+            }
             actions.extend(self.admit_record(at, link, &bytes));
+        }
+        if dropped > 0 {
+            self.diag(
+                "unsolicited_records_dropped",
+                format!("dropped {dropped} unsolicited record(s) on link {link}"),
+            );
         }
         // New records may open routes for custody entries that had none.
         actions.extend(self.drain_custody(at));
@@ -1358,6 +1667,7 @@ impl<S: Store> Node<S> {
         // expiry anyway, this just keeps the index bounded. The store
         // keeps the bytes until the grace period elapses.
         self.evict_expired_records(now);
+        self.enforce_record_cap(RECORD_CAP);
         match self.store.record_all() {
             Ok(records) => {
                 for record in records {
@@ -1495,9 +1805,7 @@ impl<S: Store> Node<S> {
             }
         }
         if changed {
-            if let Err(e) = self.publish_record(at) {
-                self.diag("publish_record", &e);
-            }
+            self.note_link_set_changed(at);
             self.next_reconcile_at = self.next_reconcile_at.min(at + secs_to_ms(1));
         }
         actions
@@ -1575,6 +1883,7 @@ impl<S: Store> Node<S> {
                 Ok(()) => {
                     self.note_ck_claim(&rec);
                     self.index_record(bytes, rec);
+                    self.enforce_record_cap(RECORD_CAP);
                 }
                 Err(e) => {
                     self.diag("record_put", &e);
@@ -1639,6 +1948,24 @@ enum DispatchResult {
 const CUSTODY_TIMEOUT_MS: u64 = 30_000;
 const CLAIM_SWEEP_MS: u64 = 60_000;
 const MAX_PENDING_ECHOES: usize = 256;
+/// How long a lost link stays in the advertised set (spec §3 grace).
+const LINK_GRACE_MS: u64 = 5 * 60 * 1000;
+/// Cap on stored records; eviction is by salted hash (see `record_salt`).
+const RECORD_CAP: usize = 4096;
+/// Republish the record when its expiry is this close, even if nothing
+/// else changed — otherwise a quiet node's record would lapse.
+const REFRESH_EXP_HORIZON_SECS: u64 = 3 * 24 * 3600;
+/// Lifetime of a published record (seconds).
+const RECORD_LIFETIME_SECS: u64 = 7 * 24 * 3600;
+/// Per-link budget for unsolicited records (records no `want` asked for):
+/// burst capacity, refilled at this rate per second.
+const PUSH_BUDGET_CAPACITY: f64 = 16.0;
+const PUSH_BUDGET_REFILL_PER_SEC: f64 = 16.0 / 60.0;
+/// Cap on outstanding record-want credits per link; bounds how many
+/// records a peer may send us "on request" before we have seen them.
+const MAX_WANT_CREDITS: u32 = 4096;
+/// Backoff before retrying a failed record publish.
+const PUBLISH_RETRY_MS: u64 = 30_000;
 /// How often the retention sweep runs.
 const DATA_SWEEP_MS: u64 = 3_600_000;
 /// Grace period past a record's/message's expiry before it is purged.
@@ -2016,6 +2343,7 @@ impl<S: Store> Node<S> {
                             &msg.mid,
                             local::MSG_STATUS_FAILED,
                             Some(ERR_NO_ROUTE),
+                            ms_to_secs(now),
                         ) {
                             self.diag("status_set", &e);
                         }
@@ -2042,6 +2370,7 @@ impl<S: Store> Node<S> {
                         &msg.mid,
                         local::MSG_STATUS_FAILED,
                         Some(ERR_INTERNAL),
+                        ms_to_secs(now),
                     ) {
                         self.diag("status_set", &e);
                     }
@@ -2863,10 +3192,12 @@ impl<S: Store> Node<S> {
                     service.clone_from(&msg.envelope.fsvc);
                     self.store_outbound(&msg);
                 }
-                if let Err(e) = self
-                    .store
-                    .status_set(&mid, local::MSG_STATUS_IN_TRANSIT, None)
-                {
+                if let Err(e) = self.store.status_set(
+                    &mid,
+                    local::MSG_STATUS_IN_TRANSIT,
+                    None,
+                    ms_to_secs(self.now),
+                ) {
                     self.diag("status_set", &e);
                 }
                 actions.push(Action::Status {
@@ -2962,10 +3293,12 @@ impl<S: Store> Node<S> {
                     service.clone_from(&msg.envelope.fsvc);
                     self.store_outbound(&msg);
                 }
-                if let Err(e) =
-                    self.store
-                        .status_set(&mid, local::MSG_STATUS_FAILED, Some(ERR_REFUSED))
-                {
+                if let Err(e) = self.store.status_set(
+                    &mid,
+                    local::MSG_STATUS_FAILED,
+                    Some(ERR_REFUSED),
+                    ms_to_secs(self.now),
+                ) {
                     self.diag("status_set", &e);
                 }
                 actions.push(Action::Status {
@@ -3037,7 +3370,10 @@ impl<S: Store> Node<S> {
                 } else {
                     (local::MSG_STATUS_FAILED, envelope.reason)
                 };
-                if let Err(e) = self.store.status_set(&reference, status, detail) {
+                if let Err(e) =
+                    self.store
+                        .status_set(&reference, status, detail, ms_to_secs(self.now))
+                {
                     self.diag("status_set", &e);
                 }
                 self.outbound_exclusions.remove(&reference);
@@ -3134,6 +3470,8 @@ impl<S: Store> Node<S> {
         // Snow first: never crowd out real work in the same tick.
         actions.extend(self.snow_tick(now));
         actions.extend(self.reconcile_if_due(now));
+        // Notice grace-period expiries and publish anything owed.
+        self.note_link_set_changed(now);
         self.refresh_record_if_due(now);
         actions.extend(self.sweep_claims_if_due(now));
         self.sweep_data_if_due(now);
@@ -3159,15 +3497,24 @@ impl<S: Store> Node<S> {
         actions
     }
 
-    /// Republish our record when the refresh interval has elapsed.
+    /// Daily refresh (with jitter). Republishes only when something
+    /// actually changed — the advertised set differs, or the record is
+    /// close enough to expiry that letting it lapse would be worse than a
+    /// no-op republish. Spacing against other publishes is enforced by
+    /// `flush_pending_publish`.
     fn refresh_record_if_due(&mut self, now: u64) {
         if now < self.record_refresh_at {
             return;
         }
-        if let Err(e) = self.publish_record(now) {
-            self.diag("publish_record", &e);
+        self.record_refresh_at =
+            now + refresh_interval_ms(&mut self.rng, self.config.record_refresh_secs);
+        let changed = self.advertised_links(now) != self.last_published_links;
+        let exp_soon =
+            self.own_record_exp.saturating_sub(ms_to_secs(now)) < REFRESH_EXP_HORIZON_SECS;
+        if changed || exp_soon {
+            self.publish_pending = true;
+            self.flush_pending_publish(now);
         }
-        self.record_refresh_at = now + secs_to_ms(self.config.record_refresh_secs);
     }
 
     fn sweep_claims_if_due(&mut self, now: u64) -> Vec<Action> {
@@ -3204,6 +3551,7 @@ impl<S: Store> Node<S> {
                             &msg.mid,
                             local::MSG_STATUS_EXPIRED,
                             Some(ERR_EXPIRED),
+                            ms_to_secs(now),
                         ) {
                             self.diag("status_set", &e);
                         }
@@ -3246,6 +3594,7 @@ impl<S: Store> Node<S> {
                             &msg.mid,
                             local::MSG_STATUS_FAILED,
                             Some(ERR_NO_ROUTE),
+                            ms_to_secs(now),
                         ) {
                             self.diag("status_set", &e);
                         }
@@ -3558,18 +3907,6 @@ impl<S: Store> Node<S> {
     /// Split into identity and store, for crash/restart simulation.
     pub fn into_parts(self) -> (Identity, S) {
         (self.identity, self.store)
-    }
-
-    /// Rebuild from parts after a simulated crash. The store holds the
-    /// pre-crash custody state; the node re-announces nothing and simply
-    /// resumes (it holds its own record already).
-    pub fn restore(
-        config: Config,
-        identity: Identity,
-        store: S,
-        now: u64,
-    ) -> Result<Self, NodeError> {
-        Self::new(config, identity, store, now)
     }
 
     /// Swap in a new identity (after a rotation) and republish the record.
@@ -3891,7 +4228,7 @@ mod tests {
             .outbound_push(&outbound(mid1, recipient, OutboundState::Expired))
             .unwrap();
         node.store
-            .status_set(&mid1, local::MSG_STATUS_EXPIRED, Some(ERR_EXPIRED))
+            .status_set(&mid1, local::MSG_STATUS_EXPIRED, Some(ERR_EXPIRED), 1_000)
             .unwrap();
         let actions = node.on_receipt(&receipt(KIND_RECEIPT, mid1, recipient));
         assert!(actions.is_empty());
@@ -3910,7 +4247,7 @@ mod tests {
             .outbound_push(&outbound(mid2, recipient, OutboundState::Delivered))
             .unwrap();
         node.store
-            .status_set(&mid2, local::MSG_STATUS_DELIVERED, None)
+            .status_set(&mid2, local::MSG_STATUS_DELIVERED, None, 1_000)
             .unwrap();
         let actions = node.on_receipt(&receipt(KIND_NEGATIVE_RECEIPT, mid2, recipient));
         assert!(actions.is_empty());
@@ -4170,7 +4507,6 @@ mod tests {
         let _ = node.handle(Event::Frame {
             at,
             link: 999,
-            from: kel.identifier(),
             frame,
             bucket: None,
         });
@@ -4216,6 +4552,325 @@ mod tests {
                 "2001:4860:4860::8888".parse().unwrap(),
             ]
         );
+    }
+
+    // ── Record hygiene: advertised set, refresh, caps (R-11..R-13, R-17) ──
+
+    fn insert_link(
+        node: &mut Node<MemStore>,
+        link: u64,
+        peer: Option<Identifier>,
+        pinned: bool,
+        since: u64,
+    ) {
+        let ck = lattice_crypto::channel_x25519_public(&ChannelSeed::from_bytes([0x77; 32]));
+        node.links
+            .insert(link, LinkState::new(peer, ck, pinned, since));
+    }
+
+    #[test]
+    fn advertised_set_dedups_by_peer() {
+        let mut node = test_node();
+        let peer = Identifier::from_bytes([0xA1; 32]);
+        insert_link(&mut node, 1, Some(peer), false, 1_000);
+        insert_link(&mut node, 2, Some(peer), false, 2_000);
+        assert_eq!(node.advertised_links(3_000), vec![peer]);
+    }
+
+    #[test]
+    fn advertised_set_prefers_pinned_then_oldest_and_caps_at_max_links() {
+        let mut node = test_node();
+        // 32 unpinned links (oldest) and 8 pinned links (newest).
+        for i in 0..32u8 {
+            insert_link(
+                &mut node,
+                u64::from(i) + 1,
+                Some(Identifier::from_bytes([i + 1; 32])),
+                false,
+                1_000 + u64::from(i),
+            );
+        }
+        for i in 0..8u8 {
+            insert_link(
+                &mut node,
+                100 + u64::from(i),
+                Some(Identifier::from_bytes([0x80 + i; 32])),
+                true,
+                9_000 + u64::from(i),
+            );
+        }
+        let advertised = node.advertised_links(10_000);
+        assert_eq!(advertised.len(), lattice_proto::record::MAX_LINKS);
+        // All 8 pinned links are kept despite being the newest.
+        for i in 0..8u8 {
+            assert!(advertised.contains(&Identifier::from_bytes([0x80 + i; 32])));
+        }
+        // The 24 oldest unpinned links are kept; the 8 newest are dropped.
+        for i in 0..24u8 {
+            assert!(advertised.contains(&Identifier::from_bytes([i + 1; 32])));
+        }
+        for i in 24..32u8 {
+            assert!(!advertised.contains(&Identifier::from_bytes([i + 1; 32])));
+        }
+    }
+
+    #[test]
+    fn lost_link_stays_advertised_for_the_grace_period() {
+        let mut node = test_node();
+        let peer = Identifier::from_bytes([0xA1; 32]);
+        link_up(&mut node, 1, peer, 1_000);
+        assert_eq!(node.advertised_links(1_000), vec![peer]);
+        node.handle(Event::LinkDown { at: 2_000, link: 1 });
+        // Still advertised inside the grace window...
+        assert_eq!(node.advertised_links(2_000 + LINK_GRACE_MS), vec![peer]);
+        // ...and gone once it elapses.
+        assert!(node.advertised_links(2_000 + LINK_GRACE_MS + 1).is_empty());
+    }
+
+    #[test]
+    fn grace_expiry_republishes_without_the_lost_link() {
+        let mut node = test_node();
+        node.config.republish_min_interval_secs = 0;
+        let peer = Identifier::from_bytes([0xA1; 32]);
+        link_up(&mut node, 1, peer, 1_000);
+        let rec = stored_record(&node, &node.own_id, Scope::Wan).unwrap();
+        assert_eq!(rec.links, vec![peer]);
+        // The link goes down; the grace keeps it in the record.
+        node.handle(Event::LinkDown { at: 2_000, link: 1 });
+        let rec = stored_record(&node, &node.own_id, Scope::Wan).unwrap();
+        assert_eq!(rec.links, vec![peer]);
+        // Once the grace elapses, the next tick drops it and republishes.
+        node.handle(Event::Tick {
+            at: 2_000 + LINK_GRACE_MS + 1,
+        });
+        let rec = stored_record(&node, &node.own_id, Scope::Wan).unwrap();
+        assert!(rec.links.is_empty());
+    }
+
+    #[test]
+    fn record_advertises_each_peer_once() {
+        let mut node = test_node();
+        node.config.republish_min_interval_secs = 0;
+        let peer = Identifier::from_bytes([0xA1; 32]);
+        link_up(&mut node, 1, peer, 1_000);
+        link_up(&mut node, 2, peer, 1_100);
+        let rec = stored_record(&node, &node.own_id, Scope::Wan).unwrap();
+        assert_eq!(rec.links, vec![peer]);
+    }
+
+    #[test]
+    fn republish_is_spaced_after_a_change() {
+        let mut node = test_node();
+        node.config.republish_min_interval_secs = 120;
+        let peer = Identifier::from_bytes([0xA1; 32]);
+        let before = node
+            .store
+            .record_get(&node.own_id, Scope::Wan)
+            .unwrap()
+            .unwrap();
+        link_up(&mut node, 1, peer, 1_001);
+        // Within the spacing window: no republish.
+        let during = node
+            .store
+            .record_get(&node.own_id, Scope::Wan)
+            .unwrap()
+            .unwrap();
+        assert_eq!(before.bytes, during.bytes);
+        // After the window elapses, the pending publish flushes on a tick.
+        node.handle(Event::Tick {
+            at: 1_001 + 120_000 + 1,
+        });
+        let after = node
+            .store
+            .record_get(&node.own_id, Scope::Wan)
+            .unwrap()
+            .unwrap();
+        assert_ne!(before.bytes, after.bytes);
+        let rec = stored_record(&node, &node.own_id, Scope::Wan).unwrap();
+        assert_eq!(rec.links, vec![peer]);
+    }
+
+    #[test]
+    fn refresh_republishes_only_when_something_changed() {
+        let mut node = test_node();
+        // Make the refresh due immediately; nothing has changed and the
+        // record is fresh, so nothing is republished.
+        node.record_refresh_at = 2_000;
+        let before = node
+            .store
+            .record_get(&node.own_id, Scope::Wan)
+            .unwrap()
+            .unwrap();
+        node.handle(Event::Tick { at: 2_000 });
+        let after = node
+            .store
+            .record_get(&node.own_id, Scope::Wan)
+            .unwrap()
+            .unwrap();
+        assert_eq!(before.bytes, after.bytes);
+        // With the record near expiry the refresh must republish.
+        node.own_record_exp = 1;
+        node.record_refresh_at = 3_000;
+        node.handle(Event::Tick { at: 3_000 });
+        let after = node
+            .store
+            .record_get(&node.own_id, Scope::Wan)
+            .unwrap()
+            .unwrap();
+        assert_ne!(before.bytes, after.bytes);
+    }
+
+    #[test]
+    fn status_rows_are_swept_after_the_ttl() {
+        let mut node = test_node();
+        let mid = MessageId::from_bytes([0x42; 16]);
+        node.store
+            .status_set(&mid, local::MSG_STATUS_DELIVERED, None, 1_000)
+            .unwrap();
+        // Within the TTL the row survives the sweep.
+        node.sweep_store_expired(secs_to_ms(1_000 + lattice_store::STATUS_TTL_SECS - 1));
+        assert!(node.store.status_get(&mid).unwrap().is_some());
+        // Past the TTL the row is gone.
+        node.sweep_store_expired(secs_to_ms(1_000 + lattice_store::STATUS_TTL_SECS + 1));
+        assert!(node.store.status_get(&mid).unwrap().is_none());
+    }
+
+    #[test]
+    fn record_cap_evicts_by_salted_hash_and_keeps_own_record() {
+        let mut node = test_node();
+        let own = node.own_id;
+        for i in 0..6u8 {
+            let id = Identifier::from_bytes([i + 1; 32]);
+            node.store.record_put(&id, Scope::Wan, &[i; 16], 0).unwrap();
+        }
+        assert_eq!(node.store.record_count().unwrap(), 7);
+        node.enforce_record_cap(4);
+        assert_eq!(node.store.record_count().unwrap(), 4);
+        assert!(node.store.record_get(&own, Scope::Wan).unwrap().is_some());
+        // Idempotent: a second pass evicts nothing.
+        node.enforce_record_cap(4);
+        assert_eq!(node.store.record_count().unwrap(), 4);
+    }
+
+    #[test]
+    fn unsolicited_records_are_dropped_past_the_push_budget() {
+        let mut node = test_node();
+        let link = 7u64;
+        link_up(&mut node, link, Identifier::from_bytes([0xCC; 32]), 1_000);
+        let frame = Frame::Records(lattice_proto::frames::RecordsFrame {
+            records: (0..20u8).map(|i| vec![i; 8]).collect(),
+        });
+        let (_actions, diags) = node.handle(Event::Frame {
+            at: 1_001,
+            link,
+            frame,
+            bucket: None,
+        });
+        let dropped = diags
+            .iter()
+            .find(|d| d.op == "unsolicited_records_dropped")
+            .unwrap_or_else(|| panic!("expected a drop diagnostic, got {diags:?}"));
+        assert!(dropped.detail.contains('4'), "{}", dropped.detail);
+    }
+
+    #[test]
+    fn solicited_record_bypasses_the_push_budget() {
+        let mut node = test_node();
+        let link = 7u64;
+        link_up(&mut node, link, Identifier::from_bytes([0xCC; 32]), 1_000);
+        // Drain the budget and grant one want credit, as if we had asked.
+        if let Some(l) = node.links.get_mut(&link) {
+            l.push_tokens = 0.0;
+            l.want_credits = 1;
+        }
+        let sender = Identity::from_seed(&[0x5B; 32]);
+        admit_kel(&mut node, &sender.kel, 1_001);
+        let record = build_record(
+            sender.kel.events().to_vec(),
+            1,
+            Scope::Wan,
+            &sender.signing_seed,
+            &sender.channel_seed,
+        );
+        let frame = Frame::Records(lattice_proto::frames::RecordsFrame {
+            records: vec![record.encode()],
+        });
+        node.handle(Event::Frame {
+            at: 1_002,
+            link,
+            frame,
+            bucket: None,
+        });
+        assert!(
+            node.store
+                .record_get(&sender.id(), Scope::Wan)
+                .unwrap()
+                .is_some(),
+            "a solicited record must be admitted even with an empty push budget"
+        );
+    }
+
+    #[test]
+    fn rotation_is_refused_when_the_record_cannot_be_published() {
+        // Pre-seed the store with a valid own record so startup does not
+        // publish; the node then comes up with a config whose endpoints
+        // make any record unpublishable, and rotation must fail rather
+        // than publish bytes peers reject.
+        let seed = [0x5C; 32];
+        let identity = Identity::from_seed(&seed);
+        let kel = identity.kel.clone();
+        let rec = lattice_proto::record::PeerRecord::build(
+            lattice_proto::record::RecordParams {
+                kel: kel.clone(),
+                prev_seq: 0,
+                now: 1,
+                exp: 100_000,
+                channel_key: lattice_crypto::channel_public(&identity.channel_seed),
+                channel_seed: identity.channel_seed.clone(),
+                envelope_key: identity.xwing_public,
+                mode: Mode::Public,
+                scope: Scope::Wan,
+                endpoints: vec![lattice_proto::record::Endpoint {
+                    url: "ws://mesh.example.com/".into(),
+                    ips: vec![],
+                }],
+                links: vec![],
+                gateways: vec![],
+                capabilities: 1,
+                serves: vec![],
+            },
+            &identity.signing_seed,
+        )
+        .unwrap();
+        let mut store = MemStore::new();
+        store
+            .record_put(&identity.id(), Scope::Wan, &rec.encode(), 0)
+            .unwrap();
+        store
+            .kel_put(
+                &identity.id(),
+                &kel.to_object_bytes().unwrap(),
+                &KelHeadSeen {
+                    seq: kel.head().seq,
+                    commitment: kel.head().commitment,
+                    seen: 0,
+                    abandoned: false,
+                },
+            )
+            .unwrap();
+        let cfg = Config {
+            snow_per_min: 0.0,
+            advertise: (0..16)
+                .map(|i| format!("ws://{}.example.com/", "a".repeat(180) + &i.to_string()))
+                .collect(),
+            ..Config::default()
+        };
+        let mut node = Node::new(cfg, identity, store, 1_000).expect("node starts");
+        let err = node
+            .reload_identity(Identity::from_seed(&seed), 2_000, RotationKind::Rotate)
+            .expect_err("rotation must be refused when the record cannot be published");
+        let msg = err.to_string();
+        assert!(msg.contains("RECORD_MAX"), "unexpected error: {msg}");
     }
 
     #[test]
@@ -4604,7 +5259,6 @@ mod tests {
         let (actions, _) = node.handle(Event::Frame {
             at: now,
             link: 200,
-            from: dst,
             frame: custody_frame(leg, CUSTODY_ALREADY_HAVE),
             bucket: None,
         });
@@ -4655,7 +5309,6 @@ mod tests {
         let (_actions, _) = node.handle(Event::Frame {
             at: now,
             link: 200,
-            from: dst,
             frame: custody_frame(leg, CUSTODY_ALREADY_HAVE),
             bucket: None,
         });
@@ -4699,7 +5352,6 @@ mod tests {
             let (_actions, _) = node.handle(Event::Frame {
                 at: now,
                 link: 200,
-                from: dst,
                 frame: custody_frame(leg, result),
                 bucket: None,
             });
@@ -4738,7 +5390,6 @@ mod tests {
         let (actions, _) = node.handle(Event::Frame {
             at: now,
             link: 300,
-            from: stray,
             frame: custody_frame(leg, CUSTODY_ACCEPTED),
             bucket: None,
         });
@@ -4749,7 +5400,6 @@ mod tests {
         let (_actions, _) = node.handle(Event::Frame {
             at: now,
             link: 200,
-            from: dst,
             frame: custody_frame(leg, CUSTODY_ACCEPTED),
             bucket: None,
         });
@@ -4782,7 +5432,6 @@ mod tests {
         let (actions, _) = node.handle(Event::Frame {
             at: now,
             link: 300,
-            from: stray,
             frame: custody_frame(leg, CUSTODY_REFUSED),
             bucket: None,
         });
@@ -4794,7 +5443,6 @@ mod tests {
         let (_actions, _) = node.handle(Event::Frame {
             at: now,
             link: 200,
-            from: dst,
             frame: custody_frame(leg, CUSTODY_REFUSED),
             bucket: None,
         });
@@ -4874,7 +5522,6 @@ mod tests {
         let (actions, _) = node.handle(Event::Frame {
             at: now,
             link: 100,
-            from: sender.id(),
             frame: Frame::Offer(OfferFrame { message: wire }),
             bucket: None,
         });
@@ -4928,7 +5575,6 @@ mod tests {
         let (actions, _) = node.handle(Event::Frame {
             at: now,
             link: 100,
-            from: sender.id(),
             frame: Frame::Offer(OfferFrame { message: wire }),
             bucket: None,
         });
@@ -4970,7 +5616,6 @@ mod tests {
         let (actions, _) = node.handle(Event::Frame {
             at: now,
             link: 100,
-            from: sender.id(),
             frame: Frame::Offer(OfferFrame { message: wire }),
             bucket: None,
         });
@@ -5042,7 +5687,6 @@ mod tests {
         let (actions, _) = node.handle(Event::Frame {
             at: now,
             link: 100,
-            from: sender.id(),
             frame: Frame::Offer(OfferFrame { message: wire }),
             bucket: None,
         });
@@ -5080,7 +5724,6 @@ mod tests {
         let (actions, _) = node.handle(Event::Frame {
             at: now,
             link: 100,
-            from: sender.id(),
             frame: Frame::Offer(OfferFrame { message: wire }),
             bucket: None,
         });
@@ -5135,7 +5778,6 @@ mod tests {
         let (actions, _) = node.handle(Event::Frame {
             at: now,
             link: 100,
-            from: sender.id(),
             frame: Frame::Offer(OfferFrame { message: wire }),
             bucket: None,
         });
@@ -5164,7 +5806,6 @@ mod tests {
         let (actions, _) = node.handle(Event::Frame {
             at: now,
             link: 100,
-            from: upstream,
             frame: Frame::Offer(OfferFrame { message: wire }),
             bucket: None,
         });
@@ -5246,7 +5887,6 @@ mod tests {
             node.handle(Event::Frame {
                 at: now,
                 link: 100,
-                from: peer,
                 frame: Frame::Reconcile(ReconcileFrame { ranges }),
                 bucket: None,
             })
@@ -5328,7 +5968,6 @@ mod tests {
         let (actions, _) = node.handle(Event::Frame {
             at: now,
             link: 300,
-            from: stray,
             frame: Frame::Offer(OfferFrame { message: wire }),
             bucket: None,
         });
@@ -5422,7 +6061,6 @@ mod tests {
         node.handle(Event::Frame {
             at: 1_000,
             link: 100,
-            from: peer,
             frame: Frame::Dummy(DummyFrame { echo: true }),
             bucket: Some(1),
         });
@@ -5453,7 +6091,6 @@ mod tests {
             node.handle(Event::Frame {
                 at: 1_000,
                 link: 100,
-                from: peer,
                 frame: Frame::Dummy(DummyFrame { echo: true }),
                 bucket: Some(bucket),
             });
@@ -5478,7 +6115,6 @@ mod tests {
         node.handle(Event::Frame {
             at: 1_000,
             link: 100,
-            from: peer,
             frame: Frame::Dummy(DummyFrame { echo: true }),
             bucket: None,
         });
@@ -5500,7 +6136,6 @@ mod tests {
             node.handle(Event::Frame {
                 at: 1_000,
                 link: 100,
-                from: peer,
                 frame: Frame::Dummy(DummyFrame { echo: true }),
                 bucket: Some(2),
             });
@@ -5524,7 +6159,6 @@ mod tests {
             node.handle(Event::Frame {
                 at: 1_000,
                 link: 100,
-                from: peer,
                 frame: Frame::Dummy(DummyFrame { echo: true }),
                 bucket: Some(2),
             });
@@ -5535,7 +6169,6 @@ mod tests {
         node.handle(Event::Frame {
             at: 4_000,
             link: 100,
-            from: peer,
             frame: Frame::Dummy(DummyFrame { echo: true }),
             bucket: Some(2),
         });
@@ -5546,7 +6179,6 @@ mod tests {
         node.handle(Event::Frame {
             at: 4_000,
             link: 100,
-            from: peer,
             frame: Frame::Dummy(DummyFrame { echo: true }),
             bucket: Some(2),
         });
@@ -5567,7 +6199,6 @@ mod tests {
             node.handle(Event::Frame {
                 at: 1_000,
                 link: 100,
-                from: peer_a,
                 frame: Frame::Dummy(DummyFrame { echo: true }),
                 bucket: Some(2),
             });
@@ -5576,7 +6207,6 @@ mod tests {
         node.handle(Event::Frame {
             at: 1_000,
             link: 200,
-            from: peer_b,
             frame: Frame::Dummy(DummyFrame { echo: true }),
             bucket: Some(2),
         });
@@ -5624,7 +6254,6 @@ mod tests {
         node.handle(Event::Frame {
             at: 1_050,
             link: 100,
-            from: peer,
             frame: custody_frame(leg, CUSTODY_ACCEPTED),
             bucket: None,
         });
