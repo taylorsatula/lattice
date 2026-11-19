@@ -113,3 +113,32 @@ fn per_range_group_sub_cap_is_enforced() {
         .count();
     assert_eq!(total, 16);
 }
+
+/// A candidate whose dial always fails is never linked; the others are.
+#[test]
+fn blocked_dial_candidate_is_not_linked() {
+    let mut sim = Sim::new(fast_config());
+    sim.add_node(); // node 0: no endpoint
+    for i in 1..=4 {
+        sim.add_node_with(|c| {
+            c.advertise = vec![format!("ws://203.0.{i}.1/")];
+        });
+    }
+    full_mesh(&mut sim, 5);
+    sim.run_for(5);
+    for j in 1..5 {
+        if let Some(l) = sim.link_between(0, j) {
+            sim.set_link(l, LinkState::Down);
+        }
+    }
+    sim.set_dial_blocked(0, 1, true);
+    sim.run_for(15);
+    assert!(
+        sim.up_link_between(0, 1).is_none(),
+        "a blocked candidate must never link"
+    );
+    let others = (2..=4)
+        .filter(|&j| sim.up_link_between(0, j).is_some())
+        .count();
+    assert_eq!(others, 3, "the unblocked candidates must link");
+}

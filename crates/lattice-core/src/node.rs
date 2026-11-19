@@ -2689,13 +2689,24 @@ impl<S: Store> Node<S> {
                 }
             }
         }
-        // Bound the table: evict the oldest non-anchor entries.
+        // Bound the table: evict the oldest non-anchor entries, preferring
+        // peers we are not currently linked to (a linked peer re-saves
+        // itself on the next bind anyway, but there is no reason to drop
+        // it first).
         while self.saved_peers.len() > neighbor::MAX_SAVED_PEERS {
+            let linked: HashSet<Identifier> =
+                self.links.values().filter_map(|l| l.peer).collect();
             let victim = self
                 .saved_peers
                 .values()
-                .filter(|p| !p.anchor)
+                .filter(|p| !p.anchor && !linked.contains(&p.id))
                 .min_by_key(|p| p.saved_at)
+                .or_else(|| {
+                    self.saved_peers
+                        .values()
+                        .filter(|p| !p.anchor)
+                        .min_by_key(|p| p.saved_at)
+                })
                 .map(|p| (p.id, p.scope));
             let Some((id, scope)) = victim else { break };
             self.saved_peers.remove(&(id, scope));
