@@ -31,6 +31,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
+name = "base32ct"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e27957ac55e90ce032f6736755cd74cea202e97e19f22e8ba2d0bc0413f99ec9"
+
+[[package]]
 name = "blake3"
 version = "1.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -348,6 +354,7 @@ version = "0.0.0"
 dependencies = [
  "lattice-crypto",
  "lattice-proto",
+ "lattice-types",
  "libfuzzer-sys",
 ]
 
@@ -355,6 +362,7 @@ dependencies = [
 name = "lattice-proto"
 version = "0.0.0"
 dependencies = [
+ "base32ct",
  "lattice-crypto",
  "lattice-types",
  "serde",

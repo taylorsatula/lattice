@@ -14,6 +14,7 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 lattice-proto = { path = "../crates/lattice-proto" }
 lattice-crypto = { path = "../crates/lattice-crypto" }
+lattice-types = { path = "../crates/lattice-types" }
 
 [[bin]]
 name = "cbor_decode"
