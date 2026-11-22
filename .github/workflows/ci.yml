@@ -97,11 +97,14 @@ jobs:
         with:
           tool: cargo-fuzz
       - name: build fuzz targets
-        run: cargo +nightly fuzz build
+        # cargo-fuzz defaults to x86_64-unknown-linux-musl on Linux, whose
+        # static libc is incompatible with the address sanitizer. Build for
+        # the host (gnu) target instead.
+        run: cargo +nightly fuzz build --target x86_64-unknown-linux-gnu
       - name: smoke-run fuzz targets (45s each)
         run: |
           set -e
           for target in cbor_decode frame_decode message_open message_parse record_parse parse_init local_deframe decode_kel; do
             echo "== $target"
-            cargo +nightly fuzz run "$target" -- -max_total_time=45 -timeout=25
+            cargo +nightly fuzz run "$target" --target x86_64-unknown-linux-gnu -- -max_total_time=45 -timeout=25
           done
